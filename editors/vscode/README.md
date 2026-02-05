@@ -303,19 +303,19 @@ VS Code Extension (TypeScript)
 
 ## Contributing
 
-- [Report Issues](https://github.com/luna-lang/luna/issues)
-- [View Source](https://github.com/luna-lang/luna/tree/main/vscode-extension)
-- [Documentation](https://luna-lang.dev/docs)
+- [Report Issues](https://github.com/LMDtokyo/Luna/issues)
+- [View Source](https://github.com/LMDtokyo/Luna/tree/main/editors/vscode)
+- [Documentation](https://github.com/LMDtokyo/Luna#readme)
 
 ---
 
 ## License
 
-MIT License - see [LICENSE](https://github.com/luna-lang/luna/blob/main/LICENSE)
+GPLv3 License - see [LICENSE](https://github.com/LMDtokyo/Luna/blob/main/LICENSE)
 
 ---
 
 <p align="center">
   <strong>Luna v4.2 "The Absolute"</strong> — 100% Self-Hosted<br>
-  Made with 🌙 by the <a href="https://github.com/luna-lang">Luna Team</a>
+  Made with 🌙 by <a href="https://github.com/LMDtokyo">LMDtokyo</a>
 </p>
