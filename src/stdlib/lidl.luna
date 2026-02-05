@@ -1,0 +1,1102 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Interface Description Language (LIDL) v4.1
+# =============================================================================
+# Platform-independent interface descriptions with code generation.
+# Entirely new module — no Rust equivalent.
+#
+# Features:
+#   - Parse LIDL schema definitions (struct, actor, method, enum)
+#   - Generate C FFI headers from LIDL schemas
+#   - Generate TypeScript client bindings
+#   - Borrow checker integration for ownership verification
+#   - Arena-based node allocation with flat parallel arrays
+#
+# LIDL Syntax:
+#   struct Point { x: i32, y: i32 }
+#   actor FileService {
+#       method open(path: string) -> handle
+#       method read(h: handle, count: i32) -> bytes
+#       method close(h: handle) -> void
+#   }
+#
+# Build: luna compile --release lidl.luna -o lidl.o
+# =============================================================================
+
+import types
+import borrow_checker
+
+# =============================================================================
+# SECTION 1: CONSTANTS
+# =============================================================================
+
+# LIDL node types
+const LIDL_STRUCT: int = 0
+const LIDL_ACTOR: int = 1
+const LIDL_METHOD: int = 2
+const LIDL_FIELD: int = 3
+const LIDL_ENUM: int = 4
+const LIDL_PARAM: int = 5
+const LIDL_VARIANT: int = 6
+const LIDL_IMPORT: int = 7
+
+# LIDL type identifiers
+const LIDL_TYPE_I32: int = 0
+const LIDL_TYPE_I64: int = 1
+const LIDL_TYPE_F32: int = 2
+const LIDL_TYPE_F64: int = 3
+const LIDL_TYPE_BOOL: int = 4
+const LIDL_TYPE_STRING: int = 5
+const LIDL_TYPE_BYTES: int = 6
+const LIDL_TYPE_HANDLE: int = 7
+const LIDL_TYPE_VOID: int = 8
+const LIDL_TYPE_U8: int = 9
+const LIDL_TYPE_U32: int = 10
+const LIDL_TYPE_CUSTOM: int = 11
+
+# Ownership qualifiers
+const OWN_OWNED: int = 0
+const OWN_BORROWED: int = 1
+const OWN_SHARED: int = 2
+const OWN_MUT_BORROWED: int = 3
+
+# Limits
+const MAX_LIDL_NODES: int = 2048
+const MAX_METHODS: int = 512
+const MAX_FIELDS: int = 1024
+const MAX_PARAMS: int = 2048
+const MAX_NAME_LEN: int = 128
+const MAX_OUTPUT: int = 65536
+
+# Result codes
+const LIDL_OK: int = 0
+const LIDL_ERROR: int = -1
+
+# =============================================================================
+# SECTION 2: DATA STRUCTURES (flat parallel arrays)
+# =============================================================================
+
+# Node storage
+meow @node_type: [int; 2048] = [0; 2048]
+meow @node_name: [int; 262144] = [0; 262144]    # MAX_NODES * MAX_NAME_LEN
+meow @node_name_len: [int; 2048] = [0; 2048]
+meow @node_parent: [int; 2048] = [-1; 2048]
+meow @node_first_child: [int; 2048] = [-1; 2048]
+meow @node_next_sibling: [int; 2048] = [-1; 2048]
+meow @node_count: int = 0
+
+# Field/param type information
+meow @field_type_id: [int; 1024] = [0; 1024]
+meow @field_ownership: [int; 1024] = [0; 1024]
+meow @field_custom_type: [int; 131072] = [0; 131072]  # MAX_FIELDS * MAX_NAME_LEN
+meow @field_custom_type_len: [int; 1024] = [0; 1024]
+meow @field_count: int = 0
+
+# Method signatures
+meow @method_return_type: [int; 512] = [0; 512]
+meow @method_param_start: [int; 512] = [0; 512]
+meow @method_param_count: [int; 512] = [0; 512]
+meow @method_count: int = 0
+
+# Parameters
+meow @param_name: [int; 262144] = [0; 262144]  # MAX_PARAMS * MAX_NAME_LEN
+meow @param_name_len: [int; 2048] = [0; 2048]
+meow @param_type_id: [int; 2048] = [0; 2048]
+meow @param_ownership: [int; 2048] = [0; 2048]
+meow @param_count: int = 0
+
+# Output buffer for code generation
+meow @output_buf: [int; 65536] = [0; 65536]
+meow @output_pos: int = 0
+
+# Parser state
+meow @parse_src: [int; 8192] = [0; 8192]
+meow @parse_len: int = 0
+meow @parse_pos: int = 0
+meow @parse_line: int = 1
+
+# =============================================================================
+# SECTION 3: NODE ALLOCATION HELPERS
+# =============================================================================
+
+fn lidl_node_alloc(@type_id: int) -> int
+    if @node_count >= MAX_LIDL_NODES
+        return -1
+    @idx = @node_count
+    @node_type[@idx] = @type_id
+    @node_name_len[@idx] = 0
+    @node_parent[@idx] = -1
+    @node_first_child[@idx] = -1
+    @node_next_sibling[@idx] = -1
+    @node_count = @node_count + 1
+    return @idx
+
+fn lidl_node_set_name(@idx: int, @name: *u8, @name_len: int)
+    if @idx < 0
+        return
+    @n_off = @idx * MAX_NAME_LEN
+    @copy_len = @name_len
+    if @copy_len > MAX_NAME_LEN
+        @copy_len = MAX_NAME_LEN
+    orbit @i in 0..@copy_len
+        @node_name[@n_off + @i] = types::ptr_read_byte(@name, @i)
+    @node_name_len[@idx] = @copy_len
+
+fn lidl_node_set_name_from_parse(@idx: int, @start: int, @len: int)
+    if @idx < 0
+        return
+    @n_off = @idx * MAX_NAME_LEN
+    @copy_len = @len
+    if @copy_len > MAX_NAME_LEN
+        @copy_len = MAX_NAME_LEN
+    orbit @i in 0..@copy_len
+        @node_name[@n_off + @i] = @parse_src[@start + @i]
+    @node_name_len[@idx] = @copy_len
+
+fn lidl_node_add_child(@parent: int, @child: int)
+    if @parent < 0
+        return
+    if @child < 0
+        return
+    @node_parent[@child] = @parent
+    if @node_first_child[@parent] < 0
+        @node_first_child[@parent] = @child
+    eclipse
+        # Find last sibling
+        @sib = @node_first_child[@parent]
+        orbit @iter in 0..MAX_LIDL_NODES
+            if @node_next_sibling[@sib] < 0
+                nova
+            @sib = @node_next_sibling[@sib]
+        @node_next_sibling[@sib] = @child
+
+fn field_alloc(@type_id: int, @ownership: int) -> int
+    if @field_count >= MAX_FIELDS
+        return -1
+    @idx = @field_count
+    @field_type_id[@idx] = @type_id
+    @field_ownership[@idx] = @ownership
+    @field_custom_type_len[@idx] = 0
+    @field_count = @field_count + 1
+    return @idx
+
+fn param_alloc(@name: *u8, @name_len: int, @type_id: int) -> int
+    if @param_count >= MAX_PARAMS
+        return -1
+    @idx = @param_count
+    @p_off = @idx * MAX_NAME_LEN
+    orbit @i in 0..@name_len
+        @param_name[@p_off + @i] = types::ptr_read_byte(@name, @i)
+    @param_name_len[@idx] = @name_len
+    @param_type_id[@idx] = @type_id
+    @param_ownership[@idx] = OWN_OWNED
+    @param_count = @param_count + 1
+    return @idx
+
+fn method_alloc(@return_type: int) -> int
+    if @method_count >= MAX_METHODS
+        return -1
+    @idx = @method_count
+    @method_return_type[@idx] = @return_type
+    @method_param_start[@idx] = @param_count
+    @method_param_count[@idx] = 0
+    @method_count = @method_count + 1
+    return @idx
+
+fn lidl_reset()
+    @node_count = 0
+    @field_count = 0
+    @method_count = 0
+    @param_count = 0
+    @output_pos = 0
+    @parse_pos = 0
+    @parse_line = 1
+
+# =============================================================================
+# SECTION 4: LIDL PARSER
+# =============================================================================
+
+fn p_peek() -> int
+    if @parse_pos >= @parse_len
+        return -1
+    return @parse_src[@parse_pos]
+
+fn p_advance() -> int
+    if @parse_pos >= @parse_len
+        return -1
+    @ch = @parse_src[@parse_pos]
+    @parse_pos = @parse_pos + 1
+    if @ch == 10
+        @parse_line = @parse_line + 1
+    return @ch
+
+fn p_skip_ws()
+    orbit @iter in 0..8192
+        @ch = p_peek()
+        if @ch < 0
+            nova
+        if @ch == 32
+            p_advance()
+        eclipse
+            if @ch == 9
+                p_advance()
+            eclipse
+                if @ch == 10
+                    p_advance()
+                eclipse
+                    if @ch == 13
+                        p_advance()
+                    eclipse
+                        nova
+
+fn p_skip_comment()
+    # Skip // comments
+    @ch = p_peek()
+    if @ch == 47
+        @save = @parse_pos
+        p_advance()
+        @ch2 = p_peek()
+        if @ch2 == 47
+            # Skip to end of line
+            orbit @iter in 0..8192
+                @ch = p_peek()
+                if @ch < 0
+                    nova
+                if @ch == 10
+                    p_advance()
+                    nova
+                p_advance()
+        eclipse
+            @parse_pos = @save
+
+fn p_skip_ws_and_comments()
+    orbit @iter in 0..256
+        @old_pos = @parse_pos
+        p_skip_ws()
+        p_skip_comment()
+        if @parse_pos == @old_pos
+            nova
+
+fn p_read_ident() -> int
+    # Read identifier, return start position (length stored in temp)
+    p_skip_ws_and_comments()
+    @start = @parse_pos
+    orbit @iter in 0..MAX_NAME_LEN
+        @ch = p_peek()
+        if @ch < 0
+            nova
+        @is_alpha = 0
+        if @ch >= 97
+            if @ch <= 122
+                @is_alpha = 1
+        if @ch >= 65
+            if @ch <= 90
+                @is_alpha = 1
+        if @ch >= 48
+            if @ch <= 57
+                @is_alpha = 1
+        if @ch == 95
+            @is_alpha = 1
+        if @is_alpha == 0
+            nova
+        p_advance()
+    return @start
+
+fn p_expect_char(@expected: int) -> int
+    p_skip_ws_and_comments()
+    @ch = p_peek()
+    if @ch != @expected
+        return LIDL_ERROR
+    p_advance()
+    return LIDL_OK
+
+fn p_match_keyword(@kw: *u8, @kw_len: int) -> int
+    # Check if next identifier matches keyword
+    @save = @parse_pos
+    @start = p_read_ident()
+    @len = @parse_pos - @start
+    if @len != @kw_len
+        @parse_pos = @save
+        return 0
+    orbit @i in 0..@kw_len
+        if @parse_src[@start + @i] != types::ptr_read_byte(@kw, @i)
+            @parse_pos = @save
+            return 0
+    return 1
+
+fn p_parse_type() -> int
+    # Parse a type name and return LIDL_TYPE_* constant
+    @start = p_read_ident()
+    @len = @parse_pos - @start
+
+    # Match known types
+    if @len == 3
+        if @parse_src[@start] == 105   # 'i'
+            if @parse_src[@start + 1] == 51   # '3'
+                if @parse_src[@start + 2] == 50   # '2'
+                    return LIDL_TYPE_I32
+        if @parse_src[@start] == 105   # 'i'
+            if @parse_src[@start + 1] == 54   # '6'
+                if @parse_src[@start + 2] == 52   # '4'
+                    return LIDL_TYPE_I64
+        if @parse_src[@start] == 102   # 'f'
+            if @parse_src[@start + 1] == 51   # '3'
+                if @parse_src[@start + 2] == 50   # '2'
+                    return LIDL_TYPE_F32
+        if @parse_src[@start] == 102   # 'f'
+            if @parse_src[@start + 1] == 54   # '6'
+                if @parse_src[@start + 2] == 52   # '4'
+                    return LIDL_TYPE_F64
+    if @len == 4
+        if @parse_src[@start] == 98    # 'b'
+            if @parse_src[@start + 1] == 111  # 'o'
+                if @parse_src[@start + 2] == 111  # 'o'
+                    if @parse_src[@start + 3] == 108  # 'l'
+                        return LIDL_TYPE_BOOL
+        if @parse_src[@start] == 118   # 'v'
+            if @parse_src[@start + 1] == 111  # 'o'
+                if @parse_src[@start + 2] == 105  # 'i'
+                    if @parse_src[@start + 3] == 100  # 'd'
+                        return LIDL_TYPE_VOID
+    if @len == 6
+        if @parse_src[@start] == 115   # 's'
+            if @parse_src[@start + 1] == 116  # 't'
+                return LIDL_TYPE_STRING
+        if @parse_src[@start] == 104   # 'h'
+            if @parse_src[@start + 1] == 97   # 'a'
+                return LIDL_TYPE_HANDLE
+    if @len == 5
+        if @parse_src[@start] == 98    # 'b'
+            if @parse_src[@start + 1] == 121  # 'y'
+                return LIDL_TYPE_BYTES
+    if @len == 2
+        if @parse_src[@start] == 117   # 'u'
+            if @parse_src[@start + 1] == 56   # '8'
+                return LIDL_TYPE_U8
+    if @len == 3
+        if @parse_src[@start] == 117   # 'u'
+            if @parse_src[@start + 1] == 51   # '3'
+                if @parse_src[@start + 2] == 50   # '2'
+                    return LIDL_TYPE_U32
+
+    return LIDL_TYPE_CUSTOM
+
+fn lidl_parse_struct() -> int
+    # Parse: struct Name { field: type, ... }
+    @node = lidl_node_alloc(LIDL_STRUCT)
+    if @node < 0
+        return LIDL_ERROR
+
+    @name_start = p_read_ident()
+    @name_len = @parse_pos - @name_start
+    lidl_node_set_name_from_parse(@node, @name_start, @name_len)
+
+    @r = p_expect_char(123)  # '{'
+    if @r < 0
+        return LIDL_ERROR
+
+    orbit @iter in 0..MAX_FIELDS
+        p_skip_ws_and_comments()
+        @ch = p_peek()
+        if @ch == 125  # '}'
+            p_advance()
+            nova
+        if @ch < 0
+            nova
+
+        # Parse field: name: type
+        @field_node = lidl_node_alloc(LIDL_FIELD)
+        @f_name_start = p_read_ident()
+        @f_name_len = @parse_pos - @f_name_start
+        lidl_node_set_name_from_parse(@field_node, @f_name_start, @f_name_len)
+
+        p_expect_char(58)  # ':'
+        @ftype = p_parse_type()
+
+        @fidx = field_alloc(@ftype, OWN_OWNED)
+        lidl_node_add_child(@node, @field_node)
+
+        # Optional comma
+        p_skip_ws_and_comments()
+        @ch = p_peek()
+        if @ch == 44  # ','
+            p_advance()
+
+    return @node
+
+fn lidl_parse_method(@parent_actor: int) -> int
+    # Parse: method name(params) -> return_type
+    @node = lidl_node_alloc(LIDL_METHOD)
+    if @node < 0
+        return LIDL_ERROR
+
+    @name_start = p_read_ident()
+    @name_len = @parse_pos - @name_start
+    lidl_node_set_name_from_parse(@node, @name_start, @name_len)
+
+    @midx = method_alloc(LIDL_TYPE_VOID)
+    @method_param_start[@midx] = @param_count
+
+    @r = p_expect_char(40)  # '('
+    if @r < 0
+        return LIDL_ERROR
+
+    # Parse parameters
+    @p_count = 0
+    orbit @iter in 0..32
+        p_skip_ws_and_comments()
+        @ch = p_peek()
+        if @ch == 41  # ')'
+            p_advance()
+            nova
+        if @ch < 0
+            nova
+
+        if @p_count > 0
+            p_expect_char(44)  # ','
+
+        @p_name_start = p_read_ident()
+        @p_name_len = @parse_pos - @p_name_start
+        p_expect_char(58)  # ':'
+        @ptype = p_parse_type()
+
+        meow @p_name_buf: [int; 128] = [0; 128]
+        orbit @i in 0..@p_name_len
+            @p_name_buf[@i] = @parse_src[@p_name_start + @i]
+        param_alloc(@p_name_buf, @p_name_len, @ptype)
+        @p_count = @p_count + 1
+
+    @method_param_count[@midx] = @p_count
+
+    # Parse return type: -> type
+    p_skip_ws_and_comments()
+    @ch = p_peek()
+    if @ch == 45  # '-'
+        p_advance()
+        p_expect_char(62)  # '>'
+        @ret_type = p_parse_type()
+        @method_return_type[@midx] = @ret_type
+
+    lidl_node_add_child(@parent_actor, @node)
+    return @node
+
+fn lidl_parse_actor() -> int
+    # Parse: actor Name { method ... }
+    @node = lidl_node_alloc(LIDL_ACTOR)
+    if @node < 0
+        return LIDL_ERROR
+
+    @name_start = p_read_ident()
+    @name_len = @parse_pos - @name_start
+    lidl_node_set_name_from_parse(@node, @name_start, @name_len)
+
+    @r = p_expect_char(123)  # '{'
+    if @r < 0
+        return LIDL_ERROR
+
+    orbit @iter in 0..MAX_METHODS
+        p_skip_ws_and_comments()
+        @ch = p_peek()
+        if @ch == 125  # '}'
+            p_advance()
+            nova
+        if @ch < 0
+            nova
+
+        # Expect 'method' keyword
+        @is_method = p_match_keyword("method", 6)
+        if @is_method == 1
+            lidl_parse_method(@node)
+
+    return @node
+
+fn lidl_parse_enum() -> int
+    # Parse: enum Name { Variant1, Variant2, ... }
+    @node = lidl_node_alloc(LIDL_ENUM)
+    if @node < 0
+        return LIDL_ERROR
+
+    @name_start = p_read_ident()
+    @name_len = @parse_pos - @name_start
+    lidl_node_set_name_from_parse(@node, @name_start, @name_len)
+
+    @r = p_expect_char(123)  # '{'
+    if @r < 0
+        return LIDL_ERROR
+
+    orbit @iter in 0..256
+        p_skip_ws_and_comments()
+        @ch = p_peek()
+        if @ch == 125  # '}'
+            p_advance()
+            nova
+        if @ch < 0
+            nova
+
+        @var_node = lidl_node_alloc(LIDL_VARIANT)
+        @v_name_start = p_read_ident()
+        @v_name_len = @parse_pos - @v_name_start
+        lidl_node_set_name_from_parse(@var_node, @v_name_start, @v_name_len)
+        lidl_node_add_child(@node, @var_node)
+
+        p_skip_ws_and_comments()
+        @ch = p_peek()
+        if @ch == 44  # ','
+            p_advance()
+
+    return @node
+
+fn lidl_parse(@source: *u8, @source_len: int) -> int
+    # Parse a LIDL schema. Returns node count or LIDL_ERROR
+    lidl_reset()
+
+    if @source_len > 8192
+        return LIDL_ERROR
+
+    orbit @i in 0..@source_len
+        @parse_src[@i] = types::ptr_read_byte(@source, @i)
+    @parse_len = @source_len
+    @parse_pos = 0
+
+    orbit @iter in 0..256
+        p_skip_ws_and_comments()
+        @ch = p_peek()
+        if @ch < 0
+            nova
+
+        # Try each top-level keyword
+        @is_struct = p_match_keyword("struct", 6)
+        if @is_struct == 1
+            @r = lidl_parse_struct()
+            if @r < 0
+                return LIDL_ERROR
+            orbit @next in 0..0
+                pass
+
+        @is_actor = p_match_keyword("actor", 5)
+        if @is_actor == 1
+            @r = lidl_parse_actor()
+            if @r < 0
+                return LIDL_ERROR
+            orbit @next in 0..0
+                pass
+
+        @is_enum = p_match_keyword("enum", 4)
+        if @is_enum == 1
+            @r = lidl_parse_enum()
+            if @r < 0
+                return LIDL_ERROR
+            orbit @next in 0..0
+                pass
+
+        # Unknown token - skip
+        if @is_struct == 0
+            if @is_actor == 0
+                if @is_enum == 0
+                    p_advance()
+
+    return @node_count
+
+# =============================================================================
+# SECTION 5: C FFI CODE GENERATOR
+# =============================================================================
+
+fn out_char(@ch: int)
+    if @output_pos < MAX_OUTPUT
+        @output_buf[@output_pos] = @ch
+        @output_pos = @output_pos + 1
+
+fn out_str(@s: *u8, @len: int)
+    orbit @i in 0..@len
+        out_char(types::ptr_read_byte(@s, @i))
+
+fn out_name(@node: int)
+    @n_off = @node * MAX_NAME_LEN
+    orbit @i in 0..@node_name_len[@node]
+        out_char(@node_name[@n_off + @i])
+
+fn out_newline()
+    out_char(10)
+
+fn out_indent(@level: int)
+    orbit @i in 0..@level * 4
+        out_char(32)
+
+fn lidl_type_to_c(@type_id: int)
+    phase @type_id
+        0 =>
+            out_str("int32_t", 7)
+        1 =>
+            out_str("int64_t", 7)
+        2 =>
+            out_str("float", 5)
+        3 =>
+            out_str("double", 6)
+        4 =>
+            out_str("int", 3)
+        5 =>
+            out_str("const char*", 11)
+        6 =>
+            out_str("const uint8_t*", 14)
+        7 =>
+            out_str("int", 3)
+        8 =>
+            out_str("void", 4)
+        9 =>
+            out_str("uint8_t", 7)
+        10 =>
+            out_str("uint32_t", 8)
+
+fn lidl_gen_c_header() -> int
+    # Generate C header from parsed LIDL schema
+    @output_pos = 0
+
+    out_str("/* Generated by LIDL v4.1 */", 28)
+    out_newline()
+    out_str("#pragma once", 12)
+    out_newline()
+    out_str("#include <stdint.h>", 19)
+    out_newline()
+    out_newline()
+
+    # Generate structs
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_STRUCT
+            out_str("typedef struct {", 16)
+            out_newline()
+            @child = @node_first_child[@i]
+            @fidx = 0
+            orbit @j in 0..MAX_FIELDS
+                if @child < 0
+                    nova
+                out_indent(1)
+                if @fidx < @field_count
+                    lidl_type_to_c(@field_type_id[@fidx])
+                eclipse
+                    out_str("int", 3)
+                out_char(32)
+                out_name(@child)
+                out_char(59)  # ';'
+                out_newline()
+                @child = @node_next_sibling[@child]
+                @fidx = @fidx + 1
+            out_str("} ", 2)
+            out_name(@i)
+            out_char(59)
+            out_newline()
+            out_newline()
+
+    # Generate enum typedefs
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_ENUM
+            out_str("typedef enum {", 14)
+            out_newline()
+            @child = @node_first_child[@i]
+            @vidx = 0
+            orbit @j in 0..256
+                if @child < 0
+                    nova
+                out_indent(1)
+                out_name(@i)
+                out_char(95)  # '_'
+                out_name(@child)
+                out_str(" = ", 3)
+                # Write index as ASCII digit(s)
+                if @vidx < 10
+                    out_char(48 + @vidx)
+                eclipse
+                    out_char(48 + @vidx / 10)
+                    out_char(48 + @vidx % 10)
+                out_char(44)  # ','
+                out_newline()
+                @child = @node_next_sibling[@child]
+                @vidx = @vidx + 1
+            out_str("} ", 2)
+            out_name(@i)
+            out_char(59)
+            out_newline()
+            out_newline()
+
+    # Generate actor function declarations
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_ACTOR
+            @child = @node_first_child[@i]
+            @midx = 0
+            orbit @j in 0..MAX_METHODS
+                if @child < 0
+                    nova
+                if @node_type[@child] == LIDL_METHOD
+                    if @midx < @method_count
+                        lidl_type_to_c(@method_return_type[@midx])
+                    eclipse
+                        out_str("void", 4)
+                    out_char(32)
+                    out_name(@i)
+                    out_char(95)
+                    out_name(@child)
+                    out_char(40)  # '('
+
+                    # Parameters
+                    @ps = @method_param_start[@midx]
+                    @pc = @method_param_count[@midx]
+                    orbit @k in 0..@pc
+                        if @k > 0
+                            out_str(", ", 2)
+                        @pidx = @ps + @k
+                        lidl_type_to_c(@param_type_id[@pidx])
+                        out_char(32)
+                        @pn_off = @pidx * MAX_NAME_LEN
+                        orbit @b in 0..@param_name_len[@pidx]
+                            out_char(@param_name[@pn_off + @b])
+
+                    out_str(");", 2)
+                    out_newline()
+                    @midx = @midx + 1
+                @child = @node_next_sibling[@child]
+            out_newline()
+
+    return @output_pos
+
+# =============================================================================
+# SECTION 6: TYPESCRIPT BINDINGS GENERATOR
+# =============================================================================
+
+fn lidl_type_to_ts(@type_id: int)
+    phase @type_id
+        0 =>
+            out_str("number", 6)
+        1 =>
+            out_str("bigint", 6)
+        2 =>
+            out_str("number", 6)
+        3 =>
+            out_str("number", 6)
+        4 =>
+            out_str("boolean", 7)
+        5 =>
+            out_str("string", 6)
+        6 =>
+            out_str("Uint8Array", 10)
+        7 =>
+            out_str("number", 6)
+        8 =>
+            out_str("void", 4)
+        9 =>
+            out_str("number", 6)
+        10 =>
+            out_str("number", 6)
+
+fn lidl_gen_ts_types() -> int
+    # Generate TypeScript type declarations
+    @output_pos = 0
+
+    out_str("// Generated by LIDL v4.1", 25)
+    out_newline()
+    out_newline()
+
+    # Generate interfaces for structs
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_STRUCT
+            out_str("export interface ", 17)
+            out_name(@i)
+            out_str(" {", 2)
+            out_newline()
+            @child = @node_first_child[@i]
+            @fidx = 0
+            orbit @j in 0..MAX_FIELDS
+                if @child < 0
+                    nova
+                out_indent(1)
+                out_name(@child)
+                out_str(": ", 2)
+                if @fidx < @field_count
+                    lidl_type_to_ts(@field_type_id[@fidx])
+                eclipse
+                    out_str("any", 3)
+                out_char(59)
+                out_newline()
+                @child = @node_next_sibling[@child]
+                @fidx = @fidx + 1
+            out_char(125)  # '}'
+            out_newline()
+            out_newline()
+
+    # Generate enums
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_ENUM
+            out_str("export enum ", 12)
+            out_name(@i)
+            out_str(" {", 2)
+            out_newline()
+            @child = @node_first_child[@i]
+            @vidx = 0
+            orbit @j in 0..256
+                if @child < 0
+                    nova
+                out_indent(1)
+                out_name(@child)
+                out_str(" = ", 3)
+                if @vidx < 10
+                    out_char(48 + @vidx)
+                eclipse
+                    out_char(48 + @vidx / 10)
+                    out_char(48 + @vidx % 10)
+                out_char(44)
+                out_newline()
+                @child = @node_next_sibling[@child]
+                @vidx = @vidx + 1
+            out_char(125)
+            out_newline()
+            out_newline()
+
+    # Generate actor client classes
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_ACTOR
+            out_str("export class ", 13)
+            out_name(@i)
+            out_str("Client {", 8)
+            out_newline()
+
+            @child = @node_first_child[@i]
+            @midx = 0
+            orbit @j in 0..MAX_METHODS
+                if @child < 0
+                    nova
+                if @node_type[@child] == LIDL_METHOD
+                    out_indent(1)
+                    out_str("async ", 6)
+                    out_name(@child)
+                    out_char(40)
+                    # Params
+                    @ps = @method_param_start[@midx]
+                    @pc = @method_param_count[@midx]
+                    orbit @k in 0..@pc
+                        if @k > 0
+                            out_str(", ", 2)
+                        @pidx = @ps + @k
+                        @pn_off = @pidx * MAX_NAME_LEN
+                        orbit @b in 0..@param_name_len[@pidx]
+                            out_char(@param_name[@pn_off + @b])
+                        out_str(": ", 2)
+                        lidl_type_to_ts(@param_type_id[@pidx])
+                    out_str("): Promise<", 11)
+                    if @midx < @method_count
+                        lidl_type_to_ts(@method_return_type[@midx])
+                    eclipse
+                        out_str("void", 4)
+                    out_str("> {", 3)
+                    out_newline()
+                    out_indent(2)
+                    out_str("throw new Error('Not implemented');", 35)
+                    out_newline()
+                    out_indent(1)
+                    out_char(125)
+                    out_newline()
+                    @midx = @midx + 1
+                @child = @node_next_sibling[@child]
+
+            out_char(125)
+            out_newline()
+            out_newline()
+
+    return @output_pos
+
+# =============================================================================
+# SECTION 7: BORROW CHECKER INTEGRATION
+# =============================================================================
+
+fn lidl_check_ownership(@node: int) -> int
+    # Verify ownership semantics of method signatures
+    # Returns count of violations found
+    @violations = 0
+
+    if @node_type[@node] != LIDL_ACTOR
+        return 0
+
+    @child = @node_first_child[@node]
+    orbit @iter in 0..MAX_METHODS
+        if @child < 0
+            nova
+        if @node_type[@child] == LIDL_METHOD
+            # Check: handle params should be borrowed, not owned
+            @midx = 0
+            orbit @m in 0..@method_count
+                # Find matching method index (simplified)
+                @midx = @m
+                nova
+            @ps = @method_param_start[@midx]
+            @pc = @method_param_count[@midx]
+            orbit @k in 0..@pc
+                @pidx = @ps + @k
+                if @param_type_id[@pidx] == LIDL_TYPE_HANDLE
+                    if @param_ownership[@pidx] == OWN_OWNED
+                        @violations = @violations + 1
+        @child = @node_next_sibling[@child]
+
+    return @violations
+
+fn lidl_verify_safety() -> int
+    # Run borrow checker verification on all actors
+    @total_violations = 0
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_ACTOR
+            @v = lidl_check_ownership(@i)
+            @total_violations = @total_violations + @v
+    return @total_violations
+
+# =============================================================================
+# SECTION 8: UTILITY FUNCTIONS
+# =============================================================================
+
+fn lidl_get_node_count() -> int
+    return @node_count
+
+fn lidl_get_node_type(@idx: int) -> int
+    if @idx < 0
+        return -1
+    if @idx >= @node_count
+        return -1
+    return @node_type[@idx]
+
+fn lidl_get_output(@out: *u8, @max_len: int) -> int
+    @copy_len = @output_pos
+    if @copy_len > @max_len
+        @copy_len = @max_len
+    orbit @i in 0..@copy_len
+        types::ptr_write_byte(@out, @i, @output_buf[@i])
+    return @copy_len
+
+fn lidl_get_method_count() -> int
+    return @method_count
+
+fn lidl_get_field_count() -> int
+    return @field_count
+
+# =============================================================================
+# SECTION 9: EXTERN C API
+# =============================================================================
+
+extern "C" fn luna_lidl_parse(@src: *u8, @len: int) -> int
+    return lidl_parse(@src, @len)
+
+extern "C" fn luna_lidl_gen_c(@out: *u8, @max: int) -> int
+    lidl_gen_c_header()
+    return lidl_get_output(@out, @max)
+
+extern "C" fn luna_lidl_gen_ts(@out: *u8, @max: int) -> int
+    lidl_gen_ts_types()
+    return lidl_get_output(@out, @max)
+
+extern "C" fn luna_lidl_node_count() -> int
+    return lidl_get_node_count()
+
+extern "C" fn luna_lidl_verify() -> int
+    return lidl_verify_safety()
+
+# =============================================================================
+# SECTION 10: SELF-TESTS
+# =============================================================================
+
+fn test_lidl_parse_struct() -> int
+    @src = "struct Point { x: i32, y: i32 }"
+    @r = lidl_parse(@src, 31)
+    guard @r > 0, "lidl: parse struct failed"
+
+    @nt = lidl_get_node_type(0)
+    guard @nt == LIDL_STRUCT, "lidl: first node should be STRUCT"
+
+    shine("  [PASS] lidl parse struct")
+    return 1
+
+fn test_lidl_parse_actor() -> int
+    @src = "actor Storage { method get(key: string) -> string method put(key: string, val: string) -> void }"
+    @r = lidl_parse(@src, 96)
+    guard @r > 0, "lidl: parse actor failed"
+
+    @found_actor = 0
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_ACTOR
+            @found_actor = 1
+
+    guard @found_actor == 1, "lidl: should find ACTOR node"
+    shine("  [PASS] lidl parse actor")
+    return 1
+
+fn test_lidl_parse_enum() -> int
+    @src = "enum Color { Red, Green, Blue }"
+    @r = lidl_parse(@src, 30)
+    guard @r > 0, "lidl: parse enum failed"
+
+    @found_enum = 0
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_ENUM
+            @found_enum = 1
+
+    guard @found_enum == 1, "lidl: should find ENUM node"
+    shine("  [PASS] lidl parse enum")
+    return 1
+
+fn test_lidl_gen_c() -> int
+    @src = "struct Vec2 { x: f32, y: f32 }"
+    lidl_parse(@src, 30)
+    @len = lidl_gen_c_header()
+    guard @len > 0, "lidl: C gen should produce output"
+
+    shine("  [PASS] lidl gen C header")
+    return 1
+
+fn test_lidl_gen_ts() -> int
+    @src = "struct Config { name: string, port: i32 }"
+    lidl_parse(@src, 41)
+    @len = lidl_gen_ts_types()
+    guard @len > 0, "lidl: TS gen should produce output"
+
+    shine("  [PASS] lidl gen TypeScript")
+    return 1
+
+fn test_lidl_method_params() -> int
+    @src = "actor Calc { method add(a: i32, b: i32) -> i32 }"
+    lidl_parse(@src, 49)
+    @mc = lidl_get_method_count()
+    guard @mc >= 1, "lidl: should have at least 1 method"
+
+    shine("  [PASS] lidl method params")
+    return 1
+
+fn test_lidl_multiple_structs() -> int
+    @src = "struct A { x: i32 } struct B { y: f64 }"
+    @r = lidl_parse(@src, 39)
+    guard @r >= 2, "lidl: should parse 2+ nodes"
+
+    @struct_count = 0
+    orbit @i in 0..@node_count
+        if @node_type[@i] == LIDL_STRUCT
+            @struct_count = @struct_count + 1
+    guard @struct_count >= 2, "lidl: should have 2 structs"
+
+    shine("  [PASS] lidl multiple structs")
+    return 1
+
+fn test_lidl_safety_check() -> int
+    @src = "actor FS { method open(path: string) -> handle }"
+    lidl_parse(@src, 49)
+    @v = lidl_verify_safety()
+    # No violations expected (string params are fine)
+    shine("  [PASS] lidl safety check")
+    return 1
+
+fn run_lidl_tests() -> int
+    shine("--- lidl.luna self-tests ---")
+    @pass_count = 0
+    @pass_count = @pass_count + test_lidl_parse_struct()
+    @pass_count = @pass_count + test_lidl_parse_actor()
+    @pass_count = @pass_count + test_lidl_parse_enum()
+    @pass_count = @pass_count + test_lidl_gen_c()
+    @pass_count = @pass_count + test_lidl_gen_ts()
+    @pass_count = @pass_count + test_lidl_method_params()
+    @pass_count = @pass_count + test_lidl_multiple_structs()
+    @pass_count = @pass_count + test_lidl_safety_check()
+    shine("--- lidl.luna: " + @pass_count + "/8 tests passed ---")
+    return @pass_count

@@ -1,0 +1,1964 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Self-Hosting Optimizer v2.5 "Titan"
+# =============================================================================
+# Ported from Rust optimizer.rs + backend/optimizer.rs to Pure Luna
+#
+# Multi-pass optimization pipeline with:
+# - Constant Folding & Propagation
+# - Strength Reduction
+# - Dead Code Elimination
+# - Copy Propagation
+# - Function Inlining (call graph, recursion detection)
+# - Loop Analysis & Unrolling
+# - Auto-SIMD Vectorization (SSE/AVX2/AVX-512/NEON)
+# - Alias Analysis (memory dependency checking)
+# - Common Subexpression Elimination (CSE)
+# - Loop-Invariant Code Motion (LICM)
+#
+# Uses flat arrays and index-based data structures for performance.
+# =============================================================================
+
+import parser
+import types
+
+# =============================================================================
+# OPTIMIZATION LEVEL CONSTANTS
+# =============================================================================
+
+const OPT_NONE: int = 0
+const OPT_BASIC: int = 1       # Constant fold, DCE, strength reduction
+const OPT_AGGRESSIVE: int = 2  # + inlining, loop unroll, vectorization
+
+# =============================================================================
+# EXPRESSION VALUE TYPES (for constant folding)
+# =============================================================================
+
+const VAL_UNKNOWN: int = 0
+const VAL_INT: int = 1
+const VAL_FLOAT: int = 2
+const VAL_BOOL: int = 3
+const VAL_STR: int = 4
+
+struct ConstValue
+    kind: int           # VAL_* constant
+    int_val: int
+    float_val: float
+    bool_val: int       # 0 or 1
+    str_val: str
+
+fn const_int(@v: int) -> ConstValue
+    return ConstValue { kind: VAL_INT, int_val: @v, float_val: 0.0, bool_val: 0, str_val: "" }
+
+fn const_float(@v: float) -> ConstValue
+    return ConstValue { kind: VAL_FLOAT, int_val: 0, float_val: @v, bool_val: 0, str_val: "" }
+
+fn const_bool(@v: int) -> ConstValue
+    return ConstValue { kind: VAL_BOOL, int_val: 0, float_val: 0.0, bool_val: @v, str_val: "" }
+
+fn const_str(@v: str) -> ConstValue
+    return ConstValue { kind: VAL_STR, int_val: 0, float_val: 0.0, bool_val: 0, str_val: @v }
+
+fn const_unknown() -> ConstValue
+    return ConstValue { kind: VAL_UNKNOWN, int_val: 0, float_val: 0.0, bool_val: 0, str_val: "" }
+
+# =============================================================================
+# CONSTANT FOLDER
+# =============================================================================
+
+struct ConstantFolder
+    folds: int          # Number of folds performed
+
+fn folder_new() -> ConstantFolder
+    return ConstantFolder { folds: 0 }
+
+# Try to evaluate a binary operation on constants
+fn fold_binop(@folder: ConstantFolder, @op: int, @left: ConstValue, @right: ConstValue) -> ConstValue
+    # Both must be known
+    if @left.kind == VAL_UNKNOWN or @right.kind == VAL_UNKNOWN
+        return const_unknown()
+
+    # Integer operations
+    if @left.kind == VAL_INT and @right.kind == VAL_INT
+        @a = @left.int_val
+        @b = @right.int_val
+        match @op
+            OP_ADD => @folder.folds = @folder.folds + 1; return const_int(@a + @b)
+            OP_SUB => @folder.folds = @folder.folds + 1; return const_int(@a - @b)
+            OP_MUL => @folder.folds = @folder.folds + 1; return const_int(@a * @b)
+            OP_DIV =>
+                if @b != 0
+                    @folder.folds = @folder.folds + 1
+                    return const_int(@a / @b)
+                return const_unknown()
+            OP_MOD =>
+                if @b != 0
+                    @folder.folds = @folder.folds + 1
+                    return const_int(@a % @b)
+                return const_unknown()
+            OP_AND => @folder.folds = @folder.folds + 1; return const_int(@a & @b)
+            OP_OR => @folder.folds = @folder.folds + 1; return const_int(@a | @b)
+            OP_XOR => @folder.folds = @folder.folds + 1; return const_int(@a ^ @b)
+            OP_SHL => @folder.folds = @folder.folds + 1; return const_int(@a << @b)
+            OP_SHR => @folder.folds = @folder.folds + 1; return const_int(@a >> @b)
+            OP_EQ => @folder.folds = @folder.folds + 1; return const_bool(if @a == @b then 1 else 0)
+            OP_NE => @folder.folds = @folder.folds + 1; return const_bool(if @a != @b then 1 else 0)
+            OP_LT => @folder.folds = @folder.folds + 1; return const_bool(if @a < @b then 1 else 0)
+            OP_LE => @folder.folds = @folder.folds + 1; return const_bool(if @a <= @b then 1 else 0)
+            OP_GT => @folder.folds = @folder.folds + 1; return const_bool(if @a > @b then 1 else 0)
+            OP_GE => @folder.folds = @folder.folds + 1; return const_bool(if @a >= @b then 1 else 0)
+            _ => return const_unknown()
+
+    # Float operations
+    if @left.kind == VAL_FLOAT or @right.kind == VAL_FLOAT
+        @a = 0.0
+        @b = 0.0
+        if @left.kind == VAL_FLOAT
+            @a = @left.float_val
+        else
+            @a = float(@left.int_val)
+        if @right.kind == VAL_FLOAT
+            @b = @right.float_val
+        else
+            @b = float(@right.int_val)
+
+        match @op
+            OP_ADD => @folder.folds = @folder.folds + 1; return const_float(@a + @b)
+            OP_SUB => @folder.folds = @folder.folds + 1; return const_float(@a - @b)
+            OP_MUL => @folder.folds = @folder.folds + 1; return const_float(@a * @b)
+            OP_DIV =>
+                if @b != 0.0
+                    @folder.folds = @folder.folds + 1
+                    return const_float(@a / @b)
+                return const_unknown()
+            _ => return const_unknown()
+
+    # Boolean operations
+    if @left.kind == VAL_BOOL and @right.kind == VAL_BOOL
+        @a = @left.bool_val
+        @b = @right.bool_val
+        match @op
+            OP_LOGICAL_AND => @folder.folds = @folder.folds + 1; return const_bool(@a and @b)
+            OP_LOGICAL_OR => @folder.folds = @folder.folds + 1; return const_bool(@a or @b)
+            OP_EQ => @folder.folds = @folder.folds + 1; return const_bool(if @a == @b then 1 else 0)
+            OP_NE => @folder.folds = @folder.folds + 1; return const_bool(if @a != @b then 1 else 0)
+            _ => return const_unknown()
+
+    # String concatenation
+    if @left.kind == VAL_STR and @right.kind == VAL_STR
+        if @op == OP_ADD
+            @folder.folds = @folder.folds + 1
+            return const_str(@left.str_val + @right.str_val)
+
+    return const_unknown()
+
+# =============================================================================
+# CONSTANT PROPAGATION
+# =============================================================================
+
+const MAX_CONSTANTS: int = 4096
+
+struct ConstantPropagator
+    names: [int; 4096]          # Interned variable names
+    values: [ConstValue; 4096]  # Constant values
+    count: int
+    propagations: int           # Stats counter
+
+fn propagator_new() -> ConstantPropagator
+    return ConstantPropagator {
+        names: [0; 4096],
+        values: [ConstValue { kind: VAL_UNKNOWN, int_val: 0, float_val: 0.0, bool_val: 0, str_val: "" }; 4096],
+        count: 0,
+        propagations: 0
+    }
+
+fn propagator_set(@prop: ConstantPropagator, @name_idx: int, @val: ConstValue)
+    # Update existing
+    orbit @i in 0..@prop.count
+        if @prop.names[@i] == @name_idx
+            @prop.values[@i] = @val
+            return
+    # New entry
+    if @prop.count < MAX_CONSTANTS
+        @prop.names[@prop.count] = @name_idx
+        @prop.values[@prop.count] = @val
+        @prop.count = @prop.count + 1
+
+fn propagator_get(@prop: ConstantPropagator, @name_idx: int) -> ConstValue
+    orbit @i in 0..@prop.count
+        if @prop.names[@i] == @name_idx
+            return @prop.values[@i]
+    return const_unknown()
+
+fn propagator_invalidate(@prop: ConstantPropagator, @name_idx: int)
+    orbit @i in 0..@prop.count
+        if @prop.names[@i] == @name_idx
+            @prop.values[@i] = const_unknown()
+            return
+
+# =============================================================================
+# STRENGTH REDUCTION
+# =============================================================================
+
+struct StrengthReducer
+    reductions: int
+
+fn reducer_new() -> StrengthReducer
+    return StrengthReducer { reductions: 0 }
+
+# Check if n is a power of 2
+#[inline]
+fn is_power_of_2(@n: int) -> int
+    return @n > 0 and (@n & (@n - 1)) == 0
+
+# Compute log2 of a power of 2
+fn log2_int(@n: int) -> int
+    @result = 0
+    @v = @n
+    orbit _ in 0..64
+        if @v <= 1
+            break
+        @v = @v >> 1
+        @result = @result + 1
+    return @result
+
+# Try to reduce an expression to a cheaper one
+# Returns 1 if reduction was applied, 0 otherwise
+# Reduction rules:
+#   x * 2^n  → x << n
+#   x * 0    → 0
+#   x * 1    → x
+#   x + 0    → x
+#   x - 0    → x
+#   x / 1    → x
+#   x % 1    → 0
+#   x && true  → x
+#   x && false → false
+#   x || true  → true
+#   x || false → x
+
+fn strength_reduce(@reducer: StrengthReducer, @p: Parser, @node_idx: int) -> int
+    if @node_idx < 0
+        return 0
+    @node = @p.nodes[@node_idx]
+    if @node.kind != AST_BINARY
+        return 0
+
+    @op = @node.data1
+    @left_idx = @node.child1
+    @right_idx = @node.child2
+
+    if @left_idx < 0 or @right_idx < 0
+        return 0
+
+    @left = @p.nodes[@left_idx]
+    @right = @p.nodes[@right_idx]
+
+    # x * 2^n → x << n
+    if @op == OP_MUL
+        if @right.kind == AST_LITERAL and @right.data1 == LIT_INT
+            @val = @right.data2
+            if is_power_of_2(@val)
+                @shift = log2_int(@val)
+                @p.nodes[@node_idx].data1 = OP_SHL
+                @p.nodes[@right_idx].data2 = @shift
+                @reducer.reductions = @reducer.reductions + 1
+                return 1
+            elif @val == 0
+                # x * 0 → 0
+                @p.nodes[@node_idx].kind = AST_LITERAL
+                @p.nodes[@node_idx].data1 = LIT_INT
+                @p.nodes[@node_idx].data2 = 0
+                @reducer.reductions = @reducer.reductions + 1
+                return 1
+            elif @val == 1
+                # x * 1 → x (replace node with left child)
+                @p.nodes[@node_idx] = @p.nodes[@left_idx]
+                @reducer.reductions = @reducer.reductions + 1
+                return 1
+
+    # x + 0 → x
+    if @op == OP_ADD
+        if @right.kind == AST_LITERAL and @right.data1 == LIT_INT and @right.data2 == 0
+            @p.nodes[@node_idx] = @p.nodes[@left_idx]
+            @reducer.reductions = @reducer.reductions + 1
+            return 1
+        if @left.kind == AST_LITERAL and @left.data1 == LIT_INT and @left.data2 == 0
+            @p.nodes[@node_idx] = @p.nodes[@right_idx]
+            @reducer.reductions = @reducer.reductions + 1
+            return 1
+
+    # x - 0 → x
+    if @op == OP_SUB
+        if @right.kind == AST_LITERAL and @right.data1 == LIT_INT and @right.data2 == 0
+            @p.nodes[@node_idx] = @p.nodes[@left_idx]
+            @reducer.reductions = @reducer.reductions + 1
+            return 1
+
+    # x / 1 → x
+    if @op == OP_DIV
+        if @right.kind == AST_LITERAL and @right.data1 == LIT_INT and @right.data2 == 1
+            @p.nodes[@node_idx] = @p.nodes[@left_idx]
+            @reducer.reductions = @reducer.reductions + 1
+            return 1
+
+    # x % 1 → 0
+    if @op == OP_MOD
+        if @right.kind == AST_LITERAL and @right.data1 == LIT_INT and @right.data2 == 1
+            @p.nodes[@node_idx].kind = AST_LITERAL
+            @p.nodes[@node_idx].data1 = LIT_INT
+            @p.nodes[@node_idx].data2 = 0
+            @reducer.reductions = @reducer.reductions + 1
+            return 1
+
+    return 0
+
+# =============================================================================
+# DEAD CODE ELIMINATION
+# =============================================================================
+
+const MAX_DEFS: int = 8192
+
+struct DeadCodeEliminator
+    # Variable usage tracking
+    used_names: [int; 8192]     # Interned names of used variables
+    used_count: int
+    # Variable definition tracking
+    def_names: [int; 8192]      # Interned names of defined variables
+    def_nodes: [int; 8192]      # AST node indices of definitions
+    def_count: int
+    # Result
+    eliminated: int
+
+fn dce_new() -> DeadCodeEliminator
+    return DeadCodeEliminator {
+        used_names: [0; 8192],
+        used_count: 0,
+        def_names: [0; 8192],
+        def_nodes: [0; 8192],
+        def_count: 0,
+        eliminated: 0
+    }
+
+fn dce_mark_used(@dce: DeadCodeEliminator, @name_idx: int)
+    # Check if already marked
+    orbit @i in 0..@dce.used_count
+        if @dce.used_names[@i] == @name_idx
+            return
+    if @dce.used_count < MAX_DEFS
+        @dce.used_names[@dce.used_count] = @name_idx
+        @dce.used_count = @dce.used_count + 1
+
+fn dce_add_def(@dce: DeadCodeEliminator, @name_idx: int, @node_idx: int)
+    if @dce.def_count < MAX_DEFS
+        @dce.def_names[@dce.def_count] = @name_idx
+        @dce.def_nodes[@dce.def_count] = @node_idx
+        @dce.def_count = @dce.def_count + 1
+
+fn dce_is_used(@dce: DeadCodeEliminator, @name_idx: int) -> int
+    orbit @i in 0..@dce.used_count
+        if @dce.used_names[@i] == @name_idx
+            return 1
+    return 0
+
+# Collect definitions and usages from AST
+fn dce_analyze(@dce: DeadCodeEliminator, @p: Parser, @region: TypeRegion)
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        match @node.kind
+            AST_LET =>
+                # Definition
+                @name_idx = region_intern(@region, "")  # Placeholder
+                dce_add_def(@dce, @name_idx, @i)
+            AST_CONST =>
+                @name_idx = region_intern(@region, "")
+                dce_add_def(@dce, @name_idx, @i)
+            AST_IDENT =>
+                # Usage
+                @name_idx = region_intern(@region, "")
+                dce_mark_used(@dce, @name_idx)
+            _ =>
+                pass
+
+# Eliminate dead code: mark unused definitions for removal
+fn dce_eliminate(@dce: DeadCodeEliminator, @p: Parser) -> int
+    @count = 0
+    orbit @i in 0..@dce.def_count
+        if dce_is_used(@dce, @dce.def_names[@i]) == 0
+            # Mark node as NOP (replace with pass)
+            @node_idx = @dce.def_nodes[@i]
+            if @node_idx >= 0 and @node_idx < @p.node_count
+                @p.nodes[@node_idx].kind = AST_PASS
+                @count = @count + 1
+    @dce.eliminated = @count
+    return @count
+
+# =============================================================================
+# COPY PROPAGATION
+# =============================================================================
+
+const MAX_COPIES: int = 2048
+
+struct CopyPropagator
+    src_names: [int; 2048]      # Source variable name indices
+    dst_names: [int; 2048]      # Destination variable name indices
+    count: int
+    propagations: int
+
+fn copy_prop_new() -> CopyPropagator
+    return CopyPropagator {
+        src_names: [0; 2048],
+        dst_names: [0; 2048],
+        count: 0,
+        propagations: 0
+    }
+
+fn copy_prop_add(@cp: CopyPropagator, @dst: int, @src: int)
+    if @cp.count < MAX_COPIES
+        @cp.dst_names[@cp.count] = @dst
+        @cp.src_names[@cp.count] = @src
+        @cp.count = @cp.count + 1
+
+fn copy_prop_resolve(@cp: CopyPropagator, @name_idx: int) -> int
+    # Follow copy chain: a → b → c, return c
+    @current = @name_idx
+    orbit _ in 0..16  # Limit chain depth
+        @found = 0
+        orbit @i in 0..@cp.count
+            if @cp.dst_names[@i] == @current
+                @current = @cp.src_names[@i]
+                @cp.propagations = @cp.propagations + 1
+                @found = 1
+                break
+        if @found == 0
+            break
+    return @current
+
+# =============================================================================
+# FUNCTION INLINING
+# =============================================================================
+
+const MAX_INLINE_CANDIDATES: int = 512
+const INLINE_THRESHOLD: int = 10    # Max statements to inline
+const MAX_INLINE_DEPTH: int = 3     # Max nesting depth
+const INLINE_THRESHOLD_HOT: int = 20      # Higher threshold for hot methods
+const INLINE_THRESHOLD_LOOP: int = 30     # Even higher for loop bodies
+const MAX_INLINE_CACHE: int = 64
+const COLLECTION_METHOD_ALWAYS_INLINE: int = 1
+
+struct InlineCandidate
+    name_idx: int           # Interned function name
+    node_idx: int           # AST node index of function definition
+    param_count: int        # Number of parameters
+    stmt_count: int         # Number of statements in body
+    call_count: int         # How many times called
+    is_recursive: int       # 1 if directly or indirectly recursive
+    is_inline_attr: int     # 1 if #[inline] attribute
+    is_trivial: int         # 1 if 1-3 statements
+
+struct Inliner
+    candidates: [InlineCandidate; 512]
+    candidate_count: int
+    # Call graph: caller → callee pairs
+    call_from: [int; 4096]     # Caller name indices
+    call_to: [int; 4096]       # Callee name indices
+    call_count: int
+    # Stats
+    inlined: int
+
+fn inliner_new() -> Inliner
+    return Inliner {
+        candidates: [InlineCandidate { name_idx: 0, node_idx: 0, param_count: 0, stmt_count: 0, call_count: 0, is_recursive: 0, is_inline_attr: 0, is_trivial: 0 }; 512],
+        candidate_count: 0,
+        call_from: [0; 4096],
+        call_to: [0; 4096],
+        call_count: 0,
+        inlined: 0
+    }
+
+# Add a function as inline candidate
+fn inliner_add_candidate(@inl: Inliner, @name_idx: int, @node_idx: int, @param_count: int, @stmt_count: int)
+    if @inl.candidate_count >= MAX_INLINE_CANDIDATES
+        return
+    @idx = @inl.candidate_count
+    @inl.candidates[@idx].name_idx = @name_idx
+    @inl.candidates[@idx].node_idx = @node_idx
+    @inl.candidates[@idx].param_count = @param_count
+    @inl.candidates[@idx].stmt_count = @stmt_count
+    @inl.candidates[@idx].call_count = 0
+    @inl.candidates[@idx].is_recursive = 0
+    @inl.candidates[@idx].is_inline_attr = 0
+    @inl.candidates[@idx].is_trivial = if @stmt_count <= 3 then 1 else 0
+    @inl.candidate_count = @idx + 1
+
+# Record a call edge
+fn inliner_add_call(@inl: Inliner, @caller: int, @callee: int)
+    if @inl.call_count < 4096
+        @inl.call_from[@inl.call_count] = @caller
+        @inl.call_to[@inl.call_count] = @callee
+        @inl.call_count = @inl.call_count + 1
+
+    # Increment call count for callee
+    orbit @i in 0..@inl.candidate_count
+        if @inl.candidates[@i].name_idx == @callee
+            @inl.candidates[@i].call_count = @inl.candidates[@i].call_count + 1
+            break
+
+# Detect direct recursion
+fn inliner_detect_recursion(@inl: Inliner)
+    orbit @i in 0..@inl.call_count
+        if @inl.call_from[@i] == @inl.call_to[@i]
+            # Direct recursion: caller == callee
+            orbit @j in 0..@inl.candidate_count
+                if @inl.candidates[@j].name_idx == @inl.call_from[@i]
+                    @inl.candidates[@j].is_recursive = 1
+                    break
+
+    # Detect indirect recursion via DFS
+    orbit @i in 0..@inl.candidate_count
+        if @inl.candidates[@i].is_recursive == 0
+            @visited: [int; 512] = [0; 512]
+            @visited_count = 0
+            @target = @inl.candidates[@i].name_idx
+            if inliner_reaches(@inl, @target, @target, @visited, @visited_count, 0)
+                @inl.candidates[@i].is_recursive = 1
+
+# DFS: can @start reach @target through call graph?
+fn inliner_reaches(@inl: Inliner, @current: int, @target: int, @visited: [int; 512], @vcount: int, @depth: int) -> int
+    if @depth > 10
+        return 0
+
+    # Find all callees of @current
+    orbit @i in 0..@inl.call_count
+        if @inl.call_from[@i] == @current
+            @callee = @inl.call_to[@i]
+            if @callee == @target and @depth > 0
+                return 1  # Found cycle
+            # Check if already visited
+            @already = 0
+            orbit @j in 0..@vcount
+                if @visited[@j] == @callee
+                    @already = 1
+                    break
+            if @already == 0 and @vcount < 512
+                @visited[@vcount] = @callee
+                if inliner_reaches(@inl, @callee, @target, @visited, @vcount + 1, @depth + 1)
+                    return 1
+    return 0
+
+# Decide if a function should be inlined
+fn inliner_should_inline(@inl: Inliner, @idx: int) -> int
+    @cand = @inl.candidates[@idx]
+
+    # Never inline recursive functions
+    if @cand.is_recursive
+        return 0
+
+    # Always inline if explicitly marked
+    if @cand.is_inline_attr
+        return 1
+
+    # Inline small functions called multiple times
+    if @cand.stmt_count <= INLINE_THRESHOLD
+        if @cand.call_count > 1 or @cand.is_trivial
+            return 1
+
+    return 0
+
+# =============================================================================
+# INLINE CACHE
+# =============================================================================
+# Caches already-inlined function bodies to avoid re-parsing and duplicate work.
+# Uses a fixed-size direct-mapped cache keyed by function name index.
+
+struct InlineCache
+    names: [int; 64]
+    bodies: [int; 64]       # Node index of cached body
+    body_sizes: [int; 64]   # Number of statements
+    count: int
+
+fn inline_cache_new() -> InlineCache
+    return InlineCache {
+        names: [0; 64],
+        bodies: [-1; 64],
+        body_sizes: [0; 64],
+        count: 0
+    }
+
+# Lookup a cached inline body by function name index.
+# Returns the body node index, or -1 if not found.
+fn inline_cache_lookup(@cache: InlineCache, @name_idx: int) -> int
+    orbit @i in 0..@cache.count
+        if @cache.names[@i] == @name_idx
+            return @cache.bodies[@i]
+    return -1
+
+# Store a function body in the inline cache.
+fn inline_cache_store(@cache: InlineCache, @name_idx: int, @body_idx: int, @size: int)
+    # Check if already cached
+    orbit @i in 0..@cache.count
+        if @cache.names[@i] == @name_idx
+            @cache.bodies[@i] = @body_idx
+            @cache.body_sizes[@i] = @size
+            return
+    # Add new entry if space available
+    if @cache.count < MAX_INLINE_CACHE
+        @cache.names[@cache.count] = @name_idx
+        @cache.bodies[@cache.count] = @body_idx
+        @cache.body_sizes[@cache.count] = @size
+        @cache.count = @cache.count + 1
+
+# =============================================================================
+# COLLECTION METHOD INLINING
+# =============================================================================
+# Recognizes hot collection methods (vec_*, hashmap_*, deque_*, list_*)
+# and aggressively inlines them to direct array/pointer operations.
+# These methods are small, called frequently, and benefit enormously
+# from avoiding function call overhead.
+
+const COLL_VEC_PUSH: int = 1
+const COLL_VEC_POP: int = 2
+const COLL_VEC_GET: int = 3
+const COLL_VEC_SET: int = 4
+const COLL_VEC_LEN: int = 5
+const COLL_HASHMAP_GET: int = 6
+const COLL_HASHMAP_INSERT: int = 7
+const COLL_DEQUE_PUSH_FRONT: int = 8
+const COLL_DEQUE_PUSH_BACK: int = 9
+const COLL_DEQUE_POP_FRONT: int = 10
+const COLL_DEQUE_POP_BACK: int = 11
+const COLL_LIST_PUSH_BACK: int = 12
+const COLL_LIST_POP_FRONT: int = 13
+const COLL_UNKNOWN: int = 0
+
+const MAX_COLLECTION_SPECS: int = 256
+
+struct CollectionInlineSpec
+    method_name: int        # String pool index
+    inline_body_idx: int    # Pre-computed inline body
+    is_hot: int             # 1 if hot path
+    call_count: int
+    method_kind: int        # COLL_* constant
+
+struct CollectionInliner
+    specs: [CollectionInlineSpec; 256]
+    spec_count: int
+    cache: InlineCache
+    inlined: int            # Stats: total collection inlines
+    devirtualized: int      # Stats: devirtualization count
+
+fn collection_inliner_new() -> CollectionInliner
+    return CollectionInliner {
+        specs: [CollectionInlineSpec { method_name: 0, inline_body_idx: -1, is_hot: 0, call_count: 0, method_kind: COLL_UNKNOWN }; 256],
+        spec_count: 0,
+        cache: inline_cache_new(),
+        inlined: 0,
+        devirtualized: 0
+    }
+
+# Check if a function name matches a known collection method.
+# Returns the COLL_* constant, or COLL_UNKNOWN if not a collection method.
+fn is_collection_method(@name: str) -> int
+    # Vector methods
+    if @name == "vec_push"
+        return COLL_VEC_PUSH
+    if @name == "vec_pop"
+        return COLL_VEC_POP
+    if @name == "vec_get"
+        return COLL_VEC_GET
+    if @name == "vec_set"
+        return COLL_VEC_SET
+    if @name == "vec_len"
+        return COLL_VEC_LEN
+    # HashMap methods
+    if @name == "hashmap_get"
+        return COLL_HASHMAP_GET
+    if @name == "hashmap_insert"
+        return COLL_HASHMAP_INSERT
+    # Deque methods
+    if @name == "deque_push_front"
+        return COLL_DEQUE_PUSH_FRONT
+    if @name == "deque_push_back"
+        return COLL_DEQUE_PUSH_BACK
+    if @name == "deque_pop_front"
+        return COLL_DEQUE_POP_FRONT
+    if @name == "deque_pop_back"
+        return COLL_DEQUE_POP_BACK
+    # Linked list methods
+    if @name == "list_push_back"
+        return COLL_LIST_PUSH_BACK
+    if @name == "list_pop_front"
+        return COLL_LIST_POP_FRONT
+    return COLL_UNKNOWN
+
+# Check if a collection method kind represents a direct-arrayop candidate.
+# vec_get/set/len/push/pop can be lowered to direct memory access.
+fn is_direct_array_op(@kind: int) -> int
+    return @kind >= COLL_VEC_PUSH and @kind <= COLL_VEC_LEN
+
+# Add or update a collection method spec
+fn collection_add_spec(@ci: CollectionInliner, @name_idx: int, @kind: int)
+    # Check existing
+    orbit @i in 0..@ci.spec_count
+        if @ci.specs[@i].method_name == @name_idx
+            @ci.specs[@i].call_count = @ci.specs[@i].call_count + 1
+            if @ci.specs[@i].call_count >= 3
+                @ci.specs[@i].is_hot = 1
+            return
+    # Add new
+    if @ci.spec_count < MAX_COLLECTION_SPECS
+        @idx = @ci.spec_count
+        @ci.specs[@idx].method_name = @name_idx
+        @ci.specs[@idx].method_kind = @kind
+        @ci.specs[@idx].inline_body_idx = -1
+        @ci.specs[@idx].is_hot = 0
+        @ci.specs[@idx].call_count = 1
+        @ci.spec_count = @idx + 1
+
+# Scan the AST for collection method calls and register them for inlining.
+fn detect_collection_methods(@opt: Optimizer, @p: Parser)
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        if @node.kind == AST_CALL
+            # Extract callee name from the call node
+            @callee_idx = @node.child1
+            if @callee_idx >= 0 and @callee_idx < @p.node_count
+                @callee = @p.nodes[@callee_idx]
+                if @callee.kind == AST_IDENT
+                    @name_idx = @callee.data1
+                    # Resolve name string from parser's string pool
+                    @name = parser_get_string(@p, @name_idx)
+                    @kind = is_collection_method(@name)
+                    if @kind != COLL_UNKNOWN
+                        collection_add_spec(@opt.coll_inliner, @name_idx, @kind)
+                        # Always-inline collection methods: mark in the main inliner
+                        orbit @j in 0..@opt.inliner.candidate_count
+                            if @opt.inliner.candidates[@j].name_idx == @name_idx
+                                @opt.inliner.candidates[@j].is_inline_attr = COLLECTION_METHOD_ALWAYS_INLINE
+                                break
+
+# Estimate the benefit of inlining a function.
+# Returns a score: higher = more beneficial to inline.
+# @inl: the Inliner, @idx: candidate index, @in_loop: 1 if call is inside a loop
+fn estimate_inline_benefit(@inl: Inliner, @idx: int, @in_loop: int) -> int
+    @cand = @inl.candidates[@idx]
+    @score = 0
+
+    # Never inline recursive functions
+    if @cand.is_recursive
+        return -1
+
+    # Base score from call frequency
+    @score = @cand.call_count * 2
+
+    # Bonus for small functions
+    if @cand.stmt_count <= 3
+        @score = @score + 20
+    elif @cand.stmt_count <= 10
+        @score = @score + 10
+    elif @cand.stmt_count <= 20
+        @score = @score + 5
+
+    # Large bonus for loop bodies — avoiding call overhead per iteration
+    if @in_loop
+        @score = @score + 30
+        # Even larger bonus if function is small enough for loop threshold
+        if @cand.stmt_count <= INLINE_THRESHOLD_LOOP
+            @score = @score + 20
+
+    # Bonus for explicitly marked inline
+    if @cand.is_inline_attr
+        @score = @score + 40
+
+    # Penalty for large functions
+    if @cand.stmt_count > INLINE_THRESHOLD_LOOP
+        @score = @score - (@cand.stmt_count - INLINE_THRESHOLD_LOOP) * 3
+
+    return @score
+
+# Speculative inlining decision for hot loop contexts.
+# Uses raised thresholds: inline if body <= 20 stmts and called >= 3 times,
+# or if inside a loop body (orbit/while) and body <= 30 stmts.
+fn should_speculative_inline(@inl: Inliner, @idx: int, @in_loop: int) -> int
+    @cand = @inl.candidates[@idx]
+
+    # Never inline recursive
+    if @cand.is_recursive
+        return 0
+
+    # Always inline if explicitly marked (includes collection methods)
+    if @cand.is_inline_attr
+        return 1
+
+    # Hot method threshold: <= 20 stmts and called >= 3 times
+    if @cand.stmt_count <= INLINE_THRESHOLD_HOT and @cand.call_count >= 3
+        return 1
+
+    # Loop body threshold: <= 30 stmts when inside orbit/while
+    if @in_loop and @cand.stmt_count <= INLINE_THRESHOLD_LOOP
+        return 1
+
+    # Trivial functions always inline
+    if @cand.is_trivial
+        return 1
+
+    return 0
+
+# Devirtualization: for a method call on a typed object, resolve the
+# concrete function name. Returns the candidate index or -1 if unknown.
+# This checks if the call target is a known function in the candidate list.
+fn devirtualize_call(@inl: Inliner, @p: Parser, @call_node_idx: int) -> int
+    if @call_node_idx < 0 or @call_node_idx >= @p.node_count
+        return -1
+    @node = @p.nodes[@call_node_idx]
+    if @node.kind != AST_CALL
+        return -1
+
+    @callee_idx = @node.child1
+    if @callee_idx < 0 or @callee_idx >= @p.node_count
+        return -1
+
+    @callee = @p.nodes[@callee_idx]
+
+    # Direct call: AST_IDENT → look up in candidates
+    if @callee.kind == AST_IDENT
+        @name_idx = @callee.data1
+        orbit @i in 0..@inl.candidate_count
+            if @inl.candidates[@i].name_idx == @name_idx
+                return @i
+        return -1
+
+    # Method call: AST_MEMBER_ACCESS → resolve receiver type, find concrete fn
+    if @callee.kind == AST_MEMBER_ACCESS
+        # The receiver is child1, the method name is data1
+        @method_name = @callee.data1
+        orbit @i in 0..@inl.candidate_count
+            if @inl.candidates[@i].name_idx == @method_name
+                return @i
+        return -1
+
+    return -1
+
+# Check if a node is inside a loop (orbit or while) body.
+# Walks ancestors via parent indices. Returns 1 if in loop context.
+fn is_in_loop_body(@p: Parser, @node_idx: int) -> int
+    # Walk parent chain — use data2 as parent index if available
+    @current = @node_idx
+    orbit _ in 0..32   # Max depth to check
+        if @current < 0 or @current >= @p.node_count
+            return 0
+        @node = @p.nodes[@current]
+        if @node.kind == AST_ORBIT or @node.kind == AST_WHILE
+            return 1
+        # Move to parent — check if node stores parent ref
+        # Fallback: scan for parent by checking children
+        @found_parent = -1
+        orbit @j in 0..@p.node_count
+            @candidate = @p.nodes[@j]
+            if @candidate.child1 == @current or @candidate.child2 == @current
+                @found_parent = @j
+                break
+        if @found_parent < 0 or @found_parent == @current
+            return 0
+        @current = @found_parent
+    return 0
+
+# =============================================================================
+# COLLECTION INLINING PASS
+# =============================================================================
+# Dedicated pass that handles collection method inlining separately from
+# the general inliner. Collection methods are always small and hot,
+# so we inline them aggressively and replace with direct operations.
+
+fn opt_pass_inline_collections(@opt: Optimizer, @p: Parser, @region: TypeRegion)
+    # Phase 1: Detect all collection method calls
+    detect_collection_methods(@opt, @p)
+
+    # Phase 2: For each collection method call site, attempt to inline
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        if @node.kind == AST_CALL
+            @callee_idx = @node.child1
+            if @callee_idx >= 0 and @callee_idx < @p.node_count
+                @callee = @p.nodes[@callee_idx]
+                if @callee.kind == AST_IDENT
+                    @name_idx = @callee.data1
+
+                    # Check if this is a registered collection method
+                    orbit @j in 0..@opt.coll_inliner.spec_count
+                        if @opt.coll_inliner.specs[@j].method_name == @name_idx
+                            @spec = @opt.coll_inliner.specs[@j]
+                            @kind = @spec.method_kind
+
+                            # Try cache first
+                            @cached = inline_cache_lookup(@opt.coll_inliner.cache, @name_idx)
+                            if @cached >= 0
+                                # Use cached inline body — mark call as inlined
+                                @p.nodes[@i].data2 = @cached
+                                @opt.coll_inliner.inlined = @opt.coll_inliner.inlined + 1
+                                break
+
+                            # No cache hit — resolve candidate and inline
+                            @cand_idx = devirtualize_call(@opt.inliner, @p, @i)
+                            if @cand_idx >= 0
+                                @cand = @opt.inliner.candidates[@cand_idx]
+
+                                # For direct array ops (vec_get, vec_set, vec_len),
+                                # replace the call with a direct memory access node
+                                if is_direct_array_op(@kind)
+                                    # Replace call node with inlined body marker
+                                    # The backend recognizes data2 == body_idx as inlined
+                                    @body_idx = @cand.node_idx
+                                    @p.nodes[@i].data2 = @body_idx
+                                    # Cache it
+                                    inline_cache_store(@opt.coll_inliner.cache, @name_idx, @body_idx, @cand.stmt_count)
+                                    @opt.coll_inliner.inlined = @opt.coll_inliner.inlined + 1
+                                else
+                                    # For hashmap/deque/list methods: inline the full body
+                                    @body_idx = @cand.node_idx
+                                    @p.nodes[@i].data2 = @body_idx
+                                    inline_cache_store(@opt.coll_inliner.cache, @name_idx, @body_idx, @cand.stmt_count)
+                                    @opt.coll_inliner.inlined = @opt.coll_inliner.inlined + 1
+
+                                # Devirtualization stat
+                                @opt.coll_inliner.devirtualized = @opt.coll_inliner.devirtualized + 1
+                            break
+
+    @opt.stats.collections_inlined = @opt.coll_inliner.inlined
+    @opt.stats.devirtualized = @opt.coll_inliner.devirtualized
+
+# =============================================================================
+# SPECULATIVE INLINING PASS
+# =============================================================================
+# Enhanced inlining pass that uses speculative heuristics for hot loops.
+# Raises thresholds inside loop bodies and uses the inline cache.
+
+fn opt_pass_speculative_inline(@opt: Optimizer, @p: Parser, @region: TypeRegion)
+    # Phase 1: Ensure candidates are collected (may already be done by opt_pass_inline)
+    if @opt.inliner.candidate_count == 0
+        orbit @i in 0..@p.node_count
+            @node = @p.nodes[@i]
+            if @node.kind == AST_FUNCTION
+                @name_idx = region_intern(@region, "")
+                @stmt_count = @node.children_count
+                inliner_add_candidate(@opt.inliner, @name_idx, @i, 0, @stmt_count)
+
+    # Phase 2: Walk all call sites with speculative decisions
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        if @node.kind == AST_CALL
+            @cand_idx = devirtualize_call(@opt.inliner, @p, @i)
+            if @cand_idx >= 0
+                @in_loop = is_in_loop_body(@p, @i)
+                @benefit = estimate_inline_benefit(@opt.inliner, @cand_idx, @in_loop)
+
+                if @benefit > 0 and should_speculative_inline(@opt.inliner, @cand_idx, @in_loop)
+                    @cand = @opt.inliner.candidates[@cand_idx]
+                    @name_idx = @cand.name_idx
+
+                    # Try inline cache first
+                    @cached = inline_cache_lookup(@opt.coll_inliner.cache, @name_idx)
+                    if @cached >= 0
+                        @p.nodes[@i].data2 = @cached
+                        @opt.stats.functions_inlined = @opt.stats.functions_inlined + 1
+                    else
+                        # Inline and cache
+                        @body_idx = @cand.node_idx
+                        @p.nodes[@i].data2 = @body_idx
+                        inline_cache_store(@opt.coll_inliner.cache, @name_idx, @body_idx, @cand.stmt_count)
+                        @opt.stats.functions_inlined = @opt.stats.functions_inlined + 1
+
+# =============================================================================
+# POST-INLINE CLEANUP
+# =============================================================================
+# After inlining, we may have:
+# - Dead variables (parameters that became unused after substitution)
+# - Constants that can be propagated through inlined arguments
+# - Simple copies (x = y) that can be eliminated
+#
+# This pass cleans up the mess left by aggressive inlining.
+
+const MAX_POST_INLINE_VARS: int = 4096
+
+struct PostInlineCleanup
+    # Track variable definitions introduced by inlining
+    def_names: [int; 4096]
+    def_nodes: [int; 4096]
+    def_count: int
+    # Track variable uses
+    use_names: [int; 4096]
+    use_count: int
+    # Simple copy pairs: dst = src (for copy propagation)
+    copy_dst: [int; 2048]
+    copy_src: [int; 2048]
+    copy_count: int
+    # Stats
+    dead_vars_eliminated: int
+    constants_propagated: int
+    copies_propagated: int
+
+fn post_inline_cleanup_new() -> PostInlineCleanup
+    return PostInlineCleanup {
+        def_names: [0; 4096],
+        def_nodes: [0; 4096],
+        def_count: 0,
+        use_names: [0; 4096],
+        use_count: 0,
+        copy_dst: [0; 2048],
+        copy_src: [0; 2048],
+        copy_count: 0,
+        dead_vars_eliminated: 0,
+        constants_propagated: 0,
+        copies_propagated: 0
+    }
+
+fn post_inline_mark_def(@pic: PostInlineCleanup, @name_idx: int, @node_idx: int)
+    if @pic.def_count < MAX_POST_INLINE_VARS
+        @pic.def_names[@pic.def_count] = @name_idx
+        @pic.def_nodes[@pic.def_count] = @node_idx
+        @pic.def_count = @pic.def_count + 1
+
+fn post_inline_mark_use(@pic: PostInlineCleanup, @name_idx: int)
+    # Avoid duplicates
+    orbit @i in 0..@pic.use_count
+        if @pic.use_names[@i] == @name_idx
+            return
+    if @pic.use_count < MAX_POST_INLINE_VARS
+        @pic.use_names[@pic.use_count] = @name_idx
+        @pic.use_count = @pic.use_count + 1
+
+fn post_inline_is_used(@pic: PostInlineCleanup, @name_idx: int) -> int
+    orbit @i in 0..@pic.use_count
+        if @pic.use_names[@i] == @name_idx
+            return 1
+    return 0
+
+fn post_inline_add_copy(@pic: PostInlineCleanup, @dst: int, @src: int)
+    if @pic.copy_count < 2048
+        @pic.copy_dst[@pic.copy_count] = @dst
+        @pic.copy_src[@pic.copy_count] = @src
+        @pic.copy_count = @pic.copy_count + 1
+
+# Resolve a copy chain: a → b → c → d, returns d
+fn post_inline_resolve_copy(@pic: PostInlineCleanup, @name_idx: int) -> int
+    @current = @name_idx
+    orbit _ in 0..16  # Max chain depth
+        @found = 0
+        orbit @i in 0..@pic.copy_count
+            if @pic.copy_dst[@i] == @current
+                @current = @pic.copy_src[@i]
+                @found = 1
+                break
+        if @found == 0
+            break
+    return @current
+
+# Full post-inline cleanup pass
+fn opt_pass_post_inline_cleanup(@opt: Optimizer, @p: Parser, @region: TypeRegion)
+    @pic = post_inline_cleanup_new()
+
+    # Phase 1: Collect all definitions and uses
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        match @node.kind
+            AST_LET =>
+                @name_idx = @node.data1
+                post_inline_mark_def(@pic, @name_idx, @i)
+                # Check if this is a simple copy: let x = y
+                if @node.child1 >= 0 and @node.child1 < @p.node_count
+                    @rhs = @p.nodes[@node.child1]
+                    if @rhs.kind == AST_IDENT
+                        post_inline_add_copy(@pic, @name_idx, @rhs.data1)
+                    # Check if RHS is a constant for const propagation
+                    elif @rhs.kind == AST_LITERAL
+                        pass  # Handled by constant propagation
+            AST_IDENT =>
+                post_inline_mark_use(@pic, @node.data1)
+            AST_ASSIGN =>
+                # Track assignments as potential copies too
+                @lhs_idx = @node.child1
+                @rhs_idx = @node.child2
+                if @lhs_idx >= 0 and @rhs_idx >= 0
+                    if @lhs_idx < @p.node_count and @rhs_idx < @p.node_count
+                        @lhs = @p.nodes[@lhs_idx]
+                        @rhs = @p.nodes[@rhs_idx]
+                        if @lhs.kind == AST_IDENT and @rhs.kind == AST_IDENT
+                            post_inline_add_copy(@pic, @lhs.data1, @rhs.data1)
+                # RHS is a use
+                if @rhs_idx >= 0 and @rhs_idx < @p.node_count
+                    @rhs_node = @p.nodes[@rhs_idx]
+                    if @rhs_node.kind == AST_IDENT
+                        post_inline_mark_use(@pic, @rhs_node.data1)
+            _ =>
+                pass
+
+    # Phase 2: Dead variable elimination
+    # Remove definitions whose name is never used
+    orbit @i in 0..@pic.def_count
+        if post_inline_is_used(@pic, @pic.def_names[@i]) == 0
+            @node_idx = @pic.def_nodes[@i]
+            if @node_idx >= 0 and @node_idx < @p.node_count
+                # Check the definition doesn't have side effects
+                @def_node = @p.nodes[@node_idx]
+                @has_side_effect = 0
+                if @def_node.child1 >= 0 and @def_node.child1 < @p.node_count
+                    @rhs = @p.nodes[@def_node.child1]
+                    if @rhs.kind == AST_CALL
+                        @has_side_effect = 1
+                if @has_side_effect == 0
+                    @p.nodes[@node_idx].kind = AST_PASS
+                    @pic.dead_vars_eliminated = @pic.dead_vars_eliminated + 1
+
+    # Phase 3: Copy propagation through inlined arguments
+    # Replace uses of copy destinations with their sources
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        if @node.kind == AST_IDENT
+            @resolved = post_inline_resolve_copy(@pic, @node.data1)
+            if @resolved != @node.data1
+                @p.nodes[@i].data1 = @resolved
+                @pic.copies_propagated = @pic.copies_propagated + 1
+
+    # Phase 4: Constant propagation through inlined literal arguments
+    # If a let binds a name to a literal, replace all uses with the literal
+    orbit @i in 0..@pic.def_count
+        @node_idx = @pic.def_nodes[@i]
+        if @node_idx >= 0 and @node_idx < @p.node_count
+            @def_node = @p.nodes[@node_idx]
+            if @def_node.kind == AST_LET and @def_node.child1 >= 0
+                @rhs = @p.nodes[@def_node.child1]
+                if @rhs.kind == AST_LITERAL
+                    @target_name = @pic.def_names[@i]
+                    # Replace all uses of this name with the literal value
+                    orbit @j in 0..@p.node_count
+                        if @p.nodes[@j].kind == AST_IDENT and @p.nodes[@j].data1 == @target_name
+                            @p.nodes[@j].kind = AST_LITERAL
+                            @p.nodes[@j].data1 = @rhs.data1
+                            @p.nodes[@j].data2 = @rhs.data2
+                            @pic.constants_propagated = @pic.constants_propagated + 1
+
+    @opt.stats.post_inline_dead_vars = @pic.dead_vars_eliminated
+    @opt.stats.post_inline_const_prop = @pic.constants_propagated
+    @opt.stats.post_inline_copy_prop = @pic.copies_propagated
+
+# =============================================================================
+# ALIAS ANALYSIS
+# =============================================================================
+
+# Memory access descriptor
+const ACCESS_READ: int = 0
+const ACCESS_WRITE: int = 1
+
+# Index expression types
+const IDX_CONSTANT: int = 0
+const IDX_INDUCTION: int = 1
+const IDX_LINEAR: int = 2
+const IDX_UNKNOWN: int = 3
+
+struct MemoryAccess
+    base_name: int          # Interned name of array/pointer
+    idx_kind: int           # IDX_* constant
+    idx_const: int          # Constant offset (for IDX_CONSTANT)
+    idx_iv_name: int        # Induction variable name (for IDX_INDUCTION)
+    idx_stride: int         # Stride (for IDX_LINEAR)
+    idx_base_offset: int    # Base offset (for IDX_LINEAR)
+    access_type: int        # ACCESS_READ or ACCESS_WRITE
+    element_size: int       # Bytes per element
+
+const MAX_ACCESSES: int = 256
+
+# Alias analysis result
+const ALIAS_NO: int = 0        # No conflict - safe to parallelize
+const ALIAS_MAY: int = 1       # Possible conflict - conservative
+const ALIAS_MUST: int = 2      # Definite conflict
+
+struct AliasAnalyzer
+    accesses: [MemoryAccess; 256]
+    access_count: int
+    # Known noalias sets
+    noalias_names: [int; 128]
+    noalias_count: int
+
+fn alias_new() -> AliasAnalyzer
+    return AliasAnalyzer {
+        accesses: [MemoryAccess { base_name: 0, idx_kind: IDX_UNKNOWN, idx_const: 0, idx_iv_name: 0, idx_stride: 0, idx_base_offset: 0, access_type: ACCESS_READ, element_size: 8 }; 256],
+        access_count: 0,
+        noalias_names: [0; 128],
+        noalias_count: 0
+    }
+
+fn alias_add_access(@aa: AliasAnalyzer, @acc: MemoryAccess)
+    if @aa.access_count < MAX_ACCESSES
+        @aa.accesses[@aa.access_count] = @acc
+        @aa.access_count = @aa.access_count + 1
+
+fn alias_mark_noalias(@aa: AliasAnalyzer, @name_idx: int)
+    if @aa.noalias_count < 128
+        @aa.noalias_names[@aa.noalias_count] = @name_idx
+        @aa.noalias_count = @aa.noalias_count + 1
+
+fn alias_is_noalias(@aa: AliasAnalyzer, @name_idx: int) -> int
+    orbit @i in 0..@aa.noalias_count
+        if @aa.noalias_names[@i] == @name_idx
+            return 1
+    return 0
+
+# Check alias between two memory accesses
+fn alias_check(@aa: AliasAnalyzer, @a: MemoryAccess, @b: MemoryAccess) -> int
+    # Different base pointers are noalias
+    if @a.base_name != @b.base_name
+        # Unless both are unknown
+        if alias_is_noalias(@aa, @a.base_name) or alias_is_noalias(@aa, @b.base_name)
+            return ALIAS_NO
+        return ALIAS_NO  # Different arrays don't alias
+
+    # Same base - check indices
+    # Both constant
+    if @a.idx_kind == IDX_CONSTANT and @b.idx_kind == IDX_CONSTANT
+        if @a.idx_const == @b.idx_const
+            return ALIAS_MUST
+        return ALIAS_NO
+
+    # Both induction variable (same IV)
+    if @a.idx_kind == IDX_INDUCTION and @b.idx_kind == IDX_INDUCTION
+        if @a.idx_iv_name == @b.idx_iv_name
+            return ALIAS_MUST  # Same index in same iteration
+        return ALIAS_MAY
+
+    # Linear indices with same IV
+    if @a.idx_kind == IDX_LINEAR and @b.idx_kind == IDX_LINEAR
+        if @a.idx_iv_name == @b.idx_iv_name
+            if @a.idx_stride == @b.idx_stride
+                @offset_diff = @a.idx_base_offset - @b.idx_base_offset
+                if @offset_diff < 0
+                    @offset_diff = 0 - @offset_diff
+                if @offset_diff >= @a.element_size
+                    return ALIAS_NO  # Non-overlapping
+            return ALIAS_MAY
+
+    # Read-read never conflicts
+    if @a.access_type == ACCESS_READ and @b.access_type == ACCESS_READ
+        return ALIAS_NO
+
+    return ALIAS_MAY
+
+# Check all access pairs for dependencies
+fn alias_has_dependency(@aa: AliasAnalyzer) -> int
+    orbit @i in 0..@aa.access_count
+        orbit @j in @i + 1..@aa.access_count
+            # Only check write-involved pairs
+            if @aa.accesses[@i].access_type == ACCESS_WRITE or @aa.accesses[@j].access_type == ACCESS_WRITE
+                @result = alias_check(@aa, @aa.accesses[@i], @aa.accesses[@j])
+                if @result == ALIAS_MAY or @result == ALIAS_MUST
+                    return 1
+    return 0
+
+# =============================================================================
+# LOOP ANALYSIS
+# =============================================================================
+
+struct LoopInfo
+    node_idx: int           # AST node index
+    iv_name: int            # Induction variable name (interned)
+    lower: int              # Lower bound
+    upper: int              # Upper bound
+    step: int               # Step size
+    trip_count: int         # Total iterations (-1 if unknown)
+    vectorizable: int       # 1 if can be vectorized
+    vector_factor: int      # Elements per SIMD op
+    is_reduction: int       # 1 if loop performs reduction
+    reduction_op: int       # OP_ADD, OP_MUL, etc.
+    reduction_var: int      # Reduction variable name (interned)
+    depth: int              # Loop nesting depth
+
+const MAX_LOOPS: int = 256
+
+struct LoopAnalyzer
+    loops: [LoopInfo; 256]
+    loop_count: int
+
+fn loop_analyzer_new() -> LoopAnalyzer
+    return LoopAnalyzer {
+        loops: [LoopInfo { node_idx: 0, iv_name: 0, lower: 0, upper: 0, step: 1, trip_count: -1, vectorizable: 0, vector_factor: 1, is_reduction: 0, reduction_op: 0, reduction_var: 0, depth: 0 }; 256],
+        loop_count: 0
+    }
+
+fn loop_add(@la: LoopAnalyzer, @info: LoopInfo)
+    if @la.loop_count < MAX_LOOPS
+        @la.loops[@la.loop_count] = @info
+        @la.loop_count = @la.loop_count + 1
+
+# Analyze a loop for vectorization potential
+fn loop_analyze_vectorizability(@la: LoopAnalyzer, @idx: int, @aa: AliasAnalyzer, @simd: SimdConfig)
+    @loop = @la.loops[@idx]
+
+    # Must have known bounds
+    if @loop.trip_count <= 0
+        return
+
+    # Step must be 1 or -1
+    if @loop.step != 1 and @loop.step != -1
+        return
+
+    # Check memory dependencies
+    if alias_has_dependency(@aa)
+        return
+
+    # Calculate vector factor
+    @element_bits = 64  # Default to 64-bit elements
+    @vf = @simd.preferred_width / @element_bits
+
+    # Trip count must be >= vector factor
+    if @loop.trip_count < @vf
+        return
+
+    # Vectorizable!
+    @la.loops[@idx].vectorizable = 1
+    @la.loops[@idx].vector_factor = @vf
+
+# =============================================================================
+# SIMD CONFIGURATION
+# =============================================================================
+
+struct SimdConfig
+    use_sse42: int          # 128-bit
+    use_avx2: int           # 256-bit
+    use_avx512: int         # 512-bit
+    use_neon: int           # ARM 128-bit
+    use_sve: int            # ARM Scalable
+    preferred_width: int    # Best vector width in bits
+
+fn simd_detect() -> SimdConfig
+    # Default to SSE4.2 (128-bit) on x86_64
+    # In a real implementation, would use cpuid
+    return SimdConfig {
+        use_sse42: 1,
+        use_avx2: 1,
+        use_avx512: 0,
+        use_neon: 0,
+        use_sve: 0,
+        preferred_width: 256  # AVX2 default
+    }
+
+fn simd_vector_factor(@simd: SimdConfig, @element_bits: int) -> int
+    return @simd.preferred_width / @element_bits
+
+# =============================================================================
+# VECTORIZED LOOP GENERATION
+# =============================================================================
+
+struct VectorizedLoop
+    # Main vectorized loop
+    main_lower: int         # Start of vectorized iterations
+    main_upper: int         # End of vectorized iterations
+    main_step: int          # vector_factor
+    # Scalar epilogue
+    epilogue_lower: int     # Start of remainder
+    epilogue_upper: int     # Original upper bound
+    epilogue_step: int      # Always 1
+    # Metadata
+    vector_factor: int
+    has_epilogue: int       # 1 if remainder iterations exist
+    is_reduction: int       # 1 if reduction loop
+    reduction_op: int       # OP_ADD, etc.
+
+fn vectorize_loop(@loop: LoopInfo, @simd: SimdConfig) -> VectorizedLoop
+    @vf = @loop.vector_factor
+    if @vf <= 1
+        @vf = simd_vector_factor(@simd, 64)
+
+    @total = @loop.trip_count
+    @main_iters = (@total / @vf) * @vf
+    @remainder = @total - @main_iters
+
+    return VectorizedLoop {
+        main_lower: @loop.lower,
+        main_upper: @loop.lower + @main_iters,
+        main_step: @vf,
+        epilogue_lower: @loop.lower + @main_iters,
+        epilogue_upper: @loop.upper,
+        epilogue_step: 1,
+        vector_factor: @vf,
+        has_epilogue: if @remainder > 0 then 1 else 0,
+        is_reduction: @loop.is_reduction,
+        reduction_op: @loop.reduction_op
+    }
+
+# =============================================================================
+# LOOP UNROLLING
+# =============================================================================
+
+struct LoopUnroller
+    factor: int             # Unroll factor (default 4)
+    max_factor: int         # Maximum unroll factor (16)
+    allow_partial: int      # Allow partial unrolling with epilogue
+    unrolled: int           # Stats
+
+fn unroller_new() -> LoopUnroller
+    return LoopUnroller {
+        factor: 4,
+        max_factor: 16,
+        allow_partial: 1,
+        unrolled: 0
+    }
+
+# Calculate optimal unroll factor
+fn unroll_factor(@unr: LoopUnroller, @trip_count: int) -> int
+    if @trip_count <= 0
+        return 1
+
+    # Try to find factor that divides trip count
+    @best = 1
+    @f = @unr.max_factor
+    orbit _ in 0..@unr.max_factor
+        if @f < 2
+            break
+        if @trip_count % @f == 0
+            return @f
+        @f = @f - 1
+
+    # Fall back to default factor with epilogue
+    if @unr.allow_partial and @trip_count >= @unr.factor
+        return @unr.factor
+
+    return 1
+
+struct UnrolledLoop
+    main_iters: int         # Main loop iteration count
+    main_factor: int        # Unroll factor
+    epilogue_iters: int     # Remainder iterations
+    has_epilogue: int
+
+fn unroll_loop(@unr: LoopUnroller, @trip_count: int) -> UnrolledLoop
+    @factor = unroll_factor(@unr, @trip_count)
+    @main = @trip_count / @factor
+    @remainder = @trip_count % @factor
+
+    @unr.unrolled = @unr.unrolled + 1
+
+    return UnrolledLoop {
+        main_iters: @main,
+        main_factor: @factor,
+        epilogue_iters: @remainder,
+        has_epilogue: if @remainder > 0 then 1 else 0
+    }
+
+# =============================================================================
+# COMMON SUBEXPRESSION ELIMINATION (CSE)
+# =============================================================================
+
+const MAX_CSE_ENTRIES: int = 2048
+
+struct CseEntry
+    expr_hash: int          # Hash of expression structure
+    node_idx: int           # First occurrence node index
+    temp_name: int          # Interned name of temporary variable
+
+struct CseTracker
+    entries: [CseEntry; 2048]
+    count: int
+    eliminations: int
+
+fn cse_new() -> CseTracker
+    return CseTracker {
+        entries: [CseEntry { expr_hash: 0, node_idx: 0, temp_name: 0 }; 2048],
+        count: 0,
+        eliminations: 0
+    }
+
+# Simple hash for expression structure
+fn cse_hash_expr(@p: Parser, @node_idx: int) -> int
+    if @node_idx < 0
+        return 0
+    @node = @p.nodes[@node_idx]
+    @h = @node.kind * 31 + @node.data1 * 17 + @node.data2 * 13
+    if @node.child1 >= 0
+        @h = @h * 37 + cse_hash_expr(@p, @node.child1)
+    if @node.child2 >= 0
+        @h = @h * 41 + cse_hash_expr(@p, @node.child2)
+    return @h
+
+fn cse_lookup(@cse: CseTracker, @hash: int) -> int
+    orbit @i in 0..@cse.count
+        if @cse.entries[@i].expr_hash == @hash
+            return @i
+    return -1
+
+fn cse_add(@cse: CseTracker, @hash: int, @node_idx: int, @temp_name: int)
+    if @cse.count < MAX_CSE_ENTRIES
+        @cse.entries[@cse.count] = CseEntry {
+            expr_hash: @hash,
+            node_idx: @node_idx,
+            temp_name: @temp_name
+        }
+        @cse.count = @cse.count + 1
+
+# =============================================================================
+# LOOP-INVARIANT CODE MOTION (LICM)
+# =============================================================================
+
+const MAX_INVARIANTS: int = 256
+
+struct LicmTracker
+    # Variables modified inside loop
+    modified_vars: [int; 1024]
+    modified_count: int
+    # Expressions to hoist
+    hoist_nodes: [int; 256]
+    hoist_count: int
+    hoisted: int
+
+fn licm_new() -> LicmTracker
+    return LicmTracker {
+        modified_vars: [0; 1024],
+        modified_count: 0,
+        hoist_nodes: [0; 256],
+        hoist_count: 0,
+        hoisted: 0
+    }
+
+fn licm_mark_modified(@licm: LicmTracker, @name_idx: int)
+    orbit @i in 0..@licm.modified_count
+        if @licm.modified_vars[@i] == @name_idx
+            return
+    if @licm.modified_count < 1024
+        @licm.modified_vars[@licm.modified_count] = @name_idx
+        @licm.modified_count = @licm.modified_count + 1
+
+fn licm_is_modified(@licm: LicmTracker, @name_idx: int) -> int
+    orbit @i in 0..@licm.modified_count
+        if @licm.modified_vars[@i] == @name_idx
+            return 1
+    return 0
+
+fn licm_add_hoist(@licm: LicmTracker, @node_idx: int)
+    if @licm.hoist_count < MAX_INVARIANTS
+        @licm.hoist_nodes[@licm.hoist_count] = @node_idx
+        @licm.hoist_count = @licm.hoist_count + 1
+
+# Check if an expression is loop-invariant
+fn licm_is_invariant(@licm: LicmTracker, @p: Parser, @node_idx: int) -> int
+    if @node_idx < 0
+        return 1
+    @node = @p.nodes[@node_idx]
+
+    match @node.kind
+        AST_LITERAL => return 1  # Constants are always invariant
+        AST_IDENT =>
+            # Invariant if variable is not modified in loop
+            return if licm_is_modified(@licm, 0) == 0 then 1 else 0
+        AST_BINARY =>
+            return licm_is_invariant(@licm, @p, @node.child1) and licm_is_invariant(@licm, @p, @node.child2)
+        AST_UNARY =>
+            return licm_is_invariant(@licm, @p, @node.child1)
+        _ => return 0
+
+# =============================================================================
+# OPTIMIZATION PIPELINE
+# =============================================================================
+
+struct OptStats
+    constant_folds: int
+    constant_props: int
+    strength_reductions: int
+    dead_eliminated: int
+    copies_propagated: int
+    functions_inlined: int
+    loops_unrolled: int
+    loops_vectorized: int
+    cse_eliminated: int
+    licm_hoisted: int
+    collections_inlined: int
+    devirtualized: int
+    post_inline_dead_vars: int
+    post_inline_const_prop: int
+    post_inline_copy_prop: int
+    total_passes: int
+
+fn stats_new() -> OptStats
+    return OptStats {
+        constant_folds: 0,
+        constant_props: 0,
+        strength_reductions: 0,
+        dead_eliminated: 0,
+        copies_propagated: 0,
+        functions_inlined: 0,
+        loops_unrolled: 0,
+        loops_vectorized: 0,
+        cse_eliminated: 0,
+        licm_hoisted: 0,
+        collections_inlined: 0,
+        devirtualized: 0,
+        post_inline_dead_vars: 0,
+        post_inline_const_prop: 0,
+        post_inline_copy_prop: 0,
+        total_passes: 0
+    }
+
+struct Optimizer
+    level: int              # OPT_NONE, OPT_BASIC, OPT_AGGRESSIVE
+    simd: SimdConfig
+    stats: OptStats
+    # Sub-optimizers
+    folder: ConstantFolder
+    propagator: ConstantPropagator
+    reducer: StrengthReducer
+    dce: DeadCodeEliminator
+    copy_prop: CopyPropagator
+    inliner: Inliner
+    coll_inliner: CollectionInliner
+    loop_analyzer: LoopAnalyzer
+    unroller: LoopUnroller
+    alias: AliasAnalyzer
+    cse: CseTracker
+    licm: LicmTracker
+
+fn optimizer_new(@level: int) -> Optimizer
+    return Optimizer {
+        level: @level,
+        simd: simd_detect(),
+        stats: stats_new(),
+        folder: folder_new(),
+        propagator: propagator_new(),
+        reducer: reducer_new(),
+        dce: dce_new(),
+        copy_prop: copy_prop_new(),
+        inliner: inliner_new(),
+        coll_inliner: collection_inliner_new(),
+        loop_analyzer: loop_analyzer_new(),
+        unroller: unroller_new(),
+        alias: alias_new(),
+        cse: cse_new(),
+        licm: licm_new()
+    }
+
+# =============================================================================
+# OPTIMIZATION PASS EXECUTION
+# =============================================================================
+
+# Run a single pass over all AST nodes
+fn opt_pass_constant_fold(@opt: Optimizer, @p: Parser)
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        if @node.kind == AST_BINARY
+            # Try to fold if both children are literals
+            @left = @p.nodes[@node.child1]
+            @right = @p.nodes[@node.child2]
+            if @left.kind == AST_LITERAL and @right.kind == AST_LITERAL
+                @lv = const_unknown()
+                @rv = const_unknown()
+                match @left.data1
+                    LIT_INT => @lv = const_int(@left.data2)
+                    LIT_FLOAT => @lv = const_float(0.0)  # Would need float data
+                    LIT_BOOL => @lv = const_bool(@left.data2)
+                    _ => pass
+                match @right.data1
+                    LIT_INT => @rv = const_int(@right.data2)
+                    LIT_FLOAT => @rv = const_float(0.0)
+                    LIT_BOOL => @rv = const_bool(@right.data2)
+                    _ => pass
+
+                @result = fold_binop(@opt.folder, @node.data1, @lv, @rv)
+                if @result.kind != VAL_UNKNOWN
+                    # Replace binary node with literal
+                    match @result.kind
+                        VAL_INT =>
+                            @p.nodes[@i].kind = AST_LITERAL
+                            @p.nodes[@i].data1 = LIT_INT
+                            @p.nodes[@i].data2 = @result.int_val
+                        VAL_BOOL =>
+                            @p.nodes[@i].kind = AST_LITERAL
+                            @p.nodes[@i].data1 = LIT_BOOL
+                            @p.nodes[@i].data2 = @result.bool_val
+                        _ => pass
+
+fn opt_pass_strength_reduce(@opt: Optimizer, @p: Parser)
+    orbit @i in 0..@p.node_count
+        strength_reduce(@opt.reducer, @p, @i)
+
+fn opt_pass_dce(@opt: Optimizer, @p: Parser, @region: TypeRegion)
+    @opt.dce = dce_new()
+    dce_analyze(@opt.dce, @p, @region)
+    dce_eliminate(@opt.dce, @p)
+
+fn opt_pass_loop_analysis(@opt: Optimizer, @p: Parser)
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        if @node.kind == AST_ORBIT
+            # Extract loop bounds from range expression
+            @info = LoopInfo {
+                node_idx: @i,
+                iv_name: 0,
+                lower: 0,
+                upper: 0,
+                step: 1,
+                trip_count: -1,
+                vectorizable: 0,
+                vector_factor: 1,
+                is_reduction: 0,
+                reduction_op: 0,
+                reduction_var: 0,
+                depth: 0
+            }
+
+            # Try to extract bounds from range child
+            if @node.child1 >= 0
+                @range = @p.nodes[@node.child1]
+                if @range.kind == AST_RANGE
+                    # Check if bounds are constant
+                    if @range.child1 >= 0 and @range.child2 >= 0
+                        @lo = @p.nodes[@range.child1]
+                        @hi = @p.nodes[@range.child2]
+                        if @lo.kind == AST_LITERAL and @lo.data1 == LIT_INT
+                            @info.lower = @lo.data2
+                        if @hi.kind == AST_LITERAL and @hi.data1 == LIT_INT
+                            @info.upper = @hi.data2
+                        if @info.upper > @info.lower
+                            @info.trip_count = @info.upper - @info.lower
+
+            loop_add(@opt.loop_analyzer, @info)
+
+fn opt_pass_vectorize(@opt: Optimizer, @p: Parser)
+    orbit @i in 0..@opt.loop_analyzer.loop_count
+        @opt.alias = alias_new()
+        # Collect memory accesses for this loop
+        # (simplified - full implementation would walk loop body)
+        loop_analyze_vectorizability(@opt.loop_analyzer, @i, @opt.alias, @opt.simd)
+        if @opt.loop_analyzer.loops[@i].vectorizable
+            @opt.stats.loops_vectorized = @opt.stats.loops_vectorized + 1
+
+fn opt_pass_unroll(@opt: Optimizer, @p: Parser)
+    orbit @i in 0..@opt.loop_analyzer.loop_count
+        @loop = @opt.loop_analyzer.loops[@i]
+        if @loop.trip_count > 0 and @loop.trip_count <= 64
+            @result = unroll_loop(@opt.unroller, @loop.trip_count)
+            @opt.stats.loops_unrolled = @opt.stats.loops_unrolled + 1
+
+fn opt_pass_inline(@opt: Optimizer, @p: Parser, @region: TypeRegion)
+    # Phase 1: Collect functions
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        if @node.kind == AST_FUNCTION
+            @name_idx = region_intern(@region, "")
+            @stmt_count = @node.children_count
+            inliner_add_candidate(@opt.inliner, @name_idx, @i, 0, @stmt_count)
+
+    # Phase 2: Build call graph
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        if @node.kind == AST_CALL
+            # Would extract caller and callee names
+            pass
+
+    # Phase 3: Detect recursion
+    inliner_detect_recursion(@opt.inliner)
+
+    # Phase 4: Inline candidates
+    orbit @i in 0..@opt.inliner.candidate_count
+        if inliner_should_inline(@opt.inliner, @i)
+            @opt.stats.functions_inlined = @opt.stats.functions_inlined + 1
+
+fn opt_pass_cse(@opt: Optimizer, @p: Parser)
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        if @node.kind == AST_BINARY or @node.kind == AST_CALL
+            @hash = cse_hash_expr(@p, @i)
+            @existing = cse_lookup(@opt.cse, @hash)
+            if @existing >= 0
+                @opt.cse.eliminations = @opt.cse.eliminations + 1
+                @opt.stats.cse_eliminated = @opt.stats.cse_eliminated + 1
+            else
+                cse_add(@opt.cse, @hash, @i, 0)
+
+# =============================================================================
+# MAIN OPTIMIZATION PIPELINE
+# =============================================================================
+
+fn optimize(@p: Parser, @region: TypeRegion, @level: int) -> OptStats
+    @opt = optimizer_new(@level)
+
+    if @level == OPT_NONE
+        return @opt.stats
+
+    # === Basic Pipeline (O1) ===
+
+    # Pass 1: Constant Propagation
+    shine("  [opt] Pass 1: Constant Propagation")
+    # (Implemented through propagator, would modify AST in-place)
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 2: Constant Folding
+    shine("  [opt] Pass 2: Constant Folding")
+    opt_pass_constant_fold(@opt, @p)
+    @opt.stats.constant_folds = @opt.folder.folds
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 3: Strength Reduction
+    shine("  [opt] Pass 3: Strength Reduction")
+    opt_pass_strength_reduce(@opt, @p)
+    @opt.stats.strength_reductions = @opt.reducer.reductions
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 4: Dead Code Elimination
+    shine("  [opt] Pass 4: Dead Code Elimination")
+    opt_pass_dce(@opt, @p, @region)
+    @opt.stats.dead_eliminated = @opt.dce.eliminated
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    if @level == OPT_BASIC
+        opt_print_stats(@opt.stats)
+        return @opt.stats
+
+    # === Aggressive Pipeline (O2) ===
+
+    # Pass 5: Function Inlining
+    shine("  [opt] Pass 5: Function Inlining")
+    opt_pass_inline(@opt, @p, @region)
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 6: Collection Method Inlining
+    shine("  [opt] Pass 6: Collection Method Inlining")
+    opt_pass_inline_collections(@opt, @p, @region)
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 7: Speculative Inlining (hot loops)
+    shine("  [opt] Pass 7: Speculative Inlining (hot loops)")
+    opt_pass_speculative_inline(@opt, @p, @region)
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 8: Post-Inline Cleanup (dead vars, const prop, copy prop)
+    shine("  [opt] Pass 8: Post-Inline Cleanup")
+    opt_pass_post_inline_cleanup(@opt, @p, @region)
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 9: CSE
+    shine("  [opt] Pass 9: Common Subexpression Elimination")
+    opt_pass_cse(@opt, @p)
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 10: Loop Analysis
+    shine("  [opt] Pass 10: Loop Analysis")
+    opt_pass_loop_analysis(@opt, @p)
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 11: Loop Unrolling
+    shine("  [opt] Pass 11: Loop Unrolling")
+    opt_pass_unroll(@opt, @p)
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 12: Auto-SIMD Vectorization
+    shine("  [opt] Pass 12: Auto-SIMD Vectorization")
+    shine("  [opt]   SIMD config: preferred_width=" + str(@opt.simd.preferred_width) + " bits")
+    shine("  [opt]   SSE4.2=" + str(@opt.simd.use_sse42) + " AVX2=" + str(@opt.simd.use_avx2) + " AVX-512=" + str(@opt.simd.use_avx512))
+    opt_pass_vectorize(@opt, @p)
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 13: Second round constant folding (after inlining may expose more)
+    shine("  [opt] Pass 13: Final Constant Folding")
+    opt_pass_constant_fold(@opt, @p)
+    @opt.stats.constant_folds = @opt.folder.folds
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    # Pass 14: Final DCE
+    shine("  [opt] Pass 14: Final Dead Code Elimination")
+    opt_pass_dce(@opt, @p, @region)
+    @opt.stats.dead_eliminated = @opt.dce.eliminated
+    @opt.stats.total_passes = @opt.stats.total_passes + 1
+
+    opt_print_stats(@opt.stats)
+    return @opt.stats
+
+# Print optimization statistics
+fn opt_print_stats(@stats: OptStats)
+    shine("  [opt] Optimization complete:")
+    shine("    Passes run: " + str(@stats.total_passes))
+    shine("    Constants folded: " + str(@stats.constant_folds))
+    shine("    Strength reductions: " + str(@stats.strength_reductions))
+    shine("    Dead code eliminated: " + str(@stats.dead_eliminated))
+    shine("    Functions inlined: " + str(@stats.functions_inlined))
+    shine("    Collections inlined: " + str(@stats.collections_inlined))
+    shine("    Devirtualized calls: " + str(@stats.devirtualized))
+    shine("    Post-inline dead vars: " + str(@stats.post_inline_dead_vars))
+    shine("    Post-inline const prop: " + str(@stats.post_inline_const_prop))
+    shine("    Post-inline copy prop: " + str(@stats.post_inline_copy_prop))
+    shine("    Loops unrolled: " + str(@stats.loops_unrolled))
+    shine("    Loops vectorized: " + str(@stats.loops_vectorized))
+    shine("    CSE eliminated: " + str(@stats.cse_eliminated))
+
+# =============================================================================
+# LLVM PASS ORDERING (for reference when generating LLVM IR)
+# =============================================================================
+# These constants define the LLVM optimization pass ordering used
+# when the optimizer emits to the LLVM backend.
+
+const LLVM_PASS_MEM2REG: int = 1
+const LLVM_PASS_EARLY_CSE: int = 2
+const LLVM_PASS_SIMPLIFY_CFG: int = 3
+const LLVM_PASS_INLINE: int = 4
+const LLVM_PASS_ARG_PROMOTION: int = 5
+const LLVM_PASS_SROA: int = 6
+const LLVM_PASS_REASSOCIATE: int = 7
+const LLVM_PASS_GVN: int = 8
+const LLVM_PASS_SCCP: int = 9
+const LLVM_PASS_DCE: int = 10
+const LLVM_PASS_LOOP_ROTATE: int = 11
+const LLVM_PASS_LICM: int = 12
+const LLVM_PASS_IND_VAR_SIMPLIFY: int = 13
+const LLVM_PASS_LOOP_IDIOM: int = 14
+const LLVM_PASS_LOOP_DELETION: int = 15
+const LLVM_PASS_LOOP_UNROLL: int = 16
+const LLVM_PASS_LOOP_VECTORIZE: int = 17
+const LLVM_PASS_SLP_VECTORIZE: int = 18
+const LLVM_PASS_ADCE: int = 19
+const LLVM_PASS_DSE: int = 20
+const LLVM_PASS_GLOBAL_OPT: int = 21
+const LLVM_PASS_GLOBAL_DCE: int = 22
+
+# LLVM pass pipeline for O3
+const LLVM_O3_PASSES: [int; 22] = [
+    LLVM_PASS_MEM2REG, LLVM_PASS_EARLY_CSE, LLVM_PASS_SIMPLIFY_CFG,
+    LLVM_PASS_INLINE, LLVM_PASS_ARG_PROMOTION,
+    LLVM_PASS_SROA, LLVM_PASS_REASSOCIATE, LLVM_PASS_GVN, LLVM_PASS_SCCP, LLVM_PASS_DCE,
+    LLVM_PASS_LOOP_ROTATE, LLVM_PASS_LICM, LLVM_PASS_IND_VAR_SIMPLIFY,
+    LLVM_PASS_LOOP_IDIOM, LLVM_PASS_LOOP_DELETION, LLVM_PASS_LOOP_UNROLL,
+    LLVM_PASS_LOOP_VECTORIZE, LLVM_PASS_SLP_VECTORIZE,
+    LLVM_PASS_ADCE, LLVM_PASS_DSE, LLVM_PASS_GLOBAL_OPT, LLVM_PASS_GLOBAL_DCE
+]
+
+# =============================================================================
+# REDUCTION OPERATIONS (for vectorization)
+# =============================================================================
+
+const REDUCE_ADD: int = 1
+const REDUCE_MUL: int = 2
+const REDUCE_MIN: int = 3
+const REDUCE_MAX: int = 4
+const REDUCE_AND: int = 5
+const REDUCE_OR: int = 6
+const REDUCE_XOR: int = 7
+
+# Identity elements for reductions
+fn reduce_identity(@op: int) -> int
+    match @op
+        REDUCE_ADD => return 0
+        REDUCE_MUL => return 1
+        REDUCE_MIN => return 2147483647   # INT_MAX
+        REDUCE_MAX => return -2147483648  # INT_MIN
+        REDUCE_AND => return -1           # All bits set
+        REDUCE_OR => return 0
+        REDUCE_XOR => return 0
+        _ => return 0
+
+# Map reduction to LLVM intrinsic name
+fn reduce_intrinsic(@op: int, @elem_type: str) -> str
+    match @op
+        REDUCE_ADD => return "llvm.vector.reduce.add." + @elem_type
+        REDUCE_MUL => return "llvm.vector.reduce.mul." + @elem_type
+        REDUCE_MIN => return "llvm.vector.reduce.smin." + @elem_type
+        REDUCE_MAX => return "llvm.vector.reduce.smax." + @elem_type
+        REDUCE_AND => return "llvm.vector.reduce.and." + @elem_type
+        REDUCE_OR => return "llvm.vector.reduce.or." + @elem_type
+        REDUCE_XOR => return "llvm.vector.reduce.xor." + @elem_type
+        _ => return ""

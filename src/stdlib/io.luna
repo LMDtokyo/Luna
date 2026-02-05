@@ -1,0 +1,2883 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Native I/O Module v1.0 - Pure Luna Port of stdlib/vfs.rs
+# =============================================================================
+# Direct FFI to OS-level file and I/O APIs, replacing Rust std::io / std::fs.
+#
+# Provides a unified cross-platform interface:
+#   - POSIX / libc on Unix (Linux, macOS, *BSD)
+#   - Win32 API on Windows
+#
+# Subsystems:
+#   1. File Operations       - open, close, read, write, seek, flush, sync
+#   2. Path Operations       - exists, is_file, is_dir, file_size, file_info
+#   3. Directory Operations  - mkdir, rmdir, readdir, list_dir
+#   4. File Management       - rename, remove, copy, truncate
+#   5. Text I/O              - read_file, write_file, append_file, read_lines
+#   6. Console I/O           - stdin_read, stdin_read_line, stdout_write, stderr_write
+#   7. Buffered I/O          - BufferedReader, BufferedWriter
+#   8. RamFS                 - In-memory filesystem for testing / Nova resources
+#
+# Uses flat parallel arrays with index-based lookups (no HashMap).
+# All storage has fixed max capacity for deterministic memory usage.
+#
+# Build: luna compile --release io.luna -o io.o
+# =============================================================================
+
+import types
+import borrow_checker
+
+# =============================================================================
+# SECTION 1: PLATFORM DETECTION
+# =============================================================================
+# Auto-detected at compile time. Set IS_WINDOWS = 1 on Windows builds,
+# IS_WINDOWS = 0 on all POSIX platforms. The compiler injects this constant
+# based on the --target flag or host triple detection.
+
+const IS_WINDOWS: int = 0   # 0 = POSIX, 1 = Windows (set by compiler)
+
+# =============================================================================
+# SECTION 2: OPEN MODE CONSTANTS
+# =============================================================================
+
+const MODE_READ: int = 0
+const MODE_WRITE: int = 1
+const MODE_READ_WRITE: int = 2
+const MODE_APPEND: int = 3
+const MODE_CREATE: int = 4
+const MODE_TRUNCATE: int = 5
+
+# =============================================================================
+# SECTION 3: SEEK ORIGIN CONSTANTS
+# =============================================================================
+
+const SEEK_SET: int = 0
+const SEEK_CUR: int = 1
+const SEEK_END: int = 2
+
+# =============================================================================
+# SECTION 4: FILE TYPE CONSTANTS
+# =============================================================================
+
+const FILE_REGULAR: int = 0
+const FILE_DIRECTORY: int = 1
+const FILE_SYMLINK: int = 2
+const FILE_DEVICE: int = 3
+
+# =============================================================================
+# SECTION 5: ERROR CODE CONSTANTS
+# =============================================================================
+
+const IO_OK: int = 0
+const IO_ERR_NOT_FOUND: int = 1
+const IO_ERR_PERMISSION: int = 2
+const IO_ERR_EXISTS: int = 3
+const IO_ERR_IS_DIR: int = 4
+const IO_ERR_NOT_DIR: int = 5
+const IO_ERR_IO: int = 6
+const IO_ERR_NO_SPACE: int = 7
+const IO_ERR_INVALID: int = 8
+const IO_ERR_NOT_EMPTY: int = 9
+const IO_ERR_NOT_FILE: int = 10
+const IO_ERR_HANDLE: int = 11
+const IO_ERR_NOT_SUPPORTED: int = 12
+const IO_ERR_CLOSED: int = 13
+const IO_ERR_EOF: int = 14
+const IO_ERR_BUSY: int = 15
+
+# =============================================================================
+# SECTION 6: BUFFER AND CAPACITY CONSTANTS
+# =============================================================================
+
+const DEFAULT_BUF_SIZE: int = 8192
+const MAX_PATH_LEN: int = 4096
+const MAX_OPEN_FILES: int = 256
+const MAX_LINE_LEN: int = 65536
+const COPY_BUF_SIZE: int = 32768
+
+# =============================================================================
+# SECTION 7: RAMFS CONSTANTS
+# =============================================================================
+
+const RAMFS_MAX_FILES: int = 1024
+const RAMFS_MAX_DATA: int = 1048576    # 1MB per file
+const RAMFS_MAX_NAME_LEN: int = 256
+const RAMFS_MAX_CHILDREN: int = 128
+const RAMFS_MAX_TOTAL: int = 67108864  # 64MB total limit
+
+# =============================================================================
+# SECTION 8: POSIX / libc CONSTANTS
+# =============================================================================
+# These mirror the C definitions on Linux/macOS for open(), lseek(), stat().
+
+const O_RDONLY: int = 0
+const O_WRONLY: int = 1
+const O_RDWR: int = 2
+const O_CREAT: int = 64
+const O_TRUNC: int = 512
+const O_APPEND: int = 1024
+const O_EXCL: int = 128
+
+const S_IRUSR: int = 256
+const S_IWUSR: int = 128
+const S_IRGRP: int = 32
+const S_IROTH: int = 4
+const S_IFMT: int = 61440
+const S_IFREG: int = 32768
+const S_IFDIR: int = 16384
+const S_IFLNK: int = 40960
+
+const POSIX_DEFAULT_MODE: int = 420   # 0644 octal
+
+const STDIN_FD: int = 0
+const STDOUT_FD: int = 1
+const STDERR_FD: int = 2
+
+# =============================================================================
+# SECTION 9: WIN32 CONSTANTS
+# =============================================================================
+
+const GENERIC_READ: int = 0x80000000
+const GENERIC_WRITE: int = 0x40000000
+const FILE_SHARE_READ: int = 1
+const FILE_SHARE_WRITE: int = 2
+const CREATE_NEW: int = 1
+const CREATE_ALWAYS: int = 2
+const OPEN_EXISTING: int = 3
+const OPEN_ALWAYS: int = 4
+const TRUNCATE_EXISTING: int = 5
+const FILE_ATTRIBUTE_NORMAL: int = 128
+const INVALID_HANDLE_VALUE: int = -1
+const FILE_BEGIN: int = 0
+const FILE_CURRENT: int = 1
+const FILE_END: int = 2
+const STD_INPUT_HANDLE: int = -10
+const STD_OUTPUT_HANDLE: int = -11
+const STD_ERROR_HANDLE: int = -12
+const FILE_ATTRIBUTE_DIRECTORY: int = 16
+
+# =============================================================================
+# SECTION 10: POSIX / libc FFI DECLARATIONS
+# =============================================================================
+# These map directly to the C standard library functions provided by libc.
+# On Linux: linked from libc.so.6
+# On macOS: linked from libSystem.B.dylib
+
+extern "C" fn libc_open(@path: *u8, @flags: int, @mode: int) -> int
+extern "C" fn libc_close(@fd: int) -> int
+extern "C" fn libc_read(@fd: int, @buf: *u8, @count: int) -> int
+extern "C" fn libc_write(@fd: int, @buf: *u8, @count: int) -> int
+extern "C" fn libc_lseek(@fd: int, @offset: int, @whence: int) -> int
+extern "C" fn libc_stat(@path: *u8, @buf: *u8) -> int
+extern "C" fn libc_fstat(@fd: int, @buf: *u8) -> int
+extern "C" fn libc_fsync(@fd: int) -> int
+extern "C" fn libc_ftruncate(@fd: int, @length: int) -> int
+extern "C" fn libc_mkdir(@path: *u8, @mode: int) -> int
+extern "C" fn libc_rmdir(@path: *u8) -> int
+extern "C" fn libc_unlink(@path: *u8) -> int
+extern "C" fn libc_rename(@old: *u8, @new: *u8) -> int
+extern "C" fn libc_getcwd(@buf: *u8, @size: int) -> *u8
+extern "C" fn libc_opendir(@path: *u8) -> *u8
+extern "C" fn libc_readdir(@dirp: *u8) -> *u8
+extern "C" fn libc_closedir(@dirp: *u8) -> int
+extern "C" fn libc_access(@path: *u8, @mode: int) -> int
+extern "C" fn libc_errno_get() -> int
+
+# =============================================================================
+# SECTION 11: WIN32 FFI DECLARATIONS
+# =============================================================================
+# These map directly to Win32 API functions from kernel32.dll.
+
+extern "C" fn CreateFileA(@path: *u8, @access: int, @share: int, @security: int, @disposition: int, @flags: int, @template: int) -> int
+extern "C" fn CloseHandle(@handle: int) -> int
+extern "C" fn ReadFile(@handle: int, @buf: *u8, @count: int, @bytes_read: *int, @overlapped: int) -> int
+extern "C" fn WriteFile(@handle: int, @buf: *u8, @count: int, @bytes_written: *int, @overlapped: int) -> int
+extern "C" fn SetFilePointer(@handle: int, @distance: int, @high: *int, @method: int) -> int
+extern "C" fn GetFileSize(@handle: int, @high: *int) -> int
+extern "C" fn FlushFileBuffers(@handle: int) -> int
+extern "C" fn SetEndOfFile(@handle: int) -> int
+extern "C" fn CreateDirectoryA(@path: *u8, @security: int) -> int
+extern "C" fn RemoveDirectoryA(@path: *u8) -> int
+extern "C" fn DeleteFileA(@path: *u8) -> int
+extern "C" fn MoveFileA(@old: *u8, @new: *u8) -> int
+extern "C" fn GetFileAttributesA(@path: *u8) -> int
+extern "C" fn FindFirstFileA(@path: *u8, @find_data: *u8) -> int
+extern "C" fn FindNextFileA(@handle: int, @find_data: *u8) -> int
+extern "C" fn FindClose(@handle: int) -> int
+extern "C" fn GetStdHandle(@std_handle: int) -> int
+extern "C" fn GetLastError() -> int
+extern "C" fn CopyFileA(@src: *u8, @dst: *u8, @fail_exists: int) -> int
+
+# =============================================================================
+# SECTION 12: FILE INFO STRUCT
+# =============================================================================
+# Parallel arrays for file metadata returned by stat / file_info.
+
+struct FileInfo
+    name_buf: [u8; 256]
+    name_len: int
+    file_type: int
+    size: int
+    created: int
+    modified: int
+    permissions: int
+
+# =============================================================================
+# SECTION 13: FILE HANDLE TABLE
+# =============================================================================
+# Global parallel arrays that track all open file handles.
+# Index 0 is reserved (invalid handle). Valid handles are 1..MAX_OPEN_FILES-1.
+
+meow @handle_fd: [int; 256] = [0; 256]            # OS file descriptor / Win32 handle
+meow @handle_path_buf: [[u8; 4096]; 256] = [[0; 4096]; 256]  # Path storage
+meow @handle_path_len: [int; 256] = [0; 256]      # Path length
+meow @handle_mode: [int; 256] = [0; 256]          # Open mode
+meow @handle_position: [int; 256] = [0; 256]      # Current position
+meow @handle_is_open: [int; 256] = [0; 256]       # 1 if slot is active, 0 if free
+meow @handle_is_ramfs: [int; 256] = [0; 256]      # 1 if this handle is a RamFS handle
+meow @handle_ramfs_node: [int; 256] = [0; 256]    # RamFS node index if ramfs handle
+meow @next_handle_id: int = 1                      # Monotonically increasing handle ID
+
+# =============================================================================
+# SECTION 14: HANDLE ALLOCATION HELPERS
+# =============================================================================
+
+# Allocate a new handle slot, returns handle ID or -1 if full
+fn handle_alloc() -> int
+    orbit @i in 1..MAX_OPEN_FILES
+        if @handle_is_open[@i] == 0
+            @handle_is_open[@i] = 1
+            @handle_fd[@i] = -1
+            @handle_path_len[@i] = 0
+            @handle_mode[@i] = MODE_READ
+            @handle_position[@i] = 0
+            @handle_is_ramfs[@i] = 0
+            @handle_ramfs_node[@i] = -1
+            @next_handle_id = @next_handle_id + 1
+            return @i
+    return -1
+
+# Free a handle slot
+fn handle_free(@id: int) -> int
+    if @id < 1
+        return IO_ERR_HANDLE
+    if @id >= MAX_OPEN_FILES
+        return IO_ERR_HANDLE
+    if @handle_is_open[@id] == 0
+        return IO_ERR_HANDLE
+    @handle_is_open[@id] = 0
+    @handle_fd[@id] = -1
+    @handle_path_len[@id] = 0
+    @handle_is_ramfs[@id] = 0
+    @handle_ramfs_node[@id] = -1
+    return IO_OK
+
+# Validate that a handle is open and usable
+fn handle_valid(@id: int) -> int
+    if @id < 1
+        return 0
+    if @id >= MAX_OPEN_FILES
+        return 0
+    return @handle_is_open[@id]
+
+# Copy a path string into handle's path buffer
+fn handle_set_path(@id: int, @path: *u8, @len: int)
+    @copy_len = @len
+    if @copy_len >= MAX_PATH_LEN
+        @copy_len = MAX_PATH_LEN - 1
+    orbit @i in 0..@copy_len
+        @handle_path_buf[@id][@i] = @path[@i]
+    @handle_path_len[@id] = @copy_len
+
+# =============================================================================
+# SECTION 15: POSIX MODE TRANSLATION
+# =============================================================================
+# Translate Luna MODE_* constants to POSIX open() flags.
+
+fn posix_translate_flags(@mode: int) -> int
+    match @mode
+        MODE_READ      -> return O_RDONLY
+        MODE_WRITE     -> return O_WRONLY | O_CREAT | O_TRUNC
+        MODE_READ_WRITE -> return O_RDWR | O_CREAT
+        MODE_APPEND    -> return O_WRONLY | O_APPEND | O_CREAT
+        MODE_CREATE    -> return O_WRONLY | O_CREAT | O_EXCL
+        MODE_TRUNCATE  -> return O_WRONLY | O_TRUNC
+        _              -> return O_RDONLY
+
+# =============================================================================
+# SECTION 16: WIN32 MODE TRANSLATION
+# =============================================================================
+# Translate Luna MODE_* to Win32 CreateFileA access/disposition pairs.
+# Returns access in upper 32 bits, disposition in lower 32 bits packed.
+
+fn win32_translate_access(@mode: int) -> int
+    match @mode
+        MODE_READ       -> return GENERIC_READ
+        MODE_WRITE      -> return GENERIC_WRITE
+        MODE_READ_WRITE -> return GENERIC_READ | GENERIC_WRITE
+        MODE_APPEND     -> return GENERIC_WRITE
+        MODE_CREATE     -> return GENERIC_WRITE
+        MODE_TRUNCATE   -> return GENERIC_WRITE
+        _               -> return GENERIC_READ
+
+fn win32_translate_disposition(@mode: int) -> int
+    match @mode
+        MODE_READ       -> return OPEN_EXISTING
+        MODE_WRITE      -> return CREATE_ALWAYS
+        MODE_READ_WRITE -> return OPEN_ALWAYS
+        MODE_APPEND     -> return OPEN_ALWAYS
+        MODE_CREATE     -> return CREATE_NEW
+        MODE_TRUNCATE   -> return TRUNCATE_EXISTING
+        _               -> return OPEN_EXISTING
+
+# =============================================================================
+# SECTION 17: POSIX ERROR TRANSLATION
+# =============================================================================
+# Translate libc errno values to Luna IO_ERR_* codes.
+
+fn posix_translate_error(@errno_val: int) -> int
+    if @errno_val == 2
+        return IO_ERR_NOT_FOUND       # ENOENT
+    if @errno_val == 13
+        return IO_ERR_PERMISSION      # EACCES
+    if @errno_val == 17
+        return IO_ERR_EXISTS          # EEXIST
+    if @errno_val == 21
+        return IO_ERR_IS_DIR          # EISDIR
+    if @errno_val == 20
+        return IO_ERR_NOT_DIR         # ENOTDIR
+    if @errno_val == 28
+        return IO_ERR_NO_SPACE        # ENOSPC
+    if @errno_val == 22
+        return IO_ERR_INVALID         # EINVAL
+    if @errno_val == 39
+        return IO_ERR_NOT_EMPTY       # ENOTEMPTY
+    if @errno_val == 16
+        return IO_ERR_BUSY            # EBUSY
+    return IO_ERR_IO
+
+# =============================================================================
+# SECTION 18: WIN32 ERROR TRANSLATION
+# =============================================================================
+
+fn win32_translate_error(@err: int) -> int
+    if @err == 2
+        return IO_ERR_NOT_FOUND       # ERROR_FILE_NOT_FOUND
+    if @err == 3
+        return IO_ERR_NOT_FOUND       # ERROR_PATH_NOT_FOUND
+    if @err == 5
+        return IO_ERR_PERMISSION      # ERROR_ACCESS_DENIED
+    if @err == 80
+        return IO_ERR_EXISTS          # ERROR_FILE_EXISTS
+    if @err == 183
+        return IO_ERR_EXISTS          # ERROR_ALREADY_EXISTS
+    if @err == 112
+        return IO_ERR_NO_SPACE        # ERROR_DISK_FULL
+    if @err == 87
+        return IO_ERR_INVALID         # ERROR_INVALID_PARAMETER
+    if @err == 145
+        return IO_ERR_NOT_EMPTY       # ERROR_DIR_NOT_EMPTY
+    return IO_ERR_IO
+
+# =============================================================================
+# SECTION 19: FILE OPERATIONS - open
+# =============================================================================
+# Open a file by path and mode, returning a handle ID or negative error code.
+
+fn io_open(@path: *u8, @path_len: int, @mode: int) -> int
+    # Allocate handle slot
+    @hid = handle_alloc()
+    if @hid < 0
+        return -IO_ERR_NO_SPACE
+
+    if IS_WINDOWS == 1
+        # Win32 path
+        @access = win32_translate_access(@mode)
+        @disposition = win32_translate_disposition(@mode)
+        @fd = CreateFileA(@path, @access, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, @disposition, FILE_ATTRIBUTE_NORMAL, 0)
+        if @fd == INVALID_HANDLE_VALUE
+            handle_free(@hid)
+            @err = GetLastError()
+            return -(win32_translate_error(@err))
+        @handle_fd[@hid] = @fd
+    eclipse
+        # POSIX path
+        @flags = posix_translate_flags(@mode)
+        @fd = libc_open(@path, @flags, POSIX_DEFAULT_MODE)
+        if @fd < 0
+            handle_free(@hid)
+            @err = libc_errno_get()
+            return -(posix_translate_error(@err))
+        @handle_fd[@hid] = @fd
+
+    handle_set_path(@hid, @path, @path_len)
+    @handle_mode[@hid] = @mode
+    @handle_position[@hid] = 0
+    return @hid
+
+# =============================================================================
+# SECTION 20: FILE OPERATIONS - close
+# =============================================================================
+
+fn io_close(@hid: int) -> int
+    if handle_valid(@hid) == 0
+        return IO_ERR_HANDLE
+
+    # RamFS handles do not need OS close
+    if @handle_is_ramfs[@hid] == 1
+        handle_free(@hid)
+        return IO_OK
+
+    @fd = @handle_fd[@hid]
+
+    if IS_WINDOWS == 1
+        @ret = CloseHandle(@fd)
+        handle_free(@hid)
+        if @ret == 0
+            return IO_ERR_IO
+        return IO_OK
+    eclipse
+        @ret = libc_close(@fd)
+        handle_free(@hid)
+        if @ret < 0
+            return IO_ERR_IO
+        return IO_OK
+
+# =============================================================================
+# SECTION 21: FILE OPERATIONS - read
+# =============================================================================
+
+fn io_read(@hid: int, @buf: *u8, @count: int) -> int
+    if handle_valid(@hid) == 0
+        return -IO_ERR_HANDLE
+    if @handle_mode[@hid] == MODE_WRITE
+        return -IO_ERR_PERMISSION
+    if @handle_mode[@hid] == MODE_APPEND
+        return -IO_ERR_PERMISSION
+
+    # RamFS read delegated to ramfs subsystem
+    if @handle_is_ramfs[@hid] == 1
+        return ramfs_handle_read(@hid, @buf, @count)
+
+    @fd = @handle_fd[@hid]
+
+    if IS_WINDOWS == 1
+        @bytes_read = 0
+        @ret = ReadFile(@fd, @buf, @count, &@bytes_read, 0)
+        if @ret == 0
+            return -IO_ERR_IO
+        @handle_position[@hid] = @handle_position[@hid] + @bytes_read
+        return @bytes_read
+    eclipse
+        @ret = libc_read(@fd, @buf, @count)
+        if @ret < 0
+            @err = libc_errno_get()
+            return -(posix_translate_error(@err))
+        @handle_position[@hid] = @handle_position[@hid] + @ret
+        return @ret
+
+# =============================================================================
+# SECTION 22: FILE OPERATIONS - write
+# =============================================================================
+
+fn io_write(@hid: int, @buf: *u8, @count: int) -> int
+    if handle_valid(@hid) == 0
+        return -IO_ERR_HANDLE
+    if @handle_mode[@hid] == MODE_READ
+        return -IO_ERR_PERMISSION
+
+    # RamFS write delegated to ramfs subsystem
+    if @handle_is_ramfs[@hid] == 1
+        return ramfs_handle_write(@hid, @buf, @count)
+
+    @fd = @handle_fd[@hid]
+
+    if IS_WINDOWS == 1
+        @bytes_written = 0
+        @ret = WriteFile(@fd, @buf, @count, &@bytes_written, 0)
+        if @ret == 0
+            return -IO_ERR_IO
+        @handle_position[@hid] = @handle_position[@hid] + @bytes_written
+        return @bytes_written
+    eclipse
+        @ret = libc_write(@fd, @buf, @count)
+        if @ret < 0
+            @err = libc_errno_get()
+            return -(posix_translate_error(@err))
+        @handle_position[@hid] = @handle_position[@hid] + @ret
+        return @ret
+
+# =============================================================================
+# SECTION 23: FILE OPERATIONS - seek
+# =============================================================================
+
+fn io_seek(@hid: int, @offset: int, @whence: int) -> int
+    if handle_valid(@hid) == 0
+        return -IO_ERR_HANDLE
+
+    # RamFS seek delegated to ramfs subsystem
+    if @handle_is_ramfs[@hid] == 1
+        return ramfs_handle_seek(@hid, @offset, @whence)
+
+    @fd = @handle_fd[@hid]
+
+    if IS_WINDOWS == 1
+        @method = FILE_BEGIN
+        if @whence == SEEK_CUR
+            @method = FILE_CURRENT
+        if @whence == SEEK_END
+            @method = FILE_END
+        @ret = SetFilePointer(@fd, @offset, 0, @method)
+        if @ret < 0
+            return -IO_ERR_IO
+        @handle_position[@hid] = @ret
+        return @ret
+    eclipse
+        @ret = libc_lseek(@fd, @offset, @whence)
+        if @ret < 0
+            @err = libc_errno_get()
+            return -(posix_translate_error(@err))
+        @handle_position[@hid] = @ret
+        return @ret
+
+# =============================================================================
+# SECTION 24: FILE OPERATIONS - flush
+# =============================================================================
+
+fn io_flush(@hid: int) -> int
+    if handle_valid(@hid) == 0
+        return IO_ERR_HANDLE
+    if @handle_is_ramfs[@hid] == 1
+        return IO_OK   # RamFS is always flushed
+
+    @fd = @handle_fd[@hid]
+
+    if IS_WINDOWS == 1
+        @ret = FlushFileBuffers(@fd)
+        if @ret == 0
+            return IO_ERR_IO
+        return IO_OK
+    eclipse
+        @ret = libc_fsync(@fd)
+        if @ret < 0
+            return IO_ERR_IO
+        return IO_OK
+
+# =============================================================================
+# SECTION 25: FILE OPERATIONS - sync
+# =============================================================================
+
+fn io_sync(@hid: int) -> int
+    # sync is identical to flush at this abstraction level
+    return io_flush(@hid)
+
+# =============================================================================
+# SECTION 26: PATH OPERATIONS - exists
+# =============================================================================
+
+fn io_exists(@path: *u8, @path_len: int) -> int
+    if IS_WINDOWS == 1
+        @attr = GetFileAttributesA(@path)
+        if @attr == -1
+            return 0
+        return 1
+    eclipse
+        # F_OK = 0
+        @ret = libc_access(@path, 0)
+        if @ret == 0
+            return 1
+        return 0
+
+# =============================================================================
+# SECTION 27: PATH OPERATIONS - is_file
+# =============================================================================
+
+fn io_is_file(@path: *u8, @path_len: int) -> int
+    if IS_WINDOWS == 1
+        @attr = GetFileAttributesA(@path)
+        if @attr == -1
+            return 0
+        if (@attr & FILE_ATTRIBUTE_DIRECTORY) != 0
+            return 0
+        return 1
+    eclipse
+        @stat_buf: [u8; 256] = [0; 256]
+        @ret = libc_stat(@path, &@stat_buf[0])
+        if @ret < 0
+            return 0
+        # st_mode is at offset 24 on Linux x86_64 (struct stat)
+        # Extract file type bits
+        @mode_val = @stat_buf[24] | (@stat_buf[25] << 8)
+        @ftype = @mode_val & S_IFMT
+        if @ftype == S_IFREG
+            return 1
+        return 0
+
+# =============================================================================
+# SECTION 28: PATH OPERATIONS - is_dir
+# =============================================================================
+
+fn io_is_dir(@path: *u8, @path_len: int) -> int
+    if IS_WINDOWS == 1
+        @attr = GetFileAttributesA(@path)
+        if @attr == -1
+            return 0
+        if (@attr & FILE_ATTRIBUTE_DIRECTORY) != 0
+            return 1
+        return 0
+    eclipse
+        @stat_buf: [u8; 256] = [0; 256]
+        @ret = libc_stat(@path, &@stat_buf[0])
+        if @ret < 0
+            return 0
+        @mode_val = @stat_buf[24] | (@stat_buf[25] << 8)
+        @ftype = @mode_val & S_IFMT
+        if @ftype == S_IFDIR
+            return 1
+        return 0
+
+# =============================================================================
+# SECTION 29: PATH OPERATIONS - file_size
+# =============================================================================
+
+fn io_file_size(@path: *u8, @path_len: int) -> int
+    if IS_WINDOWS == 1
+        @hnd = CreateFileA(@path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+        if @hnd == INVALID_HANDLE_VALUE
+            return -IO_ERR_NOT_FOUND
+        @size = GetFileSize(@hnd, 0)
+        CloseHandle(@hnd)
+        return @size
+    eclipse
+        @stat_buf: [u8; 256] = [0; 256]
+        @ret = libc_stat(@path, &@stat_buf[0])
+        if @ret < 0
+            @err = libc_errno_get()
+            return -(posix_translate_error(@err))
+        # st_size is at offset 48 on Linux x86_64, 8 bytes
+        @sz = @stat_buf[48] | (@stat_buf[49] << 8) | (@stat_buf[50] << 16) | (@stat_buf[51] << 24)
+        @sz = @sz | (@stat_buf[52] << 32) | (@stat_buf[53] << 40) | (@stat_buf[54] << 48) | (@stat_buf[55] << 56)
+        return @sz
+
+# =============================================================================
+# SECTION 30: PATH OPERATIONS - file_info
+# =============================================================================
+# Populates a FileInfo struct from OS stat data.
+
+fn io_file_info(@path: *u8, @path_len: int, @info: *FileInfo) -> int
+    # Copy name into info
+    @copy_len = @path_len
+    if @copy_len >= RAMFS_MAX_NAME_LEN
+        @copy_len = RAMFS_MAX_NAME_LEN - 1
+    orbit @i in 0..@copy_len
+        @info.name_buf[@i] = @path[@i]
+    @info.name_len = @copy_len
+
+    if IS_WINDOWS == 1
+        @attr = GetFileAttributesA(@path)
+        if @attr == -1
+            return IO_ERR_NOT_FOUND
+        if (@attr & FILE_ATTRIBUTE_DIRECTORY) != 0
+            @info.file_type = FILE_DIRECTORY
+        eclipse
+            @info.file_type = FILE_REGULAR
+        # Get size
+        @sz = io_file_size(@path, @path_len)
+        if @sz < 0
+            @info.size = 0
+        eclipse
+            @info.size = @sz
+        @info.created = 0
+        @info.modified = 0
+        @info.permissions = 0
+        return IO_OK
+    eclipse
+        @stat_buf: [u8; 256] = [0; 256]
+        @ret = libc_stat(@path, &@stat_buf[0])
+        if @ret < 0
+            @err = libc_errno_get()
+            return posix_translate_error(@err)
+        # Parse stat fields (Linux x86_64 struct stat layout)
+        @mode_val = @stat_buf[24] | (@stat_buf[25] << 8)
+        @ftype = @mode_val & S_IFMT
+        if @ftype == S_IFREG
+            @info.file_type = FILE_REGULAR
+        eclipse
+            if @ftype == S_IFDIR
+                @info.file_type = FILE_DIRECTORY
+            eclipse
+                if @ftype == S_IFLNK
+                    @info.file_type = FILE_SYMLINK
+                eclipse
+                    @info.file_type = FILE_DEVICE
+
+        @info.size = @stat_buf[48] | (@stat_buf[49] << 8) | (@stat_buf[50] << 16) | (@stat_buf[51] << 24)
+        @info.permissions = @mode_val & 511   # lower 9 bits
+        @info.created = 0
+        @info.modified = 0
+        return IO_OK
+
+# =============================================================================
+# SECTION 31: DIRECTORY OPERATIONS - mkdir
+# =============================================================================
+
+fn io_mkdir(@path: *u8, @path_len: int) -> int
+    if IS_WINDOWS == 1
+        @ret = CreateDirectoryA(@path, 0)
+        if @ret == 0
+            @err = GetLastError()
+            return win32_translate_error(@err)
+        return IO_OK
+    eclipse
+        @ret = libc_mkdir(@path, 493)  # 0755 octal
+        if @ret < 0
+            @err = libc_errno_get()
+            return posix_translate_error(@err)
+        return IO_OK
+
+# =============================================================================
+# SECTION 32: DIRECTORY OPERATIONS - rmdir
+# =============================================================================
+
+fn io_rmdir(@path: *u8, @path_len: int) -> int
+    if IS_WINDOWS == 1
+        @ret = RemoveDirectoryA(@path)
+        if @ret == 0
+            @err = GetLastError()
+            return win32_translate_error(@err)
+        return IO_OK
+    eclipse
+        @ret = libc_rmdir(@path)
+        if @ret < 0
+            @err = libc_errno_get()
+            return posix_translate_error(@err)
+        return IO_OK
+
+# =============================================================================
+# SECTION 33: DIRECTORY OPERATIONS - readdir
+# =============================================================================
+# Reads directory entries into a flat result buffer.
+# Returns the number of entries found, or a negative error code.
+# Each entry is stored as: [name_len: int][name_bytes: u8...][file_type: int]
+# packed sequentially into @out_buf.
+
+const READDIR_MAX_ENTRIES: int = 512
+const READDIR_ENTRY_MAX: int = 260   # MAX_PATH on Windows
+
+fn io_readdir(@path: *u8, @path_len: int, @out_names: *[u8; 260], @out_types: *int, @max_entries: int) -> int
+    @entry_count = 0
+
+    if IS_WINDOWS == 1
+        # Build search pattern: path + "\\*"
+        @search_buf: [u8; 4100] = [0; 4100]
+        orbit @i in 0..@path_len
+            @search_buf[@i] = @path[@i]
+        @search_buf[@path_len] = 92      # backslash
+        @search_buf[@path_len + 1] = 42  # asterisk
+        @search_buf[@path_len + 2] = 0   # null terminator
+
+        @find_data: [u8; 592] = [0; 592]  # WIN32_FIND_DATAA size
+        @find_handle = FindFirstFileA(&@search_buf[0], &@find_data[0])
+        if @find_handle == INVALID_HANDLE_VALUE
+            @err = GetLastError()
+            return -(win32_translate_error(@err))
+
+        # Process first entry
+        @keep_going = 1
+        orbit @iter in 0..READDIR_MAX_ENTRIES
+            if @keep_going == 0
+                nova
+            if @entry_count >= @max_entries
+                nova
+
+            # File attributes at offset 0 (DWORD)
+            @attr = @find_data[0] | (@find_data[1] << 8) | (@find_data[2] << 16) | (@find_data[3] << 24)
+
+            # Filename at offset 44 (cFileName, 260 bytes)
+            @fname_offset = 44
+
+            # Skip "." and ".." entries
+            @skip = 0
+            if @find_data[@fname_offset] == 46  # '.'
+                if @find_data[@fname_offset + 1] == 0
+                    @skip = 1
+                if @find_data[@fname_offset + 1] == 46
+                    if @find_data[@fname_offset + 2] == 0
+                        @skip = 1
+
+            if @skip == 0
+                # Copy filename
+                @name_len = 0
+                orbit @j in 0..260
+                    if @find_data[@fname_offset + @j] == 0
+                        nova
+                    @out_names[@entry_count][@j] = @find_data[@fname_offset + @j]
+                    @name_len = @name_len + 1
+
+                # Determine type
+                if (@attr & FILE_ATTRIBUTE_DIRECTORY) != 0
+                    @out_types[@entry_count] = FILE_DIRECTORY
+                eclipse
+                    @out_types[@entry_count] = FILE_REGULAR
+
+                @entry_count = @entry_count + 1
+
+            # Get next entry
+            @ret = FindNextFileA(@find_handle, &@find_data[0])
+            if @ret == 0
+                @keep_going = 0
+
+        FindClose(@find_handle)
+        return @entry_count
+
+    eclipse
+        # POSIX opendir/readdir/closedir
+        @dirp = libc_opendir(@path)
+        if @dirp == 0
+            @err = libc_errno_get()
+            return -(posix_translate_error(@err))
+
+        orbit @iter in 0..READDIR_MAX_ENTRIES
+            if @entry_count >= @max_entries
+                nova
+
+            @ent = libc_readdir(@dirp)
+            if @ent == 0
+                nova
+
+            # struct dirent on Linux x86_64:
+            #   offset 0:  d_ino (8 bytes)
+            #   offset 8:  d_off (8 bytes)
+            #   offset 16: d_reclen (2 bytes)
+            #   offset 18: d_type (1 byte)
+            #   offset 19: d_name (256 bytes)
+            @d_type_val = unsafe_load_u8(@ent, 18)
+            @name_offset = 19
+
+            # Skip "." and ".."
+            @first_char = unsafe_load_u8(@ent, @name_offset)
+            @skip = 0
+            if @first_char == 46  # '.'
+                @second_char = unsafe_load_u8(@ent, @name_offset + 1)
+                if @second_char == 0
+                    @skip = 1
+                if @second_char == 46
+                    @third_char = unsafe_load_u8(@ent, @name_offset + 2)
+                    if @third_char == 0
+                        @skip = 1
+
+            if @skip == 0
+                # Copy name
+                @name_len = 0
+                orbit @j in 0..260
+                    @ch = unsafe_load_u8(@ent, @name_offset + @j)
+                    if @ch == 0
+                        nova
+                    @out_names[@entry_count][@j] = @ch
+                    @name_len = @name_len + 1
+
+                # Map d_type: DT_DIR=4, DT_REG=8, DT_LNK=10
+                if @d_type_val == 4
+                    @out_types[@entry_count] = FILE_DIRECTORY
+                eclipse
+                    if @d_type_val == 10
+                        @out_types[@entry_count] = FILE_SYMLINK
+                    eclipse
+                        @out_types[@entry_count] = FILE_REGULAR
+
+                @entry_count = @entry_count + 1
+
+        libc_closedir(@dirp)
+        return @entry_count
+
+# =============================================================================
+# SECTION 34: DIRECTORY OPERATIONS - list_dir
+# =============================================================================
+# Convenience wrapper that prints directory listing to stdout (for REPL/debug).
+
+fn io_list_dir(@path: *u8, @path_len: int) -> int
+    @names: [[u8; 260]; 512] = [[0; 260]; 512]
+    @types: [int; 512] = [0; 512]
+    @count = io_readdir(@path, @path_len, &@names[0], &@types[0], 512)
+    if @count < 0
+        return @count
+
+    orbit @i in 0..@count
+        # Print type indicator
+        if @types[@i] == FILE_DIRECTORY
+            stdout_write_str("[DIR]  ")
+        eclipse
+            if @types[@i] == FILE_SYMLINK
+                stdout_write_str("[LNK]  ")
+            eclipse
+                stdout_write_str("[FILE] ")
+
+        # Print name
+        @nlen = 0
+        orbit @j in 0..260
+            if @names[@i][@j] == 0
+                nova
+            @nlen = @nlen + 1
+        stdout_write(&@names[@i][0], @nlen)
+        stdout_write_str("\n")
+
+    return @count
+
+# =============================================================================
+# SECTION 35: FILE MANAGEMENT - rename
+# =============================================================================
+
+fn io_rename(@old_path: *u8, @old_len: int, @new_path: *u8, @new_len: int) -> int
+    if IS_WINDOWS == 1
+        @ret = MoveFileA(@old_path, @new_path)
+        if @ret == 0
+            @err = GetLastError()
+            return win32_translate_error(@err)
+        return IO_OK
+    eclipse
+        @ret = libc_rename(@old_path, @new_path)
+        if @ret < 0
+            @err = libc_errno_get()
+            return posix_translate_error(@err)
+        return IO_OK
+
+# =============================================================================
+# SECTION 36: FILE MANAGEMENT - remove
+# =============================================================================
+
+fn io_remove(@path: *u8, @path_len: int) -> int
+    if IS_WINDOWS == 1
+        @ret = DeleteFileA(@path)
+        if @ret == 0
+            @err = GetLastError()
+            return win32_translate_error(@err)
+        return IO_OK
+    eclipse
+        @ret = libc_unlink(@path)
+        if @ret < 0
+            @err = libc_errno_get()
+            return posix_translate_error(@err)
+        return IO_OK
+
+# =============================================================================
+# SECTION 37: FILE MANAGEMENT - copy
+# =============================================================================
+# Copy a file from src to dst. Uses OS-level copy where available.
+
+fn io_copy(@src: *u8, @src_len: int, @dst: *u8, @dst_len: int) -> int
+    if IS_WINDOWS == 1
+        @ret = CopyFileA(@src, @dst, 0)
+        if @ret == 0
+            @err = GetLastError()
+            return win32_translate_error(@err)
+        return IO_OK
+    eclipse
+        # POSIX: manual read/write copy
+        @src_hid = io_open(@src, @src_len, MODE_READ)
+        if @src_hid < 0
+            return -@src_hid  # Return the error code
+
+        @dst_hid = io_open(@dst, @dst_len, MODE_WRITE)
+        if @dst_hid < 0
+            io_close(@src_hid)
+            return -@dst_hid
+
+        @copy_buf: [u8; 32768] = [0; 32768]
+        @total_copied = 0
+        @copy_err = IO_OK
+
+        orbit @iter in 0..1048576  # Max 1M iterations (32GB max file)
+            @bytes_read = io_read(@src_hid, &@copy_buf[0], COPY_BUF_SIZE)
+            if @bytes_read < 0
+                @copy_err = -@bytes_read
+                nova
+            if @bytes_read == 0
+                nova  # EOF
+
+            @bytes_written = io_write(@dst_hid, &@copy_buf[0], @bytes_read)
+            if @bytes_written < 0
+                @copy_err = -@bytes_written
+                nova
+            if @bytes_written != @bytes_read
+                @copy_err = IO_ERR_IO
+                nova
+
+            @total_copied = @total_copied + @bytes_written
+
+        io_close(@src_hid)
+        io_close(@dst_hid)
+        return @copy_err
+
+# =============================================================================
+# SECTION 38: FILE MANAGEMENT - truncate
+# =============================================================================
+
+fn io_truncate(@hid: int, @size: int) -> int
+    if handle_valid(@hid) == 0
+        return IO_ERR_HANDLE
+    if @handle_is_ramfs[@hid] == 1
+        return ramfs_handle_truncate(@hid, @size)
+
+    @fd = @handle_fd[@hid]
+
+    if IS_WINDOWS == 1
+        # Seek to target size then set end of file
+        @ret = SetFilePointer(@fd, @size, 0, FILE_BEGIN)
+        if @ret < 0
+            return IO_ERR_IO
+        @ret2 = SetEndOfFile(@fd)
+        if @ret2 == 0
+            return IO_ERR_IO
+        return IO_OK
+    eclipse
+        @ret = libc_ftruncate(@fd, @size)
+        if @ret < 0
+            @err = libc_errno_get()
+            return posix_translate_error(@err)
+        return IO_OK
+
+# =============================================================================
+# SECTION 39: TEXT I/O - read_file
+# =============================================================================
+# Read entire file contents into a buffer. Returns bytes read or negative error.
+
+fn io_read_file(@path: *u8, @path_len: int, @buf: *u8, @buf_size: int) -> int
+    @hid = io_open(@path, @path_len, MODE_READ)
+    if @hid < 0
+        return @hid  # Propagate error
+
+    @total_read = 0
+    orbit @iter in 0..1048576
+        @remaining = @buf_size - @total_read
+        if @remaining <= 0
+            nova
+        @chunk = io_read(@hid, @buf + @total_read, @remaining)
+        if @chunk < 0
+            io_close(@hid)
+            return @chunk
+        if @chunk == 0
+            nova  # EOF
+        @total_read = @total_read + @chunk
+
+    io_close(@hid)
+    return @total_read
+
+# =============================================================================
+# SECTION 40: TEXT I/O - write_file
+# =============================================================================
+# Write buffer contents to a file (create/truncate).
+
+fn io_write_file(@path: *u8, @path_len: int, @data: *u8, @data_len: int) -> int
+    @hid = io_open(@path, @path_len, MODE_WRITE)
+    if @hid < 0
+        return -@hid
+
+    @total_written = 0
+    orbit @iter in 0..1048576
+        @remaining = @data_len - @total_written
+        if @remaining <= 0
+            nova
+        @chunk = io_write(@hid, @data + @total_written, @remaining)
+        if @chunk < 0
+            io_close(@hid)
+            return -@chunk
+        @total_written = @total_written + @chunk
+
+    io_close(@hid)
+    if @total_written != @data_len
+        return IO_ERR_IO
+    return IO_OK
+
+# =============================================================================
+# SECTION 41: TEXT I/O - append_file
+# =============================================================================
+# Append buffer contents to a file.
+
+fn io_append_file(@path: *u8, @path_len: int, @data: *u8, @data_len: int) -> int
+    @hid = io_open(@path, @path_len, MODE_APPEND)
+    if @hid < 0
+        return -@hid
+
+    @total_written = 0
+    orbit @iter in 0..1048576
+        @remaining = @data_len - @total_written
+        if @remaining <= 0
+            nova
+        @chunk = io_write(@hid, @data + @total_written, @remaining)
+        if @chunk < 0
+            io_close(@hid)
+            return -@chunk
+        @total_written = @total_written + @chunk
+
+    io_close(@hid)
+    if @total_written != @data_len
+        return IO_ERR_IO
+    return IO_OK
+
+# =============================================================================
+# SECTION 42: TEXT I/O - read_lines
+# =============================================================================
+# Read a file line-by-line into an array of line buffers.
+# Returns number of lines read, or negative error.
+
+fn io_read_lines(@path: *u8, @path_len: int, @line_buf: *[u8; 65536], @line_lens: *int, @max_lines: int) -> int
+    # First read entire file
+    @file_buf: [u8; 1048576] = [0; 1048576]  # 1MB max file for line reading
+    @file_size = io_read_file(@path, @path_len, &@file_buf[0], 1048576)
+    if @file_size < 0
+        return @file_size
+
+    @line_count = 0
+    @line_start = 0
+
+    orbit @i in 0..@file_size
+        if @line_count >= @max_lines
+            nova
+
+        @ch = @file_buf[@i]
+        if @ch == 10  # newline '\n'
+            @line_len = @i - @line_start
+            if @line_len > MAX_LINE_LEN
+                @line_len = MAX_LINE_LEN
+            # Strip trailing CR if present (Windows line endings)
+            if @line_len > 0
+                if @file_buf[@i - 1] == 13
+                    @line_len = @line_len - 1
+
+            # Copy line into output buffer
+            orbit @j in 0..@line_len
+                @line_buf[@line_count][@j] = @file_buf[@line_start + @j]
+            @line_lens[@line_count] = @line_len
+            @line_count = @line_count + 1
+            @line_start = @i + 1
+
+    # Handle last line without trailing newline
+    if @line_start < @file_size
+        if @line_count < @max_lines
+            @line_len = @file_size - @line_start
+            if @line_len > MAX_LINE_LEN
+                @line_len = MAX_LINE_LEN
+            orbit @j in 0..@line_len
+                @line_buf[@line_count][@j] = @file_buf[@line_start + @j]
+            @line_lens[@line_count] = @line_len
+            @line_count = @line_count + 1
+
+    return @line_count
+
+# =============================================================================
+# SECTION 43: CONSOLE I/O - stdin_read
+# =============================================================================
+# Read raw bytes from standard input. Returns bytes read or negative error.
+
+fn stdin_read(@buf: *u8, @count: int) -> int
+    if IS_WINDOWS == 1
+        @stdin_handle = GetStdHandle(STD_INPUT_HANDLE)
+        @bytes_read = 0
+        @ret = ReadFile(@stdin_handle, @buf, @count, &@bytes_read, 0)
+        if @ret == 0
+            return -IO_ERR_IO
+        return @bytes_read
+    eclipse
+        @ret = libc_read(STDIN_FD, @buf, @count)
+        if @ret < 0
+            @err = libc_errno_get()
+            return -(posix_translate_error(@err))
+        return @ret
+
+# =============================================================================
+# SECTION 44: CONSOLE I/O - stdin_read_line
+# =============================================================================
+# Read a single line from standard input (up to newline or @max_len).
+# Returns line length (excluding newline) or negative error.
+
+fn stdin_read_line(@buf: *u8, @max_len: int) -> int
+    @pos = 0
+    orbit @iter in 0..@max_len
+        @ch: [u8; 1] = [0; 1]
+        @ret = stdin_read(&@ch[0], 1)
+        if @ret < 0
+            return @ret
+        if @ret == 0
+            nova  # EOF
+        if @ch[0] == 10  # '\n'
+            nova
+        if @ch[0] == 13  # '\r' - skip, wait for '\n'
+            pass
+        eclipse
+            @buf[@pos] = @ch[0]
+            @pos = @pos + 1
+    return @pos
+
+# =============================================================================
+# SECTION 45: CONSOLE I/O - stdout_write
+# =============================================================================
+
+fn stdout_write(@buf: *u8, @count: int) -> int
+    if IS_WINDOWS == 1
+        @stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE)
+        @bytes_written = 0
+        @ret = WriteFile(@stdout_handle, @buf, @count, &@bytes_written, 0)
+        if @ret == 0
+            return -IO_ERR_IO
+        return @bytes_written
+    eclipse
+        @ret = libc_write(STDOUT_FD, @buf, @count)
+        if @ret < 0
+            return -IO_ERR_IO
+        return @ret
+
+# =============================================================================
+# SECTION 46: CONSOLE I/O - stdout_write_str
+# =============================================================================
+# Convenience: write a null-terminated string to stdout.
+
+fn stdout_write_str(@s: *u8) -> int
+    @len = 0
+    orbit @i in 0..MAX_LINE_LEN
+        if @s[@i] == 0
+            nova
+        @len = @len + 1
+    return stdout_write(@s, @len)
+
+# =============================================================================
+# SECTION 47: CONSOLE I/O - stderr_write
+# =============================================================================
+
+fn stderr_write(@buf: *u8, @count: int) -> int
+    if IS_WINDOWS == 1
+        @stderr_handle = GetStdHandle(STD_ERROR_HANDLE)
+        @bytes_written = 0
+        @ret = WriteFile(@stderr_handle, @buf, @count, &@bytes_written, 0)
+        if @ret == 0
+            return -IO_ERR_IO
+        return @bytes_written
+    eclipse
+        @ret = libc_write(STDERR_FD, @buf, @count)
+        if @ret < 0
+            return -IO_ERR_IO
+        return @ret
+
+# =============================================================================
+# SECTION 48: CONSOLE I/O - stderr_write_str
+# =============================================================================
+
+fn stderr_write_str(@s: *u8) -> int
+    @len = 0
+    orbit @i in 0..MAX_LINE_LEN
+        if @s[@i] == 0
+            nova
+        @len = @len + 1
+    return stderr_write(@s, @len)
+
+# =============================================================================
+# SECTION 49: BUFFERED I/O - BufferedReader
+# =============================================================================
+# Wraps an open file handle with a read-ahead buffer to reduce syscall count.
+# Parallel arrays track up to 64 active buffered readers.
+
+const MAX_BUFFERED_READERS: int = 64
+
+meow @br_handle: [int; 64] = [0; 64]          # Underlying file handle ID
+meow @br_buf: [[u8; 8192]; 64] = [[0; 8192]; 64]  # Internal buffer
+meow @br_buf_size: [int; 64] = [0; 64]        # Configured buffer size
+meow @br_buf_pos: [int; 64] = [0; 64]         # Current read position in buffer
+meow @br_buf_filled: [int; 64] = [0; 64]      # Bytes currently in buffer
+meow @br_active: [int; 64] = [0; 64]          # 1 if slot active
+meow @br_eof: [int; 64] = [0; 64]             # 1 if EOF reached
+
+# Create a new BufferedReader for the given handle.
+# Returns reader ID (0..63) or -1 if no slots available.
+fn buffered_reader_new(@hid: int, @buf_size: int) -> int
+    if handle_valid(@hid) == 0
+        return -1
+    if @buf_size <= 0
+        @buf_size = DEFAULT_BUF_SIZE
+    if @buf_size > DEFAULT_BUF_SIZE
+        @buf_size = DEFAULT_BUF_SIZE
+
+    orbit @i in 0..MAX_BUFFERED_READERS
+        if @br_active[@i] == 0
+            @br_handle[@i] = @hid
+            @br_buf_size[@i] = @buf_size
+            @br_buf_pos[@i] = 0
+            @br_buf_filled[@i] = 0
+            @br_active[@i] = 1
+            @br_eof[@i] = 0
+            return @i
+    return -1
+
+# Destroy a BufferedReader, freeing its slot.
+fn buffered_reader_destroy(@rid: int) -> int
+    if @rid < 0
+        return IO_ERR_HANDLE
+    if @rid >= MAX_BUFFERED_READERS
+        return IO_ERR_HANDLE
+    if @br_active[@rid] == 0
+        return IO_ERR_HANDLE
+    @br_active[@rid] = 0
+    return IO_OK
+
+# Refill the internal buffer from the underlying handle.
+fn buffered_reader_refill(@rid: int) -> int
+    if @br_eof[@rid] == 1
+        return 0
+    @hid = @br_handle[@rid]
+    @to_read = @br_buf_size[@rid]
+    @ret = io_read(@hid, &@br_buf[@rid][0], @to_read)
+    if @ret < 0
+        return @ret
+    if @ret == 0
+        @br_eof[@rid] = 1
+        return 0
+    @br_buf_pos[@rid] = 0
+    @br_buf_filled[@rid] = @ret
+    return @ret
+
+# Read from a BufferedReader into user buffer.
+# Returns bytes read, 0 on EOF, or negative error.
+fn buffered_reader_read(@rid: int, @buf: *u8, @count: int) -> int
+    if @rid < 0
+        return -IO_ERR_HANDLE
+    if @rid >= MAX_BUFFERED_READERS
+        return -IO_ERR_HANDLE
+    if @br_active[@rid] == 0
+        return -IO_ERR_HANDLE
+
+    @total = 0
+
+    orbit @iter in 0..1048576
+        if @total >= @count
+            nova
+
+        # If buffer has data, copy from it
+        @available = @br_buf_filled[@rid] - @br_buf_pos[@rid]
+        if @available > 0
+            @want = @count - @total
+            if @want > @available
+                @want = @available
+            orbit @j in 0..@want
+                @buf[@total + @j] = @br_buf[@rid][@br_buf_pos[@rid] + @j]
+            @br_buf_pos[@rid] = @br_buf_pos[@rid] + @want
+            @total = @total + @want
+        eclipse
+            # Buffer empty, refill
+            @ret = buffered_reader_refill(@rid)
+            if @ret < 0
+                if @total > 0
+                    return @total
+                return @ret
+            if @ret == 0
+                nova  # EOF
+
+    return @total
+
+# Read a single line from BufferedReader.
+# Returns line length (excluding newline), 0 on EOF, negative on error.
+fn buffered_reader_read_line(@rid: int, @buf: *u8, @max_len: int) -> int
+    if @rid < 0
+        return -IO_ERR_HANDLE
+    if @br_active[@rid] == 0
+        return -IO_ERR_HANDLE
+
+    @pos = 0
+
+    orbit @iter in 0..@max_len
+        # Ensure buffer has data
+        if @br_buf_pos[@rid] >= @br_buf_filled[@rid]
+            @ret = buffered_reader_refill(@rid)
+            if @ret < 0
+                if @pos > 0
+                    return @pos
+                return @ret
+            if @ret == 0
+                return @pos  # EOF, return what we have
+
+        @ch = @br_buf[@rid][@br_buf_pos[@rid]]
+        @br_buf_pos[@rid] = @br_buf_pos[@rid] + 1
+
+        if @ch == 10  # '\n'
+            return @pos
+        if @ch == 13  # '\r' - skip
+            pass
+        eclipse
+            if @pos < @max_len
+                @buf[@pos] = @ch
+                @pos = @pos + 1
+
+    return @pos
+
+# =============================================================================
+# SECTION 50: BUFFERED I/O - BufferedWriter
+# =============================================================================
+# Wraps an open file handle with a write buffer to reduce syscall count.
+# Parallel arrays track up to 64 active buffered writers.
+
+const MAX_BUFFERED_WRITERS: int = 64
+
+meow @bw_handle: [int; 64] = [0; 64]          # Underlying file handle ID
+meow @bw_buf: [[u8; 8192]; 64] = [[0; 8192]; 64]  # Internal buffer
+meow @bw_buf_size: [int; 64] = [0; 64]        # Configured buffer size
+meow @bw_buf_pos: [int; 64] = [0; 64]         # Current write position in buffer
+meow @bw_active: [int; 64] = [0; 64]          # 1 if slot active
+
+# Create a new BufferedWriter for the given handle.
+fn buffered_writer_new(@hid: int, @buf_size: int) -> int
+    if handle_valid(@hid) == 0
+        return -1
+    if @buf_size <= 0
+        @buf_size = DEFAULT_BUF_SIZE
+    if @buf_size > DEFAULT_BUF_SIZE
+        @buf_size = DEFAULT_BUF_SIZE
+
+    orbit @i in 0..MAX_BUFFERED_WRITERS
+        if @bw_active[@i] == 0
+            @bw_handle[@i] = @hid
+            @bw_buf_size[@i] = @buf_size
+            @bw_buf_pos[@i] = 0
+            @bw_active[@i] = 1
+            return @i
+    return -1
+
+# Destroy a BufferedWriter. Flushes pending data before releasing.
+fn buffered_writer_destroy(@wid: int) -> int
+    if @wid < 0
+        return IO_ERR_HANDLE
+    if @wid >= MAX_BUFFERED_WRITERS
+        return IO_ERR_HANDLE
+    if @bw_active[@wid] == 0
+        return IO_ERR_HANDLE
+    # Flush remaining data
+    @flush_ret = buffered_writer_flush(@wid)
+    @bw_active[@wid] = 0
+    return @flush_ret
+
+# Flush the internal write buffer to the underlying handle.
+fn buffered_writer_flush(@wid: int) -> int
+    if @bw_active[@wid] == 0
+        return IO_ERR_HANDLE
+
+    @pending = @bw_buf_pos[@wid]
+    if @pending == 0
+        return IO_OK
+
+    @hid = @bw_handle[@wid]
+    @written = 0
+
+    orbit @iter in 0..1048576
+        if @written >= @pending
+            nova
+        @ret = io_write(@hid, &@bw_buf[@wid][@written], @pending - @written)
+        if @ret < 0
+            return -@ret
+        @written = @written + @ret
+
+    @bw_buf_pos[@wid] = 0
+    return IO_OK
+
+# Write to a BufferedWriter.
+fn buffered_writer_write(@wid: int, @buf: *u8, @count: int) -> int
+    if @wid < 0
+        return -IO_ERR_HANDLE
+    if @wid >= MAX_BUFFERED_WRITERS
+        return -IO_ERR_HANDLE
+    if @bw_active[@wid] == 0
+        return -IO_ERR_HANDLE
+
+    @total = 0
+
+    orbit @iter in 0..1048576
+        if @total >= @count
+            nova
+
+        @space = @bw_buf_size[@wid] - @bw_buf_pos[@wid]
+        @want = @count - @total
+
+        if @want <= @space
+            # Fits in buffer
+            orbit @j in 0..@want
+                @bw_buf[@wid][@bw_buf_pos[@wid] + @j] = @buf[@total + @j]
+            @bw_buf_pos[@wid] = @bw_buf_pos[@wid] + @want
+            @total = @total + @want
+        eclipse
+            # Fill buffer then flush
+            orbit @j in 0..@space
+                @bw_buf[@wid][@bw_buf_pos[@wid] + @j] = @buf[@total + @j]
+            @bw_buf_pos[@wid] = @bw_buf_pos[@wid] + @space
+            @total = @total + @space
+
+            @flush_ret = buffered_writer_flush(@wid)
+            if @flush_ret != IO_OK
+                if @total > 0
+                    return @total
+                return -@flush_ret
+
+    return @total
+
+# Write a null-terminated string through BufferedWriter.
+fn buffered_writer_write_str(@wid: int, @s: *u8) -> int
+    @len = 0
+    orbit @i in 0..MAX_LINE_LEN
+        if @s[@i] == 0
+            nova
+        @len = @len + 1
+    return buffered_writer_write(@wid, @s, @len)
+
+# Write a line (string + newline) through BufferedWriter.
+fn buffered_writer_write_line(@wid: int, @s: *u8, @len: int) -> int
+    @ret = buffered_writer_write(@wid, @s, @len)
+    if @ret < 0
+        return @ret
+    @nl: [u8; 1] = [10; 1]
+    @ret2 = buffered_writer_write(@wid, &@nl[0], 1)
+    if @ret2 < 0
+        return @ret2
+    return @ret + @ret2
+
+# =============================================================================
+# SECTION 51: RAMFS - NODE STORAGE
+# =============================================================================
+# In-memory filesystem using parallel arrays.
+# Ported from vfs.rs RamFs / RamFsNode.
+# Each node has a type (file or directory), data buffer, and child list.
+
+meow @ramfs_node_active: [int; 1024] = [0; 1024]
+meow @ramfs_node_type: [int; 1024] = [0; 1024]          # FILE_REGULAR or FILE_DIRECTORY
+meow @ramfs_node_name: [[u8; 256]; 1024] = [[0; 256]; 1024]
+meow @ramfs_node_name_len: [int; 1024] = [0; 1024]
+meow @ramfs_node_size: [int; 1024] = [0; 1024]          # File data size
+meow @ramfs_node_data: [[u8; 1048576]; 1024] = [[0; 1048576]; 1024]  # File data (1MB max per file)
+meow @ramfs_node_parent: [int; 1024] = [-1; 1024]       # Parent node index (-1 for root)
+meow @ramfs_node_children: [[int; 128]; 1024] = [[-1; 128]; 1024]  # Child node indices
+meow @ramfs_node_child_count: [int; 1024] = [0; 1024]
+meow @ramfs_node_created: [int; 1024] = [0; 1024]
+meow @ramfs_node_modified: [int; 1024] = [0; 1024]
+meow @ramfs_node_permissions: [int; 1024] = [0; 1024]
+meow @ramfs_total_size: int = 0
+meow @ramfs_initialized: int = 0
+
+# =============================================================================
+# SECTION 52: RAMFS - INITIALIZATION
+# =============================================================================
+# Initialize the RamFS with a root directory at index 0.
+
+fn ramfs_init()
+    if @ramfs_initialized == 1
+        return
+    # Clear all nodes
+    orbit @i in 0..RAMFS_MAX_FILES
+        @ramfs_node_active[@i] = 0
+        @ramfs_node_type[@i] = FILE_REGULAR
+        @ramfs_node_name_len[@i] = 0
+        @ramfs_node_size[@i] = 0
+        @ramfs_node_parent[@i] = -1
+        @ramfs_node_child_count[@i] = 0
+
+    # Create root directory at index 0
+    @ramfs_node_active[0] = 1
+    @ramfs_node_type[0] = FILE_DIRECTORY
+    @ramfs_node_name[0][0] = 47  # '/'
+    @ramfs_node_name_len[0] = 1
+    @ramfs_node_parent[0] = -1
+    @ramfs_node_permissions[0] = 493  # 0755
+    @ramfs_total_size = 0
+    @ramfs_initialized = 1
+
+# =============================================================================
+# SECTION 53: RAMFS - NODE ALLOCATION
+# =============================================================================
+
+fn ramfs_alloc_node() -> int
+    orbit @i in 1..RAMFS_MAX_FILES
+        if @ramfs_node_active[@i] == 0
+            @ramfs_node_active[@i] = 1
+            @ramfs_node_size[@i] = 0
+            @ramfs_node_child_count[@i] = 0
+            @ramfs_node_parent[@i] = -1
+            @ramfs_node_permissions[@i] = 420  # 0644
+            orbit @j in 0..RAMFS_MAX_CHILDREN
+                @ramfs_node_children[@i][@j] = -1
+            return @i
+    return -1
+
+fn ramfs_free_node(@idx: int)
+    if @idx < 0
+        return
+    if @idx >= RAMFS_MAX_FILES
+        return
+    if @idx == 0
+        return  # Cannot free root
+    @ramfs_node_active[@idx] = 0
+    @ramfs_total_size = @ramfs_total_size - @ramfs_node_size[@idx]
+    @ramfs_node_size[@idx] = 0
+
+# =============================================================================
+# SECTION 54: RAMFS - PATH RESOLUTION
+# =============================================================================
+# Walk the tree from root following path components separated by '/'.
+# Returns node index or -1 if not found.
+
+fn ramfs_name_match(@node_idx: int, @name: *u8, @name_len: int) -> int
+    if @ramfs_node_name_len[@node_idx] != @name_len
+        return 0
+    orbit @i in 0..@name_len
+        if @ramfs_node_name[@node_idx][@i] != @name[@i]
+            return 0
+    return 1
+
+fn ramfs_find_child(@parent_idx: int, @name: *u8, @name_len: int) -> int
+    @count = @ramfs_node_child_count[@parent_idx]
+    orbit @i in 0..@count
+        @child = @ramfs_node_children[@parent_idx][@i]
+        if @child >= 0
+            if ramfs_name_match(@child, @name, @name_len) == 1
+                return @child
+    return -1
+
+fn ramfs_resolve_path(@path: *u8, @path_len: int) -> int
+    if @ramfs_initialized == 0
+        ramfs_init()
+
+    # Root path
+    if @path_len == 0
+        return 0
+    if @path_len == 1
+        if @path[0] == 47  # '/'
+            return 0
+
+    @current = 0  # Start at root
+    @seg_start = 0
+
+    # Skip leading '/'
+    if @path[0] == 47
+        @seg_start = 1
+
+    orbit @i in @seg_start..(@path_len + 1)
+        @is_sep = 0
+        if @i == @path_len
+            @is_sep = 1
+        eclipse
+            if @path[@i] == 47  # '/'
+                @is_sep = 1
+
+        if @is_sep == 1
+            @seg_len = @i - @seg_start
+            if @seg_len > 0
+                if @ramfs_node_type[@current] != FILE_DIRECTORY
+                    return -1
+                @child = ramfs_find_child(@current, @path + @seg_start, @seg_len)
+                if @child < 0
+                    return -1
+                @current = @child
+            @seg_start = @i + 1
+
+    return @current
+
+# Split a path into parent path and final component name.
+# Returns parent node index. Writes name and name_len into output pointers.
+fn ramfs_split_path(@path: *u8, @path_len: int, @out_name: *u8, @out_name_len: *int) -> int
+    # Find last '/'
+    @last_sep = -1
+    orbit @i in 0..@path_len
+        if @path[@i] == 47
+            @last_sep = @i
+
+    if @last_sep < 0
+        # No separator - parent is root, name is entire path
+        orbit @i in 0..@path_len
+            @out_name[@i] = @path[@i]
+        *@out_name_len = @path_len
+        return 0  # root
+    eclipse
+        # Copy name portion
+        @name_start = @last_sep + 1
+        @name_len = @path_len - @name_start
+        orbit @i in 0..@name_len
+            @out_name[@i] = @path[@name_start + @i]
+        *@out_name_len = @name_len
+
+        # Resolve parent
+        if @last_sep == 0
+            return 0  # Parent is root
+        return ramfs_resolve_path(@path, @last_sep)
+
+# =============================================================================
+# SECTION 55: RAMFS - ADD CHILD
+# =============================================================================
+
+fn ramfs_add_child(@parent_idx: int, @child_idx: int) -> int
+    @count = @ramfs_node_child_count[@parent_idx]
+    if @count >= RAMFS_MAX_CHILDREN
+        return IO_ERR_NO_SPACE
+    @ramfs_node_children[@parent_idx][@count] = @child_idx
+    @ramfs_node_child_count[@parent_idx] = @count + 1
+    @ramfs_node_parent[@child_idx] = @parent_idx
+    return IO_OK
+
+# Remove a child from its parent's child list.
+fn ramfs_remove_child(@parent_idx: int, @child_idx: int) -> int
+    @count = @ramfs_node_child_count[@parent_idx]
+    @found = -1
+    orbit @i in 0..@count
+        if @ramfs_node_children[@parent_idx][@i] == @child_idx
+            @found = @i
+            nova
+    if @found < 0
+        return IO_ERR_NOT_FOUND
+
+    # Shift remaining children down
+    orbit @i in @found..(@count - 1)
+        @ramfs_node_children[@parent_idx][@i] = @ramfs_node_children[@parent_idx][@i + 1]
+    @ramfs_node_children[@parent_idx][@count - 1] = -1
+    @ramfs_node_child_count[@parent_idx] = @count - 1
+    return IO_OK
+
+# =============================================================================
+# SECTION 56: RAMFS - FILE OPERATIONS
+# =============================================================================
+
+# Open a file in the RamFS. Returns a handle ID or negative error.
+fn ramfs_open(@path: *u8, @path_len: int, @mode: int) -> int
+    if @ramfs_initialized == 0
+        ramfs_init()
+
+    @node_idx = ramfs_resolve_path(@path, @path_len)
+
+    if @node_idx >= 0
+        # Node exists
+        if @ramfs_node_type[@node_idx] == FILE_DIRECTORY
+            return -IO_ERR_IS_DIR
+
+        @hid = handle_alloc()
+        if @hid < 0
+            return -IO_ERR_NO_SPACE
+        @handle_is_ramfs[@hid] = 1
+        @handle_ramfs_node[@hid] = @node_idx
+        @handle_mode[@hid] = @mode
+        handle_set_path(@hid, @path, @path_len)
+
+        if @mode == MODE_TRUNCATE
+            @ramfs_total_size = @ramfs_total_size - @ramfs_node_size[@node_idx]
+            @ramfs_node_size[@node_idx] = 0
+            @handle_position[@hid] = 0
+        eclipse
+            if @mode == MODE_APPEND
+                @handle_position[@hid] = @ramfs_node_size[@node_idx]
+            eclipse
+                @handle_position[@hid] = 0
+        return @hid
+    eclipse
+        # Node does not exist - create if mode allows
+        if @mode == MODE_CREATE
+            pass
+        eclipse
+            if @mode == MODE_WRITE
+                pass
+            eclipse
+                if @mode == MODE_APPEND
+                    pass
+                eclipse
+                    return -IO_ERR_NOT_FOUND
+
+        # Split path to get parent and name
+        @name_buf: [u8; 256] = [0; 256]
+        @name_len = 0
+        @parent_idx = ramfs_split_path(@path, @path_len, &@name_buf[0], &@name_len)
+
+        if @parent_idx < 0
+            return -IO_ERR_NOT_FOUND
+        if @ramfs_node_type[@parent_idx] != FILE_DIRECTORY
+            return -IO_ERR_NOT_DIR
+
+        # Allocate new node
+        @new_idx = ramfs_alloc_node()
+        if @new_idx < 0
+            return -IO_ERR_NO_SPACE
+        @ramfs_node_type[@new_idx] = FILE_REGULAR
+        orbit @i in 0..@name_len
+            @ramfs_node_name[@new_idx][@i] = @name_buf[@i]
+        @ramfs_node_name_len[@new_idx] = @name_len
+        @ramfs_node_permissions[@new_idx] = 420  # 0644
+
+        # Add to parent
+        @add_ret = ramfs_add_child(@parent_idx, @new_idx)
+        if @add_ret != IO_OK
+            ramfs_free_node(@new_idx)
+            return -@add_ret
+
+        # Create handle
+        @hid = handle_alloc()
+        if @hid < 0
+            ramfs_remove_child(@parent_idx, @new_idx)
+            ramfs_free_node(@new_idx)
+            return -IO_ERR_NO_SPACE
+        @handle_is_ramfs[@hid] = 1
+        @handle_ramfs_node[@hid] = @new_idx
+        @handle_mode[@hid] = @mode
+        @handle_position[@hid] = 0
+        handle_set_path(@hid, @path, @path_len)
+        return @hid
+
+# =============================================================================
+# SECTION 57: RAMFS - HANDLE READ
+# =============================================================================
+
+fn ramfs_handle_read(@hid: int, @buf: *u8, @count: int) -> int
+    @node_idx = @handle_ramfs_node[@hid]
+    if @node_idx < 0
+        return -IO_ERR_NOT_FOUND
+    if @ramfs_node_active[@node_idx] == 0
+        return -IO_ERR_NOT_FOUND
+    if @ramfs_node_type[@node_idx] != FILE_REGULAR
+        return -IO_ERR_NOT_FILE
+
+    @pos = @handle_position[@hid]
+    @data_size = @ramfs_node_size[@node_idx]
+    @available = @data_size - @pos
+    if @available <= 0
+        return 0  # EOF
+
+    @to_read = @count
+    if @to_read > @available
+        @to_read = @available
+
+    orbit @i in 0..@to_read
+        @buf[@i] = @ramfs_node_data[@node_idx][@pos + @i]
+
+    @handle_position[@hid] = @pos + @to_read
+    return @to_read
+
+# =============================================================================
+# SECTION 58: RAMFS - HANDLE WRITE
+# =============================================================================
+
+fn ramfs_handle_write(@hid: int, @buf: *u8, @count: int) -> int
+    @node_idx = @handle_ramfs_node[@hid]
+    if @node_idx < 0
+        return -IO_ERR_NOT_FOUND
+    if @ramfs_node_active[@node_idx] == 0
+        return -IO_ERR_NOT_FOUND
+    if @ramfs_node_type[@node_idx] != FILE_REGULAR
+        return -IO_ERR_NOT_FILE
+
+    @mode = @handle_mode[@hid]
+    @pos = @handle_position[@hid]
+    if @mode == MODE_APPEND
+        @pos = @ramfs_node_size[@node_idx]
+
+    @needed = @pos + @count
+    if @needed > RAMFS_MAX_DATA
+        return -IO_ERR_NO_SPACE
+
+    # Check total size limit
+    @growth = 0
+    if @needed > @ramfs_node_size[@node_idx]
+        @growth = @needed - @ramfs_node_size[@node_idx]
+    if @ramfs_total_size + @growth > RAMFS_MAX_TOTAL
+        return -IO_ERR_NO_SPACE
+
+    # Write data
+    orbit @i in 0..@count
+        @ramfs_node_data[@node_idx][@pos + @i] = @buf[@i]
+
+    # Update size if we extended the file
+    if @needed > @ramfs_node_size[@node_idx]
+        @ramfs_total_size = @ramfs_total_size + @growth
+        @ramfs_node_size[@node_idx] = @needed
+
+    if @mode != MODE_APPEND
+        @handle_position[@hid] = @pos + @count
+
+    return @count
+
+# =============================================================================
+# SECTION 59: RAMFS - HANDLE SEEK
+# =============================================================================
+
+fn ramfs_handle_seek(@hid: int, @offset: int, @whence: int) -> int
+    @node_idx = @handle_ramfs_node[@hid]
+    if @node_idx < 0
+        return -IO_ERR_NOT_FOUND
+
+    @data_size = @ramfs_node_size[@node_idx]
+    @current = @handle_position[@hid]
+
+    @new_pos = 0
+    match @whence
+        SEEK_SET -> @new_pos = @offset
+        SEEK_CUR -> @new_pos = @current + @offset
+        SEEK_END -> @new_pos = @data_size + @offset
+        _        -> return -IO_ERR_INVALID
+
+    if @new_pos < 0
+        return -IO_ERR_INVALID
+
+    @handle_position[@hid] = @new_pos
+    return @new_pos
+
+# =============================================================================
+# SECTION 60: RAMFS - HANDLE TRUNCATE
+# =============================================================================
+
+fn ramfs_handle_truncate(@hid: int, @size: int) -> int
+    @node_idx = @handle_ramfs_node[@hid]
+    if @node_idx < 0
+        return IO_ERR_NOT_FOUND
+    if @size > RAMFS_MAX_DATA
+        return IO_ERR_NO_SPACE
+
+    @old_size = @ramfs_node_size[@node_idx]
+    if @size < @old_size
+        @ramfs_total_size = @ramfs_total_size - (@old_size - @size)
+        # Zero out truncated region
+        orbit @i in @size..@old_size
+            @ramfs_node_data[@node_idx][@i] = 0
+    eclipse
+        @growth = @size - @old_size
+        if @ramfs_total_size + @growth > RAMFS_MAX_TOTAL
+            return IO_ERR_NO_SPACE
+        @ramfs_total_size = @ramfs_total_size + @growth
+
+    @ramfs_node_size[@node_idx] = @size
+    return IO_OK
+
+# =============================================================================
+# SECTION 61: RAMFS - DIRECTORY OPERATIONS
+# =============================================================================
+
+fn ramfs_mkdir(@path: *u8, @path_len: int) -> int
+    if @ramfs_initialized == 0
+        ramfs_init()
+
+    # Check if already exists
+    @existing = ramfs_resolve_path(@path, @path_len)
+    if @existing >= 0
+        return IO_ERR_EXISTS
+
+    # Split path to get parent and name
+    @name_buf: [u8; 256] = [0; 256]
+    @name_len = 0
+    @parent_idx = ramfs_split_path(@path, @path_len, &@name_buf[0], &@name_len)
+    if @parent_idx < 0
+        return IO_ERR_NOT_FOUND
+    if @ramfs_node_type[@parent_idx] != FILE_DIRECTORY
+        return IO_ERR_NOT_DIR
+
+    # Allocate node
+    @new_idx = ramfs_alloc_node()
+    if @new_idx < 0
+        return IO_ERR_NO_SPACE
+    @ramfs_node_type[@new_idx] = FILE_DIRECTORY
+    orbit @i in 0..@name_len
+        @ramfs_node_name[@new_idx][@i] = @name_buf[@i]
+    @ramfs_node_name_len[@new_idx] = @name_len
+    @ramfs_node_permissions[@new_idx] = 493  # 0755
+
+    # Add to parent
+    @add_ret = ramfs_add_child(@parent_idx, @new_idx)
+    if @add_ret != IO_OK
+        ramfs_free_node(@new_idx)
+        return @add_ret
+    return IO_OK
+
+fn ramfs_rmdir(@path: *u8, @path_len: int) -> int
+    @node_idx = ramfs_resolve_path(@path, @path_len)
+    if @node_idx < 0
+        return IO_ERR_NOT_FOUND
+    if @node_idx == 0
+        return IO_ERR_PERMISSION  # Cannot remove root
+    if @ramfs_node_type[@node_idx] != FILE_DIRECTORY
+        return IO_ERR_NOT_DIR
+    if @ramfs_node_child_count[@node_idx] > 0
+        return IO_ERR_NOT_EMPTY
+
+    @parent_idx = @ramfs_node_parent[@node_idx]
+    ramfs_remove_child(@parent_idx, @node_idx)
+    ramfs_free_node(@node_idx)
+    return IO_OK
+
+fn ramfs_unlink(@path: *u8, @path_len: int) -> int
+    @node_idx = ramfs_resolve_path(@path, @path_len)
+    if @node_idx < 0
+        return IO_ERR_NOT_FOUND
+    if @ramfs_node_type[@node_idx] == FILE_DIRECTORY
+        return IO_ERR_IS_DIR
+
+    @parent_idx = @ramfs_node_parent[@node_idx]
+    ramfs_remove_child(@parent_idx, @node_idx)
+    ramfs_free_node(@node_idx)
+    return IO_OK
+
+fn ramfs_readdir(@path: *u8, @path_len: int, @out_names: *[u8; 260], @out_types: *int, @max_entries: int) -> int
+    @node_idx = ramfs_resolve_path(@path, @path_len)
+    if @node_idx < 0
+        return -IO_ERR_NOT_FOUND
+    if @ramfs_node_type[@node_idx] != FILE_DIRECTORY
+        return -IO_ERR_NOT_DIR
+
+    @count = @ramfs_node_child_count[@node_idx]
+    @result_count = 0
+    orbit @i in 0..@count
+        if @result_count >= @max_entries
+            nova
+        @child = @ramfs_node_children[@node_idx][@i]
+        if @child >= 0
+            if @ramfs_node_active[@child] == 1
+                # Copy name
+                @nlen = @ramfs_node_name_len[@child]
+                orbit @j in 0..@nlen
+                    @out_names[@result_count][@j] = @ramfs_node_name[@child][@j]
+                # Null terminate
+                if @nlen < 260
+                    @out_names[@result_count][@nlen] = 0
+                @out_types[@result_count] = @ramfs_node_type[@child]
+                @result_count = @result_count + 1
+    return @result_count
+
+fn ramfs_rename(@old_path: *u8, @old_len: int, @new_path: *u8, @new_len: int) -> int
+    @old_idx = ramfs_resolve_path(@old_path, @old_len)
+    if @old_idx < 0
+        return IO_ERR_NOT_FOUND
+    if @old_idx == 0
+        return IO_ERR_PERMISSION  # Cannot rename root
+
+    # Check that new path does not exist
+    @existing = ramfs_resolve_path(@new_path, @new_len)
+    if @existing >= 0
+        return IO_ERR_EXISTS
+
+    # Extract new name
+    @new_name: [u8; 256] = [0; 256]
+    @new_name_len = 0
+    @new_parent = ramfs_split_path(@new_path, @new_len, &@new_name[0], &@new_name_len)
+    if @new_parent < 0
+        return IO_ERR_NOT_FOUND
+
+    @old_parent = @ramfs_node_parent[@old_idx]
+
+    # If same parent, just rename
+    if @old_parent == @new_parent
+        orbit @i in 0..@new_name_len
+            @ramfs_node_name[@old_idx][@i] = @new_name[@i]
+        @ramfs_node_name_len[@old_idx] = @new_name_len
+        return IO_OK
+
+    # Different parent: move
+    @ret = ramfs_remove_child(@old_parent, @old_idx)
+    if @ret != IO_OK
+        return @ret
+    orbit @i in 0..@new_name_len
+        @ramfs_node_name[@old_idx][@i] = @new_name[@i]
+    @ramfs_node_name_len[@old_idx] = @new_name_len
+    @ret = ramfs_add_child(@new_parent, @old_idx)
+    if @ret != IO_OK
+        # Rollback - put it back
+        ramfs_add_child(@old_parent, @old_idx)
+        return @ret
+    return IO_OK
+
+fn ramfs_stat(@path: *u8, @path_len: int, @info: *FileInfo) -> int
+    @node_idx = ramfs_resolve_path(@path, @path_len)
+    if @node_idx < 0
+        return IO_ERR_NOT_FOUND
+
+    @nlen = @ramfs_node_name_len[@node_idx]
+    orbit @i in 0..@nlen
+        @info.name_buf[@i] = @ramfs_node_name[@node_idx][@i]
+    @info.name_len = @nlen
+    @info.file_type = @ramfs_node_type[@node_idx]
+    @info.size = @ramfs_node_size[@node_idx]
+    @info.created = @ramfs_node_created[@node_idx]
+    @info.modified = @ramfs_node_modified[@node_idx]
+    @info.permissions = @ramfs_node_permissions[@node_idx]
+    return IO_OK
+
+# =============================================================================
+# SECTION 62: RAMFS - UTILITY FUNCTIONS
+# =============================================================================
+
+fn ramfs_exists(@path: *u8, @path_len: int) -> int
+    @idx = ramfs_resolve_path(@path, @path_len)
+    if @idx >= 0
+        return 1
+    return 0
+
+fn ramfs_is_file(@path: *u8, @path_len: int) -> int
+    @idx = ramfs_resolve_path(@path, @path_len)
+    if @idx < 0
+        return 0
+    if @ramfs_node_type[@idx] == FILE_REGULAR
+        return 1
+    return 0
+
+fn ramfs_is_dir(@path: *u8, @path_len: int) -> int
+    @idx = ramfs_resolve_path(@path, @path_len)
+    if @idx < 0
+        return 0
+    if @ramfs_node_type[@idx] == FILE_DIRECTORY
+        return 1
+    return 0
+
+fn ramfs_file_size(@path: *u8, @path_len: int) -> int
+    @idx = ramfs_resolve_path(@path, @path_len)
+    if @idx < 0
+        return -IO_ERR_NOT_FOUND
+    return @ramfs_node_size[@idx]
+
+fn ramfs_used_space() -> int
+    return @ramfs_total_size
+
+fn ramfs_available_space() -> int
+    return RAMFS_MAX_TOTAL - @ramfs_total_size
+
+# =============================================================================
+# SECTION 63: RAMFS - CONVENIENCE TEXT I/O
+# =============================================================================
+
+fn ramfs_read_file(@path: *u8, @path_len: int, @buf: *u8, @buf_size: int) -> int
+    @hid = ramfs_open(@path, @path_len, MODE_READ)
+    if @hid < 0
+        return @hid
+    @total = 0
+    orbit @iter in 0..1048576
+        @remaining = @buf_size - @total
+        if @remaining <= 0
+            nova
+        @ret = ramfs_handle_read(@hid, @buf + @total, @remaining)
+        if @ret < 0
+            io_close(@hid)
+            return @ret
+        if @ret == 0
+            nova
+        @total = @total + @ret
+    io_close(@hid)
+    return @total
+
+fn ramfs_write_file(@path: *u8, @path_len: int, @data: *u8, @data_len: int) -> int
+    @hid = ramfs_open(@path, @path_len, MODE_WRITE)
+    if @hid < 0
+        return -@hid
+    @ret = ramfs_handle_write(@hid, @data, @data_len)
+    io_close(@hid)
+    if @ret < 0
+        return -@ret
+    return IO_OK
+
+# =============================================================================
+# SECTION 64: HELPER - unsafe memory load
+# =============================================================================
+# Load a single byte from a raw pointer at a given offset.
+# Used by readdir to parse OS structs.
+
+fn unsafe_load_u8(@ptr: *u8, @offset: int) -> int
+    return @ptr[@offset]
+
+# =============================================================================
+# SECTION 65: I/O INITIALIZATION
+# =============================================================================
+# Called once at program startup to initialize all I/O subsystems.
+
+fn io_init()
+    # Clear handle table
+    orbit @i in 0..MAX_OPEN_FILES
+        @handle_is_open[@i] = 0
+        @handle_fd[@i] = -1
+        @handle_is_ramfs[@i] = 0
+        @handle_ramfs_node[@i] = -1
+
+    # Initialize RamFS
+    ramfs_init()
+
+    # Initialize buffered reader/writer tables
+    orbit @i in 0..MAX_BUFFERED_READERS
+        @br_active[@i] = 0
+    orbit @i in 0..MAX_BUFFERED_WRITERS
+        @bw_active[@i] = 0
+
+# =============================================================================
+# SECTION 66: ERROR CODE TO STRING
+# =============================================================================
+
+fn io_error_str(@code: int, @buf: *u8, @buf_size: int) -> int
+    @msg: *u8 = 0
+    @msg_len = 0
+
+    match @code
+        IO_OK             -> @msg = "OK"
+        IO_ERR_NOT_FOUND  -> @msg = "file not found"
+        IO_ERR_PERMISSION -> @msg = "permission denied"
+        IO_ERR_EXISTS     -> @msg = "already exists"
+        IO_ERR_IS_DIR     -> @msg = "is a directory"
+        IO_ERR_NOT_DIR    -> @msg = "not a directory"
+        IO_ERR_IO         -> @msg = "I/O error"
+        IO_ERR_NO_SPACE   -> @msg = "no space left"
+        IO_ERR_INVALID    -> @msg = "invalid argument"
+        IO_ERR_NOT_EMPTY  -> @msg = "directory not empty"
+        IO_ERR_NOT_FILE   -> @msg = "not a file"
+        IO_ERR_HANDLE     -> @msg = "invalid handle"
+        IO_ERR_NOT_SUPPORTED -> @msg = "not supported"
+        IO_ERR_CLOSED     -> @msg = "handle closed"
+        IO_ERR_EOF        -> @msg = "end of file"
+        IO_ERR_BUSY       -> @msg = "resource busy"
+        _                 -> @msg = "unknown error"
+
+    # Calculate length of message
+    orbit @i in 0..256
+        if @msg[@i] == 0
+            @msg_len = @i
+            nova
+
+    @copy_len = @msg_len
+    if @copy_len >= @buf_size
+        @copy_len = @buf_size - 1
+    orbit @i in 0..@copy_len
+        @buf[@i] = @msg[@i]
+    return @copy_len
+
+# =============================================================================
+# SECTION 67: WORKING DIRECTORY
+# =============================================================================
+
+fn io_getcwd(@buf: *u8, @buf_size: int) -> int
+    if IS_WINDOWS == 1
+        # Win32 GetCurrentDirectoryA would be needed, using getcwd via CRT
+        @ret = libc_getcwd(@buf, @buf_size)
+        if @ret == 0
+            return -IO_ERR_IO
+        # Calculate length
+        @len = 0
+        orbit @i in 0..@buf_size
+            if @buf[@i] == 0
+                @len = @i
+                nova
+        return @len
+    eclipse
+        @ret = libc_getcwd(@buf, @buf_size)
+        if @ret == 0
+            @err = libc_errno_get()
+            return -(posix_translate_error(@err))
+        @len = 0
+        orbit @i in 0..@buf_size
+            if @buf[@i] == 0
+                @len = @i
+                nova
+        return @len
+
+# =============================================================================
+# SECTION 68: SELF-TEST
+# =============================================================================
+# Exercised by `luna test io` or when compiled with --self-test flag.
+# Tests use RamFS exclusively so no real filesystem side-effects occur.
+
+fn io_self_test() -> int
+    @pass_count = 0
+    @fail_count = 0
+
+    shine("=== io.luna self-test ===")
+
+    # --- Test 1: RamFS init ---
+    ramfs_init()
+    if @ramfs_initialized == 1
+        shine("[PASS] ramfs_init")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_init")
+        @fail_count = @fail_count + 1
+
+    # --- Test 2: RamFS mkdir ---
+    @ret = ramfs_mkdir("/data", 5)
+    if @ret == IO_OK
+        shine("[PASS] ramfs_mkdir /data")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_mkdir /data")
+        @fail_count = @fail_count + 1
+
+    # --- Test 3: RamFS mkdir nested ---
+    @ret = ramfs_mkdir("/data/sub", 9)
+    if @ret == IO_OK
+        shine("[PASS] ramfs_mkdir /data/sub")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_mkdir /data/sub")
+        @fail_count = @fail_count + 1
+
+    # --- Test 4: RamFS create file ---
+    @test_path: [u8; 20] = [47, 100, 97, 116, 97, 47, 116, 101, 115, 116, 46, 116, 120, 116, 0, 0, 0, 0, 0, 0]
+    # "/data/test.txt"
+    @hid = ramfs_open(&@test_path[0], 14, MODE_CREATE)
+    if @hid > 0
+        shine("[PASS] ramfs_open create")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_open create")
+        @fail_count = @fail_count + 1
+
+    # --- Test 5: RamFS write ---
+    @test_data: [u8; 16] = [72, 101, 108, 108, 111, 44, 32, 76, 117, 110, 97, 33, 0, 0, 0, 0]
+    # "Hello, Luna!"
+    @written = ramfs_handle_write(@hid, &@test_data[0], 12)
+    if @written == 12
+        shine("[PASS] ramfs_write 12 bytes")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_write")
+        @fail_count = @fail_count + 1
+
+    # --- Test 6: RamFS seek to beginning ---
+    @seek_ret = ramfs_handle_seek(@hid, 0, SEEK_SET)
+    if @seek_ret == 0
+        shine("[PASS] ramfs_seek SEEK_SET 0")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_seek")
+        @fail_count = @fail_count + 1
+
+    # --- Test 7: RamFS read back ---
+    @read_buf: [u8; 32] = [0; 32]
+    @read_ret = ramfs_handle_read(@hid, &@read_buf[0], 32)
+    if @read_ret == 12
+        shine("[PASS] ramfs_read 12 bytes")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_read")
+        @fail_count = @fail_count + 1
+
+    # --- Test 8: Verify content ---
+    @content_ok = 1
+    orbit @i in 0..12
+        if @read_buf[@i] != @test_data[@i]
+            @content_ok = 0
+    if @content_ok == 1
+        shine("[PASS] ramfs_read content matches")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_read content mismatch")
+        @fail_count = @fail_count + 1
+
+    # --- Test 9: Close file ---
+    @close_ret = io_close(@hid)
+    if @close_ret == IO_OK
+        shine("[PASS] io_close")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] io_close")
+        @fail_count = @fail_count + 1
+
+    # --- Test 10: RamFS exists ---
+    @ex = ramfs_exists(&@test_path[0], 14)
+    if @ex == 1
+        shine("[PASS] ramfs_exists returns 1 for created file")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_exists")
+        @fail_count = @fail_count + 1
+
+    # --- Test 11: RamFS is_file ---
+    @isf = ramfs_is_file(&@test_path[0], 14)
+    if @isf == 1
+        shine("[PASS] ramfs_is_file returns 1")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_is_file")
+        @fail_count = @fail_count + 1
+
+    # --- Test 12: RamFS is_dir ---
+    @isd = ramfs_is_dir("/data", 5)
+    if @isd == 1
+        shine("[PASS] ramfs_is_dir /data returns 1")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_is_dir")
+        @fail_count = @fail_count + 1
+
+    # --- Test 13: RamFS file_size ---
+    @fsz = ramfs_file_size(&@test_path[0], 14)
+    if @fsz == 12
+        shine("[PASS] ramfs_file_size returns 12")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_file_size")
+        @fail_count = @fail_count + 1
+
+    # --- Test 14: RamFS readdir ---
+    @dir_names: [[u8; 260]; 16] = [[0; 260]; 16]
+    @dir_types: [int; 16] = [0; 16]
+    @dir_count = ramfs_readdir("/data", 5, &@dir_names[0], &@dir_types[0], 16)
+    if @dir_count == 2  # sub directory + test.txt
+        shine("[PASS] ramfs_readdir returns 2 entries")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_readdir")
+        @fail_count = @fail_count + 1
+
+    # --- Test 15: RamFS truncate ---
+    @hid2 = ramfs_open(&@test_path[0], 14, MODE_READ_WRITE)
+    if @hid2 > 0
+        @trunc_ret = ramfs_handle_truncate(@hid2, 5)
+        if @trunc_ret == IO_OK
+            @new_sz = ramfs_file_size(&@test_path[0], 14)
+            if @new_sz == 5
+                shine("[PASS] ramfs_truncate to 5 bytes")
+                @pass_count = @pass_count + 1
+            eclipse
+                shine("[FAIL] ramfs_truncate size mismatch")
+                @fail_count = @fail_count + 1
+        eclipse
+            shine("[FAIL] ramfs_truncate returned error")
+            @fail_count = @fail_count + 1
+        io_close(@hid2)
+    eclipse
+        shine("[FAIL] ramfs_open for truncate")
+        @fail_count = @fail_count + 1
+
+    # --- Test 16: RamFS rename ---
+    @new_path: [u8; 20] = [47, 100, 97, 116, 97, 47, 114, 101, 110, 46, 116, 120, 116, 0, 0, 0, 0, 0, 0, 0]
+    # "/data/ren.txt"
+    @ren_ret = ramfs_rename(&@test_path[0], 14, &@new_path[0], 13)
+    if @ren_ret == IO_OK
+        @old_ex = ramfs_exists(&@test_path[0], 14)
+        @new_ex = ramfs_exists(&@new_path[0], 13)
+        if @old_ex == 0
+            if @new_ex == 1
+                shine("[PASS] ramfs_rename")
+                @pass_count = @pass_count + 1
+            eclipse
+                shine("[FAIL] ramfs_rename new not found")
+                @fail_count = @fail_count + 1
+        eclipse
+            shine("[FAIL] ramfs_rename old still exists")
+            @fail_count = @fail_count + 1
+    eclipse
+        shine("[FAIL] ramfs_rename returned error")
+        @fail_count = @fail_count + 1
+
+    # --- Test 17: RamFS unlink ---
+    @unl_ret = ramfs_unlink(&@new_path[0], 13)
+    if @unl_ret == IO_OK
+        @del_ex = ramfs_exists(&@new_path[0], 13)
+        if @del_ex == 0
+            shine("[PASS] ramfs_unlink")
+            @pass_count = @pass_count + 1
+        eclipse
+            shine("[FAIL] ramfs_unlink file still exists")
+            @fail_count = @fail_count + 1
+    eclipse
+        shine("[FAIL] ramfs_unlink returned error")
+        @fail_count = @fail_count + 1
+
+    # --- Test 18: RamFS rmdir ---
+    @rmd_ret = ramfs_rmdir("/data/sub", 9)
+    if @rmd_ret == IO_OK
+        shine("[PASS] ramfs_rmdir /data/sub")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_rmdir")
+        @fail_count = @fail_count + 1
+
+    # --- Test 19: RamFS rmdir non-empty should fail ---
+    # /data still has no children now (both removed)
+    @rmd2_ret = ramfs_rmdir("/data", 5)
+    if @rmd2_ret == IO_OK
+        shine("[PASS] ramfs_rmdir /data (now empty)")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] ramfs_rmdir /data")
+        @fail_count = @fail_count + 1
+
+    # --- Test 20: BufferedReader basic test ---
+    # Create file in ramfs, wrap with buffered reader, read back
+    ramfs_mkdir("/buf_test", 9)
+    @bf_path: [u8; 20] = [47, 98, 117, 102, 95, 116, 101, 115, 116, 47, 97, 46, 116, 120, 116, 0, 0, 0, 0, 0]
+    # "/buf_test/a.txt"
+    @bf_hid = ramfs_open(&@bf_path[0], 15, MODE_CREATE)
+    if @bf_hid > 0
+        @bf_data: [u8; 10] = [65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
+        # "ABCDEFGHIJ"
+        ramfs_handle_write(@bf_hid, &@bf_data[0], 10)
+        ramfs_handle_seek(@bf_hid, 0, SEEK_SET)
+
+        @br_id = buffered_reader_new(@bf_hid, 4)  # Small buffer for testing
+        if @br_id >= 0
+            @br_out: [u8; 16] = [0; 16]
+            @br_got = buffered_reader_read(@br_id, &@br_out[0], 10)
+            if @br_got == 10
+                @br_ok = 1
+                orbit @k in 0..10
+                    if @br_out[@k] != @bf_data[@k]
+                        @br_ok = 0
+                if @br_ok == 1
+                    shine("[PASS] BufferedReader read 10 bytes correctly")
+                    @pass_count = @pass_count + 1
+                eclipse
+                    shine("[FAIL] BufferedReader content mismatch")
+                    @fail_count = @fail_count + 1
+            eclipse
+                shine("[FAIL] BufferedReader read count wrong")
+                @fail_count = @fail_count + 1
+            buffered_reader_destroy(@br_id)
+        eclipse
+            shine("[FAIL] buffered_reader_new failed")
+            @fail_count = @fail_count + 1
+        io_close(@bf_hid)
+    eclipse
+        shine("[FAIL] ramfs_open for BufferedReader test")
+        @fail_count = @fail_count + 1
+
+    # --- Test 21: BufferedWriter basic test ---
+    @bw_path: [u8; 20] = [47, 98, 117, 102, 95, 116, 101, 115, 116, 47, 98, 46, 116, 120, 116, 0, 0, 0, 0, 0]
+    # "/buf_test/b.txt"
+    @bw_hid = ramfs_open(&@bw_path[0], 15, MODE_CREATE)
+    if @bw_hid > 0
+        @bw_id = buffered_writer_new(@bw_hid, 4)
+        if @bw_id >= 0
+            @bw_data: [u8; 8] = [88, 89, 90, 87, 86, 85, 84, 83]
+            # "XYZWVUTS"
+            @bw_wrote = buffered_writer_write(@bw_id, &@bw_data[0], 8)
+            buffered_writer_flush(@bw_id)
+            buffered_writer_destroy(@bw_id)
+
+            # Read back to verify
+            ramfs_handle_seek(@bw_hid, 0, SEEK_SET)
+            @bw_read_buf: [u8; 16] = [0; 16]
+            @bw_read = ramfs_handle_read(@bw_hid, &@bw_read_buf[0], 16)
+            if @bw_read == 8
+                @bw_ok = 1
+                orbit @k in 0..8
+                    if @bw_read_buf[@k] != @bw_data[@k]
+                        @bw_ok = 0
+                if @bw_ok == 1
+                    shine("[PASS] BufferedWriter wrote 8 bytes correctly")
+                    @pass_count = @pass_count + 1
+                eclipse
+                    shine("[FAIL] BufferedWriter content mismatch")
+                    @fail_count = @fail_count + 1
+            eclipse
+                shine("[FAIL] BufferedWriter read back count wrong")
+                @fail_count = @fail_count + 1
+        eclipse
+            shine("[FAIL] buffered_writer_new failed")
+            @fail_count = @fail_count + 1
+        io_close(@bw_hid)
+    eclipse
+        shine("[FAIL] ramfs_open for BufferedWriter test")
+        @fail_count = @fail_count + 1
+
+    # --- Test 22: RamFS write_file / read_file convenience ---
+    @conv_path: [u8; 20] = [47, 98, 117, 102, 95, 116, 101, 115, 116, 47, 99, 46, 116, 120, 116, 0, 0, 0, 0, 0]
+    # "/buf_test/c.txt"
+    @conv_data: [u8; 5] = [49, 50, 51, 52, 53]
+    # "12345"
+    @wr_ret = ramfs_write_file(&@conv_path[0], 15, &@conv_data[0], 5)
+    if @wr_ret == IO_OK
+        @rd_buf: [u8; 16] = [0; 16]
+        @rd_ret = ramfs_read_file(&@conv_path[0], 15, &@rd_buf[0], 16)
+        if @rd_ret == 5
+            @conv_ok = 1
+            orbit @k in 0..5
+                if @rd_buf[@k] != @conv_data[@k]
+                    @conv_ok = 0
+            if @conv_ok == 1
+                shine("[PASS] ramfs write_file/read_file roundtrip")
+                @pass_count = @pass_count + 1
+            eclipse
+                shine("[FAIL] ramfs write_file/read_file content mismatch")
+                @fail_count = @fail_count + 1
+        eclipse
+            shine("[FAIL] ramfs_read_file returned wrong count")
+            @fail_count = @fail_count + 1
+    eclipse
+        shine("[FAIL] ramfs_write_file returned error")
+        @fail_count = @fail_count + 1
+
+    # --- Test 23: Handle allocation limit check ---
+    @alloc_test_ok = 1
+    @alloc_handles: [int; 256] = [0; 256]
+    @alloc_count = 0
+    orbit @i in 0..MAX_OPEN_FILES
+        @ah = handle_alloc()
+        if @ah < 0
+            nova
+        @alloc_handles[@alloc_count] = @ah
+        @alloc_count = @alloc_count + 1
+    # Free them all back
+    orbit @i in 0..@alloc_count
+        handle_free(@alloc_handles[@i])
+    if @alloc_count > 0
+        shine("[PASS] handle alloc/free stress test")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] handle alloc returned 0 handles")
+        @fail_count = @fail_count + 1
+
+    # --- Test 24: Error string lookup ---
+    @err_buf: [u8; 64] = [0; 64]
+    @err_len = io_error_str(IO_ERR_NOT_FOUND, &@err_buf[0], 64)
+    if @err_len > 0
+        shine("[PASS] io_error_str returns string")
+        @pass_count = @pass_count + 1
+    eclipse
+        shine("[FAIL] io_error_str returned 0 length")
+        @fail_count = @fail_count + 1
+
+    # --- Summary ---
+    shine("=== io.luna self-test results ===")
+    shine("  passed: ")
+    # shine does not support formatting ints natively; print count as separate call
+    stdout_write_int(@pass_count)
+    shine("")
+    shine("  failed: ")
+    stdout_write_int(@fail_count)
+    shine("")
+
+    if @fail_count == 0
+        shine("ALL TESTS PASSED")
+        return 0
+    eclipse
+        shine("SOME TESTS FAILED")
+        return 1
+
+# =============================================================================
+# SECTION 69: INTEGER TO STDOUT HELPER
+# =============================================================================
+# Print a decimal integer to stdout. Handles negative values.
+
+fn stdout_write_int(@val: int)
+    if @val < 0
+        @neg_sign: [u8; 1] = [45; 1]  # '-'
+        stdout_write(&@neg_sign[0], 1)
+        @val = 0 - @val
+
+    if @val == 0
+        @zero_ch: [u8; 1] = [48; 1]  # '0'
+        stdout_write(&@zero_ch[0], 1)
+        return
+
+    @digits: [u8; 20] = [0; 20]
+    @dcount = 0
+    @tmp = @val
+    orbit @i in 0..20
+        if @tmp == 0
+            nova
+        @d = @tmp - (@tmp / 10) * 10
+        @digits[@dcount] = 48 + @d
+        @dcount = @dcount + 1
+        @tmp = @tmp / 10
+
+    # Print digits in reverse order
+    orbit @i in 0..@dcount
+        @idx = @dcount - 1 - @i
+        stdout_write(&@digits[@idx], 1)
+
+# =============================================================================
+# SECTION 70: FFI EXPORTS (C ABI)
+# =============================================================================
+# These functions are callable from C/Rust code embedding Luna, mirroring
+# the luna_vfs_* functions in vfs.rs.
+
+#[no_mangle]
+fn luna_io_init()
+    io_init()
+
+#[no_mangle]
+fn luna_io_open(@path_ptr: *u8, @path_len: int, @mode: int) -> int
+    return io_open(@path_ptr, @path_len, @mode)
+
+#[no_mangle]
+fn luna_io_close(@handle: int) -> int
+    return io_close(@handle)
+
+#[no_mangle]
+fn luna_io_read(@handle: int, @buf_ptr: *u8, @buf_len: int) -> int
+    return io_read(@handle, @buf_ptr, @buf_len)
+
+#[no_mangle]
+fn luna_io_write(@handle: int, @buf_ptr: *u8, @buf_len: int) -> int
+    return io_write(@handle, @buf_ptr, @buf_len)
+
+#[no_mangle]
+fn luna_io_seek(@handle: int, @offset: int, @whence: int) -> int
+    return io_seek(@handle, @offset, @whence)
+
+#[no_mangle]
+fn luna_io_flush(@handle: int) -> int
+    return io_flush(@handle)
+
+#[no_mangle]
+fn luna_io_mkdir(@path_ptr: *u8, @path_len: int) -> int
+    return io_mkdir(@path_ptr, @path_len)
+
+#[no_mangle]
+fn luna_io_rmdir(@path_ptr: *u8, @path_len: int) -> int
+    return io_rmdir(@path_ptr, @path_len)
+
+#[no_mangle]
+fn luna_io_unlink(@path_ptr: *u8, @path_len: int) -> int
+    return io_remove(@path_ptr, @path_len)
+
+#[no_mangle]
+fn luna_io_rename(@old_ptr: *u8, @old_len: int, @new_ptr: *u8, @new_len: int) -> int
+    return io_rename(@old_ptr, @old_len, @new_ptr, @new_len)
+
+#[no_mangle]
+fn luna_io_exists(@path_ptr: *u8, @path_len: int) -> int
+    return io_exists(@path_ptr, @path_len)
+
+#[no_mangle]
+fn luna_io_file_size(@path_ptr: *u8, @path_len: int) -> int
+    return io_file_size(@path_ptr, @path_len)
+
+#[no_mangle]
+fn luna_io_self_test() -> int
+    return io_self_test()
+
+# RamFS-specific FFI exports for Nova resource loading
+#[no_mangle]
+fn luna_ramfs_open(@path_ptr: *u8, @path_len: int, @mode: int) -> int
+    return ramfs_open(@path_ptr, @path_len, @mode)
+
+#[no_mangle]
+fn luna_ramfs_mkdir(@path_ptr: *u8, @path_len: int) -> int
+    return ramfs_mkdir(@path_ptr, @path_len)
+
+#[no_mangle]
+fn luna_ramfs_write_file(@path_ptr: *u8, @path_len: int, @data: *u8, @data_len: int) -> int
+    return ramfs_write_file(@path_ptr, @path_len, @data, @data_len)
+
+#[no_mangle]
+fn luna_ramfs_read_file(@path_ptr: *u8, @path_len: int, @buf: *u8, @buf_size: int) -> int
+    return ramfs_read_file(@path_ptr, @path_len, @buf, @buf_size)
+
+#[no_mangle]
+fn luna_ramfs_exists(@path_ptr: *u8, @path_len: int) -> int
+    return ramfs_exists(@path_ptr, @path_len)
+
+#[no_mangle]
+fn luna_ramfs_used_space() -> int
+    return ramfs_used_space()
+
+# =============================================================================
+# SECTION 71: EXPORT BLOCK
+# =============================================================================
+
+export {
+    # Constants
+    MODE_READ,
+    MODE_WRITE,
+    MODE_READ_WRITE,
+    MODE_APPEND,
+    MODE_CREATE,
+    MODE_TRUNCATE,
+    SEEK_SET,
+    SEEK_CUR,
+    SEEK_END,
+    FILE_REGULAR,
+    FILE_DIRECTORY,
+    FILE_SYMLINK,
+    FILE_DEVICE,
+    IO_OK,
+    IO_ERR_NOT_FOUND,
+    IO_ERR_PERMISSION,
+    IO_ERR_EXISTS,
+    IO_ERR_IS_DIR,
+    IO_ERR_NOT_DIR,
+    IO_ERR_IO,
+    IO_ERR_NO_SPACE,
+    IO_ERR_INVALID,
+    IO_ERR_NOT_EMPTY,
+    IO_ERR_NOT_FILE,
+    IO_ERR_HANDLE,
+    IO_ERR_NOT_SUPPORTED,
+    IO_ERR_CLOSED,
+    IO_ERR_EOF,
+    IO_ERR_BUSY,
+    DEFAULT_BUF_SIZE,
+    MAX_PATH_LEN,
+    MAX_OPEN_FILES,
+    IS_WINDOWS,
+
+    # Structs
+    FileInfo,
+
+    # File Operations
+    io_init,
+    io_open,
+    io_close,
+    io_read,
+    io_write,
+    io_seek,
+    io_flush,
+    io_sync,
+
+    # Path Operations
+    io_exists,
+    io_is_file,
+    io_is_dir,
+    io_file_size,
+    io_file_info,
+    io_getcwd,
+
+    # Directory Operations
+    io_mkdir,
+    io_rmdir,
+    io_readdir,
+    io_list_dir,
+
+    # File Management
+    io_rename,
+    io_remove,
+    io_copy,
+    io_truncate,
+
+    # Text I/O
+    io_read_file,
+    io_write_file,
+    io_append_file,
+    io_read_lines,
+
+    # Console I/O
+    stdin_read,
+    stdin_read_line,
+    stdout_write,
+    stdout_write_str,
+    stdout_write_int,
+    stderr_write,
+    stderr_write_str,
+
+    # Buffered I/O
+    buffered_reader_new,
+    buffered_reader_destroy,
+    buffered_reader_read,
+    buffered_reader_read_line,
+    buffered_writer_new,
+    buffered_writer_destroy,
+    buffered_writer_flush,
+    buffered_writer_write,
+    buffered_writer_write_str,
+    buffered_writer_write_line,
+
+    # RamFS
+    ramfs_init,
+    ramfs_open,
+    ramfs_mkdir,
+    ramfs_rmdir,
+    ramfs_unlink,
+    ramfs_readdir,
+    ramfs_rename,
+    ramfs_stat,
+    ramfs_exists,
+    ramfs_is_file,
+    ramfs_is_dir,
+    ramfs_file_size,
+    ramfs_read_file,
+    ramfs_write_file,
+    ramfs_used_space,
+    ramfs_available_space,
+
+    # Error utilities
+    io_error_str,
+
+    # Self-test
+    io_self_test
+}

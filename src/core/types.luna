@@ -1,0 +1,3488 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Self-Hosting Type Checker v2.5 "Genesis"
+# =============================================================================
+# Hindley-Milner type inference + FFI safety + null safety + region analysis
+# Ported from Rust typechecker.rs + type_inference.rs to Pure Luna
+#
+# KEY INNOVATION: Linear Memory Regions for type graph storage
+# - All type nodes allocated within a region
+# - Region freed instantly after analysis phase completes
+# - No GC pause, no fragmentation, deterministic cleanup
+#
+# Architecture:
+# 1. TypeRegion: arena allocator for all type graph nodes
+# 2. Substitution: constraint solver via Robinson's unification
+# 3. TypeChecker: two-pass validation (collect defs → check types)
+# 4. TypeInferencer: Hindley-Milner with generalize/instantiate
+# =============================================================================
+
+import parser
+
+# =============================================================================
+# TYPE SYSTEM CONSTANTS
+# =============================================================================
+
+# === Primitive Type IDs ===
+const TYPE_INT: int = 1
+const TYPE_FLOAT: int = 2
+const TYPE_STR: int = 3
+const TYPE_BOOL: int = 4
+const TYPE_NONE: int = 5
+const TYPE_VOID: int = 6
+const TYPE_ANY: int = 7
+const TYPE_CHAR: int = 8
+
+# === Composite Type IDs ===
+const TYPE_LIST: int = 10           # [T]
+const TYPE_DICT: int = 11           # {K: V}
+const TYPE_TUPLE: int = 12          # (A, B, C)
+const TYPE_FN: int = 13             # fn(A, B) -> C
+const TYPE_NULLABLE: int = 14       # T?
+
+# === Algebraic Type IDs ===
+const TYPE_GENERIC: int = 20        # Type variable: T, U, V
+const TYPE_APPLIED: int = 21        # Instantiated generic: Vec[int]
+const TYPE_ADT: int = 22            # ADT instance: Option[int]::Some
+const TYPE_CUSTOM: int = 23         # User struct/enum
+
+# === FFI Type IDs ===
+const TYPE_RAW_PTR: int = 30        # *T, *mut T
+const TYPE_NULLABLE_PTR: int = 31   # ?*T
+const TYPE_OPAQUE: int = 32         # Handle["FILE"]
+const TYPE_CSTR: int = 33           # C string
+const TYPE_CWSTR: int = 34          # Wide C string
+const TYPE_EXTERN_FN: int = 35      # Function pointer
+
+# === Inference Type IDs ===
+const TYPE_VAR: int = 40            # Unification variable τN
+const TYPE_VARIANT: int = 41        # ADT variant instance
+
+# === Meow (Lazy) ===
+const TYPE_MEOW: int = 50           # Meow[T] - lazy/deferred
+
+# === Ptr (Safe) ===
+const TYPE_PTR: int = 51            # Safe pointer
+
+# =============================================================================
+# AST NODE KIND CONSTANTS (from parser.luna)
+# =============================================================================
+# Extended statement node kinds (must match parser.luna)
+const AST_UNLESS: int = 60
+const AST_GUARD: int = 61
+const AST_ECLIPSE: int = 62
+const AST_SEAL_STRUCT: int = 63
+const AST_ACTOR: int = 64
+const AST_FLOW: int = 65
+const AST_SPAWN: int = 66
+const AST_SEND: int = 67
+const AST_REQUIRE: int = 68
+const AST_ENSURE: int = 69
+const AST_EXTERN_FN: int = 70
+const AST_DEFER: int = 71
+const AST_ATOMIC: int = 72
+const AST_DROP: int = 73
+const AST_VOLATILE_READ: int = 74
+const AST_VOLATILE_WRITE: int = 75
+const AST_GLOBAL_ALLOC: int = 76
+
+# Extended expression node kinds (must match parser.luna)
+const AST_DICT: int = 80
+const AST_PIPE: int = 81
+const AST_NULL_COALESCE: int = 82
+const AST_MOVE: int = 83
+const AST_FREEZE: int = 84
+const AST_BOX_ALLOC: int = 85
+const AST_RC_ALLOC: int = 86
+const AST_WEAK_REF: int = 87
+const AST_RAW_PTR: int = 88
+
+# =============================================================================
+# FFI SAFETY CONSTANTS
+# =============================================================================
+
+const FFI_SAFE: int = 0
+const FFI_UNSAFE: int = 1
+const FFI_TRUSTED: int = 2
+
+# === FFI Error Kinds ===
+const FFI_ERR_UNSAFE_CALL: int = 1
+const FFI_ERR_UNSAFE_DEREF: int = 2
+const FFI_ERR_UNSAFE_CSTR: int = 3
+const FFI_ERR_LIFETIME_MISMATCH: int = 4
+const FFI_ERR_NULLABLE_UNCHECKED: int = 5
+const FFI_ERR_INVALID_ABI: int = 6
+const FFI_ERR_MISSING_LIFETIME: int = 7
+const FFI_ERR_UNSAFE_IN_SAFE: int = 8
+
+# =============================================================================
+# LINEAR MEMORY REGION - Type Graph Arena
+# =============================================================================
+# All type nodes are allocated within a TypeRegion.
+# When type checking completes, the entire region is freed at once.
+# This eliminates GC pauses and prevents type graph memory leaks.
+
+const REGION_MAX_NODES: int = 65536
+const REGION_MAX_STRINGS: int = 16384
+const REGION_MAX_CHILDREN: int = 131072
+
+# === Type Node (arena-allocated) ===
+# Flat representation for cache-friendly traversal
+struct TypeNode
+    id: int             # Unique ID within region
+    kind: int           # TYPE_* constant
+    # Payload fields (meaning depends on kind)
+    data1: int          # e.g., type_var ID, param count
+    data2: int          # e.g., mutability flag
+    # String reference (index into string table)
+    name_idx: int       # Index into region string table (-1 if none)
+    # Children (indices into node array)
+    child1: int         # First child type node (-1 if none)
+    child2: int         # Second child type node
+    # For nodes with many children (fn params, tuple elements)
+    children_start: int # Start index in children array
+    children_count: int # Number of children
+    # Lifetime annotation
+    lifetime_idx: int   # Lifetime string index (-1 if none)
+
+# === Type Region (arena allocator) ===
+struct TypeRegion
+    nodes: [TypeNode; 65536]        # Pre-allocated type node array
+    node_count: int                  # Number of allocated nodes
+    strings: [str; 16384]           # String intern table
+    string_count: int                # Number of strings
+    children: [int; 131072]         # Children index arrays
+    children_count: int              # Children array usage
+    # Region metadata
+    phase: int                       # 0=active, 1=frozen, 2=freed
+    total_bytes: int                 # Tracking total allocation
+
+# === Region Creation and Management ===
+
+fn region_new() -> TypeRegion
+    return TypeRegion {
+        nodes: [TypeNode { id: 0, kind: 0, data1: 0, data2: 0, name_idx: -1, child1: -1, child2: -1, children_start: 0, children_count: 0, lifetime_idx: -1 }; 65536],
+        node_count: 0,
+        strings: [""; 16384],
+        string_count: 0,
+        children: [0; 131072],
+        children_count: 0,
+        phase: 0,
+        total_bytes: 0
+    }
+
+# Intern a string in the region, returning its index
+# Returns existing index if string already interned
+fn region_intern(@region: TypeRegion, @s: str) -> int
+    # Linear search for existing string (could optimize with hash later)
+    orbit @i in 0..@region.string_count
+        if @region.strings[@i] == @s
+            return @i
+
+    # Not found - allocate new
+    @idx = @region.string_count
+    if @idx >= REGION_MAX_STRINGS
+        return -1  # Region string table full
+    @region.strings[@idx] = @s
+    @region.string_count = @idx + 1
+    return @idx
+
+# Allocate a new type node in the region
+fn region_alloc_node(@region: TypeRegion, @kind: int) -> int
+    if @region.phase != 0
+        return -1  # Region frozen or freed
+    @idx = @region.node_count
+    if @idx >= REGION_MAX_NODES
+        return -1  # Region full
+    @region.nodes[@idx] = TypeNode {
+        id: @idx,
+        kind: @kind,
+        data1: 0,
+        data2: 0,
+        name_idx: -1,
+        child1: -1,
+        child2: -1,
+        children_start: 0,
+        children_count: 0,
+        lifetime_idx: -1
+    }
+    @region.node_count = @idx + 1
+    @region.total_bytes = @region.total_bytes + 80  # approximate TypeNode size
+    return @idx
+
+# Add children indices to the children array
+fn region_add_children(@region: TypeRegion, @child_ids: [int; 32], @count: int) -> int
+    @start = @region.children_count
+    if @start + @count > REGION_MAX_CHILDREN
+        return -1
+    orbit @i in 0..@count
+        @region.children[@start + @i] = @child_ids[@i]
+    @region.children_count = @start + @count
+    return @start
+
+# Freeze region (no more allocations allowed)
+fn region_freeze(@region: TypeRegion)
+    @region.phase = 1
+
+# Free entire region at once (deterministic, instant)
+fn region_free(@region: TypeRegion)
+    @region.phase = 2
+    @region.node_count = 0
+    @region.string_count = 0
+    @region.children_count = 0
+    @region.total_bytes = 0
+
+# Get string by index
+#[inline]
+fn region_get_string(@region: TypeRegion, @idx: int) -> str
+    if @idx < 0 or @idx >= @region.string_count
+        return ""
+    return @region.strings[@idx]
+
+# =============================================================================
+# TYPE NODE CONSTRUCTORS (allocate within region)
+# =============================================================================
+
+# Create primitive type node
+fn type_prim(@region: TypeRegion, @kind: int) -> int
+    return region_alloc_node(@region, @kind)
+
+fn type_int(@region: TypeRegion) -> int
+    return type_prim(@region, TYPE_INT)
+
+fn type_float(@region: TypeRegion) -> int
+    return type_prim(@region, TYPE_FLOAT)
+
+fn type_str(@region: TypeRegion) -> int
+    return type_prim(@region, TYPE_STR)
+
+fn type_bool(@region: TypeRegion) -> int
+    return type_prim(@region, TYPE_BOOL)
+
+fn type_none(@region: TypeRegion) -> int
+    return type_prim(@region, TYPE_NONE)
+
+fn type_void(@region: TypeRegion) -> int
+    return type_prim(@region, TYPE_VOID)
+
+fn type_any(@region: TypeRegion) -> int
+    return type_prim(@region, TYPE_ANY)
+
+# Create list type: [T]
+fn type_list(@region: TypeRegion, @elem: int) -> int
+    @node = region_alloc_node(@region, TYPE_LIST)
+    if @node >= 0
+        @region.nodes[@node].child1 = @elem
+    return @node
+
+# Create dict type: {K: V}
+fn type_dict(@region: TypeRegion, @key: int, @val: int) -> int
+    @node = region_alloc_node(@region, TYPE_DICT)
+    if @node >= 0
+        @region.nodes[@node].child1 = @key
+        @region.nodes[@node].child2 = @val
+    return @node
+
+# Create tuple type: (A, B, ...)
+fn type_tuple(@region: TypeRegion, @elems: [int; 32], @count: int) -> int
+    @node = region_alloc_node(@region, TYPE_TUPLE)
+    if @node >= 0
+        @start = region_add_children(@region, @elems, @count)
+        @region.nodes[@node].children_start = @start
+        @region.nodes[@node].children_count = @count
+    return @node
+
+# Create function type: fn(params) -> ret
+fn type_fn(@region: TypeRegion, @params: [int; 32], @param_count: int, @ret: int) -> int
+    @node = region_alloc_node(@region, TYPE_FN)
+    if @node >= 0
+        @start = region_add_children(@region, @params, @param_count)
+        @region.nodes[@node].children_start = @start
+        @region.nodes[@node].children_count = @param_count
+        @region.nodes[@node].child1 = @ret  # return type
+    return @node
+
+# Create nullable type: T?
+fn type_nullable(@region: TypeRegion, @inner: int) -> int
+    @node = region_alloc_node(@region, TYPE_NULLABLE)
+    if @node >= 0
+        @region.nodes[@node].child1 = @inner
+    return @node
+
+# Create generic type variable: T, U, V
+fn type_generic(@region: TypeRegion, @name: str) -> int
+    @node = region_alloc_node(@region, TYPE_GENERIC)
+    if @node >= 0
+        @region.nodes[@node].name_idx = region_intern(@region, @name)
+    return @node
+
+# Create applied generic: Vec[int], Map[str, int]
+fn type_applied(@region: TypeRegion, @name: str, @args: [int; 32], @arg_count: int) -> int
+    @node = region_alloc_node(@region, TYPE_APPLIED)
+    if @node >= 0
+        @region.nodes[@node].name_idx = region_intern(@region, @name)
+        @start = region_add_children(@region, @args, @arg_count)
+        @region.nodes[@node].children_start = @start
+        @region.nodes[@node].children_count = @arg_count
+    return @node
+
+# Create custom/struct type
+fn type_custom(@region: TypeRegion, @name: str) -> int
+    @node = region_alloc_node(@region, TYPE_CUSTOM)
+    if @node >= 0
+        @region.nodes[@node].name_idx = region_intern(@region, @name)
+    return @node
+
+# Create type variable for inference: τ0, τ1, τ2, ...
+fn type_var(@region: TypeRegion, @var_id: int) -> int
+    @node = region_alloc_node(@region, TYPE_VAR)
+    if @node >= 0
+        @region.nodes[@node].data1 = @var_id
+    return @node
+
+# Create ADT variant: Option::Some(T), Result::Ok(T)
+fn type_variant(@region: TypeRegion, @type_name: str, @variant_name: str, @fields: [int; 32], @field_count: int) -> int
+    @node = region_alloc_node(@region, TYPE_VARIANT)
+    if @node >= 0
+        @region.nodes[@node].name_idx = region_intern(@region, @type_name)
+        @region.nodes[@node].data1 = region_intern(@region, @variant_name)
+        @start = region_add_children(@region, @fields, @field_count)
+        @region.nodes[@node].children_start = @start
+        @region.nodes[@node].children_count = @field_count
+    return @node
+
+# Create meow (lazy) type: Meow[T]
+fn type_meow(@region: TypeRegion, @inner: int) -> int
+    @node = region_alloc_node(@region, TYPE_MEOW)
+    if @node >= 0
+        @region.nodes[@node].child1 = @inner
+    return @node
+
+# === FFI Type Constructors ===
+
+fn type_raw_ptr(@region: TypeRegion, @inner: int, @mutable: int, @lifetime: str) -> int
+    @node = region_alloc_node(@region, TYPE_RAW_PTR)
+    if @node >= 0
+        @region.nodes[@node].child1 = @inner
+        @region.nodes[@node].data1 = @mutable  # 1 = mutable
+        if @lifetime != ""
+            @region.nodes[@node].lifetime_idx = region_intern(@region, @lifetime)
+    return @node
+
+fn type_nullable_ptr(@region: TypeRegion, @inner: int, @lifetime: str) -> int
+    @node = region_alloc_node(@region, TYPE_NULLABLE_PTR)
+    if @node >= 0
+        @region.nodes[@node].child1 = @inner
+        if @lifetime != ""
+            @region.nodes[@node].lifetime_idx = region_intern(@region, @lifetime)
+    return @node
+
+fn type_opaque(@region: TypeRegion, @name: str, @lifetime: str) -> int
+    @node = region_alloc_node(@region, TYPE_OPAQUE)
+    if @node >= 0
+        @region.nodes[@node].name_idx = region_intern(@region, @name)
+        if @lifetime != ""
+            @region.nodes[@node].lifetime_idx = region_intern(@region, @lifetime)
+    return @node
+
+fn type_extern_fn(@region: TypeRegion, @abi: str, @params: [int; 32], @param_count: int, @ret: int) -> int
+    @node = region_alloc_node(@region, TYPE_EXTERN_FN)
+    if @node >= 0
+        @region.nodes[@node].name_idx = region_intern(@region, @abi)
+        @start = region_add_children(@region, @params, @param_count)
+        @region.nodes[@node].children_start = @start
+        @region.nodes[@node].children_count = @param_count
+        @region.nodes[@node].child1 = @ret
+    return @node
+
+# =============================================================================
+# TYPE EQUALITY AND COMPARISON
+# =============================================================================
+
+# Check if two type nodes represent the same type
+fn types_equal(@region: TypeRegion, @a: int, @b: int) -> int
+    if @a == @b
+        return 1
+    if @a < 0 or @b < 0
+        return 0
+    @na = @region.nodes[@a]
+    @nb = @region.nodes[@b]
+    if @na.kind != @nb.kind
+        return 0
+
+    match @na.kind
+        TYPE_INT => return 1
+        TYPE_FLOAT => return 1
+        TYPE_STR => return 1
+        TYPE_BOOL => return 1
+        TYPE_NONE => return 1
+        TYPE_VOID => return 1
+        TYPE_ANY => return 1
+        TYPE_CHAR => return 1
+
+        TYPE_LIST =>
+            return types_equal(@region, @na.child1, @nb.child1)
+
+        TYPE_DICT =>
+            return types_equal(@region, @na.child1, @nb.child1) and types_equal(@region, @na.child2, @nb.child2)
+
+        TYPE_NULLABLE =>
+            return types_equal(@region, @na.child1, @nb.child1)
+
+        TYPE_FN =>
+            if @na.children_count != @nb.children_count
+                return 0
+            # Check return type
+            if types_equal(@region, @na.child1, @nb.child1) == 0
+                return 0
+            # Check param types
+            orbit @i in 0..@na.children_count
+                @pa = @region.children[@na.children_start + @i]
+                @pb = @region.children[@nb.children_start + @i]
+                if types_equal(@region, @pa, @pb) == 0
+                    return 0
+            return 1
+
+        TYPE_GENERIC =>
+            return @na.name_idx == @nb.name_idx
+
+        TYPE_APPLIED =>
+            if @na.name_idx != @nb.name_idx
+                return 0
+            if @na.children_count != @nb.children_count
+                return 0
+            orbit @i in 0..@na.children_count
+                @pa = @region.children[@na.children_start + @i]
+                @pb = @region.children[@nb.children_start + @i]
+                if types_equal(@region, @pa, @pb) == 0
+                    return 0
+            return 1
+
+        TYPE_CUSTOM =>
+            return @na.name_idx == @nb.name_idx
+
+        TYPE_VAR =>
+            return @na.data1 == @nb.data1
+
+        TYPE_MEOW =>
+            return types_equal(@region, @na.child1, @nb.child1)
+
+        _ => return 0
+
+# Check type compatibility (expected vs actual)
+# Handles promotions: int → float, T → T?, None → T?
+fn types_compatible(@region: TypeRegion, @expected: int, @actual: int) -> int
+    if @expected < 0 or @actual < 0
+        return 1  # Unknown types are compatible
+    if @expected == @actual
+        return 1
+
+    @ne = @region.nodes[@expected]
+    @na = @region.nodes[@actual]
+
+    # Any matches everything
+    if @ne.kind == TYPE_ANY or @na.kind == TYPE_ANY
+        return 1
+
+    # None matches nullable
+    if @na.kind == TYPE_NONE and @ne.kind == TYPE_NULLABLE
+        return 1
+
+    # Numeric promotion: int → float
+    if @ne.kind == TYPE_FLOAT and @na.kind == TYPE_INT
+        return 1
+
+    # Nullable widening: T actual → T? expected
+    if @ne.kind == TYPE_NULLABLE
+        return types_compatible(@region, @ne.child1, @actual)
+
+    # Meow unwrap: Meow[T] → T
+    if @na.kind == TYPE_MEOW
+        return types_compatible(@region, @expected, @na.child1)
+    if @ne.kind == TYPE_MEOW
+        return types_compatible(@region, @ne.child1, @actual)
+
+    # Same kind - structural check
+    return types_equal(@region, @expected, @actual)
+
+# =============================================================================
+# SUBSTITUTION (Constraint Solver)
+# =============================================================================
+# Maps type variables (τN) to concrete types
+# Used by Hindley-Milner unification algorithm
+
+const SUBST_MAX: int = 4096
+
+struct Substitution
+    var_ids: [int; 4096]        # Type variable IDs
+    type_ids: [int; 4096]       # Mapped type node IDs (in region)
+    count: int                   # Number of mappings
+
+fn subst_new() -> Substitution
+    return Substitution {
+        var_ids: [0; 4096],
+        type_ids: [0; 4096],
+        count: 0
+    }
+
+# Insert or update a mapping: τvar_id ↦ type_id
+fn subst_insert(@subst: Substitution, @var_id: int, @type_id: int)
+    # Check if already exists
+    orbit @i in 0..@subst.count
+        if @subst.var_ids[@i] == @var_id
+            @subst.type_ids[@i] = @type_id
+            return
+    # New mapping
+    if @subst.count < SUBST_MAX
+        @subst.var_ids[@subst.count] = @var_id
+        @subst.type_ids[@subst.count] = @type_id
+        @subst.count = @subst.count + 1
+
+# Lookup mapping for type variable
+fn subst_lookup(@subst: Substitution, @var_id: int) -> int
+    orbit @i in 0..@subst.count
+        if @subst.var_ids[@i] == @var_id
+            return @subst.type_ids[@i]
+    return -1  # Not found
+
+# Apply substitution to a type, producing resolved type
+# Creates new nodes in the region as needed
+fn subst_apply(@subst: Substitution, @region: TypeRegion, @type_id: int) -> int
+    if @type_id < 0
+        return @type_id
+
+    @node = @region.nodes[@type_id]
+
+    match @node.kind
+        TYPE_VAR =>
+            @resolved = subst_lookup(@subst, @node.data1)
+            if @resolved >= 0
+                # Transitively resolve: if τ0→τ1 and τ1→int, follow chain
+                return subst_apply(@subst, @region, @resolved)
+            return @type_id
+
+        TYPE_LIST =>
+            @inner = subst_apply(@subst, @region, @node.child1)
+            if @inner == @node.child1
+                return @type_id
+            return type_list(@region, @inner)
+
+        TYPE_DICT =>
+            @k = subst_apply(@subst, @region, @node.child1)
+            @v = subst_apply(@subst, @region, @node.child2)
+            if @k == @node.child1 and @v == @node.child2
+                return @type_id
+            return type_dict(@region, @k, @v)
+
+        TYPE_NULLABLE =>
+            @inner = subst_apply(@subst, @region, @node.child1)
+            if @inner == @node.child1
+                return @type_id
+            return type_nullable(@region, @inner)
+
+        TYPE_FN =>
+            @changed = 0
+            @params: [int; 32] = [0; 32]
+            orbit @i in 0..@node.children_count
+                @orig = @region.children[@node.children_start + @i]
+                @resolved = subst_apply(@subst, @region, @orig)
+                @params[@i] = @resolved
+                if @resolved != @orig
+                    @changed = 1
+            @ret = subst_apply(@subst, @region, @node.child1)
+            if @ret != @node.child1
+                @changed = 1
+            if @changed == 0
+                return @type_id
+            return type_fn(@region, @params, @node.children_count, @ret)
+
+        TYPE_APPLIED =>
+            @changed = 0
+            @args: [int; 32] = [0; 32]
+            orbit @i in 0..@node.children_count
+                @orig = @region.children[@node.children_start + @i]
+                @resolved = subst_apply(@subst, @region, @orig)
+                @args[@i] = @resolved
+                if @resolved != @orig
+                    @changed = 1
+            if @changed == 0
+                return @type_id
+            @name = region_get_string(@region, @node.name_idx)
+            return type_applied(@region, @name, @args, @node.children_count)
+
+        TYPE_TUPLE =>
+            @changed = 0
+            @elems: [int; 32] = [0; 32]
+            orbit @i in 0..@node.children_count
+                @orig = @region.children[@node.children_start + @i]
+                @resolved = subst_apply(@subst, @region, @orig)
+                @elems[@i] = @resolved
+                if @resolved != @orig
+                    @changed = 1
+            if @changed == 0
+                return @type_id
+            return type_tuple(@region, @elems, @node.children_count)
+
+        TYPE_MEOW =>
+            @inner = subst_apply(@subst, @region, @node.child1)
+            if @inner == @node.child1
+                return @type_id
+            return type_meow(@region, @inner)
+
+        _ =>
+            return @type_id
+
+# Compose two substitutions: result = s2 ∘ s1
+# Apply s2 to all types in s1, then add s2's mappings
+fn subst_compose(@s1: Substitution, @s2: Substitution, @region: TypeRegion) -> Substitution
+    @result = subst_new()
+
+    # Apply s2 to all types in s1
+    orbit @i in 0..@s1.count
+        @resolved = subst_apply(@s2, @region, @s1.type_ids[@i])
+        subst_insert(@result, @s1.var_ids[@i], @resolved)
+
+    # Add s2's mappings (don't overwrite s1's)
+    orbit @i in 0..@s2.count
+        @existing = subst_lookup(@result, @s2.var_ids[@i])
+        if @existing < 0
+            subst_insert(@result, @s2.var_ids[@i], @s2.type_ids[@i])
+
+    return @result
+
+# =============================================================================
+# OCCURS CHECK
+# =============================================================================
+# Prevents infinite types: τ0 ≈ fn(τ0) → Error
+
+fn occurs_check(@region: TypeRegion, @var_id: int, @type_id: int) -> int
+    if @type_id < 0
+        return 0
+    @node = @region.nodes[@type_id]
+
+    match @node.kind
+        TYPE_VAR =>
+            return @node.data1 == @var_id
+
+        TYPE_LIST =>
+            return occurs_check(@region, @var_id, @node.child1)
+
+        TYPE_DICT =>
+            return occurs_check(@region, @var_id, @node.child1) or occurs_check(@region, @var_id, @node.child2)
+
+        TYPE_FN =>
+            if occurs_check(@region, @var_id, @node.child1)
+                return 1
+            orbit @i in 0..@node.children_count
+                @child = @region.children[@node.children_start + @i]
+                if occurs_check(@region, @var_id, @child)
+                    return 1
+            return 0
+
+        TYPE_APPLIED =>
+            orbit @i in 0..@node.children_count
+                @child = @region.children[@node.children_start + @i]
+                if occurs_check(@region, @var_id, @child)
+                    return 1
+            return 0
+
+        TYPE_NULLABLE =>
+            return occurs_check(@region, @var_id, @node.child1)
+
+        TYPE_TUPLE =>
+            orbit @i in 0..@node.children_count
+                @child = @region.children[@node.children_start + @i]
+                if occurs_check(@region, @var_id, @child)
+                    return 1
+            return 0
+
+        TYPE_MEOW =>
+            return occurs_check(@region, @var_id, @node.child1)
+
+        _ => return 0
+
+# =============================================================================
+# UNIFICATION (Robinson's Algorithm)
+# =============================================================================
+# Solves type constraints by finding most general unifier
+
+# Unification result codes
+const UNIFY_OK: int = 0
+const UNIFY_MISMATCH: int = 1
+const UNIFY_OCCURS: int = 2
+const UNIFY_ARITY: int = 3
+
+struct UnifyResult
+    code: int       # UNIFY_* constant
+    detail: str     # Error description
+
+fn unify_ok() -> UnifyResult
+    return UnifyResult { code: UNIFY_OK, detail: "" }
+
+fn unify_err(@code: int, @detail: str) -> UnifyResult
+    return UnifyResult { code: @code, detail: @detail }
+
+# Main unification entry point
+fn unify(@region: TypeRegion, @subst: Substitution, @t1: int, @t2: int) -> UnifyResult
+    # Resolve through substitution first
+    @a = subst_apply(@subst, @region, @t1)
+    @b = subst_apply(@subst, @region, @t2)
+
+    if @a < 0 or @b < 0
+        return unify_ok()
+    if @a == @b
+        return unify_ok()
+
+    @na = @region.nodes[@a]
+    @nb = @region.nodes[@b]
+
+    # Case 1: Either is a type variable → bind it
+    if @na.kind == TYPE_VAR
+        if occurs_check(@region, @na.data1, @b)
+            return unify_err(UNIFY_OCCURS, "infinite type: variable occurs in target")
+        subst_insert(@subst, @na.data1, @b)
+        return unify_ok()
+
+    if @nb.kind == TYPE_VAR
+        if occurs_check(@region, @nb.data1, @a)
+            return unify_err(UNIFY_OCCURS, "infinite type: variable occurs in target")
+        subst_insert(@subst, @nb.data1, @a)
+        return unify_ok()
+
+    # Case 2: Any matches everything
+    if @na.kind == TYPE_ANY or @nb.kind == TYPE_ANY
+        return unify_ok()
+
+    # Case 3: Numeric promotion (int → float)
+    if @na.kind == TYPE_INT and @nb.kind == TYPE_FLOAT
+        return unify_ok()
+    if @na.kind == TYPE_FLOAT and @nb.kind == TYPE_INT
+        return unify_ok()
+
+    # Case 4: Same primitive
+    if @na.kind == @nb.kind
+        match @na.kind
+            TYPE_INT => return unify_ok()
+            TYPE_FLOAT => return unify_ok()
+            TYPE_STR => return unify_ok()
+            TYPE_BOOL => return unify_ok()
+            TYPE_NONE => return unify_ok()
+            TYPE_VOID => return unify_ok()
+            TYPE_CHAR => return unify_ok()
+
+            TYPE_LIST =>
+                return unify(@region, @subst, @na.child1, @nb.child1)
+
+            TYPE_DICT =>
+                @r1 = unify(@region, @subst, @na.child1, @nb.child1)
+                if @r1.code != UNIFY_OK
+                    return @r1
+                return unify(@region, @subst, @na.child2, @nb.child2)
+
+            TYPE_NULLABLE =>
+                return unify(@region, @subst, @na.child1, @nb.child1)
+
+            TYPE_FN =>
+                if @na.children_count != @nb.children_count
+                    return unify_err(UNIFY_ARITY, "function parameter count mismatch")
+                # Unify params
+                orbit @i in 0..@na.children_count
+                    @pa = @region.children[@na.children_start + @i]
+                    @pb = @region.children[@nb.children_start + @i]
+                    @r = unify(@region, @subst, @pa, @pb)
+                    if @r.code != UNIFY_OK
+                        return @r
+                # Unify return types
+                return unify(@region, @subst, @na.child1, @nb.child1)
+
+            TYPE_APPLIED =>
+                if @na.name_idx != @nb.name_idx
+                    return unify_err(UNIFY_MISMATCH, "different generic types")
+                if @na.children_count != @nb.children_count
+                    return unify_err(UNIFY_ARITY, "generic argument count mismatch")
+                orbit @i in 0..@na.children_count
+                    @pa = @region.children[@na.children_start + @i]
+                    @pb = @region.children[@nb.children_start + @i]
+                    @r = unify(@region, @subst, @pa, @pb)
+                    if @r.code != UNIFY_OK
+                        return @r
+                return unify_ok()
+
+            TYPE_TUPLE =>
+                if @na.children_count != @nb.children_count
+                    return unify_err(UNIFY_ARITY, "tuple length mismatch")
+                orbit @i in 0..@na.children_count
+                    @pa = @region.children[@na.children_start + @i]
+                    @pb = @region.children[@nb.children_start + @i]
+                    @r = unify(@region, @subst, @pa, @pb)
+                    if @r.code != UNIFY_OK
+                        return @r
+                return unify_ok()
+
+            TYPE_CUSTOM =>
+                if @na.name_idx == @nb.name_idx
+                    return unify_ok()
+                return unify_err(UNIFY_MISMATCH, "different struct types")
+
+            TYPE_MEOW =>
+                return unify(@region, @subst, @na.child1, @nb.child1)
+
+            _ =>
+                return unify_err(UNIFY_MISMATCH, "incompatible types")
+
+    # Nullable ↔ concrete: T? ≈ T → unify inner
+    if @na.kind == TYPE_NULLABLE
+        return unify(@region, @subst, @na.child1, @b)
+    if @nb.kind == TYPE_NULLABLE
+        return unify(@region, @subst, @a, @nb.child1)
+
+    # Meow unwrap: Meow[T] ≈ T → unify inner
+    if @na.kind == TYPE_MEOW
+        return unify(@region, @subst, @na.child1, @b)
+    if @nb.kind == TYPE_MEOW
+        return unify(@region, @subst, @a, @nb.child1)
+
+    return unify_err(UNIFY_MISMATCH, "type mismatch")
+
+# =============================================================================
+# TYPE VARIABLE GENERATOR
+# =============================================================================
+
+struct TypeVarGen
+    counter: int
+
+fn vargen_new() -> TypeVarGen
+    return TypeVarGen { counter: 0 }
+
+fn vargen_fresh(@gen: TypeVarGen) -> int
+    @id = @gen.counter
+    @gen.counter = @id + 1
+    return @id
+
+fn vargen_fresh_type(@gen: TypeVarGen, @region: TypeRegion) -> int
+    @id = vargen_fresh(@gen)
+    return type_var(@region, @id)
+
+# =============================================================================
+# TYPE ERROR
+# =============================================================================
+
+const MAX_ERRORS: int = 256
+
+struct TypeError
+    message: str
+    line: int
+    hint: str
+    ffi_kind: int       # FFI_ERR_* or 0 if not FFI-related
+
+fn type_error_new(@msg: str, @line: int) -> TypeError
+    return TypeError { message: @msg, line: @line, hint: "", ffi_kind: 0 }
+
+fn type_error_with_hint(@msg: str, @line: int, @hint: str) -> TypeError
+    return TypeError { message: @msg, line: @line, hint: @hint, ffi_kind: 0 }
+
+fn type_error_ffi(@kind: int, @line: int) -> TypeError
+    @msg = ""
+    @hint = ""
+    match @kind
+        FFI_ERR_UNSAFE_CALL =>
+            @msg = "Call to extern function requires unsafe block"
+            @hint = "Wrap the call in: unsafe { ... }"
+        FFI_ERR_UNSAFE_DEREF =>
+            @msg = "Dereferencing raw pointer requires unsafe block"
+            @hint = "Raw pointer operations are unsafe. Use: unsafe { *ptr }"
+        FFI_ERR_UNSAFE_CSTR =>
+            @msg = "C string operation requires unsafe block"
+            @hint = "C strings may not be null-terminated"
+        FFI_ERR_LIFETIME_MISMATCH =>
+            @msg = "Lifetime mismatch in FFI context"
+            @hint = "Check lifetime annotations on FFI types"
+        FFI_ERR_NULLABLE_UNCHECKED =>
+            @msg = "Nullable pointer used without null check"
+            @hint = "Check with: if ptr != none { ... }"
+        FFI_ERR_INVALID_ABI =>
+            @msg = "Invalid ABI specification"
+            @hint = "Valid ABIs: \"C\", \"stdcall\", \"fastcall\""
+        FFI_ERR_MISSING_LIFETIME =>
+            @msg = "Missing lifetime annotation on FFI type"
+            @hint = "Add lifetime: *'static T or *'caller T"
+        FFI_ERR_UNSAFE_IN_SAFE =>
+            @msg = "Unsafe operation in safe context"
+            @hint = "Mark function as unsafe or wrap in unsafe block"
+        _ =>
+            @msg = "Unknown FFI error"
+    return TypeError { message: @msg, line: @line, hint: @hint, ffi_kind: @kind }
+
+# =============================================================================
+# FUNCTION INFO (signature registry)
+# =============================================================================
+
+const MAX_FUNCTIONS: int = 4096
+const MAX_PARAMS: int = 16
+
+struct FunctionInfo
+    name_idx: int               # Interned name
+    param_names: [int; 16]      # Interned param name indices
+    param_types: [int; 16]      # Type node IDs for each param
+    param_count: int
+    return_type: int            # Type node ID
+    requires_unsafe: int        # 1 if extern fn
+    ffi_safety: int             # FFI_* constant
+
+# =============================================================================
+# STRUCT INFO
+# =============================================================================
+
+const MAX_STRUCTS: int = 2048
+const MAX_FIELDS: int = 32
+
+struct StructInfo
+    name_idx: int               # Interned name
+    field_names: [int; 32]      # Interned field name indices
+    field_types: [int; 32]      # Type node IDs
+    field_count: int
+    type_params: [int; 8]       # Generic type parameter name indices
+    type_param_count: int
+
+# =============================================================================
+# SCOPE STACK (variable bindings)
+# =============================================================================
+
+const MAX_SCOPES: int = 64
+const MAX_VARS_PER_SCOPE: int = 256
+
+struct ScopeEntry
+    name_idx: int       # Interned variable name
+    type_id: int        # Type node ID in region
+
+struct Scope
+    entries: [ScopeEntry; 256]
+    count: int
+
+fn scope_new() -> Scope
+    return Scope {
+        entries: [ScopeEntry { name_idx: 0, type_id: 0 }; 256],
+        count: 0
+    }
+
+fn scope_define(@scope: Scope, @name_idx: int, @type_id: int)
+    if @scope.count < MAX_VARS_PER_SCOPE
+        @scope.entries[@scope.count] = ScopeEntry { name_idx: @name_idx, type_id: @type_id }
+        @scope.count = @scope.count + 1
+
+fn scope_lookup(@scope: Scope, @name_idx: int) -> int
+    # Search backwards for most recent binding
+    @i = @scope.count - 1
+    orbit _ in 0..@scope.count
+        if @i < 0
+            break
+        if @scope.entries[@i].name_idx == @name_idx
+            return @scope.entries[@i].type_id
+        @i = @i - 1
+    return -1
+
+# =============================================================================
+# UNSAFE CONTEXT TRACKER
+# =============================================================================
+
+struct UnsafeContext
+    depth: int                  # Nesting level (0 = safe)
+    extern_fns: [int; 1024]    # Interned names of extern fns
+    extern_safety: [int; 1024] # FFI safety level per extern fn
+    extern_count: int
+
+fn unsafe_ctx_new() -> UnsafeContext
+    return UnsafeContext {
+        depth: 0,
+        extern_fns: [0; 1024],
+        extern_safety: [0; 1024],
+        extern_count: 0
+    }
+
+fn unsafe_enter(@ctx: UnsafeContext)
+    @ctx.depth = @ctx.depth + 1
+
+fn unsafe_exit(@ctx: UnsafeContext)
+    if @ctx.depth > 0
+        @ctx.depth = @ctx.depth - 1
+
+fn unsafe_is_active(@ctx: UnsafeContext) -> int
+    return @ctx.depth > 0
+
+fn unsafe_register_extern(@ctx: UnsafeContext, @name_idx: int, @safety: int)
+    if @ctx.extern_count < 1024
+        @ctx.extern_fns[@ctx.extern_count] = @name_idx
+        @ctx.extern_safety[@ctx.extern_count] = @safety
+        @ctx.extern_count = @ctx.extern_count + 1
+
+fn unsafe_get_extern_safety(@ctx: UnsafeContext, @name_idx: int) -> int
+    orbit @i in 0..@ctx.extern_count
+        if @ctx.extern_fns[@i] == @name_idx
+            return @ctx.extern_safety[@i]
+    return -1  # Not an extern fn
+
+fn unsafe_requires_call(@ctx: UnsafeContext, @name_idx: int) -> int
+    @safety = unsafe_get_extern_safety(@ctx, @name_idx)
+    if @safety < 0
+        return 0  # Not extern
+    return @safety == FFI_UNSAFE or @safety == FFI_TRUSTED
+
+# Check if a type requires unsafe context
+fn type_requires_unsafe(@region: TypeRegion, @type_id: int) -> int
+    if @type_id < 0
+        return 0
+    @kind = @region.nodes[@type_id].kind
+    return @kind == TYPE_RAW_PTR or @kind == TYPE_NULLABLE_PTR or @kind == TYPE_CSTR or @kind == TYPE_CWSTR
+
+# =============================================================================
+# NULL SAFETY TRACKER
+# =============================================================================
+# Tracks variables that have been null-checked in current scope
+
+const MAX_NULL_CHECKED: int = 128
+
+struct NullSafety
+    # Stack of null-checked variable sets per scope
+    checked: [int; 128]         # Interned names of checked vars
+    counts: [int; 64]          # Count per scope level
+    depth: int                  # Current scope depth
+
+fn null_safety_new() -> NullSafety
+    return NullSafety {
+        checked: [0; 128],
+        counts: [0; 64],
+        depth: 0
+    }
+
+fn null_push_scope(@ns: NullSafety)
+    if @ns.depth < 63
+        @ns.depth = @ns.depth + 1
+        @ns.counts[@ns.depth] = 0
+
+fn null_pop_scope(@ns: NullSafety)
+    if @ns.depth > 0
+        # Remove entries for this scope
+        @remove = @ns.counts[@ns.depth]
+        # (entries are at end of checked array, just reduce count conceptually)
+        @ns.depth = @ns.depth - 1
+
+fn null_mark_checked(@ns: NullSafety, @name_idx: int)
+    @total = 0
+    orbit @i in 0..@ns.depth + 1
+        @total = @total + @ns.counts[@i]
+    if @total < MAX_NULL_CHECKED
+        @ns.checked[@total] = @name_idx
+        @ns.counts[@ns.depth] = @ns.counts[@ns.depth] + 1
+
+fn null_is_checked(@ns: NullSafety, @name_idx: int) -> int
+    @total = 0
+    orbit @i in 0..@ns.depth + 1
+        @total = @total + @ns.counts[@i]
+    orbit @i in 0..@total
+        if @ns.checked[@i] == @name_idx
+            return 1
+    return 0
+
+# =============================================================================
+# TYPE CHECKER (Main Engine)
+# =============================================================================
+
+struct TypeChecker
+    region: TypeRegion           # Type graph arena
+    # Function registry
+    functions: [FunctionInfo; 4096]
+    fn_count: int
+    # Struct registry
+    structs: [StructInfo; 2048]
+    struct_count: int
+    # Scope stack
+    scopes: [Scope; 64]
+    scope_depth: int
+    # Error collection
+    errors: [TypeError; 256]
+    error_count: int
+    warnings: [str; 256]
+    warning_count: int
+    # Context tracking
+    current_line: int
+    current_return_type: int     # Type node ID for current fn return
+    # Safety
+    unsafe_ctx: UnsafeContext
+    null_safety: NullSafety
+    # Type inference
+    vargen: TypeVarGen
+    subst: Substitution
+
+fn typechecker_new() -> TypeChecker
+    @tc = TypeChecker {
+        region: region_new(),
+        functions: [FunctionInfo { name_idx: 0, param_names: [0; 16], param_types: [0; 16], param_count: 0, return_type: 0, requires_unsafe: 0, ffi_safety: 0 }; 4096],
+        fn_count: 0,
+        structs: [StructInfo { name_idx: 0, field_names: [0; 32], field_types: [0; 32], field_count: 0, type_params: [0; 8], type_param_count: 0 }; 2048],
+        struct_count: 0,
+        scopes: [scope_new(); 64],
+        scope_depth: 0,
+        errors: [TypeError { message: "", line: 0, hint: "", ffi_kind: 0 }; 256],
+        error_count: 0,
+        warnings: [""; 256],
+        warning_count: 0,
+        current_line: 0,
+        current_return_type: -1,
+        unsafe_ctx: unsafe_ctx_new(),
+        null_safety: null_safety_new(),
+        vargen: vargen_new(),
+        subst: subst_new()
+    }
+    # Register built-in functions
+    tc_register_builtins(@tc)
+    return @tc
+
+# === SCOPE MANAGEMENT ===
+
+fn tc_push_scope(@tc: TypeChecker)
+    if @tc.scope_depth < MAX_SCOPES - 1
+        @tc.scope_depth = @tc.scope_depth + 1
+        @tc.scopes[@tc.scope_depth] = scope_new()
+
+fn tc_pop_scope(@tc: TypeChecker)
+    if @tc.scope_depth > 0
+        @tc.scope_depth = @tc.scope_depth - 1
+
+fn tc_define(@tc: TypeChecker, @name: str, @type_id: int)
+    @name_idx = region_intern(@tc.region, @name)
+    scope_define(@tc.scopes[@tc.scope_depth], @name_idx, @type_id)
+
+fn tc_lookup(@tc: TypeChecker, @name: str) -> int
+    @name_idx = region_intern(@tc.region, @name)
+    # Search from innermost scope outward
+    @d = @tc.scope_depth
+    orbit _ in 0..@tc.scope_depth + 1
+        if @d < 0
+            break
+        @result = scope_lookup(@tc.scopes[@d], @name_idx)
+        if @result >= 0
+            return @result
+        @d = @d - 1
+    return -1  # Not found
+
+# === FUNCTION REGISTRY ===
+
+fn tc_define_fn(@tc: TypeChecker, @name: str, @params: [int; 16], @param_count: int, @ret: int)
+    if @tc.fn_count >= MAX_FUNCTIONS
+        return
+    @idx = @tc.fn_count
+    @tc.functions[@idx].name_idx = region_intern(@tc.region, @name)
+    orbit @i in 0..@param_count
+        @tc.functions[@idx].param_types[@i] = @params[@i]
+    @tc.functions[@idx].param_count = @param_count
+    @tc.functions[@idx].return_type = @ret
+    @tc.functions[@idx].requires_unsafe = 0
+    @tc.functions[@idx].ffi_safety = FFI_SAFE
+    @tc.fn_count = @idx + 1
+
+fn tc_lookup_fn(@tc: TypeChecker, @name: str) -> int
+    @name_idx = region_intern(@tc.region, @name)
+    orbit @i in 0..@tc.fn_count
+        if @tc.functions[@i].name_idx == @name_idx
+            return @i
+    return -1
+
+# === STRUCT REGISTRY ===
+
+fn tc_define_struct(@tc: TypeChecker, @name: str, @field_names: [str; 32], @field_types: [int; 32], @field_count: int)
+    if @tc.struct_count >= MAX_STRUCTS
+        return
+    @idx = @tc.struct_count
+    @tc.structs[@idx].name_idx = region_intern(@tc.region, @name)
+    orbit @i in 0..@field_count
+        @tc.structs[@idx].field_names[@i] = region_intern(@tc.region, @field_names[@i])
+        @tc.structs[@idx].field_types[@i] = @field_types[@i]
+    @tc.structs[@idx].field_count = @field_count
+    @tc.struct_count = @idx + 1
+
+fn tc_lookup_struct(@tc: TypeChecker, @name: str) -> int
+    @name_idx = region_intern(@tc.region, @name)
+    orbit @i in 0..@tc.struct_count
+        if @tc.structs[@i].name_idx == @name_idx
+            return @i
+    return -1
+
+# === ERROR REPORTING ===
+
+fn tc_error(@tc: TypeChecker, @msg: str, @line: int)
+    if @tc.error_count < MAX_ERRORS
+        @tc.errors[@tc.error_count] = type_error_new(@msg, @line)
+        @tc.error_count = @tc.error_count + 1
+
+fn tc_error_hint(@tc: TypeChecker, @msg: str, @line: int, @hint: str)
+    if @tc.error_count < MAX_ERRORS
+        @tc.errors[@tc.error_count] = type_error_with_hint(@msg, @line, @hint)
+        @tc.error_count = @tc.error_count + 1
+
+fn tc_error_ffi(@tc: TypeChecker, @kind: int, @line: int)
+    if @tc.error_count < MAX_ERRORS
+        @tc.errors[@tc.error_count] = type_error_ffi(@kind, @line)
+        @tc.error_count = @tc.error_count + 1
+
+fn tc_warning(@tc: TypeChecker, @msg: str)
+    if @tc.warning_count < 256
+        @tc.warnings[@tc.warning_count] = @msg
+        @tc.warning_count = @tc.warning_count + 1
+
+# =============================================================================
+# BUILT-IN FUNCTION REGISTRATION
+# =============================================================================
+
+fn tc_register_builtins(@tc: TypeChecker)
+    @r = @tc.region
+
+    # === I/O ===
+    @any_t = type_any(@r)
+    @int_t = type_int(@r)
+    @float_t = type_float(@r)
+    @str_t = type_str(@r)
+    @bool_t = type_bool(@r)
+    @none_t = type_none(@r)
+    @void_t = type_void(@r)
+    @list_any = type_list(@r, @any_t)
+
+    # I/O functions
+    @p1: [int; 16] = [0; 16]
+    @p1[0] = @any_t
+    tc_define_fn(@tc, "print", @p1, 1, @none_t)
+    tc_define_fn(@tc, "println", @p1, 1, @none_t)
+    tc_define_fn(@tc, "shine", @p1, 1, @none_t)
+
+    @p0: [int; 16] = [0; 16]
+    @p0[0] = @str_t
+    tc_define_fn(@tc, "input", @p0, 1, @str_t)
+
+    # Type conversion
+    tc_define_fn(@tc, "str", @p1, 1, @str_t)
+    tc_define_fn(@tc, "int", @p1, 1, @int_t)
+    tc_define_fn(@tc, "float", @p1, 1, @float_t)
+    tc_define_fn(@tc, "bool", @p1, 1, @bool_t)
+    tc_define_fn(@tc, "type", @p1, 1, @str_t)
+    tc_define_fn(@tc, "typeof", @p1, 1, @str_t)
+
+    # Math
+    @pn: [int; 16] = [0; 16]
+    @pn[0] = @float_t
+    tc_define_fn(@tc, "abs", @pn, 1, @float_t)
+    tc_define_fn(@tc, "round", @pn, 1, @int_t)
+    tc_define_fn(@tc, "floor", @pn, 1, @int_t)
+    tc_define_fn(@tc, "ceil", @pn, 1, @int_t)
+    tc_define_fn(@tc, "sqrt", @pn, 1, @float_t)
+    tc_define_fn(@tc, "sin", @pn, 1, @float_t)
+    tc_define_fn(@tc, "cos", @pn, 1, @float_t)
+
+    @p2n: [int; 16] = [0; 16]
+    @p2n[0] = @float_t
+    @p2n[1] = @float_t
+    tc_define_fn(@tc, "pow", @p2n, 2, @float_t)
+    tc_define_fn(@tc, "min", @p2n, 2, @float_t)
+    tc_define_fn(@tc, "max", @p2n, 2, @float_t)
+
+    # Random
+    tc_define_fn(@tc, "random", @p0, 0, @float_t)
+
+    # String operations
+    @ps: [int; 16] = [0; 16]
+    @ps[0] = @str_t
+    tc_define_fn(@tc, "upper", @ps, 1, @str_t)
+    tc_define_fn(@tc, "lower", @ps, 1, @str_t)
+    tc_define_fn(@tc, "trim", @ps, 1, @str_t)
+    tc_define_fn(@tc, "len", @p1, 1, @int_t)
+
+    @ps2: [int; 16] = [0; 16]
+    @ps2[0] = @str_t
+    @ps2[1] = @str_t
+    tc_define_fn(@tc, "split", @ps2, 2, type_list(@r, @str_t))
+    tc_define_fn(@tc, "contains", @ps2, 2, @bool_t)
+    tc_define_fn(@tc, "starts_with", @ps2, 2, @bool_t)
+    tc_define_fn(@tc, "ends_with", @ps2, 2, @bool_t)
+
+    @ps3: [int; 16] = [0; 16]
+    @ps3[0] = @str_t
+    @ps3[1] = @str_t
+    @ps3[2] = @str_t
+    tc_define_fn(@tc, "replace", @ps3, 3, @str_t)
+
+    # List operations
+    tc_define_fn(@tc, "push", @p1, 1, @none_t)
+    tc_define_fn(@tc, "pop", @p1, 1, @any_t)
+    tc_define_fn(@tc, "reverse", @p1, 1, @list_any)
+    tc_define_fn(@tc, "sort", @p1, 1, @list_any)
+
+    # Higher-order
+    @phof: [int; 16] = [0; 16]
+    @phof[0] = @list_any
+    @phof[1] = @any_t  # fn
+    tc_define_fn(@tc, "map", @phof, 2, @list_any)
+    tc_define_fn(@tc, "filter", @phof, 2, @list_any)
+    tc_define_fn(@tc, "reduce", @phof, 2, @any_t)
+
+    # File I/O
+    tc_define_fn(@tc, "read_file", @ps, 1, @str_t)
+    @pfs: [int; 16] = [0; 16]
+    @pfs[0] = @str_t
+    @pfs[1] = @str_t
+    tc_define_fn(@tc, "write_file", @pfs, 2, @none_t)
+    tc_define_fn(@tc, "file_exists", @ps, 1, @bool_t)
+
+    # Utility
+    tc_define_fn(@tc, "exit", @p1, 1, @void_t)
+    tc_define_fn(@tc, "sleep", @pn, 1, @none_t)
+    @pe: [int; 16] = [0; 16]
+    tc_define_fn(@tc, "time", @pe, 0, @float_t)
+
+    @passert: [int; 16] = [0; 16]
+    @passert[0] = @bool_t
+    tc_define_fn(@tc, "assert", @passert, 1, @none_t)
+
+    # JSON
+    tc_define_fn(@tc, "json_parse", @ps, 1, @any_t)
+    tc_define_fn(@tc, "json_stringify", @p1, 1, @str_t)
+
+    # Memory
+    @pmem: [int; 16] = [0; 16]
+    @pmem[0] = @int_t
+    tc_define_fn(@tc, "mem_alloc", @pmem, 1, @any_t)
+    tc_define_fn(@tc, "mem_free", @p1, 1, @none_t)
+    tc_define_fn(@tc, "mem_size", @p1, 1, @int_t)
+
+    @pmcopy: [int; 16] = [0; 16]
+    @pmcopy[0] = @any_t
+    @pmcopy[1] = @any_t
+    @pmcopy[2] = @int_t
+    tc_define_fn(@tc, "mem_copy", @pmcopy, 3, @none_t)
+
+    # Atomic
+    @patom: [int; 16] = [0; 16]
+    @patom[0] = @any_t
+    @patom[1] = @int_t
+    tc_define_fn(@tc, "atomic_add", @patom, 2, @int_t)
+    tc_define_fn(@tc, "atomic_sub", @patom, 2, @int_t)
+    tc_define_fn(@tc, "atomic_swap", @patom, 2, @int_t)
+
+    @pcas: [int; 16] = [0; 16]
+    @pcas[0] = @any_t
+    @pcas[1] = @int_t
+    @pcas[2] = @int_t
+    tc_define_fn(@tc, "atomic_cas", @pcas, 3, @bool_t)
+
+    # RC
+    tc_define_fn(@tc, "rc_clone", @p1, 1, @any_t)
+    tc_define_fn(@tc, "rc_count", @p1, 1, @int_t)
+    tc_define_fn(@tc, "drop", @p1, 1, @none_t)
+
+    # Format
+    @pfmt: [int; 16] = [0; 16]
+    @pfmt[0] = @str_t
+    @pfmt[1] = @any_t
+    tc_define_fn(@tc, "format", @pfmt, 2, @str_t)
+
+    # Range
+    @prng: [int; 16] = [0; 16]
+    @prng[0] = @int_t
+    @prng[1] = @int_t
+    tc_define_fn(@tc, "range", @prng, 2, type_list(@r, @int_t))
+
+# =============================================================================
+# TWO-PASS TYPE CHECKING
+# =============================================================================
+
+# === PASS 1: Collect all top-level definitions ===
+fn tc_collect_definitions(@tc: TypeChecker, @p: Parser)
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        match @node.kind
+            AST_FUNCTION =>
+                tc_collect_function(@tc, @p, @i)
+            AST_STRUCT =>
+                tc_collect_struct(@tc, @p, @i)
+            _ =>
+                pass
+
+fn tc_collect_function(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    # Extract function name from token
+    @name_tok = @p.tokens[@node.token_start + 1]  # Token after 'fn'
+    @name = ""
+    # Read name from source (simplified - uses token data)
+    if @name_tok.kind == TOKEN_IDENT
+        # Name is stored as substring of source
+        @name_idx = region_intern(@tc.region, @name)
+    # Register with inferred types for now
+    @params: [int; 16] = [0; 16]
+    @ret = type_any(@tc.region)
+    tc_define_fn(@tc, @name, @params, 0, @ret)
+
+fn tc_collect_struct(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @name = ""
+    @field_names: [str; 32] = [""; 32]
+    @field_types: [int; 32] = [0; 32]
+    tc_define_struct(@tc, @name, @field_names, @field_types, 0)
+
+# === PASS 2: Type check all statements ===
+
+fn tc_check_program(@tc: TypeChecker, @p: Parser) -> int
+    # Pass 1: collect definitions
+    tc_collect_definitions(@tc, @p)
+
+    # Pass 2: check everything
+    tc_push_scope(@tc)
+    orbit @i in 0..@p.node_count
+        @node = @p.nodes[@i]
+        # Only check top-level nodes (not children of other nodes)
+        if @node.kind >= AST_LET and @node.kind <= AST_EXPR_STMT
+            tc_check_stmt(@tc, @p, @i)
+        elif @node.kind == AST_FUNCTION
+            tc_check_function(@tc, @p, @i)
+        elif @node.kind == AST_IF
+            tc_check_if(@tc, @p, @i)
+        elif @node.kind == AST_WHILE
+            tc_check_while(@tc, @p, @i)
+        elif @node.kind == AST_ORBIT
+            tc_check_orbit(@tc, @p, @i)
+        elif @node.kind == AST_MATCH
+            tc_check_match(@tc, @p, @i)
+        elif @node.kind == AST_UNSAFE
+            tc_check_unsafe(@tc, @p, @i)
+        # === Extended statement dispatchers (v0.6+) ===
+        elif @node.kind == AST_UNLESS
+            tc_check_unless(@tc, @p, @i)
+        elif @node.kind == AST_GUARD
+            tc_check_guard(@tc, @p, @i)
+        elif @node.kind == AST_ECLIPSE
+            tc_check_eclipse(@tc, @p, @i)
+        elif @node.kind == AST_SEAL_STRUCT
+            tc_check_seal_struct(@tc, @p, @i)
+        elif @node.kind == AST_ACTOR
+            tc_check_actor(@tc, @p, @i)
+        elif @node.kind == AST_FLOW
+            tc_check_flow(@tc, @p, @i)
+        elif @node.kind == AST_SPAWN
+            tc_check_spawn(@tc, @p, @i)
+        elif @node.kind == AST_SEND
+            tc_check_send(@tc, @p, @i)
+        elif @node.kind == AST_REQUIRE
+            tc_check_require(@tc, @p, @i)
+        elif @node.kind == AST_ENSURE
+            tc_check_ensure(@tc, @p, @i)
+        elif @node.kind == AST_EXTERN_FN
+            tc_check_extern_fn(@tc, @p, @i)
+        elif @node.kind == AST_DEFER
+            tc_check_defer(@tc, @p, @i)
+        elif @node.kind == AST_ATOMIC
+            tc_check_atomic(@tc, @p, @i)
+        elif @node.kind == AST_DROP
+            tc_check_drop(@tc, @p, @i)
+        elif @node.kind == AST_ASM
+            tc_check_asm(@tc, @p, @i)
+        elif @node.kind == AST_VOLATILE_READ
+            tc_check_volatile_read(@tc, @p, @i)
+        elif @node.kind == AST_VOLATILE_WRITE
+            tc_check_volatile_write(@tc, @p, @i)
+        elif @node.kind == AST_GLOBAL_ALLOC
+            tc_check_global_alloc(@tc, @p, @i)
+    tc_pop_scope(@tc)
+
+    return @tc.error_count
+
+# === STATEMENT TYPE CHECKING ===
+
+fn tc_check_stmt(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @tc.current_line = @node.token_start
+
+    match @node.kind
+        AST_LET =>
+            tc_check_let(@tc, @p, @node_idx)
+        AST_CONST =>
+            tc_check_const(@tc, @p, @node_idx)
+        AST_ASSIGN =>
+            tc_check_assign(@tc, @p, @node_idx)
+        AST_RETURN =>
+            tc_check_return(@tc, @p, @node_idx)
+        AST_EXPR_STMT =>
+            tc_infer_expr(@tc, @p, @node.child1)
+        # === Control flow ===
+        AST_IF =>
+            tc_check_if(@tc, @p, @node_idx)
+        AST_WHILE =>
+            tc_check_while(@tc, @p, @node_idx)
+        AST_ORBIT =>
+            tc_check_orbit(@tc, @p, @node_idx)
+        AST_MATCH =>
+            tc_check_match(@tc, @p, @node_idx)
+        AST_UNSAFE =>
+            tc_check_unsafe(@tc, @p, @node_idx)
+        # === Extended statements (v0.6+) ===
+        AST_UNLESS =>
+            tc_check_unless(@tc, @p, @node_idx)
+        AST_GUARD =>
+            tc_check_guard(@tc, @p, @node_idx)
+        AST_ECLIPSE =>
+            tc_check_eclipse(@tc, @p, @node_idx)
+        AST_SEAL_STRUCT =>
+            tc_check_seal_struct(@tc, @p, @node_idx)
+        AST_ACTOR =>
+            tc_check_actor(@tc, @p, @node_idx)
+        AST_FLOW =>
+            tc_check_flow(@tc, @p, @node_idx)
+        AST_SPAWN =>
+            tc_check_spawn(@tc, @p, @node_idx)
+        AST_SEND =>
+            tc_check_send(@tc, @p, @node_idx)
+        AST_REQUIRE =>
+            tc_check_require(@tc, @p, @node_idx)
+        AST_ENSURE =>
+            tc_check_ensure(@tc, @p, @node_idx)
+        AST_EXTERN_FN =>
+            tc_check_extern_fn(@tc, @p, @node_idx)
+        AST_DEFER =>
+            tc_check_defer(@tc, @p, @node_idx)
+        AST_ATOMIC =>
+            tc_check_atomic(@tc, @p, @node_idx)
+        AST_DROP =>
+            tc_check_drop(@tc, @p, @node_idx)
+        AST_ASM =>
+            tc_check_asm(@tc, @p, @node_idx)
+        AST_VOLATILE_READ =>
+            tc_check_volatile_read(@tc, @p, @node_idx)
+        AST_VOLATILE_WRITE =>
+            tc_check_volatile_write(@tc, @p, @node_idx)
+        AST_GLOBAL_ALLOC =>
+            tc_check_global_alloc(@tc, @p, @node_idx)
+        _ =>
+            pass
+
+fn tc_check_let(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Infer value type
+    @value_type = -1
+    if @node.child2 >= 0  # has initializer
+        @value_type = tc_infer_expr(@tc, @p, @node.child2)
+
+    # Check type annotation if present
+    if @node.child1 >= 0  # has type annotation
+        @ann_type = tc_resolve_type_ann(@tc, @p, @node.child1)
+        if @value_type >= 0 and @ann_type >= 0
+            if types_compatible(@tc.region, @ann_type, @value_type) == 0
+                tc_error(@tc, "type mismatch in let binding", @line)
+        @value_type = @ann_type
+
+    if @value_type < 0
+        @value_type = type_any(@tc.region)
+
+    # Bind variable in current scope
+    # Get variable name from AST
+    @name = tc_get_node_name(@tc, @p, @node_idx)
+    tc_define(@tc, @name, @value_type)
+
+fn tc_check_const(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    @value_type = -1
+    if @node.child2 >= 0
+        @value_type = tc_infer_expr(@tc, @p, @node.child2)
+    if @value_type < 0
+        @value_type = type_any(@tc.region)
+
+    @name = tc_get_node_name(@tc, @p, @node_idx)
+    tc_define(@tc, @name, @value_type)
+
+fn tc_check_assign(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Infer target type
+    @target_type = tc_infer_expr(@tc, @p, @node.child1)
+    # Infer value type
+    @value_type = tc_infer_expr(@tc, @p, @node.child2)
+
+    if @target_type >= 0 and @value_type >= 0
+        if types_compatible(@tc.region, @target_type, @value_type) == 0
+            tc_error(@tc, "type mismatch in assignment", @line)
+
+fn tc_check_return(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    @ret_type = type_none(@tc.region)
+    if @node.child1 >= 0
+        @ret_type = tc_infer_expr(@tc, @p, @node.child1)
+
+    # Check against expected return type
+    if @tc.current_return_type >= 0 and @ret_type >= 0
+        if types_compatible(@tc.region, @tc.current_return_type, @ret_type) == 0
+            tc_error(@tc, "return type mismatch", @line)
+
+fn tc_check_function(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Save previous return type
+    @prev_ret = @tc.current_return_type
+
+    # Get function info
+    @name = tc_get_node_name(@tc, @p, @node_idx)
+    @fn_idx = tc_lookup_fn(@tc, @name)
+
+    if @fn_idx >= 0
+        @tc.current_return_type = @tc.functions[@fn_idx].return_type
+
+    # New scope for function body
+    tc_push_scope(@tc)
+
+    # Bind parameters
+    if @fn_idx >= 0
+        orbit @i in 0..@tc.functions[@fn_idx].param_count
+            @param_name_idx = @tc.functions[@fn_idx].param_names[@i]
+            @param_type = @tc.functions[@fn_idx].param_types[@i]
+            @param_name = region_get_string(@tc.region, @param_name_idx)
+            tc_define(@tc, @param_name, @param_type)
+
+    # Check body
+    if @node.children_count > 0
+        orbit @i in 0..@node.children_count
+            @child_idx = @p.children[@node.children_start + @i]
+            if @child_idx >= 0
+                tc_check_stmt(@tc, @p, @child_idx)
+
+    tc_pop_scope(@tc)
+    @tc.current_return_type = @prev_ret
+
+fn tc_check_if(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Check condition is bool
+    if @node.child1 >= 0
+        @cond_type = tc_infer_expr(@tc, @p, @node.child1)
+        if @cond_type >= 0
+            @cond_kind = @tc.region.nodes[@cond_type].kind
+            if @cond_kind != TYPE_BOOL and @cond_kind != TYPE_ANY
+                tc_error_hint(@tc, "condition must be bool", @line, "got non-boolean expression")
+
+        # Track null checks in then-branch
+        tc_extract_null_check(@tc, @p, @node.child1)
+
+    # Check then-branch
+    tc_push_scope(@tc)
+    null_push_scope(@tc.null_safety)
+    if @node.child2 >= 0
+        tc_check_block(@tc, @p, @node.child2)
+    null_pop_scope(@tc.null_safety)
+    tc_pop_scope(@tc)
+
+    # Check else-branch
+    if @node.child3 >= 0
+        tc_push_scope(@tc)
+        tc_check_block(@tc, @p, @node.child3)
+        tc_pop_scope(@tc)
+
+fn tc_check_while(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    if @node.child1 >= 0
+        @cond_type = tc_infer_expr(@tc, @p, @node.child1)
+        if @cond_type >= 0
+            @cond_kind = @tc.region.nodes[@cond_type].kind
+            if @cond_kind != TYPE_BOOL and @cond_kind != TYPE_ANY
+                tc_error(@tc, "while condition must be bool", @line)
+
+    tc_push_scope(@tc)
+    if @node.child2 >= 0
+        tc_check_block(@tc, @p, @node.child2)
+    tc_pop_scope(@tc)
+
+fn tc_check_orbit(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    tc_push_scope(@tc)
+
+    # Infer iterator type
+    if @node.child1 >= 0
+        @iter_type = tc_infer_expr(@tc, @p, @node.child1)
+        # Bind loop variable to element type
+        @elem_type = type_any(@tc.region)
+        if @iter_type >= 0
+            @iter_kind = @tc.region.nodes[@iter_type].kind
+            if @iter_kind == TYPE_LIST
+                @elem_type = @tc.region.nodes[@iter_type].child1
+        @var_name = tc_get_node_name(@tc, @p, @node_idx)
+        tc_define(@tc, @var_name, @elem_type)
+
+    # Check body
+    if @node.child2 >= 0
+        tc_check_block(@tc, @p, @node.child2)
+    tc_pop_scope(@tc)
+
+fn tc_check_match(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Infer scrutinee type
+    @scrut_type = -1
+    if @node.child1 >= 0
+        @scrut_type = tc_infer_expr(@tc, @p, @node.child1)
+
+    # Check each arm
+    orbit @i in 0..@node.children_count
+        @arm_idx = @p.children[@node.children_start + @i]
+        if @arm_idx >= 0
+            tc_push_scope(@tc)
+            # Check pattern against scrutinee type
+            tc_check_pattern(@tc, @p, @arm_idx, @scrut_type)
+            # Check arm body
+            @arm_node = @p.nodes[@arm_idx]
+            if @arm_node.child2 >= 0
+                tc_check_block(@tc, @p, @arm_node.child2)
+            tc_pop_scope(@tc)
+
+fn tc_check_unsafe(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+
+    unsafe_enter(@tc.unsafe_ctx)
+    if @node.child1 >= 0
+        tc_check_block(@tc, @p, @node.child1)
+    unsafe_exit(@tc.unsafe_ctx)
+
+# =============================================================================
+# EXTENDED STATEMENT HANDLERS (v0.6+)
+# =============================================================================
+
+# Unless - inverted if. Condition must be bool.
+fn tc_check_unless(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Check condition is bool
+    if @node.child1 >= 0
+        @cond_type = tc_infer_expr(@tc, @p, @node.child1)
+        if @cond_type >= 0
+            @cond_kind = @tc.region.nodes[@cond_type].kind
+            if @cond_kind != TYPE_BOOL and @cond_kind != TYPE_ANY
+                tc_error_hint(@tc, "unless condition must be bool", @line, "got non-boolean expression")
+
+    # Check body
+    tc_push_scope(@tc)
+    if @node.child2 >= 0
+        tc_check_block(@tc, @p, @node.child2)
+    tc_pop_scope(@tc)
+
+    # Check optional else body
+    if @node.child3 >= 0
+        tc_push_scope(@tc)
+        tc_check_block(@tc, @p, @node.child3)
+        tc_pop_scope(@tc)
+
+# Guard - guard condition else stmt. Condition must be bool.
+fn tc_check_guard(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Check condition is bool
+    if @node.child1 >= 0
+        @cond_type = tc_infer_expr(@tc, @p, @node.child1)
+        if @cond_type >= 0
+            @cond_kind = @tc.region.nodes[@cond_type].kind
+            if @cond_kind != TYPE_BOOL and @cond_kind != TYPE_ANY
+                tc_error(@tc, "guard condition must be bool", @line)
+
+    # Check else statement
+    if @node.child2 >= 0
+        tc_check_stmt(@tc, @p, @node.child2)
+
+# Eclipse - try/catch. Check body, then catch_body with catch_var as Str.
+fn tc_check_eclipse(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+
+    # Check try body
+    tc_push_scope(@tc)
+    if @node.child1 >= 0
+        tc_check_block(@tc, @p, @node.child1)
+    tc_pop_scope(@tc)
+
+    # Check catch body - define catch variable as Str type
+    tc_push_scope(@tc)
+    # catch_var name is stored in data1 as token index or child3
+    @catch_var_name = tc_get_node_name(@tc, @p, @node_idx)
+    tc_define(@tc, @catch_var_name, type_str(@tc.region))
+    if @node.child2 >= 0
+        tc_check_block(@tc, @p, @node.child2)
+    tc_pop_scope(@tc)
+
+# SealStruct - register sealed struct type with fields.
+fn tc_check_seal_struct(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+
+    # Extract struct name and register as custom type
+    @name = tc_get_node_name(@tc, @p, @node_idx)
+    @field_names: [str; 32] = [""; 32]
+    @field_types: [int; 32] = [0; 32]
+    @field_count = 0
+
+    # Process field children
+    orbit @i in 0..@node.children_count
+        @child_idx = @p.children[@node.children_start + @i]
+        if @child_idx >= 0
+            @child = @p.nodes[@child_idx]
+            @field_names[@field_count] = tc_get_node_name(@tc, @p, @child_idx)
+            # Resolve field type annotation or default to Any
+            if @child.child1 >= 0
+                @field_types[@field_count] = tc_resolve_type_ann(@tc, @p, @child.child1)
+            else
+                @field_types[@field_count] = type_any(@tc.region)
+            @field_count = @field_count + 1
+            if @field_count >= 32
+                break
+
+    tc_define_struct(@tc, @name, @field_names, @field_types, @field_count)
+
+# Actor - register actor type, push scope, add state params, check handlers.
+fn tc_check_actor(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+
+    # Push scope for actor body
+    tc_push_scope(@tc)
+
+    # Add state parameters (stored as initial children)
+    # State params use child1 as the state block
+    if @node.child1 >= 0
+        @state_block = @p.nodes[@node.child1]
+        orbit @i in 0..@state_block.children_count
+            @param_idx = @p.children[@state_block.children_start + @i]
+            if @param_idx >= 0
+                @param_name = tc_get_node_name(@tc, @p, @param_idx)
+                @param_node = @p.nodes[@param_idx]
+                @param_type = type_any(@tc.region)
+                if @param_node.child1 >= 0
+                    @param_type = tc_resolve_type_ann(@tc, @p, @param_node.child1)
+                tc_define(@tc, @param_name, @param_type)
+
+    # Check handler bodies (stored as remaining children)
+    if @node.child2 >= 0
+        @handlers_block = @p.nodes[@node.child2]
+        orbit @i in 0..@handlers_block.children_count
+            @handler_idx = @p.children[@handlers_block.children_start + @i]
+            if @handler_idx >= 0
+                tc_push_scope(@tc)
+                @handler = @p.nodes[@handler_idx]
+                # Bind handler params
+                orbit @j in 0..@handler.children_count
+                    @hp_idx = @p.children[@handler.children_start + @j]
+                    if @hp_idx >= 0
+                        @hp_name = tc_get_node_name(@tc, @p, @hp_idx)
+                        tc_define(@tc, @hp_name, type_any(@tc.region))
+                # Check handler body
+                if @handler.child2 >= 0
+                    tc_check_block(@tc, @p, @handler.child2)
+                tc_pop_scope(@tc)
+
+    tc_pop_scope(@tc)
+
+    # Register actor constructor as Custom type
+    @actor_name = tc_get_node_name(@tc, @p, @node_idx)
+    tc_define(@tc, @actor_name, type_custom(@tc.region, @actor_name))
+
+# Flow - check dependency names exist, check body, verify provides.
+fn tc_check_flow(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+    @name = tc_get_node_name(@tc, @p, @node_idx)
+
+    # Check that dependency names (needs) exist - stored in child1 block
+    if @node.child1 >= 0
+        @needs_block = @p.nodes[@node.child1]
+        orbit @i in 0..@needs_block.children_count
+            @dep_idx = @p.children[@needs_block.children_start + @i]
+            if @dep_idx >= 0
+                @dep_name = tc_get_node_name(@tc, @p, @dep_idx)
+                @dep_type = tc_lookup(@tc, @dep_name)
+                @dep_struct = tc_lookup_struct(@tc, @dep_name)
+                if @dep_type < 0 and @dep_struct < 0
+                    tc_warning(@tc, "flow dependency not found: " + @dep_name)
+
+    # Check body
+    tc_push_scope(@tc)
+    if @node.child2 >= 0
+        tc_check_block(@tc, @p, @node.child2)
+
+    # Verify provides are defined in body scope - stored in child3 block
+    if @node.child3 >= 0
+        @provides_block = @p.nodes[@node.child3]
+        orbit @i in 0..@provides_block.children_count
+            @prov_idx = @p.children[@provides_block.children_start + @i]
+            if @prov_idx >= 0
+                @prov_name = tc_get_node_name(@tc, @p, @prov_idx)
+                @prov_type = tc_lookup(@tc, @prov_name)
+                if @prov_type < 0
+                    tc_warning(@tc, "flow provides not defined in body: " + @prov_name)
+
+    tc_pop_scope(@tc)
+
+# Spawn - check actor exists, check args, define target as ActorRef.
+fn tc_check_spawn(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Check that actor exists (actor_name stored via child1 or name)
+    @actor_name = tc_get_node_name(@tc, @p, @node_idx)
+    @actor_type = tc_lookup(@tc, @actor_name)
+    if @actor_type < 0
+        tc_error(@tc, "actor not defined: " + @actor_name, @line)
+
+    # Check arguments
+    orbit @i in 0..@node.children_count
+        @arg_idx = @p.children[@node.children_start + @i]
+        if @arg_idx >= 0
+            tc_infer_expr(@tc, @p, @arg_idx)
+
+    # Define target variable as ActorRef type (uses child2 for target name)
+    if @node.child2 >= 0
+        @target_name = tc_get_node_name(@tc, @p, @node.child2)
+        @ref_type = type_custom(@tc.region, "ActorRef")
+        tc_define(@tc, @target_name, @ref_type)
+
+# Send - check target is ActorRef/Custom, check args.
+fn tc_check_send(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Check target type
+    if @node.child1 >= 0
+        @target_type = tc_infer_expr(@tc, @p, @node.child1)
+        if @target_type >= 0
+            @target_kind = @tc.region.nodes[@target_type].kind
+            if @target_kind != TYPE_CUSTOM and @target_kind != TYPE_ANY
+                tc_error(@tc, "send requires actor reference", @line)
+
+    # Check arguments
+    orbit @i in 0..@node.children_count
+        @arg_idx = @p.children[@node.children_start + @i]
+        if @arg_idx >= 0
+            tc_infer_expr(@tc, @p, @arg_idx)
+
+# Require - precondition check. Condition must be bool.
+fn tc_check_require(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    if @node.child1 >= 0
+        @cond_type = tc_infer_expr(@tc, @p, @node.child1)
+        if @cond_type >= 0
+            @cond_kind = @tc.region.nodes[@cond_type].kind
+            if @cond_kind != TYPE_BOOL and @cond_kind != TYPE_ANY
+                tc_error(@tc, "require condition must be bool", @line)
+
+# Ensure - postcondition check. Condition must be bool.
+fn tc_check_ensure(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    if @node.child1 >= 0
+        @cond_type = tc_infer_expr(@tc, @p, @node.child1)
+        if @cond_type >= 0
+            @cond_kind = @tc.region.nodes[@cond_type].kind
+            if @cond_kind != TYPE_BOOL and @cond_kind != TYPE_ANY
+                tc_error(@tc, "ensure condition must be bool", @line)
+
+# ExternFn - validate ABI, register extern function type, mark unsafe.
+fn tc_check_extern_fn(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+    @r = @tc.region
+
+    @name = tc_get_node_name(@tc, @p, @node_idx)
+
+    # Validate ABI (stored in data1 or as child attribute)
+    # ABI must be one of: "C", "stdcall", "fastcall", "system"
+    # data1 encodes the ABI kind; 0 = unknown/invalid
+    @abi = @node.data1
+    if @abi == 0
+        tc_error_ffi(@tc, FFI_ERR_INVALID_ABI, @line)
+
+    # Collect parameter types from children
+    @params: [int; 16] = [0; 16]
+    @param_count = 0
+    orbit @i in 0..@node.children_count
+        @param_idx = @p.children[@node.children_start + @i]
+        if @param_idx >= 0
+            @param_node = @p.nodes[@param_idx]
+            @param_type = type_any(@r)
+            if @param_node.child1 >= 0
+                @param_type = tc_resolve_type_ann(@tc, @p, @param_node.child1)
+            @params[@param_count] = @param_type
+            @param_count = @param_count + 1
+            if @param_count >= 16
+                break
+
+    # Resolve return type (stored in child2)
+    @ret_type = type_none(@r)
+    if @node.child2 >= 0
+        @ret_type = tc_resolve_type_ann(@tc, @p, @node.child2)
+
+    # Register function with unsafe requirement
+    tc_define_fn(@tc, @name, @params, @param_count, @ret_type)
+
+    # Mark as requiring unsafe for calls
+    @fn_idx = tc_lookup_fn(@tc, @name)
+    if @fn_idx >= 0
+        @tc.functions[@fn_idx].requires_unsafe = 1
+        @tc.functions[@fn_idx].ffi_safety = FFI_UNSAFE
+
+    # Register in unsafe context for call-site validation
+    @name_idx = region_intern(@r, @name)
+    unsafe_register_extern(@tc.unsafe_ctx, @name_idx, FFI_UNSAFE)
+
+    # Define in scope as function type
+    @fn_type_node = type_fn(@r, @params, @param_count, @ret_type)
+    tc_define(@tc, @name, @fn_type_node)
+
+# Defer - check expression type.
+fn tc_check_defer(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+
+    # Simply type-check the deferred expression
+    if @node.child1 >= 0
+        tc_infer_expr(@tc, @p, @node.child1)
+
+# Atomic - define variable with type annotation or inferred type.
+fn tc_check_atomic(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Infer value type
+    @val_type = type_any(@tc.region)
+    if @node.child2 >= 0
+        @val_type = tc_infer_expr(@tc, @p, @node.child2)
+
+    # Check type annotation if present
+    if @node.child1 >= 0
+        @ann_type = tc_resolve_type_ann(@tc, @p, @node.child1)
+        if @ann_type >= 0
+            @val_type = @ann_type
+
+    # Bind atomic variable
+    @name = tc_get_node_name(@tc, @p, @node_idx)
+    tc_define(@tc, @name, @val_type)
+
+# Drop - check expression type.
+fn tc_check_drop(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+
+    # Type-check the dropped expression
+    if @node.child1 >= 0
+        tc_infer_expr(@tc, @p, @node.child1)
+
+# Asm - require unsafe context.
+fn tc_check_asm(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Inline assembly requires unsafe context
+    if unsafe_is_active(@tc.unsafe_ctx) == 0
+        tc_error_hint(@tc, "inline assembly requires unsafe block", @line, "wrap in: unsafe { asm { ... } }")
+
+# VolatileRead - require unsafe context, check pointer type.
+fn tc_check_volatile_read(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Volatile read requires unsafe context
+    if unsafe_is_active(@tc.unsafe_ctx) == 0
+        tc_error_hint(@tc, "volatile_read requires unsafe block", @line, "wrap in: unsafe { volatile_read(ptr) }")
+
+    # Check pointer type
+    if @node.child1 >= 0
+        @ptr_type = tc_infer_expr(@tc, @p, @node.child1)
+        if @ptr_type >= 0
+            @ptr_kind = @tc.region.nodes[@ptr_type].kind
+            if @ptr_kind != TYPE_PTR and @ptr_kind != TYPE_RAW_PTR and @ptr_kind != TYPE_INT and @ptr_kind != TYPE_ANY
+                tc_error(@tc, "volatile_read expects pointer type", @line)
+
+# VolatileWrite - require unsafe context, check pointer type and value.
+fn tc_check_volatile_write(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+
+    # Volatile write requires unsafe context
+    if unsafe_is_active(@tc.unsafe_ctx) == 0
+        tc_error_hint(@tc, "volatile_write requires unsafe block", @line, "wrap in: unsafe { volatile_write(ptr, val) }")
+
+    # Check pointer type
+    if @node.child1 >= 0
+        @ptr_type = tc_infer_expr(@tc, @p, @node.child1)
+        if @ptr_type >= 0
+            @ptr_kind = @tc.region.nodes[@ptr_type].kind
+            if @ptr_kind != TYPE_PTR and @ptr_kind != TYPE_RAW_PTR and @ptr_kind != TYPE_INT and @ptr_kind != TYPE_ANY
+                tc_error(@tc, "volatile_write expects pointer type", @line)
+
+    # Check value type
+    if @node.child2 >= 0
+        tc_infer_expr(@tc, @p, @node.child2)
+
+# GlobalAllocator - verify alloc/dealloc function signatures.
+fn tc_check_global_alloc(@tc: TypeChecker, @p: Parser, @node_idx: int)
+    @node = @p.nodes[@node_idx]
+    @line = @p.tokens[@node.token_start].line
+    @r = @tc.region
+
+    @name = tc_get_node_name(@tc, @p, @node_idx)
+
+    # Verify alloc function (child1 references alloc fn name)
+    if @node.child1 >= 0
+        @alloc_name = tc_get_node_name(@tc, @p, @node.child1)
+        @alloc_fn_idx = tc_lookup_fn(@tc, @alloc_name)
+        if @alloc_fn_idx >= 0
+            # alloc must take 2 params (size, align)
+            if @tc.functions[@alloc_fn_idx].param_count != 2
+                tc_error(@tc, "allocator alloc function must take 2 parameters (size, align)", @line)
+            # alloc must return pointer type
+            @alloc_ret = @tc.functions[@alloc_fn_idx].return_type
+            if @alloc_ret >= 0
+                @ret_kind = @r.nodes[@alloc_ret].kind
+                if @ret_kind != TYPE_PTR and @ret_kind != TYPE_RAW_PTR and @ret_kind != TYPE_INT
+                    tc_error(@tc, "allocator alloc function must return pointer type", @line)
+
+    # Verify dealloc function (child2 references dealloc fn name)
+    if @node.child2 >= 0
+        @dealloc_name = tc_get_node_name(@tc, @p, @node.child2)
+        @dealloc_fn_idx = tc_lookup_fn(@tc, @dealloc_name)
+        if @dealloc_fn_idx >= 0
+            # dealloc must take 3 params (ptr, size, align)
+            if @tc.functions[@dealloc_fn_idx].param_count != 3
+                tc_error(@tc, "allocator dealloc function must take 3 parameters (ptr, size, align)", @line)
+
+    # Register the global allocator as Custom type
+    tc_define(@tc, @name, type_custom(@r, "GlobalAllocator"))
+
+fn tc_check_block(@tc: TypeChecker, @p: Parser, @block_idx: int)
+    @block = @p.nodes[@block_idx]
+    orbit @i in 0..@block.children_count
+        @child_idx = @p.children[@block.children_start + @i]
+        if @child_idx >= 0
+            tc_check_stmt(@tc, @p, @child_idx)
+
+# =============================================================================
+# EXPRESSION TYPE INFERENCE
+# =============================================================================
+
+fn tc_infer_expr(@tc: TypeChecker, @p: Parser, @expr_idx: int) -> int
+    if @expr_idx < 0
+        return type_any(@tc.region)
+
+    @node = @p.nodes[@expr_idx]
+    @r = @tc.region
+
+    match @node.kind
+        AST_LITERAL =>
+            match @node.data1
+                LIT_INT => return type_int(@r)
+                LIT_FLOAT => return type_float(@r)
+                LIT_STRING => return type_str(@r)
+                LIT_BOOL => return type_bool(@r)
+                LIT_NIL => return type_none(@r)
+                _ => return type_any(@r)
+
+        AST_IDENT =>
+            @name = tc_get_node_name(@tc, @p, @expr_idx)
+            @t = tc_lookup(@tc, @name)
+            if @t < 0
+                # Check if it's a function
+                @fn_idx = tc_lookup_fn(@tc, @name)
+                if @fn_idx >= 0
+                    return @tc.functions[@fn_idx].return_type
+                tc_error(@tc, "undefined variable", @p.tokens[@node.token_start].line)
+                return type_any(@r)
+            return @t
+
+        AST_BINARY =>
+            @left_type = tc_infer_expr(@tc, @p, @node.child1)
+            @right_type = tc_infer_expr(@tc, @p, @node.child2)
+            return tc_infer_binop(@tc, @node.data1, @left_type, @right_type, @p.tokens[@node.token_start].line)
+
+        AST_UNARY =>
+            @operand_type = tc_infer_expr(@tc, @p, @node.child1)
+            return tc_infer_unaryop(@tc, @node.data1, @operand_type, @p.tokens[@node.token_start].line)
+
+        AST_CALL =>
+            return tc_infer_call(@tc, @p, @expr_idx)
+
+        AST_INDEX =>
+            @target = tc_infer_expr(@tc, @p, @node.child1)
+            @idx_type = tc_infer_expr(@tc, @p, @node.child2)
+            if @target >= 0
+                @target_kind = @r.nodes[@target].kind
+                if @target_kind == TYPE_LIST
+                    return @r.nodes[@target].child1
+                elif @target_kind == TYPE_DICT
+                    return @r.nodes[@target].child2
+                elif @target_kind == TYPE_STR
+                    return type_str(@r)
+            return type_any(@r)
+
+        AST_FIELD =>
+            @obj_type = tc_infer_expr(@tc, @p, @node.child1)
+            if @obj_type >= 0
+                @obj_kind = @r.nodes[@obj_type].kind
+                if @obj_kind == TYPE_CUSTOM
+                    @struct_name = region_get_string(@r, @r.nodes[@obj_type].name_idx)
+                    @si = tc_lookup_struct(@tc, @struct_name)
+                    if @si >= 0
+                        @field_name = tc_get_node_name(@tc, @p, @expr_idx)
+                        @field_name_idx = region_intern(@r, @field_name)
+                        orbit @i in 0..@tc.structs[@si].field_count
+                            if @tc.structs[@si].field_names[@i] == @field_name_idx
+                                return @tc.structs[@si].field_types[@i]
+            return type_any(@r)
+
+        AST_ARRAY =>
+            if @node.children_count == 0
+                return type_list(@r, vargen_fresh_type(@tc.vargen, @r))
+            @first_type = -1
+            orbit @i in 0..@node.children_count
+                @child = @p.children[@node.children_start + @i]
+                @elem_type = tc_infer_expr(@tc, @p, @child)
+                if @first_type < 0
+                    @first_type = @elem_type
+                elif @elem_type >= 0 and @first_type >= 0
+                    # Unify all elements
+                    @ur = unify(@r, @tc.subst, @first_type, @elem_type)
+                    if @ur.code != UNIFY_OK
+                        tc_warning(@tc, "heterogeneous array elements")
+            if @first_type < 0
+                @first_type = type_any(@r)
+            return type_list(@r, @first_type)
+
+        AST_LAMBDA =>
+            # Fresh type variables for params
+            @params: [int; 32] = [0; 32]
+            @param_count = @node.data1  # number of params
+            orbit @i in 0..@param_count
+                @params[@i] = vargen_fresh_type(@tc.vargen, @r)
+            @ret = vargen_fresh_type(@tc.vargen, @r)
+            return type_fn(@r, @params, @param_count, @ret)
+
+        AST_RANGE =>
+            return type_list(@r, type_int(@r))
+
+        # === Extended Expression Handlers (v0.6+) ===
+
+        AST_DICT =>
+            # Infer key and value types from pairs
+            if @node.children_count == 0
+                return type_dict(@r, type_any(@r), type_any(@r))
+            @first_key_type = -1
+            @first_val_type = -1
+            # Children are pairs: even indices = keys, odd indices = values
+            orbit @i in 0..@node.children_count
+                @child = @p.children[@node.children_start + @i]
+                if @child >= 0
+                    @child_node = @p.nodes[@child]
+                    # Each pair has child1=key, child2=value
+                    if @child_node.child1 >= 0
+                        @kt = tc_infer_expr(@tc, @p, @child_node.child1)
+                        if @first_key_type < 0
+                            @first_key_type = @kt
+                    if @child_node.child2 >= 0
+                        @vt = tc_infer_expr(@tc, @p, @child_node.child2)
+                        if @first_val_type < 0
+                            @first_val_type = @vt
+            if @first_key_type < 0
+                @first_key_type = type_any(@r)
+            if @first_val_type < 0
+                @first_val_type = type_any(@r)
+            return type_dict(@r, @first_key_type, @first_val_type)
+
+        AST_PIPE =>
+            # Pipe operator: left ~> right. Infer both, return right's type.
+            if @node.child1 >= 0
+                tc_infer_expr(@tc, @p, @node.child1)
+            @pipe_result = type_any(@r)
+            if @node.child2 >= 0
+                @pipe_result = tc_infer_expr(@tc, @p, @node.child2)
+            return @pipe_result
+
+        AST_NULL_COALESCE =>
+            # Null coalesce: left ?? right. Unwrap nullable, check default matches.
+            @nc_left = type_any(@r)
+            @nc_right = type_any(@r)
+            if @node.child1 >= 0
+                @nc_left = tc_infer_expr(@tc, @p, @node.child1)
+            if @node.child2 >= 0
+                @nc_right = tc_infer_expr(@tc, @p, @node.child2)
+            @line = @p.tokens[@node.token_start].line
+            if @nc_left >= 0
+                @nc_left_kind = @r.nodes[@nc_left].kind
+                if @nc_left_kind == TYPE_NULLABLE
+                    # Unwrap nullable: T? → T
+                    @inner_type = @r.nodes[@nc_left].child1
+                    if @inner_type >= 0 and @nc_right >= 0
+                        if types_compatible(@r, @inner_type, @nc_right) == 0
+                            tc_warning(@tc, "null coalesce default type doesn't match nullable inner type")
+                    if @inner_type >= 0
+                        return @inner_type
+                    return type_any(@r)
+                else
+                    # Non-nullable on left - ?? is valid but pointless
+                    tc_warning(@tc, "using ?? on non-nullable type - value is never none")
+                    return @nc_left
+            return @nc_right
+
+        AST_MOVE =>
+            # Move transfers ownership - type is preserved
+            if @node.child1 >= 0
+                return tc_infer_expr(@tc, @p, @node.child1)
+            return type_any(@r)
+
+        AST_FREEZE =>
+            # Freeze makes value immutable - type is preserved
+            if @node.child1 >= 0
+                return tc_infer_expr(@tc, @p, @node.child1)
+            return type_any(@r)
+
+        AST_BOX_ALLOC =>
+            # Box allocates on heap - returns Ptr(inner_type)
+            @box_inner = type_any(@r)
+            if @node.child1 >= 0
+                @box_inner = tc_infer_expr(@tc, @p, @node.child1)
+            @box_ptr = region_alloc_node(@r, TYPE_PTR)
+            if @box_ptr >= 0
+                @r.nodes[@box_ptr].child1 = @box_inner
+            return @box_ptr
+
+        AST_RC_ALLOC =>
+            # Rc provides shared ownership - returns Ptr(inner_type)
+            @rc_inner = type_any(@r)
+            if @node.child1 >= 0
+                @rc_inner = tc_infer_expr(@tc, @p, @node.child1)
+            @rc_ptr = region_alloc_node(@r, TYPE_PTR)
+            if @rc_ptr >= 0
+                @r.nodes[@rc_ptr].child1 = @rc_inner
+            return @rc_ptr
+
+        AST_WEAK_REF =>
+            # Weak reference - returns Nullable(inner_type)
+            @weak_inner = type_any(@r)
+            if @node.child1 >= 0
+                @weak_inner = tc_infer_expr(@tc, @p, @node.child1)
+            return type_nullable(@r, @weak_inner)
+
+        AST_RAW_PTR =>
+            # Raw pointer creation - requires unsafe context, returns RawPtr
+            @line = @p.tokens[@node.token_start].line
+            @raw_inner = type_any(@r)
+            if @node.child1 >= 0
+                @raw_inner = tc_infer_expr(@tc, @p, @node.child1)
+            if unsafe_is_active(@tc.unsafe_ctx) == 0
+                tc_error_hint(@tc, "creating raw pointers is unsafe", @line, "wrap in: unsafe { raw expr }")
+            return type_raw_ptr(@r, @raw_inner, 0, "")
+
+        _ =>
+            return type_any(@r)
+
+# === Binary Operation Type Inference ===
+
+fn tc_infer_binop(@tc: TypeChecker, @op: int, @left: int, @right: int, @line: int) -> int
+    @r = @tc.region
+
+    if @left < 0 or @right < 0
+        return type_any(@r)
+
+    @lk = @r.nodes[@left].kind
+    @rk = @r.nodes[@right].kind
+
+    # Comparison operators always return bool
+    if @op == OP_EQ or @op == OP_NE or @op == OP_LT or @op == OP_LE or @op == OP_GT or @op == OP_GE
+        return type_bool(@r)
+
+    # Logical operators
+    if @op == OP_LOGICAL_AND or @op == OP_LOGICAL_OR
+        if @lk != TYPE_BOOL and @lk != TYPE_ANY
+            tc_error(@tc, "logical operator requires bool operands", @line)
+        return type_bool(@r)
+
+    # Arithmetic operators
+    if @op == OP_ADD or @op == OP_SUB or @op == OP_MUL or @op == OP_DIV or @op == OP_MOD
+        # String concatenation
+        if @op == OP_ADD and @lk == TYPE_STR and @rk == TYPE_STR
+            return type_str(@r)
+
+        # Numeric
+        if (@lk == TYPE_INT or @lk == TYPE_FLOAT) and (@rk == TYPE_INT or @rk == TYPE_FLOAT)
+            if @lk == TYPE_FLOAT or @rk == TYPE_FLOAT
+                return type_float(@r)
+            return type_int(@r)
+
+        if @lk == TYPE_ANY or @rk == TYPE_ANY
+            return type_any(@r)
+
+        tc_error(@tc, "invalid operands for arithmetic", @line)
+        return type_any(@r)
+
+    # Bitwise operators
+    if @op == OP_AND or @op == OP_OR or @op == OP_XOR or @op == OP_SHL or @op == OP_SHR
+        if @lk == TYPE_INT and @rk == TYPE_INT
+            return type_int(@r)
+        if @lk == TYPE_ANY or @rk == TYPE_ANY
+            return type_any(@r)
+        tc_error(@tc, "bitwise operators require int operands", @line)
+        return type_int(@r)
+
+    return type_any(@r)
+
+# === Unary Operation Type Inference ===
+
+fn tc_infer_unaryop(@tc: TypeChecker, @op: int, @operand: int, @line: int) -> int
+    @r = @tc.region
+
+    if @operand < 0
+        return type_any(@r)
+
+    @ok = @r.nodes[@operand].kind
+
+    match @op
+        UNOP_NEG =>
+            if @ok == TYPE_INT
+                return type_int(@r)
+            elif @ok == TYPE_FLOAT
+                return type_float(@r)
+            tc_error(@tc, "negation requires numeric operand", @line)
+            return type_any(@r)
+
+        UNOP_NOT =>
+            if @ok == TYPE_BOOL or @ok == TYPE_ANY
+                return type_bool(@r)
+            tc_error(@tc, "logical not requires bool operand", @line)
+            return type_bool(@r)
+
+        UNOP_BITNOT =>
+            if @ok == TYPE_INT
+                return type_int(@r)
+            tc_error(@tc, "bitwise not requires int operand", @line)
+            return type_int(@r)
+
+        UNOP_DEREF =>
+            # Dereferencing requires unsafe context
+            if unsafe_is_active(@tc.unsafe_ctx) == 0
+                tc_error_ffi(@tc, FFI_ERR_UNSAFE_DEREF, @line)
+            if @ok == TYPE_RAW_PTR or @ok == TYPE_PTR
+                return @r.nodes[@operand].child1
+            return type_any(@r)
+
+        UNOP_REF =>
+            return type_raw_ptr(@r, @operand, 0, "")
+
+        _ =>
+            return type_any(@r)
+
+# === Call Type Inference ===
+
+fn tc_infer_call(@tc: TypeChecker, @p: Parser, @call_idx: int) -> int
+    @node = @p.nodes[@call_idx]
+    @r = @tc.region
+    @line = @p.tokens[@node.token_start].line
+
+    @fn_name = tc_get_node_name(@tc, @p, @call_idx)
+    @fn_idx = tc_lookup_fn(@tc, @fn_name)
+
+    if @fn_idx < 0
+        # Check if it's a variable holding a function
+        @var_type = tc_lookup(@tc, @fn_name)
+        if @var_type >= 0
+            @var_kind = @r.nodes[@var_type].kind
+            if @var_kind == TYPE_FN
+                return @r.nodes[@var_type].child1  # return type
+        # Unknown function - allow with warning
+        tc_warning(@tc, "unknown function call")
+        return type_any(@r)
+
+    @fi = @tc.functions[@fn_idx]
+
+    # Check FFI safety
+    if @fi.requires_unsafe != 0
+        if unsafe_is_active(@tc.unsafe_ctx) == 0
+            tc_error_ffi(@tc, FFI_ERR_UNSAFE_CALL, @line)
+
+    # Check argument count
+    @arg_count = @node.children_count
+    if @arg_count != @fi.param_count
+        # Allow if param_count is 0 and fn uses varargs or built-in
+        if @fi.param_count > 0
+            tc_error(@tc, "wrong number of arguments", @line)
+
+    # Check argument types
+    @check_count = @arg_count
+    if @check_count > @fi.param_count
+        @check_count = @fi.param_count
+    orbit @i in 0..@check_count
+        @arg_idx = @p.children[@node.children_start + @i]
+        @arg_type = tc_infer_expr(@tc, @p, @arg_idx)
+        @param_type = @fi.param_types[@i]
+        if @arg_type >= 0 and @param_type >= 0
+            if types_compatible(@r, @param_type, @arg_type) == 0
+                tc_error(@tc, "argument type mismatch", @line)
+
+    return @fi.return_type
+
+# =============================================================================
+# PATTERN CHECKING
+# =============================================================================
+
+fn tc_check_pattern(@tc: TypeChecker, @p: Parser, @pattern_idx: int, @expected: int)
+    if @pattern_idx < 0
+        return
+    @node = @p.nodes[@pattern_idx]
+    @r = @tc.region
+
+    match @node.kind
+        AST_LITERAL =>
+            # Literal pattern - check type matches
+            @lit_type = tc_infer_expr(@tc, @p, @pattern_idx)
+            if @expected >= 0 and @lit_type >= 0
+                if types_compatible(@r, @expected, @lit_type) == 0
+                    tc_error(@tc, "pattern type mismatch", @p.tokens[@node.token_start].line)
+
+        AST_IDENT =>
+            # Variable binding - bind to expected type
+            @name = tc_get_node_name(@tc, @p, @pattern_idx)
+            if @expected >= 0
+                tc_define(@tc, @name, @expected)
+            else
+                tc_define(@tc, @name, type_any(@r))
+
+        _ =>
+            pass  # Wildcard, etc.
+
+# =============================================================================
+# NULL SAFETY HELPERS
+# =============================================================================
+
+fn tc_extract_null_check(@tc: TypeChecker, @p: Parser, @cond_idx: int)
+    if @cond_idx < 0
+        return
+    @node = @p.nodes[@cond_idx]
+    # Check for pattern: @x != none or @x != nil
+    if @node.kind == AST_BINARY
+        if @node.data1 == OP_NE
+            # Check if one side is nil
+            if @node.child2 >= 0
+                @rhs = @p.nodes[@node.child2]
+                if @rhs.kind == AST_LITERAL and @rhs.data1 == LIT_NIL
+                    # Left side is the null-checked variable
+                    if @node.child1 >= 0
+                        @lhs = @p.nodes[@node.child1]
+                        if @lhs.kind == AST_IDENT
+                            @name = tc_get_node_name(@tc, @p, @node.child1)
+                            @name_idx = region_intern(@tc.region, @name)
+                            null_mark_checked(@tc.null_safety, @name_idx)
+
+# =============================================================================
+# UTILITY HELPERS
+# =============================================================================
+
+# Get name string from AST node (reads from token)
+fn tc_get_node_name(@tc: TypeChecker, @p: Parser, @node_idx: int) -> str
+    if @node_idx < 0
+        return ""
+    @node = @p.nodes[@node_idx]
+    @tok = @p.tokens[@node.token_start]
+    # Name is a substring of source
+    # In bootstrap context, we use token start/length to extract
+    # For now, return a placeholder - actual implementation depends on
+    # source string being available
+    return ""
+
+# Resolve a type annotation AST node to a region type ID
+fn tc_resolve_type_ann(@tc: TypeChecker, @p: Parser, @ann_idx: int) -> int
+    if @ann_idx < 0
+        return -1
+    @node = @p.nodes[@ann_idx]
+    @r = @tc.region
+
+    # Type annotations are stored as AST_IDENT with type name
+    @name = tc_get_node_name(@tc, @p, @ann_idx)
+
+    if @name == "int"
+        return type_int(@r)
+    elif @name == "float"
+        return type_float(@r)
+    elif @name == "str"
+        return type_str(@r)
+    elif @name == "bool"
+        return type_bool(@r)
+    elif @name == "none"
+        return type_none(@r)
+    elif @name == "void"
+        return type_void(@r)
+    else
+        # Check for user-defined struct
+        @si = tc_lookup_struct(@tc, @name)
+        if @si >= 0
+            return type_custom(@r, @name)
+        # Unknown type
+        return type_any(@r)
+
+# =============================================================================
+# TYPE DISPLAY (for error messages)
+# =============================================================================
+
+fn type_to_string(@region: TypeRegion, @type_id: int) -> str
+    if @type_id < 0
+        return "unknown"
+
+    @node = @region.nodes[@type_id]
+
+    match @node.kind
+        TYPE_INT => return "int"
+        TYPE_FLOAT => return "float"
+        TYPE_STR => return "str"
+        TYPE_BOOL => return "bool"
+        TYPE_NONE => return "none"
+        TYPE_VOID => return "void"
+        TYPE_ANY => return "any"
+        TYPE_CHAR => return "char"
+
+        TYPE_LIST =>
+            @inner = type_to_string(@region, @node.child1)
+            return "[" + @inner + "]"
+
+        TYPE_DICT =>
+            @k = type_to_string(@region, @node.child1)
+            @v = type_to_string(@region, @node.child2)
+            return "{" + @k + ": " + @v + "}"
+
+        TYPE_NULLABLE =>
+            @inner = type_to_string(@region, @node.child1)
+            return @inner + "?"
+
+        TYPE_FN =>
+            @result = "fn("
+            orbit @i in 0..@node.children_count
+                if @i > 0
+                    @result = @result + ", "
+                @p = @region.children[@node.children_start + @i]
+                @result = @result + type_to_string(@region, @p)
+            @result = @result + ") -> "
+            @result = @result + type_to_string(@region, @node.child1)
+            return @result
+
+        TYPE_GENERIC =>
+            return region_get_string(@region, @node.name_idx)
+
+        TYPE_APPLIED =>
+            @name = region_get_string(@region, @node.name_idx)
+            @result = @name + "["
+            orbit @i in 0..@node.children_count
+                if @i > 0
+                    @result = @result + ", "
+                @arg = @region.children[@node.children_start + @i]
+                @result = @result + type_to_string(@region, @arg)
+            return @result + "]"
+
+        TYPE_CUSTOM =>
+            return region_get_string(@region, @node.name_idx)
+
+        TYPE_VAR =>
+            return "t" + str(@node.data1)
+
+        TYPE_MEOW =>
+            @inner = type_to_string(@region, @node.child1)
+            return "Meow[" + @inner + "]"
+
+        TYPE_RAW_PTR =>
+            @inner = type_to_string(@region, @node.child1)
+            if @node.data1 == 1
+                return "*mut " + @inner
+            return "*" + @inner
+
+        TYPE_NULLABLE_PTR =>
+            @inner = type_to_string(@region, @node.child1)
+            return "?*" + @inner
+
+        TYPE_OPAQUE =>
+            return "Handle[" + region_get_string(@region, @node.name_idx) + "]"
+
+        _ => return "?"
+
+# =============================================================================
+# GENERALIZATION & INSTANTIATION (Polymorphism)
+# =============================================================================
+# For Hindley-Milner let-polymorphism
+
+const MAX_SCHEME_VARS: int = 16
+
+struct Scheme
+    var_ids: [int; 16]      # Quantified type variable IDs
+    var_count: int
+    type_id: int            # The polymorphic type
+
+fn scheme_mono(@type_id: int) -> Scheme
+    return Scheme { var_ids: [0; 16], var_count: 0, type_id: @type_id }
+
+# Collect free type variables in a type
+fn collect_free_vars(@region: TypeRegion, @type_id: int, @vars: [int; 64], @count: int) -> int
+    if @type_id < 0
+        return @count
+    @node = @region.nodes[@type_id]
+
+    match @node.kind
+        TYPE_VAR =>
+            # Check if already collected
+            orbit @i in 0..@count
+                if @vars[@i] == @node.data1
+                    return @count
+            if @count < 64
+                @vars[@count] = @node.data1
+                return @count + 1
+            return @count
+
+        TYPE_LIST =>
+            return collect_free_vars(@region, @node.child1, @vars, @count)
+
+        TYPE_DICT =>
+            @c = collect_free_vars(@region, @node.child1, @vars, @count)
+            return collect_free_vars(@region, @node.child2, @vars, @c)
+
+        TYPE_FN =>
+            @c = collect_free_vars(@region, @node.child1, @vars, @count)
+            orbit @i in 0..@node.children_count
+                @child = @region.children[@node.children_start + @i]
+                @c = collect_free_vars(@region, @child, @vars, @c)
+            return @c
+
+        TYPE_NULLABLE =>
+            return collect_free_vars(@region, @node.child1, @vars, @count)
+
+        TYPE_APPLIED =>
+            @c = @count
+            orbit @i in 0..@node.children_count
+                @child = @region.children[@node.children_start + @i]
+                @c = collect_free_vars(@region, @child, @vars, @c)
+            return @c
+
+        TYPE_TUPLE =>
+            @c = @count
+            orbit @i in 0..@node.children_count
+                @child = @region.children[@node.children_start + @i]
+                @c = collect_free_vars(@region, @child, @vars, @c)
+            return @c
+
+        TYPE_MEOW =>
+            return collect_free_vars(@region, @node.child1, @vars, @count)
+
+        _ =>
+            return @count
+
+# Generalize: find free vars not in environment, quantify them
+fn generalize(@region: TypeRegion, @type_id: int, @env_vars: [int; 64], @env_var_count: int) -> Scheme
+    @free: [int; 64] = [0; 64]
+    @free_count = collect_free_vars(@region, @type_id, @free, 0)
+
+    @scheme = Scheme { var_ids: [0; 16], var_count: 0, type_id: @type_id }
+
+    # Only quantify vars NOT in the environment
+    orbit @i in 0..@free_count
+        @in_env = 0
+        orbit @j in 0..@env_var_count
+            if @free[@i] == @env_vars[@j]
+                @in_env = 1
+                break
+        if @in_env == 0 and @scheme.var_count < MAX_SCHEME_VARS
+            @scheme.var_ids[@scheme.var_count] = @free[@i]
+            @scheme.var_count = @scheme.var_count + 1
+
+    return @scheme
+
+# Instantiate: replace quantified vars with fresh type variables
+fn instantiate(@scheme: Scheme, @region: TypeRegion, @gen: TypeVarGen) -> int
+    if @scheme.var_count == 0
+        return @scheme.type_id
+
+    @subst = subst_new()
+    orbit @i in 0..@scheme.var_count
+        @fresh = vargen_fresh_type(@gen, @region)
+        subst_insert(@subst, @scheme.var_ids[@i], @fresh)
+
+    return subst_apply(@subst, @region, @scheme.type_id)
+
+# =============================================================================
+# MONOMORPHIZATION ENGINE — v4.0
+# =============================================================================
+# Full monomorphization: specializes generic functions for each concrete type
+# combination. Ported from llvm_codegen.rs GenericFn / monomorphize_and_call.
+#
+# Flow:
+#   1. Parser encounters fn foo[T](...) → calls mono_register_generic()
+#   2. Call site foo[int](...) → calls mono_resolve() → substitution + mangling
+#   3. Concrete function identity_i64 is cached in MonoInstance table
+#
+# Zero-cost abstractions: each specialization gets its own type node tree,
+# enabling backend to generate optimal machine code per concrete type.
+# =============================================================================
+
+# --- Monomorphization capacity constants ---
+const MAX_GENERIC_FNS: int = 256
+const MAX_MONO_INSTANCES: int = 1024
+const MAX_TYPE_MAP_SIZE: int = 8
+const MAX_MONO_DEPTH: int = 32
+
+# --- Trait bound constants ---
+const BOUND_NONE: int = 0
+const BOUND_NUMERIC: int = 1       # int, float
+const BOUND_CLONE: int = 2         # all types (in Luna, everything is cloneable)
+const BOUND_DISPLAY: int = 3       # types with string representation
+const BOUND_HASH: int = 4          # hashable types (excludes float due to NaN)
+const BOUND_EQ: int = 5            # types with equality (excludes float NaN)
+const BOUND_ORD: int = 6           # types with ordering
+const BOUND_COPY: int = 7          # types with copy semantics (int, float, bool)
+const BOUND_SEND: int = 8          # types safe to send across threads
+const BOUND_SYNC: int = 9          # types safe to share across threads
+
+# --- Generic function template ---
+# Stored when parser encounters a generic function definition.
+# Body is not compiled until monomorphization resolves concrete types.
+struct GenericFnTemplate
+    name_idx: int                   # Interned function name
+    type_param_names: [int; 8]      # Interned type parameter names (T, U, V...)
+    type_param_count: int
+    param_type_ids: [int; 16]       # Type IDs of formal parameters
+    param_count: int
+    return_type_id: int             # Return type node ID
+    body_node_idx: int              # AST body reference index
+    bounds: [int; 64]               # Bounds array: param_idx * 8 + bound_slot → BOUND_*
+    bound_counts: [int; 8]          # Number of bounds per type param
+    is_active: int                  # 1 if this slot is used
+
+# --- Monomorphized instance cache entry ---
+# Each unique (generic_fn, concrete_type_args) combination gets one entry.
+struct MonoInstance
+    generic_fn_idx: int             # Index into generic function table
+    mangled_name_idx: int           # Interned mangled name (e.g. "identity_i64")
+    concrete_types: [int; 8]        # Concrete type node IDs for each type param
+    type_count: int                 # Number of concrete types
+    result_fn_type: int             # Resulting concrete function type node ID
+    is_active: int                  # 1 if this slot is used
+
+# --- Monomorphization registry ---
+# Central registry for all generic function templates and their instances.
+struct MonoRegistry
+    generic_fns: [GenericFnTemplate; 256]
+    generic_fn_count: int
+    instances: [MonoInstance; 1024]
+    instance_count: int
+
+# Create a new monomorphization registry
+fn mono_registry_new() -> MonoRegistry
+    @reg = MonoRegistry {
+        generic_fns: [GenericFnTemplate {
+            name_idx: -1, type_param_names: [0; 8], type_param_count: 0,
+            param_type_ids: [0; 16], param_count: 0, return_type_id: -1,
+            body_node_idx: -1, bounds: [0; 64], bound_counts: [0; 8], is_active: 0
+        }; 256],
+        generic_fn_count: 0,
+        instances: [MonoInstance {
+            generic_fn_idx: -1, mangled_name_idx: -1,
+            concrete_types: [0; 8], type_count: 0,
+            result_fn_type: -1, is_active: 0
+        }; 1024],
+        instance_count: 0
+    }
+    return @reg
+
+# Register a generic function template.
+# Called by the type checker when it encounters fn foo[T, U](...)
+# Returns: index of registered template, or -1 on overflow
+fn mono_register_generic(@reg: MonoRegistry, @region: TypeRegion,
+                         @name: str, @type_params: [str; 8], @tp_count: int,
+                         @param_types: [int; 16], @param_count: int,
+                         @return_type: int, @body_idx: int) -> int
+    if @reg.generic_fn_count >= MAX_GENERIC_FNS
+        return -1
+    @idx = @reg.generic_fn_count
+    @reg.generic_fns[@idx].name_idx = region_intern(@region, @name)
+    @reg.generic_fns[@idx].type_param_count = @tp_count
+    orbit @i in 0..@tp_count
+        @reg.generic_fns[@idx].type_param_names[@i] = region_intern(@region, @type_params[@i])
+    @reg.generic_fns[@idx].param_count = @param_count
+    orbit @i in 0..@param_count
+        @reg.generic_fns[@idx].param_type_ids[@i] = @param_types[@i]
+    @reg.generic_fns[@idx].return_type_id = @return_type
+    @reg.generic_fns[@idx].body_node_idx = @body_idx
+    @reg.generic_fns[@idx].is_active = 1
+    orbit @i in 0..8
+        @reg.generic_fns[@idx].bound_counts[@i] = 0
+    @reg.generic_fn_count = @reg.generic_fn_count + 1
+    return @idx
+
+# Add a trait bound to a type parameter of a generic function.
+# @gf_idx: generic function index
+# @tp_idx: type parameter index (0-based)
+# @bound: BOUND_* constant
+fn mono_add_bound(@reg: MonoRegistry, @gf_idx: int, @tp_idx: int, @bound: int)
+    if @gf_idx < 0 or @gf_idx >= @reg.generic_fn_count
+        return
+    if @tp_idx < 0 or @tp_idx >= @reg.generic_fns[@gf_idx].type_param_count
+        return
+    @slot = @reg.generic_fns[@gf_idx].bound_counts[@tp_idx]
+    if @slot >= 8
+        return
+    @reg.generic_fns[@gf_idx].bounds[@tp_idx * 8 + @slot] = @bound
+    @reg.generic_fns[@gf_idx].bound_counts[@tp_idx] = @slot + 1
+
+# --- Type substitution ---
+# Recursively replace TYPE_GENERIC nodes with concrete types.
+# This is the core of monomorphization: given a type tree containing
+# generic variables (T, U), replace each occurrence with its concrete type.
+#
+# @region: type region for allocating new nodes
+# @type_id: root type node to substitute in
+# @param_names: interned names of type parameters [T_idx, U_idx, ...]
+# @concrete: concrete type node IDs to substitute
+# @count: number of type parameters
+# Returns: new type node ID with all generics replaced
+fn mono_substitute(@region: TypeRegion, @type_id: int, @param_names: [int; 8],
+                   @concrete: [int; 8], @count: int, @depth: int) -> int
+    # Depth protection against infinite recursion on cyclic/deeply-nested generics
+    if @depth > 128
+        return @type_id
+    if @type_id < 0 or @type_id >= @region.node_count
+        return @type_id
+    @node = @region.nodes[@type_id]
+    phase @node.kind
+        TYPE_GENERIC =>
+            # Look up this generic's name in the parameter map
+            orbit @i in 0..@count
+                if @node.name_idx == @param_names[@i]
+                    return @concrete[@i]
+            # Not found in map — return unchanged (free variable)
+            return @type_id
+
+        TYPE_LIST =>
+            # Recurse into element type
+            @new_child = mono_substitute(@region, @node.child1, @param_names, @concrete, @count, @depth + 1)
+            if @new_child == @node.child1
+                return @type_id
+            @result = region_alloc_node(@region, TYPE_LIST)
+            if @result >= 0
+                @region.nodes[@result].child1 = @new_child
+            return @result
+
+        TYPE_DICT =>
+            # Recurse into key and value types
+            @new_key = mono_substitute(@region, @node.child1, @param_names, @concrete, @count, @depth + 1)
+            @new_val = mono_substitute(@region, @node.child2, @param_names, @concrete, @count, @depth + 1)
+            if @new_key == @node.child1 and @new_val == @node.child2
+                return @type_id
+            @result = region_alloc_node(@region, TYPE_DICT)
+            if @result >= 0
+                @region.nodes[@result].child1 = @new_key
+                @region.nodes[@result].child2 = @new_val
+            return @result
+
+        TYPE_FN =>
+            # Recurse into parameter types and return type
+            @changed = 0
+            @new_children: [int; 32] = [0; 32]
+            @child_count = @node.children_count
+            orbit @i in 0..@child_count
+                @old = @region.children[@node.children_start + @i]
+                @new_c = mono_substitute(@region, @old, @param_names, @concrete, @count, @depth + 1)
+                @new_children[@i] = @new_c
+                if @new_c != @old
+                    @changed = 1
+            @new_ret = mono_substitute(@region, @node.child1, @param_names, @concrete, @count, @depth + 1)
+            if @new_ret != @node.child1
+                @changed = 1
+            if @changed == 0
+                return @type_id
+            @result = region_alloc_node(@region, TYPE_FN)
+            if @result >= 0
+                @start = region_add_children(@region, @new_children, @child_count)
+                @region.nodes[@result].children_start = @start
+                @region.nodes[@result].children_count = @child_count
+                @region.nodes[@result].child1 = @new_ret
+            return @result
+
+        TYPE_APPLIED =>
+            # Recurse into all type arguments
+            @changed = 0
+            @new_args: [int; 32] = [0; 32]
+            @arg_count = @node.children_count
+            orbit @i in 0..@arg_count
+                @old = @region.children[@node.children_start + @i]
+                @new_a = mono_substitute(@region, @old, @param_names, @concrete, @count, @depth + 1)
+                @new_args[@i] = @new_a
+                if @new_a != @old
+                    @changed = 1
+            if @changed == 0
+                return @type_id
+            @result = region_alloc_node(@region, TYPE_APPLIED)
+            if @result >= 0
+                @region.nodes[@result].name_idx = @node.name_idx
+                @start = region_add_children(@region, @new_args, @arg_count)
+                @region.nodes[@result].children_start = @start
+                @region.nodes[@result].children_count = @arg_count
+            return @result
+
+        TYPE_NULLABLE =>
+            @new_inner = mono_substitute(@region, @node.child1, @param_names, @concrete, @count, @depth + 1)
+            if @new_inner == @node.child1
+                return @type_id
+            @result = region_alloc_node(@region, TYPE_NULLABLE)
+            if @result >= 0
+                @region.nodes[@result].child1 = @new_inner
+            return @result
+
+        TYPE_TUPLE =>
+            @changed = 0
+            @new_elems: [int; 32] = [0; 32]
+            @elem_count = @node.children_count
+            orbit @i in 0..@elem_count
+                @old = @region.children[@node.children_start + @i]
+                @new_e = mono_substitute(@region, @old, @param_names, @concrete, @count, @depth + 1)
+                @new_elems[@i] = @new_e
+                if @new_e != @old
+                    @changed = 1
+            if @changed == 0
+                return @type_id
+            @result = region_alloc_node(@region, TYPE_TUPLE)
+            if @result >= 0
+                @start = region_add_children(@region, @new_elems, @elem_count)
+                @region.nodes[@result].children_start = @start
+                @region.nodes[@result].children_count = @elem_count
+            return @result
+
+        _ =>
+            # Primitive types (int, float, str, bool, etc.) — no substitution needed
+            return @type_id
+
+# --- Name mangling ---
+# Build a mangled name from a generic function name and concrete type arguments.
+# Example: identity + [int] → "identity_i64"
+#          swap + [int, str] → "swap_i64_str"
+fn mono_type_suffix(@region: TypeRegion, @type_id: int) -> str
+    if @type_id < 0 or @type_id >= @region.node_count
+        return "unknown"
+    @node = @region.nodes[@type_id]
+    phase @node.kind
+        TYPE_INT => return "i64"
+        TYPE_FLOAT => return "f64"
+        TYPE_STR => return "str"
+        TYPE_BOOL => return "bool"
+        TYPE_CHAR => return "char"
+        TYPE_NONE => return "none"
+        TYPE_VOID => return "void"
+        TYPE_ANY => return "any"
+        TYPE_LIST =>
+            return "list_" + mono_type_suffix(@region, @node.child1)
+        TYPE_DICT =>
+            return "dict_" + mono_type_suffix(@region, @node.child1) + "_" + mono_type_suffix(@region, @node.child2)
+        TYPE_NULLABLE =>
+            return "opt_" + mono_type_suffix(@region, @node.child1)
+        TYPE_APPLIED =>
+            @base = ""
+            if @node.name_idx >= 0 and @node.name_idx < @region.string_count
+                @base = @region.strings[@node.name_idx]
+            @result = @base
+            orbit @i in 0..@node.children_count
+                @child = @region.children[@node.children_start + @i]
+                @result = @result + "_" + mono_type_suffix(@region, @child)
+            return @result
+        TYPE_FN =>
+            @result = "fn"
+            orbit @i in 0..@node.children_count
+                @child = @region.children[@node.children_start + @i]
+                @result = @result + "_" + mono_type_suffix(@region, @child)
+            @result = @result + "_to_" + mono_type_suffix(@region, @node.child1)
+            return @result
+        TYPE_TUPLE =>
+            @result = "tuple"
+            orbit @i in 0..@node.children_count
+                @child = @region.children[@node.children_start + @i]
+                @result = @result + "_" + mono_type_suffix(@region, @child)
+            return @result
+        TYPE_CUSTOM =>
+            if @node.name_idx >= 0 and @node.name_idx < @region.string_count
+                return @region.strings[@node.name_idx]
+            return "custom"
+        _ =>
+            return "t" + str(@type_id)
+
+fn mono_mangle_name(@region: TypeRegion, @base_name: str,
+                    @concrete: [int; 8], @count: int) -> str
+    @mangled = @base_name
+    orbit @i in 0..@count
+        @mangled = @mangled + "_" + mono_type_suffix(@region, @concrete[@i])
+    return @mangled
+
+# --- Trait bound checking ---
+# Verify that concrete type arguments satisfy all trait bounds declared
+# on the generic function's type parameters.
+#
+# Returns: 0 on success, error code > 0 on violation
+# Error codes: 1 = Numeric bound violated, 2 = Hash bound violated,
+#              3 = Eq bound violated, 4 = Copy bound violated, 5 = Ord violated
+# Check if a single type satisfies a single bound (recursive for containers)
+fn mono_check_single_bound(@region: TypeRegion, @type_id: int, @bound: int, @depth: int) -> int
+    if @depth > 32
+        return 0  # Assume valid at extreme depth
+    @kind = TYPE_ANY
+    if @type_id >= 0 and @type_id < @region.node_count
+        @kind = @region.nodes[@type_id].kind
+    phase @bound
+        BOUND_NUMERIC =>
+            if @kind != TYPE_INT and @kind != TYPE_FLOAT
+                return 1
+        BOUND_HASH =>
+            if @kind == TYPE_FLOAT
+                return 2
+            # Containers satisfy Hash if their elements do
+            if @kind == TYPE_LIST or @kind == TYPE_NULLABLE
+                @child = @region.nodes[@type_id].child1
+                return mono_check_single_bound(@region, @child, @bound, @depth + 1)
+            if @kind == TYPE_DICT
+                @key = @region.nodes[@type_id].child1
+                @err = mono_check_single_bound(@region, @key, @bound, @depth + 1)
+                if @err > 0
+                    return @err
+                @val = @region.nodes[@type_id].child2
+                return mono_check_single_bound(@region, @val, @bound, @depth + 1)
+        BOUND_EQ =>
+            if @kind == TYPE_FLOAT
+                return 3
+            if @kind == TYPE_LIST or @kind == TYPE_NULLABLE
+                @child = @region.nodes[@type_id].child1
+                return mono_check_single_bound(@region, @child, @bound, @depth + 1)
+        BOUND_COPY =>
+            if @kind != TYPE_INT and @kind != TYPE_FLOAT and @kind != TYPE_BOOL and @kind != TYPE_CHAR and @kind != TYPE_NONE
+                return 4
+        BOUND_ORD =>
+            if @kind == TYPE_FN or @kind == TYPE_OPAQUE
+                return 5
+            if @kind == TYPE_LIST or @kind == TYPE_NULLABLE
+                @child = @region.nodes[@type_id].child1
+                return mono_check_single_bound(@region, @child, @bound, @depth + 1)
+        _ =>
+            @_ = 0  # CLONE, DISPLAY, SEND, SYNC — all types satisfy
+    return 0
+
+fn mono_check_bounds(@reg: MonoRegistry, @region: TypeRegion,
+                     @gf_idx: int, @concrete: [int; 8], @count: int) -> int
+    if @gf_idx < 0 or @gf_idx >= @reg.generic_fn_count
+        return -1
+    @gf = @reg.generic_fns[@gf_idx]
+    orbit @i in 0..@count
+        if @i >= @gf.type_param_count
+            break
+        @num_bounds = @gf.bound_counts[@i]
+        orbit @j in 0..@num_bounds
+            @bound = @gf.bounds[@i * 8 + @j]
+            @type_id = @concrete[@i]
+            @err = mono_check_single_bound(@region, @type_id, @bound, 0)
+            if @err > 0
+                return @err
+    return 0
+
+# --- Cache lookup ---
+# Check if a monomorphized instance already exists for the given
+# generic function and concrete types.
+# Returns: instance index, or -1 if not found
+fn mono_cache_lookup(@reg: MonoRegistry, @gf_idx: int,
+                     @concrete: [int; 8], @count: int) -> int
+    orbit @i in 0..@reg.instance_count
+        if @reg.instances[@i].is_active == 0
+            continue
+        if @reg.instances[@i].generic_fn_idx != @gf_idx
+            continue
+        if @reg.instances[@i].type_count != @count
+            continue
+        @match = 1
+        orbit @j in 0..@count
+            if @reg.instances[@i].concrete_types[@j] != @concrete[@j]
+                @match = 0
+                break
+        if @match == 1
+            return @i
+    return -1
+
+# --- Main monomorphization entry point ---
+# Resolve a generic function call with concrete type arguments.
+# 1. Check cache for existing instance
+# 2. Validate trait bounds
+# 3. Substitute types in parameters and return type
+# 4. Build mangled name
+# 5. Store in cache
+#
+# Returns: concrete function type node ID, or -1 on error
+fn mono_resolve(@reg: MonoRegistry, @region: TypeRegion,
+                @gf_idx: int, @concrete: [int; 8], @count: int) -> int
+    if @gf_idx < 0 or @gf_idx >= @reg.generic_fn_count
+        return -1
+    # Step 1: Cache lookup
+    @cached = mono_cache_lookup(@reg, @gf_idx, @concrete, @count)
+    if @cached >= 0
+        return @reg.instances[@cached].result_fn_type
+
+    # Step 2: Bounds checking
+    @bound_err = mono_check_bounds(@reg, @region, @gf_idx, @concrete, @count)
+    if @bound_err > 0
+        return -1
+
+    # Step 3: Build type parameter name → concrete type map
+    @gf = @reg.generic_fns[@gf_idx]
+    # Validate type parameter count matches
+    if @count != @gf.type_param_count
+        return -1
+    @param_names: [int; 8] = [0; 8]
+    orbit @i in 0..@count
+        @param_names[@i] = @gf.type_param_names[@i]
+
+    # Step 4: Substitute types in each formal parameter
+    @new_params: [int; 16] = [0; 16]
+    orbit @i in 0..@gf.param_count
+        @new_params[@i] = mono_substitute(@region, @gf.param_type_ids[@i],
+                                          @param_names, @concrete, @count, 0)
+
+    # Step 5: Substitute return type
+    @new_ret = mono_substitute(@region, @gf.return_type_id,
+                               @param_names, @concrete, @count, 0)
+
+    # Step 6: Build concrete function type node
+    @fn_type = region_alloc_node(@region, TYPE_FN)
+    if @fn_type < 0
+        return -1  # Allocation failed — do not cache invalid result
+    @start = region_add_children(@region, @new_params, @gf.param_count)
+    @region.nodes[@fn_type].children_start = @start
+    @region.nodes[@fn_type].children_count = @gf.param_count
+    @region.nodes[@fn_type].child1 = @new_ret
+
+    # Step 7: Build mangled name
+    @base_name = ""
+    if @gf.name_idx >= 0 and @gf.name_idx < @region.string_count
+        @base_name = @region.strings[@gf.name_idx]
+    @mangled = mono_mangle_name(@region, @base_name, @concrete, @count)
+
+    # Step 8: Store in cache
+    if @reg.instance_count < MAX_MONO_INSTANCES
+        @inst_idx = @reg.instance_count
+        @reg.instances[@inst_idx].generic_fn_idx = @gf_idx
+        @reg.instances[@inst_idx].mangled_name_idx = region_intern(@region, @mangled)
+        orbit @i in 0..@count
+            @reg.instances[@inst_idx].concrete_types[@i] = @concrete[@i]
+        @reg.instances[@inst_idx].type_count = @count
+        @reg.instances[@inst_idx].result_fn_type = @fn_type
+        @reg.instances[@inst_idx].is_active = 1
+        @reg.instance_count = @reg.instance_count + 1
+
+    return @fn_type
+
+# Get mangled name for a monomorphized instance
+fn mono_get_mangled_name(@reg: MonoRegistry, @region: TypeRegion, @inst_idx: int) -> str
+    if @inst_idx < 0 or @inst_idx >= @reg.instance_count
+        return ""
+    @name_idx = @reg.instances[@inst_idx].mangled_name_idx
+    if @name_idx >= 0 and @name_idx < @region.string_count
+        return @region.strings[@name_idx]
+    return ""
+
+# Get statistics about monomorphization
+fn mono_stats(@reg: MonoRegistry) -> str
+    @result = "Monomorphization Stats:\n"
+    @result = @result + "  Generic functions: " + str(@reg.generic_fn_count) + "/" + str(MAX_GENERIC_FNS) + "\n"
+    @result = @result + "  Instances cached:  " + str(@reg.instance_count) + "/" + str(MAX_MONO_INSTANCES) + "\n"
+    return @result
+
+# --- Monomorphization self-tests ---
+
+fn test_mono_registry()
+    shine("  [test] Mono registry creation...")
+    @reg = mono_registry_new()
+    guard @reg.generic_fn_count == 0 else
+        shine("    FAIL: expected 0 generic fns")
+        return
+    guard @reg.instance_count == 0 else
+        shine("    FAIL: expected 0 instances")
+        return
+    shine("    PASS")
+
+fn test_mono_type_suffix()
+    shine("  [test] Mono type suffix...")
+    @region = region_new(1024, 256, 512)
+    @int_node = region_alloc_node(@region, TYPE_INT)
+    @float_node = region_alloc_node(@region, TYPE_FLOAT)
+    @str_node = region_alloc_node(@region, TYPE_STR)
+    guard mono_type_suffix(@region, @int_node) == "i64" else
+        shine("    FAIL: int suffix")
+        return
+    guard mono_type_suffix(@region, @float_node) == "f64" else
+        shine("    FAIL: float suffix")
+        return
+    guard mono_type_suffix(@region, @str_node) == "str" else
+        shine("    FAIL: str suffix")
+        return
+    shine("    PASS")
+
+fn test_mono_mangle()
+    shine("  [test] Mono name mangling...")
+    @region = region_new(1024, 256, 512)
+    @int_node = region_alloc_node(@region, TYPE_INT)
+    @str_node = region_alloc_node(@region, TYPE_STR)
+    @types: [int; 8] = [0; 8]
+    @types[0] = @int_node
+    @name1 = mono_mangle_name(@region, "identity", @types, 1)
+    guard @name1 == "identity_i64" else
+        shine("    FAIL: expected 'identity_i64', got '" + @name1 + "'")
+        return
+    @types[0] = @int_node
+    @types[1] = @str_node
+    @name2 = mono_mangle_name(@region, "swap", @types, 2)
+    guard @name2 == "swap_i64_str" else
+        shine("    FAIL: expected 'swap_i64_str', got '" + @name2 + "'")
+        return
+    shine("    PASS")
+
+fn test_mono_substitute_simple()
+    shine("  [test] Mono substitute...")
+    @region = region_new(1024, 256, 512)
+    # Create a TYPE_GENERIC node for "T"
+    @t_name = region_intern(@region, "T")
+    @generic_t = region_alloc_node(@region, TYPE_GENERIC)
+    @region.nodes[@generic_t].name_idx = @t_name
+    # Create concrete int type
+    @int_node = region_alloc_node(@region, TYPE_INT)
+    # Substitute T → int
+    @param_names: [int; 8] = [0; 8]
+    @param_names[0] = @t_name
+    @concrete: [int; 8] = [0; 8]
+    @concrete[0] = @int_node
+    @result = mono_substitute(@region, @generic_t, @param_names, @concrete, 1)
+    guard @result == @int_node else
+        shine("    FAIL: substitution should return int node")
+        return
+    shine("    PASS")
+
+fn test_mono_cache()
+    shine("  [test] Mono cache hit...")
+    @reg = mono_registry_new()
+    @region = region_new(1024, 256, 512)
+    # Register a generic function
+    @tp: [str; 8] = ["T", "", "", "", "", "", "", ""]
+    @params: [int; 16] = [0; 16]
+    @t_node = region_alloc_node(@region, TYPE_GENERIC)
+    @region.nodes[@t_node].name_idx = region_intern(@region, "T")
+    @params[0] = @t_node
+    @gf_idx = mono_register_generic(@reg, @region, "identity", @tp, 1, @params, 1, @t_node, 0)
+    guard @gf_idx >= 0 else
+        shine("    FAIL: registration failed")
+        return
+    # Resolve with int
+    @int_node = region_alloc_node(@region, TYPE_INT)
+    @concrete: [int; 8] = [0; 8]
+    @concrete[0] = @int_node
+    @result1 = mono_resolve(@reg, @region, @gf_idx, @concrete, 1)
+    guard @result1 >= 0 else
+        shine("    FAIL: first resolve failed")
+        return
+    # Second resolve should hit cache
+    @result2 = mono_resolve(@reg, @region, @gf_idx, @concrete, 1)
+    guard @result2 == @result1 else
+        shine("    FAIL: cache miss on second resolve")
+        return
+    guard @reg.instance_count == 1 else
+        shine("    FAIL: expected 1 instance, got " + str(@reg.instance_count))
+        return
+    shine("    PASS")
+
+fn test_mono_bounds()
+    shine("  [test] Mono bound checking...")
+    @reg = mono_registry_new()
+    @region = region_new(1024, 256, 512)
+    @tp: [str; 8] = ["T", "", "", "", "", "", "", ""]
+    @params: [int; 16] = [0; 16]
+    @t_node = region_alloc_node(@region, TYPE_GENERIC)
+    @region.nodes[@t_node].name_idx = region_intern(@region, "T")
+    @params[0] = @t_node
+    @gf_idx = mono_register_generic(@reg, @region, "add", @tp, 1, @params, 1, @t_node, 0)
+    # Add Numeric bound
+    mono_add_bound(@reg, @gf_idx, 0, BOUND_NUMERIC)
+    # int should satisfy Numeric
+    @int_node = region_alloc_node(@region, TYPE_INT)
+    @concrete: [int; 8] = [0; 8]
+    @concrete[0] = @int_node
+    @err1 = mono_check_bounds(@reg, @region, @gf_idx, @concrete, 1)
+    guard @err1 == 0 else
+        shine("    FAIL: int should satisfy Numeric")
+        return
+    # str should NOT satisfy Numeric
+    @str_node = region_alloc_node(@region, TYPE_STR)
+    @concrete[0] = @str_node
+    @err2 = mono_check_bounds(@reg, @region, @gf_idx, @concrete, 1)
+    guard @err2 == 1 else
+        shine("    FAIL: str should violate Numeric bound")
+        return
+    shine("    PASS")
+
+# =============================================================================
+# PUBLIC API: Run type checker on a parsed program
+# =============================================================================
+
+fn typecheck(@p: Parser) -> TypeChecker
+    @tc = typechecker_new()
+
+    # Run two-pass type checking
+    @error_count = tc_check_program(@tc, @p)
+
+    # Report results
+    if @error_count > 0
+        shine("Type checking failed with " + str(@error_count) + " error(s):")
+        orbit @i in 0..@error_count
+            @err = @tc.errors[@i]
+            @msg = "  line " + str(@err.line) + ": " + @err.message
+            if @err.hint != ""
+                @msg = @msg + " (hint: " + @err.hint + ")"
+            shine(@msg)
+    else
+        shine("Type checking passed. " + str(@tc.region.node_count) + " type nodes allocated in region.")
+
+    # Freeze region - no more type allocations
+    region_freeze(@tc.region)
+
+    return @tc
+
+# Clean up type checker and free region memory
+fn typecheck_cleanup(@tc: TypeChecker)
+    @bytes = @tc.region.total_bytes
+    @nodes = @tc.region.node_count
+    region_free(@tc.region)
+    shine("Region freed: " + str(@nodes) + " nodes, ~" + str(@bytes) + " bytes reclaimed instantly")
+
+# =============================================================================
+# REGION STATISTICS
+# =============================================================================
+
+fn region_stats(@region: TypeRegion) -> str
+    @result = "TypeRegion Stats:\n"
+    @result = @result + "  Nodes: " + str(@region.node_count) + "/" + str(REGION_MAX_NODES) + "\n"
+    @result = @result + "  Strings: " + str(@region.string_count) + "/" + str(REGION_MAX_STRINGS) + "\n"
+    @result = @result + "  Children: " + str(@region.children_count) + "/" + str(REGION_MAX_CHILDREN) + "\n"
+    @result = @result + "  Estimated bytes: " + str(@region.total_bytes) + "\n"
+    @result = @result + "  Phase: "
+    match @region.phase
+        0 => @result = @result + "active"
+        1 => @result = @result + "frozen"
+        2 => @result = @result + "freed"
+        _ => @result = @result + "unknown"
+    return @result

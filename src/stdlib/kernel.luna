@@ -1,0 +1,1020 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# Luna Minimal Kernel POC
+# Demonstrates bare-metal capability - no std, no OS dependencies
+# Target: x86_64 freestanding, QEMU compatible
+#
+# Build: luna compile --freestanding --target x86_64-unknown-none kernel.luna -o kernel.bin
+# Run:   qemu-system-x86_64 -kernel kernel.bin -serial stdio
+
+# === CONSTANTS ===
+# VGA text mode buffer at 0xB8000 (80x25 characters, 2 bytes per char)
+const VGA_BUFFER: int = 0xB8000
+const VGA_WIDTH: int = 80
+const VGA_HEIGHT: int = 25
+
+# VGA colors (foreground | background << 4)
+const VGA_WHITE_ON_BLACK: int = 0x0F
+const VGA_GREEN_ON_BLACK: int = 0x0A
+const VGA_RED_ON_BLACK: int = 0x0C
+const VGA_YELLOW_ON_RED: int = 0x4E
+
+# COM1 serial port (for QEMU -serial stdio)
+const COM1_PORT: int = 0x3F8
+
+# === IDT CONSTANTS ===
+# Interrupt Descriptor Table configuration
+const IDT_ENTRIES: int = 256
+const IDT_SIZE: int = 4096             # 256 * 16 bytes per entry
+
+# Gate types for IDT entries (bits 40-43 of descriptor)
+const GATE_INTERRUPT: int = 0x8E       # Present, DPL=0, 64-bit Interrupt Gate
+const GATE_TRAP: int = 0x8F            # Present, DPL=0, 64-bit Trap Gate
+
+# Exception vector numbers
+const EXCEPTION_DIVIDE_BY_ZERO: int = 0
+const EXCEPTION_DEBUG: int = 1
+const EXCEPTION_NMI: int = 2
+const EXCEPTION_BREAKPOINT: int = 3
+const EXCEPTION_OVERFLOW: int = 4
+const EXCEPTION_BOUND_RANGE: int = 5
+const EXCEPTION_INVALID_OPCODE: int = 6
+const EXCEPTION_DEVICE_NOT_AVAIL: int = 7
+const EXCEPTION_DOUBLE_FAULT: int = 8
+const EXCEPTION_INVALID_TSS: int = 10
+const EXCEPTION_SEGMENT_NOT_PRESENT: int = 11
+const EXCEPTION_STACK_FAULT: int = 12
+const EXCEPTION_GENERAL_PROTECTION: int = 13
+const EXCEPTION_PAGE_FAULT: int = 14
+const EXCEPTION_X87_FPU: int = 16
+const EXCEPTION_ALIGNMENT_CHECK: int = 17
+const EXCEPTION_MACHINE_CHECK: int = 18
+const EXCEPTION_SIMD_FPU: int = 19
+
+# Code segment selector (assuming flat 64-bit mode from bootloader)
+const KERNEL_CS: int = 0x08
+
+# === APIC CONSTANTS (v1.9.6) ===
+# Local APIC registers (memory-mapped at 0xFEE00000)
+const LAPIC_BASE: int = 0xFEE00000
+const LAPIC_ID: int = 0x20           # Local APIC ID Register
+const LAPIC_VERSION: int = 0x30      # Local APIC Version Register
+const LAPIC_TPR: int = 0x80          # Task Priority Register
+const LAPIC_EOI: int = 0xB0          # End of Interrupt
+const LAPIC_SVR: int = 0xF0          # Spurious Interrupt Vector Register
+const LAPIC_ESR: int = 0x280         # Error Status Register
+const LAPIC_ICR_LOW: int = 0x300     # Interrupt Command Register (low)
+const LAPIC_ICR_HIGH: int = 0x310    # Interrupt Command Register (high)
+const LAPIC_LVT_TIMER: int = 0x320   # LVT Timer Register
+const LAPIC_TIMER_INIT: int = 0x380  # Initial Count Register
+const LAPIC_TIMER_CURR: int = 0x390  # Current Count Register
+const LAPIC_TIMER_DIV: int = 0x3E0   # Divide Configuration Register
+
+# I/O APIC registers (memory-mapped, typically at 0xFEC00000)
+const IOAPIC_BASE: int = 0xFEC00000
+const IOAPIC_REG_SEL: int = 0x00     # Register Select
+const IOAPIC_REG_WIN: int = 0x10     # Register Window
+const IOAPIC_ID: int = 0x00          # IOAPIC ID
+const IOAPIC_VER: int = 0x01         # IOAPIC Version
+const IOAPIC_ARB: int = 0x02         # IOAPIC Arbitration ID
+const IOAPIC_REDTBL: int = 0x10      # Redirection Table (0x10-0x3F)
+
+# APIC enable flags
+const LAPIC_SVR_ENABLE: int = 0x100  # Enable APIC bit in SVR
+const LAPIC_ICR_INIT: int = 0x500    # INIT IPI
+const LAPIC_ICR_STARTUP: int = 0x600 # Startup IPI
+const LAPIC_ICR_LEVEL: int = 0x8000  # Level triggered
+const LAPIC_ICR_ASSERT: int = 0x4000 # Assert
+const LAPIC_ICR_ALL_EXCL: int = 0xC0000  # All excluding self
+
+# ACPI RSDP signature
+const RSDP_SIGNATURE: int = 0x2052545020445352  # "RSD PTR "
+
+# MADT entry types
+const MADT_TYPE_LAPIC: int = 0       # Processor Local APIC
+const MADT_TYPE_IOAPIC: int = 1      # I/O APIC
+const MADT_TYPE_ISO: int = 2         # Interrupt Source Override
+const MADT_TYPE_NMI: int = 4         # Non-maskable Interrupt
+
+# IPI vector for inter-processor communication
+const IPI_VECTOR_WAKEUP: int = 0x40  # Wakeup vector for APs
+const IPI_VECTOR_TLB: int = 0x41     # TLB shootdown
+const IPI_VECTOR_SCHED: int = 0x42   # Scheduler IPI
+
+# Maximum supported CPUs
+const MAX_CPUS: int = 64
+
+# === SMP GLOBAL STATE ===
+meow @cpu_count = 0                  # Number of detected CPUs
+meow @bsp_lapic_id = 0               # Bootstrap processor LAPIC ID
+meow @cpu_lapic_ids: [int; 64] = [0; 64]  # LAPIC IDs for each CPU
+meow @cpu_started: [int; 64] = [0; 64]    # 1 if CPU has started
+meow @ioapic_addr = IOAPIC_BASE      # I/O APIC address (may be overridden by ACPI)
+
+# === GLOBAL STATE ===
+# Cursor position for VGA output
+meow @vga_row = 0
+meow @vga_col = 0
+
+# === ALLOCATOR (Bump allocator for freestanding mode) ===
+# Simple bump allocator - allocates from a fixed memory region
+const HEAP_START: int = 0x100000    # 1MB mark
+const HEAP_SIZE: int = 0x100000     # 1MB heap
+meow @heap_ptr = HEAP_START
+
+#[no_mangle]
+fn bump_alloc(@size: int, @align: int) -> int
+    # Align the pointer
+    @aligned = (@heap_ptr + @align - 1) & ~(@align - 1)
+    @new_ptr = @aligned + @size
+
+    # Check for OOM
+    if @new_ptr > HEAP_START + HEAP_SIZE
+        return 0  # OOM
+
+    @heap_ptr = @new_ptr
+    return @aligned
+
+#[no_mangle]
+fn bump_dealloc(@ptr: int, @size: int, @align: int)
+    # Bump allocator doesn't support deallocation
+    # Memory is reclaimed on reset
+    pass
+
+# Register our allocator
+#[global_allocator]
+struct BumpAllocator
+    alloc: bump_alloc
+    dealloc: bump_dealloc
+
+# === IDT STRUCTURES ===
+# IDT entry (16 bytes in 64-bit mode)
+# Layout:
+#   0-1:  offset_low (bits 0-15 of handler address)
+#   2-3:  selector (code segment selector)
+#   4:    ist (interrupt stack table, usually 0)
+#   5:    type_attr (gate type + DPL + present)
+#   6-7:  offset_mid (bits 16-31 of handler address)
+#   8-11: offset_high (bits 32-63 of handler address)
+#   12-15: reserved (must be 0)
+
+# IDT Pointer structure for LIDT instruction
+# Layout:
+#   0-1:  limit (size of IDT - 1)
+#   2-9:  base (linear address of IDT)
+struct IdtPointer
+    limit: u16
+    base: u64
+
+# Global IDT storage (allocated at fixed address for simplicity)
+const IDT_BASE: int = 0x200000    # 2MB mark - IDT location
+const IDTR_BASE: int = 0x201000   # IDTR storage
+
+# === IDT HELPER FUNCTIONS ===
+# Create an IDT entry at specified index
+#[freestanding]
+fn idt_set_gate(@vector: int, @handler: int, @selector: int, @type_attr: int)
+    @entry_addr = IDT_BASE + (@vector * 16)
+
+    unsafe
+        # offset_low (bits 0-15)
+        volatile_write(@entry_addr + 0, @handler & 0xFFFF)
+        volatile_write(@entry_addr + 1, (@handler >> 8) & 0xFF)
+
+        # selector (code segment)
+        volatile_write(@entry_addr + 2, @selector & 0xFF)
+        volatile_write(@entry_addr + 3, (@selector >> 8) & 0xFF)
+
+        # IST (0 for now - use main stack)
+        volatile_write(@entry_addr + 4, 0)
+
+        # type_attr
+        volatile_write(@entry_addr + 5, @type_attr)
+
+        # offset_mid (bits 16-31)
+        volatile_write(@entry_addr + 6, (@handler >> 16) & 0xFF)
+        volatile_write(@entry_addr + 7, (@handler >> 24) & 0xFF)
+
+        # offset_high (bits 32-63)
+        volatile_write(@entry_addr + 8, (@handler >> 32) & 0xFF)
+        volatile_write(@entry_addr + 9, (@handler >> 40) & 0xFF)
+        volatile_write(@entry_addr + 10, (@handler >> 48) & 0xFF)
+        volatile_write(@entry_addr + 11, (@handler >> 56) & 0xFF)
+
+        # reserved (must be 0)
+        volatile_write(@entry_addr + 12, 0)
+        volatile_write(@entry_addr + 13, 0)
+        volatile_write(@entry_addr + 14, 0)
+        volatile_write(@entry_addr + 15, 0)
+
+# Load IDT into CPU
+#[freestanding]
+fn idt_load()
+    @limit = (IDT_ENTRIES * 16) - 1
+
+    unsafe
+        # Store IDTR structure
+        volatile_write(IDTR_BASE + 0, @limit & 0xFF)
+        volatile_write(IDTR_BASE + 1, (@limit >> 8) & 0xFF)
+        volatile_write(IDTR_BASE + 2, IDT_BASE & 0xFF)
+        volatile_write(IDTR_BASE + 3, (IDT_BASE >> 8) & 0xFF)
+        volatile_write(IDTR_BASE + 4, (IDT_BASE >> 16) & 0xFF)
+        volatile_write(IDTR_BASE + 5, (IDT_BASE >> 24) & 0xFF)
+        volatile_write(IDTR_BASE + 6, (IDT_BASE >> 32) & 0xFF)
+        volatile_write(IDTR_BASE + 7, (IDT_BASE >> 40) & 0xFF)
+        volatile_write(IDTR_BASE + 8, (IDT_BASE >> 48) & 0xFF)
+        volatile_write(IDTR_BASE + 9, (IDT_BASE >> 56) & 0xFF)
+
+        # Load IDT with LIDT instruction
+        asm {
+            "lidt [{0}]"
+            :
+            : "r"(IDTR_BASE)
+            : "memory"
+        }
+
+# Clear all IDT entries
+#[freestanding]
+fn idt_clear()
+    orbit @i in 0..IDT_ENTRIES
+        @entry_addr = IDT_BASE + (@i * 16)
+        orbit @j in 0..16
+            unsafe
+                volatile_write(@entry_addr + @j, 0)
+
+# === EXCEPTION HANDLERS ===
+# Divide by zero exception handler (vector 0)
+#[interrupt]
+#[no_mangle]
+fn exception_divide_by_zero()
+    # Print panic message to VGA
+    @panic_row = 10
+    @panic_col = 20
+    @msg = "!!! DIVIDE BY ZERO EXCEPTION !!!"
+    @i = 0
+    @len = len(@msg)
+
+    orbit _ in 0..@len
+        @ch = volatile_read(@msg + @i)
+        if @ch == 0
+            break
+        vga_write_char(@panic_row, @panic_col + @i, @ch, VGA_YELLOW_ON_RED)
+        @i = @i + 1
+
+    # Print to serial
+    serial_print("PANIC: Division by zero exception!\n")
+
+    # Halt the CPU - cannot recover from this
+    unsafe
+        asm {
+            "cli"
+            "hlt"
+        }
+
+# General protection fault handler (vector 13)
+#[interrupt]
+#[no_mangle]
+fn exception_gpf()
+    @panic_row = 11
+    @panic_col = 20
+    @msg = "!!! GENERAL PROTECTION FAULT !!!"
+    @i = 0
+    @len = len(@msg)
+
+    orbit _ in 0..@len
+        @ch = volatile_read(@msg + @i)
+        if @ch == 0
+            break
+        vga_write_char(@panic_row, @panic_col + @i, @ch, VGA_YELLOW_ON_RED)
+        @i = @i + 1
+
+    serial_print("PANIC: General protection fault!\n")
+
+    unsafe
+        asm {
+            "cli"
+            "hlt"
+        }
+
+# Page fault handler (vector 14)
+#[interrupt]
+#[no_mangle]
+fn exception_page_fault()
+    @panic_row = 12
+    @panic_col = 20
+    @msg = "!!! PAGE FAULT EXCEPTION !!!"
+    @i = 0
+    @len = len(@msg)
+
+    orbit _ in 0..@len
+        @ch = volatile_read(@msg + @i)
+        if @ch == 0
+            break
+        vga_write_char(@panic_row, @panic_col + @i, @ch, VGA_YELLOW_ON_RED)
+        @i = @i + 1
+
+    serial_print("PANIC: Page fault exception!\n")
+
+    unsafe
+        asm {
+            "cli"
+            "hlt"
+        }
+
+# Double fault handler (vector 8)
+#[interrupt]
+#[no_mangle]
+fn exception_double_fault()
+    @panic_row = 13
+    @panic_col = 20
+    @msg = "!!! DOUBLE FAULT !!!"
+    @i = 0
+    @len = len(@msg)
+
+    orbit _ in 0..@len
+        @ch = volatile_read(@msg + @i)
+        if @ch == 0
+            break
+        vga_write_char(@panic_row, @panic_col + @i, @ch, VGA_YELLOW_ON_RED)
+        @i = @i + 1
+
+    serial_print("PANIC: Double fault - system halted!\n")
+
+    # Double fault is fatal - triple fault if we continue
+    unsafe
+        asm {
+            "cli"
+            "hlt"
+        }
+
+# Default handler for unhandled interrupts
+#[interrupt]
+#[no_mangle]
+fn exception_default()
+    serial_print("Unhandled interrupt!\n")
+    # For unhandled interrupts, just return (iretq)
+
+# Initialize the Interrupt Descriptor Table
+#[freestanding]
+fn idt_init()
+    serial_print("Initializing IDT...\n")
+
+    # Clear all entries first
+    idt_clear()
+
+    # Set up exception handlers
+    # Vector 0: Divide by zero
+    idt_set_gate(EXCEPTION_DIVIDE_BY_ZERO, exception_divide_by_zero, KERNEL_CS, GATE_INTERRUPT)
+
+    # Vector 8: Double fault (needs IST in production)
+    idt_set_gate(EXCEPTION_DOUBLE_FAULT, exception_double_fault, KERNEL_CS, GATE_INTERRUPT)
+
+    # Vector 13: General protection fault
+    idt_set_gate(EXCEPTION_GENERAL_PROTECTION, exception_gpf, KERNEL_CS, GATE_INTERRUPT)
+
+    # Vector 14: Page fault
+    idt_set_gate(EXCEPTION_PAGE_FAULT, exception_page_fault, KERNEL_CS, GATE_INTERRUPT)
+
+    # Fill remaining vectors with default handler
+    orbit @i in 0..IDT_ENTRIES
+        if @i != EXCEPTION_DIVIDE_BY_ZERO && @i != EXCEPTION_DOUBLE_FAULT && @i != EXCEPTION_GENERAL_PROTECTION && @i != EXCEPTION_PAGE_FAULT
+            idt_set_gate(@i, exception_default, KERNEL_CS, GATE_INTERRUPT)
+
+    # Load the IDT
+    idt_load()
+
+    serial_print("IDT loaded successfully.\n")
+
+# =============================================================================
+# APIC / SMP INITIALIZATION (v1.9.6)
+# =============================================================================
+
+# Read from Local APIC register
+#[freestanding]
+fn lapic_read(@reg: int) -> int
+    @addr = LAPIC_BASE + @reg
+    unsafe
+        return volatile_read(@addr)
+
+# Write to Local APIC register
+#[freestanding]
+fn lapic_write(@reg: int, @value: int)
+    @addr = LAPIC_BASE + @reg
+    unsafe
+        volatile_write(@addr, @value)
+
+# Get current CPU's LAPIC ID
+#[freestanding]
+fn lapic_id() -> int
+    return (lapic_read(LAPIC_ID) >> 24) & 0xFF
+
+# Send End of Interrupt to LAPIC
+#[freestanding]
+fn lapic_eoi()
+    lapic_write(LAPIC_EOI, 0)
+
+# Initialize the Local APIC
+#[freestanding]
+fn lapic_init()
+    serial_print("Initializing Local APIC...\n")
+
+    # Read current LAPIC ID
+    @bsp_lapic_id = lapic_id()
+
+    # Enable the APIC via SVR (Spurious Vector Register)
+    # Set spurious vector to 0xFF and enable bit
+    @svr = lapic_read(LAPIC_SVR)
+    @svr = @svr | LAPIC_SVR_ENABLE | 0xFF
+    lapic_write(LAPIC_SVR, @svr)
+
+    # Set Task Priority Register to 0 (accept all interrupts)
+    lapic_write(LAPIC_TPR, 0)
+
+    # Clear error status (write twice to clear)
+    lapic_write(LAPIC_ESR, 0)
+    lapic_write(LAPIC_ESR, 0)
+
+    # Send EOI to clear any pending interrupts
+    lapic_eoi()
+
+    serial_print("Local APIC initialized. BSP LAPIC ID: ")
+    serial_print_hex(@bsp_lapic_id)
+    serial_print("\n")
+
+# Print hex number to serial
+#[freestanding]
+fn serial_print_hex(@value: int)
+    @hex_chars = "0123456789ABCDEF"
+    @digits: [int; 16] = [0; 16]
+    @count = 0
+    @v = @value
+
+    if @v == 0
+        serial_write(48)  # '0'
+        return
+
+    orbit _ in 0..16
+        if @v == 0
+            break
+        @digits[@count] = @v & 0xF
+        @v = @v >> 4
+        @count = @count + 1
+
+    # Print in reverse
+    orbit @i in 0..@count
+        @idx = @count - 1 - @i
+        @ch = volatile_read(@hex_chars + @digits[@idx])
+        serial_write(@ch)
+
+# Read from I/O APIC register
+#[freestanding]
+fn ioapic_read(@reg: int) -> int
+    unsafe
+        volatile_write(@ioapic_addr + IOAPIC_REG_SEL, @reg)
+        return volatile_read(@ioapic_addr + IOAPIC_REG_WIN)
+
+# Write to I/O APIC register
+#[freestanding]
+fn ioapic_write(@reg: int, @value: int)
+    unsafe
+        volatile_write(@ioapic_addr + IOAPIC_REG_SEL, @reg)
+        volatile_write(@ioapic_addr + IOAPIC_REG_WIN, @value)
+
+# Get I/O APIC max redirection entries
+#[freestanding]
+fn ioapic_max_entries() -> int
+    @ver = ioapic_read(IOAPIC_VER)
+    return ((@ver >> 16) & 0xFF) + 1
+
+# Set I/O APIC redirection entry
+#[freestanding]
+fn ioapic_set_entry(@irq: int, @vector: int, @dest: int)
+    @reg = IOAPIC_REDTBL + (@irq * 2)
+
+    # Low 32 bits: vector, delivery mode, polarity, etc.
+    # Bits 0-7: vector
+    # Bits 8-10: delivery mode (000 = Fixed)
+    # Bit 11: destination mode (0 = Physical)
+    # Bit 13: polarity (0 = Active High)
+    # Bit 15: trigger mode (0 = Edge)
+    # Bit 16: mask (0 = Enabled)
+    @low = @vector & 0xFF
+
+    # High 32 bits: destination APIC ID
+    @high = (@dest & 0xFF) << 24
+
+    ioapic_write(@reg, @low)
+    ioapic_write(@reg + 1, @high)
+
+# Initialize I/O APIC
+#[freestanding]
+fn ioapic_init()
+    serial_print("Initializing I/O APIC...\n")
+
+    @max_irqs = ioapic_max_entries()
+    serial_print("I/O APIC supports ")
+    serial_print_hex(@max_irqs)
+    serial_print(" IRQs\n")
+
+    # Mask all IRQs initially
+    orbit @i in 0..@max_irqs
+        @reg = IOAPIC_REDTBL + (@i * 2)
+        ioapic_write(@reg, 0x10000)  # Masked
+
+    # Remap legacy IRQs to vectors 0x20-0x2F
+    # IRQ 0 (Timer) -> Vector 0x20
+    ioapic_set_entry(0, 0x20, @bsp_lapic_id)
+    # IRQ 1 (Keyboard) -> Vector 0x21
+    ioapic_set_entry(1, 0x21, @bsp_lapic_id)
+
+    serial_print("I/O APIC initialized.\n")
+
+# Find RSDP (Root System Description Pointer) in BIOS memory
+#[freestanding]
+fn find_rsdp() -> int
+    # Search in EBDA (Extended BIOS Data Area) and BIOS ROM area
+    # EBDA typically at 0x9FC00, BIOS ROM at 0xE0000-0xFFFFF
+
+    # Search 0xE0000 - 0xFFFFF (BIOS area)
+    @addr = 0xE0000
+    orbit _ in 0..8192  # 128KB / 16 bytes
+        unsafe
+            @sig = volatile_read(@addr)
+            # Check for "RSD PTR " signature (first 8 bytes)
+            if @sig == RSDP_SIGNATURE
+                # Validate checksum
+                @checksum = 0
+                orbit @i in 0..20
+                    @checksum = @checksum + volatile_read(@addr + @i)
+                if (@checksum & 0xFF) == 0
+                    return @addr
+        @addr = @addr + 16
+    return 0  # Not found
+
+# Parse ACPI MADT (Multiple APIC Description Table)
+# Returns number of CPUs found
+#[freestanding]
+fn parse_madt(@madt_addr: int) -> int
+    if @madt_addr == 0
+        return 1  # Fallback: assume single CPU
+
+    unsafe
+        # MADT header:
+        # 0-3: Signature "APIC"
+        # 4-7: Length
+        # 36-39: Local APIC Address
+        # 40-43: Flags
+
+        @length = volatile_read(@madt_addr + 4) | (volatile_read(@madt_addr + 5) << 8) | (volatile_read(@madt_addr + 6) << 16) | (volatile_read(@madt_addr + 7) << 24)
+
+        # Override LAPIC base if provided
+        @lapic_override = volatile_read(@madt_addr + 36) | (volatile_read(@madt_addr + 37) << 8) | (volatile_read(@madt_addr + 38) << 16) | (volatile_read(@madt_addr + 39) << 24)
+
+        @offset = 44  # Start of MADT entries
+        @cpus = 0
+
+        orbit _ in 0..256  # Max entries to parse
+            if @offset >= @length
+                break
+
+            @entry_type = volatile_read(@madt_addr + @offset)
+            @entry_len = volatile_read(@madt_addr + @offset + 1)
+
+            if @entry_len == 0
+                break
+
+            if @entry_type == MADT_TYPE_LAPIC
+                # Local APIC entry
+                # Byte 2: ACPI Processor ID
+                # Byte 3: APIC ID
+                # Bytes 4-7: Flags (bit 0 = enabled)
+                @apic_id = volatile_read(@madt_addr + @offset + 3)
+                @flags = volatile_read(@madt_addr + @offset + 4)
+
+                if (@flags & 1) != 0  # CPU enabled
+                    if @cpus < MAX_CPUS
+                        @cpu_lapic_ids[@cpus] = @apic_id
+                        @cpus = @cpus + 1
+
+            eclipse if @entry_type == MADT_TYPE_IOAPIC
+                # I/O APIC entry
+                # Byte 2: I/O APIC ID
+                # Bytes 4-7: I/O APIC Address
+                @ioapic_addr = volatile_read(@madt_addr + @offset + 4) | (volatile_read(@madt_addr + @offset + 5) << 8) | (volatile_read(@madt_addr + @offset + 6) << 16) | (volatile_read(@madt_addr + @offset + 7) << 24)
+
+            @offset = @offset + @entry_len
+
+        return @cpus
+
+# Find ACPI table by signature
+#[freestanding]
+fn find_acpi_table(@rsdt_addr: int, @signature: int) -> int
+    if @rsdt_addr == 0
+        return 0
+
+    unsafe
+        # RSDT header: first 36 bytes are header
+        @length = volatile_read(@rsdt_addr + 4) | (volatile_read(@rsdt_addr + 5) << 8) | (volatile_read(@rsdt_addr + 6) << 16) | (volatile_read(@rsdt_addr + 7) << 24)
+
+        @entries = (@length - 36) / 4
+        @offset = 36
+
+        orbit @i in 0..@entries
+            @table_addr = volatile_read(@rsdt_addr + @offset) | (volatile_read(@rsdt_addr + @offset + 1) << 8) | (volatile_read(@rsdt_addr + @offset + 2) << 16) | (volatile_read(@rsdt_addr + @offset + 3) << 24)
+
+            # Check signature
+            @table_sig = volatile_read(@table_addr) | (volatile_read(@table_addr + 1) << 8) | (volatile_read(@table_addr + 2) << 16) | (volatile_read(@table_addr + 3) << 24)
+
+            if @table_sig == @signature
+                return @table_addr
+
+            @offset = @offset + 4
+
+    return 0
+
+# Send IPI (Inter-Processor Interrupt) to another CPU
+#[freestanding]
+fn send_ipi(@dest_apic_id: int, @vector: int, @type: int)
+    # Write destination APIC ID to ICR high
+    lapic_write(LAPIC_ICR_HIGH, (@dest_apic_id & 0xFF) << 24)
+
+    # Write vector and type to ICR low (this triggers the IPI)
+    @icr_low = @vector | @type
+    lapic_write(LAPIC_ICR_LOW, @icr_low)
+
+    # Wait for delivery
+    orbit _ in 0..10000
+        @status = lapic_read(LAPIC_ICR_LOW)
+        if (@status & 0x1000) == 0  # Delivery status bit clear
+            break
+
+# Send INIT IPI to target CPU
+#[freestanding]
+fn send_init_ipi(@dest_apic_id: int)
+    send_ipi(@dest_apic_id, 0, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_ASSERT)
+
+    # De-assert INIT
+    orbit _ in 0..10000
+        pass  # Small delay
+
+    send_ipi(@dest_apic_id, 0, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL)
+
+# Send SIPI (Startup IPI) to target CPU
+#[freestanding]
+fn send_sipi(@dest_apic_id: int, @vector: int)
+    # Vector is the page number where AP trampoline code is located
+    # e.g., if trampoline is at 0x8000, vector is 0x08
+    send_ipi(@dest_apic_id, @vector, LAPIC_ICR_STARTUP)
+
+# IPI handler for wakeup
+#[interrupt]
+#[no_mangle]
+fn ipi_wakeup_handler()
+    serial_print("AP CPU woken up!\n")
+    lapic_eoi()
+
+# IPI handler for TLB shootdown
+#[interrupt]
+#[no_mangle]
+fn ipi_tlb_handler()
+    # Invalidate TLB
+    unsafe
+        asm {
+            "mov rax, cr3"
+            "mov cr3, rax"
+        }
+    lapic_eoi()
+
+# IPI handler for scheduler
+#[interrupt]
+#[no_mangle]
+fn ipi_sched_handler()
+    # Scheduler yield point
+    lapic_eoi()
+
+# Broadcast IPI to all CPUs except self
+#[freestanding]
+fn broadcast_ipi(@vector: int)
+    lapic_write(LAPIC_ICR_HIGH, 0)
+    lapic_write(LAPIC_ICR_LOW, @vector | LAPIC_ICR_ALL_EXCL)
+
+# Initialize SMP (Symmetric Multi-Processing)
+#[freestanding]
+fn smp_init()
+    serial_print("Initializing SMP...\n")
+
+    # Initialize Local APIC first
+    lapic_init()
+
+    # Set up IPI handlers in IDT
+    idt_set_gate(IPI_VECTOR_WAKEUP, ipi_wakeup_handler, KERNEL_CS, GATE_INTERRUPT)
+    idt_set_gate(IPI_VECTOR_TLB, ipi_tlb_handler, KERNEL_CS, GATE_INTERRUPT)
+    idt_set_gate(IPI_VECTOR_SCHED, ipi_sched_handler, KERNEL_CS, GATE_INTERRUPT)
+
+    # Try to find ACPI tables
+    @rsdp = find_rsdp()
+    if @rsdp != 0
+        serial_print("RSDP found at: ")
+        serial_print_hex(@rsdp)
+        serial_print("\n")
+
+        # Get RSDT address from RSDP (offset 16)
+        unsafe
+            @rsdt = volatile_read(@rsdp + 16) | (volatile_read(@rsdp + 17) << 8) | (volatile_read(@rsdp + 18) << 16) | (volatile_read(@rsdp + 19) << 24)
+
+            if @rsdt != 0
+                # Find MADT (signature "APIC" = 0x43495041)
+                @madt = find_acpi_table(@rsdt, 0x43495041)
+                if @madt != 0
+                    serial_print("MADT found at: ")
+                    serial_print_hex(@madt)
+                    serial_print("\n")
+                    @cpu_count = parse_madt(@madt)
+                else
+                    @cpu_count = 1
+            else
+                @cpu_count = 1
+    else
+        serial_print("RSDP not found, assuming single CPU\n")
+        @cpu_count = 1
+        @cpu_lapic_ids[0] = @bsp_lapic_id
+
+    # Mark BSP as started
+    @cpu_started[0] = 1
+
+    serial_print("Detected ")
+    serial_print_hex(@cpu_count)
+    serial_print(" CPU(s)\n")
+
+    # Initialize I/O APIC
+    ioapic_init()
+
+    # TODO: Start Application Processors (APs)
+    # This requires setting up a trampoline in low memory
+    # For now, we just detect CPUs
+
+    serial_print("SMP initialization complete.\n")
+
+# === I/O PORT ACCESS ===
+# Write byte to I/O port (x86 outb instruction)
+#[freestanding]
+fn outb(@port: int, @value: int)
+    unsafe
+        asm {
+            "mov dx, {0}"
+            "mov al, {1}"
+            "out dx, al"
+            :
+            : "r"(@port), "r"(@value)
+            : "dx", "ax"
+        }
+
+# Read byte from I/O port (x86 inb instruction)
+#[freestanding]
+fn inb(@port: int) -> int
+    @result = 0
+    unsafe
+        asm {
+            "mov dx, {0}"
+            "in al, dx"
+            "movzx {1}, al"
+            : "=r"(@result)
+            : "r"(@port)
+            : "dx", "ax"
+        }
+    return @result
+
+# === SERIAL PORT (COM1) OUTPUT ===
+# Initialize COM1 serial port at 115200 baud
+#[freestanding]
+fn serial_init()
+    outb(COM1_PORT + 1, 0x00)    # Disable interrupts
+    outb(COM1_PORT + 3, 0x80)    # Enable DLAB
+    outb(COM1_PORT + 0, 0x01)    # Baud divisor low (115200)
+    outb(COM1_PORT + 1, 0x00)    # Baud divisor high
+    outb(COM1_PORT + 3, 0x03)    # 8 bits, no parity, 1 stop bit
+    outb(COM1_PORT + 2, 0xC7)    # Enable FIFO
+    outb(COM1_PORT + 4, 0x0B)    # RTS/DSR set
+
+# Wait for transmit buffer empty and send byte
+#[freestanding]
+fn serial_write(@byte: int)
+    # Wait for transmit buffer empty (bit 5 of LSR)
+    orbit _ in 0..10000
+        if (inb(COM1_PORT + 5) & 0x20) != 0
+            break
+    outb(COM1_PORT, @byte)
+
+# Print string to serial
+#[freestanding]
+fn serial_print(@msg: str)
+    @i = 0
+    @len = len(@msg)
+    orbit _ in 0..@len
+        @ch = volatile_read(@msg + @i)
+        if @ch == 0
+            break
+        serial_write(@ch)
+        @i = @i + 1
+
+# === VGA TEXT MODE OUTPUT ===
+# Write character with color at position
+#[freestanding]
+fn vga_write_char(@row: int, @col: int, @ch: int, @color: int)
+    @offset = (@row * VGA_WIDTH + @col) * 2
+    @addr = VGA_BUFFER + @offset
+
+    unsafe
+        # Write character
+        volatile_write(@addr, @ch)
+        # Write color attribute
+        volatile_write(@addr + 1, @color)
+
+# Print string to VGA at current cursor position
+#[freestanding]
+fn vga_print(@msg: str)
+    @i = 0
+    @len = len(@msg)
+
+    orbit _ in 0..@len
+        @ch = volatile_read(@msg + @i)
+        if @ch == 0
+            break
+
+        if @ch == 10  # newline
+            @vga_row = @vga_row + 1
+            @vga_col = 0
+        else
+            vga_write_char(@vga_row, @vga_col, @ch, VGA_WHITE_ON_BLACK)
+            @vga_col = @vga_col + 1
+            if @vga_col >= VGA_WIDTH
+                @vga_col = 0
+                @vga_row = @vga_row + 1
+
+        # Scroll if needed (simple version)
+        if @vga_row >= VGA_HEIGHT
+            @vga_row = VGA_HEIGHT - 1
+
+        @i = @i + 1
+
+# Print with specific color
+#[freestanding]
+fn vga_print_color(@msg: str, @color: int)
+    @i = 0
+    @len = len(@msg)
+
+    orbit _ in 0..@len
+        @ch = volatile_read(@msg + @i)
+        if @ch == 0
+            break
+
+        if @ch != 10
+            vga_write_char(@vga_row, @vga_col, @ch, @color)
+            @vga_col = @vga_col + 1
+            if @vga_col >= VGA_WIDTH
+                @vga_col = 0
+                @vga_row = @vga_row + 1
+        else
+            @vga_row = @vga_row + 1
+            @vga_col = 0
+
+        @i = @i + 1
+
+# Clear VGA screen
+#[freestanding]
+fn vga_clear()
+    orbit @row in 0..VGA_HEIGHT
+        orbit @col in 0..VGA_WIDTH
+            vga_write_char(@row, @col, 0x20, VGA_WHITE_ON_BLACK)
+    @vga_row = 0
+    @vga_col = 0
+
+# === KERNEL ENTRY POINT ===
+# This is called by the bootloader after setting up protected/long mode
+#[naked]
+#[no_mangle]
+fn _start()
+    # Set up stack (bootloader should have done this, but just in case)
+    unsafe
+        asm {
+            "mov rsp, 0x80000"   # Stack at 512KB
+            "mov rbp, rsp"
+            "call kernel_main"
+            "cli"               # Disable interrupts
+            "hlt"               # Halt CPU
+        }
+
+# Main kernel function
+#[no_mangle]
+fn kernel_main()
+    # Initialize serial for debug output
+    serial_init()
+    serial_print("Luna Kernel v1.9.6 booting...\n")
+
+    # Clear screen and print banner
+    vga_clear()
+    vga_print_color("================================", VGA_GREEN_ON_BLACK)
+    vga_print("\n")
+    vga_print_color("   Luna OS - SMP Bare Metal    ", VGA_GREEN_ON_BLACK)
+    vga_print("\n")
+    vga_print_color("================================", VGA_GREEN_ON_BLACK)
+    vga_print("\n\n")
+
+    vga_print("Luna Kernel v1.9.6\n")
+    vga_print("Written in Luna programming language\n")
+    vga_print("SMP + APIC + VFS support\n\n")
+
+    # Initialize IDT early (before any potential exceptions)
+    vga_print("Initializing IDT...\n")
+    idt_init()
+    vga_print_color("  [OK] ", VGA_GREEN_ON_BLACK)
+    vga_print("Interrupt Descriptor Table loaded\n")
+
+    # Initialize SMP / APIC
+    vga_print("Initializing SMP/APIC...\n")
+    smp_init()
+    vga_print_color("  [OK] ", VGA_GREEN_ON_BLACK)
+    vga_print("SMP initialized, ")
+    # Print CPU count to VGA
+    if @cpu_count == 1
+        vga_print("1 CPU detected\n")
+    else
+        vga_print("multiple CPUs detected\n")
+
+    # Show allocator working
+    vga_print("Testing bump allocator...\n")
+    @ptr1 = bump_alloc(1024, 8)
+    @ptr2 = bump_alloc(2048, 16)
+    if @ptr1 != 0 && @ptr2 != 0
+        vga_print_color("  [OK] ", VGA_GREEN_ON_BLACK)
+        vga_print("Allocator working\n")
+    else
+        vga_print_color("  [FAIL] ", VGA_RED_ON_BLACK)
+        vga_print("Allocation failed\n")
+
+    # Test volatile operations
+    vga_print("Testing volatile memory access...\n")
+    unsafe
+        volatile_write(0x100000, 0xDEADBEEF)
+        @test = volatile_read(0x100000)
+        if @test == 0xDEADBEEF
+            vga_print_color("  [OK] ", VGA_GREEN_ON_BLACK)
+            vga_print("Volatile read/write working\n")
+        else
+            vga_print_color("  [FAIL] ", VGA_RED_ON_BLACK)
+            vga_print("Volatile test failed\n")
+
+    vga_print("\n")
+    vga_print_color("System ready.\n", VGA_GREEN_ON_BLACK)
+
+    # Enable interrupts now that IDT and APIC are loaded
+    unsafe
+        asm {
+            "sti"   # Set interrupt flag - enable hardware interrupts
+        }
+
+    # Send completion to serial for QEMU testing
+    serial_print("Kernel boot complete. ")
+    serial_print_hex(@cpu_count)
+    serial_print(" CPU(s), interrupts enabled.\n")
+
+    # Simple idle loop - in a real kernel this would be a scheduler
+    vga_print("Entering idle loop...\n")
+    orbit _ in 0..1
+        unsafe
+            asm {
+                "hlt"   # Halt until next interrupt
+            }
+    pass
+
+# Export kernel symbols
+export {
+    _start,
+    kernel_main,
+    vga_print,
+    serial_print,
+    idt_init,
+    idt_set_gate,
+    idt_load,
+    exception_divide_by_zero,
+    exception_gpf,
+    exception_page_fault,
+    exception_double_fault,
+    exception_default,
+    # SMP/APIC exports
+    smp_init,
+    lapic_init,
+    lapic_read,
+    lapic_write,
+    lapic_eoi,
+    lapic_id,
+    ioapic_init,
+    ioapic_read,
+    ioapic_write,
+    send_ipi,
+    broadcast_ipi,
+    ipi_wakeup_handler,
+    ipi_tlb_handler,
+    ipi_sched_handler
+}

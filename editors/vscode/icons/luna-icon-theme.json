@@ -1,0 +1,29 @@
+{
+    "iconDefinitions": {
+        "luna": {
+            "iconPath": "./luna-file.png"
+        },
+        "luna-main": {
+            "iconPath": "./luna.png"
+        }
+    },
+    "fileExtensions": {
+        "luna": "luna"
+    },
+    "fileNames": {
+        "main.luna": "luna-main",
+        "app.luna": "luna-main",
+        "Luna.toml": "luna-main"
+    },
+    "folderNames": {
+        "luna": "luna",
+        "stdlib": "luna"
+    },
+    "folderNamesExpanded": {
+        "luna": "luna",
+        "stdlib": "luna"
+    },
+    "languageIds": {
+        "luna": "luna"
+    }
+}

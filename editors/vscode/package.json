@@ -1,0 +1,200 @@
+{
+    "name": "luna-language",
+    "displayName": "Luna Language",
+    "description": "High-performance native compiled programming language v4.2 - syntax highlighting, Pure Luna LSP, IntelliSense, and debugging support",
+    "version": "1.7.0",
+    "publisher": "luna-team",
+    "icon": "icons/luna.png",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/luna-lang/luna"
+    },
+    "homepage": "https://luna-lang.dev",
+    "bugs": {
+        "url": "https://github.com/luna-lang/luna/issues"
+    },
+    "engines": {
+        "vscode": "^1.74.0"
+    },
+    "categories": [
+        "Programming Languages",
+        "Linters",
+        "Formatters",
+        "Debuggers"
+    ],
+    "keywords": [
+        "luna",
+        "programming language",
+        "compiler",
+        "native",
+        "jit",
+        "high-performance",
+        "systems programming"
+    ],
+    "galleryBanner": {
+        "color": "#1a1a2e",
+        "theme": "dark"
+    },
+    "activationEvents": [
+        "onLanguage:luna",
+        "workspaceContains:**/*.luna"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "languages": [
+            {
+                "id": "luna",
+                "aliases": ["Luna", "luna"],
+                "extensions": [".luna"],
+                "configuration": "./language-configuration.json",
+                "icon": {
+                    "light": "./icons/luna.png",
+                    "dark": "./icons/luna.png"
+                }
+            }
+        ],
+        "grammars": [
+            {
+                "language": "luna",
+                "scopeName": "source.luna",
+                "path": "./syntaxes/luna.tmLanguage.json"
+            }
+        ],
+        "configuration": {
+            "type": "object",
+            "title": "Luna",
+            "properties": {
+                "luna.path": {
+                    "type": "string",
+                    "default": "luna",
+                    "description": "Path to Luna executable",
+                    "scope": "machine-overridable"
+                },
+                "luna.lsp.enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Enable Luna Language Server for IntelliSense and diagnostics"
+                },
+                "luna.lsp.trace": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable LSP message tracing for debugging"
+                },
+                "luna.formatOnSave": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Automatically format Luna files on save"
+                },
+                "luna.checkOnSave": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Run type checking on save"
+                }
+            }
+        },
+        "commands": [
+            {
+                "command": "luna.runFile",
+                "title": "Run Current File",
+                "category": "Luna",
+                "icon": "$(play)"
+            },
+            {
+                "command": "luna.restartLsp",
+                "title": "Restart Language Server",
+                "category": "Luna",
+                "icon": "$(refresh)"
+            },
+            {
+                "command": "luna.buildFile",
+                "title": "Build Current File",
+                "category": "Luna",
+                "icon": "$(tools)"
+            },
+            {
+                "command": "luna.showOutput",
+                "title": "Show Output Channel",
+                "category": "Luna",
+                "icon": "$(output)"
+            },
+            {
+                "command": "luna.checkFile",
+                "title": "Check Current File",
+                "category": "Luna",
+                "icon": "$(check)"
+            },
+            {
+                "command": "luna.formatFile",
+                "title": "Format Current File",
+                "category": "Luna",
+                "icon": "$(code)"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "luna.runFile",
+                "key": "ctrl+shift+r",
+                "mac": "cmd+shift+r",
+                "when": "editorLangId == luna"
+            },
+            {
+                "command": "luna.buildFile",
+                "key": "ctrl+shift+b",
+                "mac": "cmd+shift+b",
+                "when": "editorLangId == luna"
+            },
+            {
+                "command": "luna.checkFile",
+                "key": "ctrl+shift+c",
+                "mac": "cmd+shift+c",
+                "when": "editorLangId == luna"
+            }
+        ],
+        "menus": {
+            "editor/title/run": [
+                {
+                    "command": "luna.runFile",
+                    "when": "editorLangId == luna",
+                    "group": "navigation"
+                }
+            ],
+            "editor/context": [
+                {
+                    "command": "luna.runFile",
+                    "when": "editorLangId == luna",
+                    "group": "luna@1"
+                }
+            ]
+        },
+        "iconThemes": [
+            {
+                "id": "luna-icons",
+                "label": "Luna Icons",
+                "path": "./icons/luna-icon-theme.json"
+            }
+        ],
+        "snippets": [
+            {
+                "language": "luna",
+                "path": "./snippets/luna.json"
+            }
+        ]
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "package": "vsce package",
+        "lint": "eslint src --ext ts"
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.1"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "@types/vscode": "^1.74.0",
+        "typescript": "^5.0.0",
+        "@vscode/vsce": "^2.22.0"
+    }
+}

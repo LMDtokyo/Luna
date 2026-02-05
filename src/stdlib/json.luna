@@ -1,0 +1,1017 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna JSON Standard Library — json.luna
+# =============================================================================
+# Pure Luna implementation of JSON parsing and serialization (RFC 8259).
+# Ported from Rust interpreter parse_json_value/value_to_json.
+#
+# Features:
+#   - Full JSON parser (recursive descent)
+#   - String escape handling (\n, \t, \", \\, \/, \b, \f, \uXXXX)
+#   - Number parsing (integers and floating point, scientific notation)
+#   - Array and object support with nesting
+#   - Serializer (compact and pretty-printed)
+#   - Object key lookup, array indexing
+#   - Builder API for programmatic construction
+#   - Validation without full parse
+#   - Fixed-capacity arena-based allocation (no heap)
+#
+# Capacity: 4096 nodes, 4096 strings, 8192 children
+# =============================================================================
+
+# =============================================================================
+# SECTION 1: TYPE CONSTANTS
+# =============================================================================
+
+const JSON_NULL: int = 0
+const JSON_BOOL: int = 1
+const JSON_INT: int = 2
+const JSON_FLOAT: int = 3
+const JSON_STRING: int = 4
+const JSON_ARRAY: int = 5
+const JSON_OBJECT: int = 6
+const JSON_ERROR: int = -1
+
+# Capacity limits
+const MAX_JSON_NODES: int = 4096
+const MAX_JSON_STRINGS: int = 4096
+const MAX_JSON_CHILDREN: int = 8192
+const MAX_JSON_DEPTH: int = 64
+const MAX_JSON_KEY_LEN: int = 256
+
+# =============================================================================
+# SECTION 2: DATA STRUCTURES
+# =============================================================================
+
+struct JsonNode
+    kind: int
+    int_val: int
+    float_val: float
+    str_idx: int
+    children_start: int
+    children_count: int
+
+struct JsonDoc
+    nodes: [JsonNode; 4096]
+    node_count: int
+    strings: [str; 4096]
+    string_count: int
+    children: [int; 8192]
+    children_count: int
+    error: str
+    error_pos: int
+    has_error: int
+
+struct JsonParser
+    input: str
+    pos: int
+    input_len: int
+    depth: int
+    doc: JsonDoc
+
+# =============================================================================
+# SECTION 3: DOCUMENT OPERATIONS
+# =============================================================================
+
+fn json_doc_new() -> JsonDoc
+    @doc = JsonDoc {
+        nodes: [JsonNode { kind: 0, int_val: 0, float_val: 0.0, str_idx: -1, children_start: 0, children_count: 0 }; 4096],
+        node_count: 0,
+        strings: [""; 4096],
+        string_count: 0,
+        children: [0; 8192],
+        children_count: 0,
+        error: "",
+        error_pos: -1,
+        has_error: 0
+    }
+    return @doc
+
+fn doc_alloc_node(@doc: JsonDoc, @kind: int) -> int
+    if @doc.node_count >= MAX_JSON_NODES
+        @doc.error = "Too many JSON nodes (max 4096)"
+        @doc.has_error = 1
+        return -1
+    @idx = @doc.node_count
+    @doc.nodes[@idx].kind = @kind
+    @doc.nodes[@idx].int_val = 0
+    @doc.nodes[@idx].float_val = 0.0
+    @doc.nodes[@idx].str_idx = -1
+    @doc.nodes[@idx].children_start = 0
+    @doc.nodes[@idx].children_count = 0
+    @doc.node_count = @doc.node_count + 1
+    return @idx
+
+fn doc_intern_string(@doc: JsonDoc, @s: str) -> int
+    orbit @i in 0..@doc.string_count
+        if @doc.strings[@i] == @s
+            return @i
+    if @doc.string_count >= MAX_JSON_STRINGS
+        @doc.error = "Too many JSON strings"
+        @doc.has_error = 1
+        return -1
+    @idx = @doc.string_count
+    @doc.strings[@idx] = @s
+    @doc.string_count = @doc.string_count + 1
+    return @idx
+
+fn doc_add_children(@doc: JsonDoc, @node_idx: int, @child_ids: [int; 256], @count: int)
+    if @doc.children_count + @count > MAX_JSON_CHILDREN
+        @doc.error = "Too many JSON children"
+        @doc.has_error = 1
+        return
+    @start = @doc.children_count
+    orbit @i in 0..@count
+        @doc.children[@doc.children_count] = @child_ids[@i]
+        @doc.children_count = @doc.children_count + 1
+    @doc.nodes[@node_idx].children_start = @start
+    @doc.nodes[@node_idx].children_count = @count
+
+# =============================================================================
+# SECTION 4: PARSER — CHARACTER UTILITIES
+# =============================================================================
+
+fn jp_new(@input: str) -> JsonParser
+    return JsonParser {
+        input: @input,
+        pos: 0,
+        input_len: len(@input),
+        depth: 0,
+        doc: json_doc_new()
+    }
+
+fn jp_at_end(@jp: JsonParser) -> int
+    if @jp.pos >= @jp.input_len
+        return 1
+    return 0
+
+fn jp_peek(@jp: JsonParser) -> str
+    if @jp.pos >= @jp.input_len
+        return ""
+    return char_at(@jp.input, @jp.pos)
+
+fn jp_advance(@jp: JsonParser) -> str
+    if @jp.pos >= @jp.input_len
+        return ""
+    @c = char_at(@jp.input, @jp.pos)
+    @jp.pos = @jp.pos + 1
+    return @c
+
+fn jp_skip_whitespace(@jp: JsonParser)
+    orbit @_ in 0..@jp.input_len
+        if @jp.pos >= @jp.input_len
+            break
+        @c = char_at(@jp.input, @jp.pos)
+        if @c == " " or @c == "\t" or @c == "\n" or @c == "\r"
+            @jp.pos = @jp.pos + 1
+        else
+            break
+
+fn jp_expect(@jp: JsonParser, @expected: str) -> int
+    if @jp.pos >= @jp.input_len
+        @jp.doc.error = "Unexpected end, expected '" + @expected + "'"
+        @jp.doc.error_pos = @jp.pos
+        @jp.doc.has_error = 1
+        return 0
+    @c = char_at(@jp.input, @jp.pos)
+    if @c != @expected
+        @jp.doc.error = "Expected '" + @expected + "' but got '" + @c + "'"
+        @jp.doc.error_pos = @jp.pos
+        @jp.doc.has_error = 1
+        return 0
+    @jp.pos = @jp.pos + 1
+    return 1
+
+fn jp_error(@jp: JsonParser, @msg: str) -> int
+    @jp.doc.error = @msg
+    @jp.doc.error_pos = @jp.pos
+    @jp.doc.has_error = 1
+    return -1
+
+# =============================================================================
+# SECTION 5: PARSER — VALUE DISPATCH
+# =============================================================================
+
+fn jp_parse_value(@jp: JsonParser) -> int
+    if @jp.doc.has_error == 1
+        return -1
+    if @jp.depth > MAX_JSON_DEPTH
+        return jp_error(@jp, "Maximum nesting depth exceeded")
+    jp_skip_whitespace(@jp)
+    if jp_at_end(@jp) == 1
+        return jp_error(@jp, "Unexpected end of input")
+    @c = jp_peek(@jp)
+    if @c == "\""
+        return jp_parse_string(@jp)
+    if @c == "{"
+        return jp_parse_object(@jp)
+    if @c == "["
+        return jp_parse_array(@jp)
+    if @c == "t"
+        return jp_parse_true(@jp)
+    if @c == "f"
+        return jp_parse_false(@jp)
+    if @c == "n"
+        return jp_parse_null(@jp)
+    if @c == "-" or (@c >= "0" and @c <= "9")
+        return jp_parse_number(@jp)
+    return jp_error(@jp, "Unexpected character: '" + @c + "'")
+
+# =============================================================================
+# SECTION 6: PARSER — PRIMITIVES
+# =============================================================================
+
+fn jp_parse_null(@jp: JsonParser) -> int
+    if @jp.pos + 4 > @jp.input_len
+        return jp_error(@jp, "Unexpected end parsing null")
+    @s = substr(@jp.input, @jp.pos, 4)
+    if @s != "null"
+        return jp_error(@jp, "Expected 'null'")
+    @jp.pos = @jp.pos + 4
+    return doc_alloc_node(@jp.doc, JSON_NULL)
+
+fn jp_parse_true(@jp: JsonParser) -> int
+    if @jp.pos + 4 > @jp.input_len
+        return jp_error(@jp, "Unexpected end parsing true")
+    @s = substr(@jp.input, @jp.pos, 4)
+    if @s != "true"
+        return jp_error(@jp, "Expected 'true'")
+    @jp.pos = @jp.pos + 4
+    @idx = doc_alloc_node(@jp.doc, JSON_BOOL)
+    if @idx >= 0
+        @jp.doc.nodes[@idx].int_val = 1
+    return @idx
+
+fn jp_parse_false(@jp: JsonParser) -> int
+    if @jp.pos + 5 > @jp.input_len
+        return jp_error(@jp, "Unexpected end parsing false")
+    @s = substr(@jp.input, @jp.pos, 5)
+    if @s != "false"
+        return jp_error(@jp, "Expected 'false'")
+    @jp.pos = @jp.pos + 5
+    @idx = doc_alloc_node(@jp.doc, JSON_BOOL)
+    if @idx >= 0
+        @jp.doc.nodes[@idx].int_val = 0
+    return @idx
+
+# =============================================================================
+# SECTION 7: PARSER — NUMBERS
+# =============================================================================
+
+fn jp_parse_number(@jp: JsonParser) -> int
+    @start = @jp.pos
+    @is_float = 0
+    if @jp.pos < @jp.input_len and char_at(@jp.input, @jp.pos) == "-"
+        @jp.pos = @jp.pos + 1
+    if @jp.pos >= @jp.input_len
+        return jp_error(@jp, "Unexpected end in number")
+    @c = char_at(@jp.input, @jp.pos)
+    if @c == "0"
+        @jp.pos = @jp.pos + 1
+    else if @c >= "1" and @c <= "9"
+        orbit @_ in 0..@jp.input_len
+            if @jp.pos >= @jp.input_len
+                break
+            @d = char_at(@jp.input, @jp.pos)
+            if @d >= "0" and @d <= "9"
+                @jp.pos = @jp.pos + 1
+            else
+                break
+    else
+        return jp_error(@jp, "Expected digit in number")
+    # Fractional part
+    if @jp.pos < @jp.input_len and char_at(@jp.input, @jp.pos) == "."
+        @is_float = 1
+        @jp.pos = @jp.pos + 1
+        if @jp.pos >= @jp.input_len or char_at(@jp.input, @jp.pos) < "0" or char_at(@jp.input, @jp.pos) > "9"
+            return jp_error(@jp, "Expected digit after decimal point")
+        orbit @_ in 0..@jp.input_len
+            if @jp.pos >= @jp.input_len
+                break
+            @d = char_at(@jp.input, @jp.pos)
+            if @d >= "0" and @d <= "9"
+                @jp.pos = @jp.pos + 1
+            else
+                break
+    # Exponent
+    if @jp.pos < @jp.input_len
+        @e = char_at(@jp.input, @jp.pos)
+        if @e == "e" or @e == "E"
+            @is_float = 1
+            @jp.pos = @jp.pos + 1
+            if @jp.pos < @jp.input_len
+                @s = char_at(@jp.input, @jp.pos)
+                if @s == "+" or @s == "-"
+                    @jp.pos = @jp.pos + 1
+            if @jp.pos >= @jp.input_len or char_at(@jp.input, @jp.pos) < "0" or char_at(@jp.input, @jp.pos) > "9"
+                return jp_error(@jp, "Expected digit in exponent")
+            orbit @_ in 0..@jp.input_len
+                if @jp.pos >= @jp.input_len
+                    break
+                @d = char_at(@jp.input, @jp.pos)
+                if @d >= "0" and @d <= "9"
+                    @jp.pos = @jp.pos + 1
+                else
+                    break
+    @num_str = substr(@jp.input, @start, @jp.pos - @start)
+    if @is_float == 1
+        @idx = doc_alloc_node(@jp.doc, JSON_FLOAT)
+        if @idx >= 0
+            @jp.doc.nodes[@idx].float_val = float(@num_str)
+        return @idx
+    else
+        @idx = doc_alloc_node(@jp.doc, JSON_INT)
+        if @idx >= 0
+            @jp.doc.nodes[@idx].int_val = int(@num_str)
+        return @idx
+
+# =============================================================================
+# SECTION 8: PARSER — STRINGS
+# =============================================================================
+
+fn jp_parse_string(@jp: JsonParser) -> int
+    if jp_expect(@jp, "\"") == 0
+        return -1
+    @result = ""
+    orbit @_ in 0..100000
+        if @jp.pos >= @jp.input_len
+            return jp_error(@jp, "Unterminated string")
+        @c = char_at(@jp.input, @jp.pos)
+        if @c == "\""
+            @jp.pos = @jp.pos + 1
+            break
+        if @c == "\\"
+            @jp.pos = @jp.pos + 1
+            if @jp.pos >= @jp.input_len
+                return jp_error(@jp, "Unterminated escape sequence")
+            @esc = char_at(@jp.input, @jp.pos)
+            @jp.pos = @jp.pos + 1
+            if @esc == "\""
+                @result = @result + "\""
+            else if @esc == "\\"
+                @result = @result + "\\"
+            else if @esc == "/"
+                @result = @result + "/"
+            else if @esc == "n"
+                @result = @result + "\n"
+            else if @esc == "t"
+                @result = @result + "\t"
+            else if @esc == "r"
+                @result = @result + "\r"
+            else if @esc == "b"
+                @result = @result + "\b"
+            else if @esc == "f"
+                @result = @result + "\f"
+            else if @esc == "u"
+                if @jp.pos + 4 > @jp.input_len
+                    return jp_error(@jp, "Incomplete unicode escape")
+                @jp.pos = @jp.pos + 4
+                @result = @result + "?"
+            else
+                return jp_error(@jp, "Invalid escape character: \\" + @esc)
+        else
+            @result = @result + @c
+            @jp.pos = @jp.pos + 1
+    @idx = doc_alloc_node(@jp.doc, JSON_STRING)
+    if @idx >= 0
+        @str_idx = doc_intern_string(@jp.doc, @result)
+        @jp.doc.nodes[@idx].str_idx = @str_idx
+    return @idx
+
+fn jp_parse_key(@jp: JsonParser) -> str
+    if @jp.pos >= @jp.input_len or char_at(@jp.input, @jp.pos) != "\""
+        @jp.doc.error = "Expected '\"' for object key"
+        @jp.doc.has_error = 1
+        return ""
+    @jp.pos = @jp.pos + 1
+    @result = ""
+    orbit @_ in 0..MAX_JSON_KEY_LEN
+        if @jp.pos >= @jp.input_len
+            @jp.doc.error = "Unterminated key string"
+            @jp.doc.has_error = 1
+            return ""
+        @c = char_at(@jp.input, @jp.pos)
+        if @c == "\""
+            @jp.pos = @jp.pos + 1
+            return @result
+        if @c == "\\"
+            @jp.pos = @jp.pos + 1
+            if @jp.pos >= @jp.input_len
+                return ""
+            @esc = char_at(@jp.input, @jp.pos)
+            @jp.pos = @jp.pos + 1
+            if @esc == "\""
+                @result = @result + "\""
+            else if @esc == "\\"
+                @result = @result + "\\"
+            else if @esc == "n"
+                @result = @result + "\n"
+            else if @esc == "t"
+                @result = @result + "\t"
+            else
+                @result = @result + @esc
+        else
+            @result = @result + @c
+            @jp.pos = @jp.pos + 1
+    return @result
+
+# =============================================================================
+# SECTION 9: PARSER — ARRAYS
+# =============================================================================
+
+fn jp_parse_array(@jp: JsonParser) -> int
+    if jp_expect(@jp, "[") == 0
+        return -1
+    @jp.depth = @jp.depth + 1
+    @idx = doc_alloc_node(@jp.doc, JSON_ARRAY)
+    if @idx < 0
+        return -1
+    @child_ids: [int; 256] = [0; 256]
+    @child_count = 0
+    jp_skip_whitespace(@jp)
+    if jp_at_end(@jp) == 0 and jp_peek(@jp) == "]"
+        @jp.pos = @jp.pos + 1
+        @jp.depth = @jp.depth - 1
+        return @idx
+    orbit @_ in 0..MAX_JSON_NODES
+        if @jp.doc.has_error == 1
+            return -1
+        @child = jp_parse_value(@jp)
+        if @child < 0
+            return -1
+        if @child_count < 256
+            @child_ids[@child_count] = @child
+            @child_count = @child_count + 1
+        jp_skip_whitespace(@jp)
+        if jp_at_end(@jp) == 1
+            return jp_error(@jp, "Unterminated array")
+        @next = jp_peek(@jp)
+        if @next == "]"
+            @jp.pos = @jp.pos + 1
+            break
+        if @next == ","
+            @jp.pos = @jp.pos + 1
+        else
+            return jp_error(@jp, "Expected ',' or ']' in array")
+    doc_add_children(@jp.doc, @idx, @child_ids, @child_count)
+    @jp.depth = @jp.depth - 1
+    return @idx
+
+# =============================================================================
+# SECTION 10: PARSER — OBJECTS
+# =============================================================================
+
+fn jp_parse_object(@jp: JsonParser) -> int
+    if jp_expect(@jp, "{") == 0
+        return -1
+    @jp.depth = @jp.depth + 1
+    @idx = doc_alloc_node(@jp.doc, JSON_OBJECT)
+    if @idx < 0
+        return -1
+    @child_ids: [int; 256] = [0; 256]
+    @child_count = 0
+    jp_skip_whitespace(@jp)
+    if jp_at_end(@jp) == 0 and jp_peek(@jp) == "}"
+        @jp.pos = @jp.pos + 1
+        @jp.depth = @jp.depth - 1
+        return @idx
+    orbit @_ in 0..MAX_JSON_NODES
+        if @jp.doc.has_error == 1
+            return -1
+        jp_skip_whitespace(@jp)
+        @key = jp_parse_key(@jp)
+        if @jp.doc.has_error == 1
+            return -1
+        @key_node = doc_alloc_node(@jp.doc, JSON_STRING)
+        if @key_node < 0
+            return -1
+        @key_str_idx = doc_intern_string(@jp.doc, @key)
+        @jp.doc.nodes[@key_node].str_idx = @key_str_idx
+        jp_skip_whitespace(@jp)
+        if jp_expect(@jp, ":") == 0
+            return -1
+        @val = jp_parse_value(@jp)
+        if @val < 0
+            return -1
+        if @child_count + 2 <= 256
+            @child_ids[@child_count] = @key_node
+            @child_count = @child_count + 1
+            @child_ids[@child_count] = @val
+            @child_count = @child_count + 1
+        jp_skip_whitespace(@jp)
+        if jp_at_end(@jp) == 1
+            return jp_error(@jp, "Unterminated object")
+        @next = jp_peek(@jp)
+        if @next == "}"
+            @jp.pos = @jp.pos + 1
+            break
+        if @next == ","
+            @jp.pos = @jp.pos + 1
+        else
+            return jp_error(@jp, "Expected ',' or '}' in object")
+    doc_add_children(@jp.doc, @idx, @child_ids, @child_count)
+    @jp.depth = @jp.depth - 1
+    return @idx
+
+# =============================================================================
+# SECTION 11: PUBLIC PARSE API
+# =============================================================================
+
+fn json_parse(@input: str) -> JsonDoc
+    @jp = jp_new(@input)
+    @root = jp_parse_value(@jp)
+    if @jp.doc.has_error == 1
+        return @jp.doc
+    jp_skip_whitespace(@jp)
+    if jp_at_end(@jp) == 0
+        jp_error(@jp, "Unexpected trailing content")
+    return @jp.doc
+
+fn json_is_valid(@input: str) -> int
+    @doc = json_parse(@input)
+    if @doc.has_error == 1
+        return 0
+    return 1
+
+fn json_root_kind(@doc: JsonDoc) -> int
+    if @doc.node_count == 0
+        return JSON_ERROR
+    return @doc.nodes[0].kind
+
+# =============================================================================
+# SECTION 12: ACCESSORS
+# =============================================================================
+
+fn json_get(@doc: JsonDoc, @obj_idx: int, @key: str) -> int
+    if @obj_idx < 0 or @obj_idx >= @doc.node_count
+        return -1
+    if @doc.nodes[@obj_idx].kind != JSON_OBJECT
+        return -1
+    @start = @doc.nodes[@obj_idx].children_start
+    @count = @doc.nodes[@obj_idx].children_count
+    orbit @i in 0..(@count / 2)
+        @key_idx = @doc.children[@start + @i * 2]
+        @val_idx = @doc.children[@start + @i * 2 + 1]
+        if @key_idx >= 0 and @key_idx < @doc.node_count
+            @k_str_idx = @doc.nodes[@key_idx].str_idx
+            if @k_str_idx >= 0 and @k_str_idx < @doc.string_count
+                if @doc.strings[@k_str_idx] == @key
+                    return @val_idx
+    return -1
+
+fn json_get_index(@doc: JsonDoc, @arr_idx: int, @index: int) -> int
+    if @arr_idx < 0 or @arr_idx >= @doc.node_count
+        return -1
+    if @doc.nodes[@arr_idx].kind != JSON_ARRAY
+        return -1
+    if @index < 0 or @index >= @doc.nodes[@arr_idx].children_count
+        return -1
+    @child_start = @doc.nodes[@arr_idx].children_start
+    return @doc.children[@child_start + @index]
+
+fn json_array_len(@doc: JsonDoc, @arr_idx: int) -> int
+    if @arr_idx < 0 or @arr_idx >= @doc.node_count
+        return 0
+    if @doc.nodes[@arr_idx].kind != JSON_ARRAY
+        return 0
+    return @doc.nodes[@arr_idx].children_count
+
+fn json_object_len(@doc: JsonDoc, @obj_idx: int) -> int
+    if @obj_idx < 0 or @obj_idx >= @doc.node_count
+        return 0
+    if @doc.nodes[@obj_idx].kind != JSON_OBJECT
+        return 0
+    return @doc.nodes[@obj_idx].children_count / 2
+
+fn json_get_string(@doc: JsonDoc, @idx: int) -> str
+    if @idx < 0 or @idx >= @doc.node_count
+        return ""
+    if @doc.nodes[@idx].kind != JSON_STRING
+        return ""
+    @si = @doc.nodes[@idx].str_idx
+    if @si < 0 or @si >= @doc.string_count
+        return ""
+    return @doc.strings[@si]
+
+fn json_get_int(@doc: JsonDoc, @idx: int) -> int
+    if @idx < 0 or @idx >= @doc.node_count
+        return 0
+    if @doc.nodes[@idx].kind != JSON_INT
+        return 0
+    return @doc.nodes[@idx].int_val
+
+fn json_get_float(@doc: JsonDoc, @idx: int) -> float
+    if @idx < 0 or @idx >= @doc.node_count
+        return 0.0
+    if @doc.nodes[@idx].kind == JSON_FLOAT
+        return @doc.nodes[@idx].float_val
+    if @doc.nodes[@idx].kind == JSON_INT
+        return float(@doc.nodes[@idx].int_val)
+    return 0.0
+
+fn json_get_bool(@doc: JsonDoc, @idx: int) -> int
+    if @idx < 0 or @idx >= @doc.node_count
+        return 0
+    if @doc.nodes[@idx].kind != JSON_BOOL
+        return 0
+    return @doc.nodes[@idx].int_val
+
+fn json_is_null(@doc: JsonDoc, @idx: int) -> int
+    if @idx < 0 or @idx >= @doc.node_count
+        return 0
+    if @doc.nodes[@idx].kind == JSON_NULL
+        return 1
+    return 0
+
+# =============================================================================
+# SECTION 13: SERIALIZER
+# =============================================================================
+
+fn json_escape_string(@s: str) -> str
+    @result = ""
+    @slen = len(@s)
+    orbit @i in 0..@slen
+        @c = char_at(@s, @i)
+        if @c == "\""
+            @result = @result + "\\\""
+        else if @c == "\\"
+            @result = @result + "\\\\"
+        else if @c == "\n"
+            @result = @result + "\\n"
+        else if @c == "\t"
+            @result = @result + "\\t"
+        else if @c == "\r"
+            @result = @result + "\\r"
+        else
+            @result = @result + @c
+    return @result
+
+fn json_stringify(@doc: JsonDoc, @idx: int) -> str
+    if @idx < 0 or @idx >= @doc.node_count
+        return "null"
+    @node = @doc.nodes[@idx]
+    if @node.kind == JSON_NULL
+        return "null"
+    if @node.kind == JSON_BOOL
+        if @node.int_val == 1
+            return "true"
+        return "false"
+    if @node.kind == JSON_INT
+        return str(@node.int_val)
+    if @node.kind == JSON_FLOAT
+        return str(@node.float_val)
+    if @node.kind == JSON_STRING
+        @s = ""
+        if @node.str_idx >= 0 and @node.str_idx < @doc.string_count
+            @s = @doc.strings[@node.str_idx]
+        return "\"" + json_escape_string(@s) + "\""
+    if @node.kind == JSON_ARRAY
+        @result = "["
+        @start = @node.children_start
+        @count = @node.children_count
+        orbit @i in 0..@count
+            if @i > 0
+                @result = @result + ","
+            @child = @doc.children[@start + @i]
+            @result = @result + json_stringify(@doc, @child)
+        return @result + "]"
+    if @node.kind == JSON_OBJECT
+        @result = "{"
+        @start = @node.children_start
+        @count = @node.children_count
+        @pair_count = @count / 2
+        orbit @i in 0..@pair_count
+            if @i > 0
+                @result = @result + ","
+            @key_node = @doc.children[@start + @i * 2]
+            @val_node = @doc.children[@start + @i * 2 + 1]
+            @result = @result + json_stringify(@doc, @key_node)
+            @result = @result + ":"
+            @result = @result + json_stringify(@doc, @val_node)
+        return @result + "}"
+    return "null"
+
+fn json_make_indent(@indent: int) -> str
+    @pad = ""
+    orbit @_ in 0..@indent
+        @pad = @pad + "  "
+    return @pad
+
+fn json_stringify_pretty(@doc: JsonDoc, @idx: int, @indent: int) -> str
+    if @idx < 0 or @idx >= @doc.node_count
+        return "null"
+    @node = @doc.nodes[@idx]
+    if @node.kind == JSON_NULL
+        return "null"
+    if @node.kind == JSON_BOOL
+        if @node.int_val == 1
+            return "true"
+        return "false"
+    if @node.kind == JSON_INT
+        return str(@node.int_val)
+    if @node.kind == JSON_FLOAT
+        return str(@node.float_val)
+    if @node.kind == JSON_STRING
+        @s = ""
+        if @node.str_idx >= 0 and @node.str_idx < @doc.string_count
+            @s = @doc.strings[@node.str_idx]
+        return "\"" + json_escape_string(@s) + "\""
+    @pad = json_make_indent(@indent)
+    @inner_pad = json_make_indent(@indent + 1)
+    if @node.kind == JSON_ARRAY
+        @start = @node.children_start
+        @count = @node.children_count
+        if @count == 0
+            return "[]"
+        @result = "[\n"
+        orbit @i in 0..@count
+            @result = @result + @inner_pad
+            @child = @doc.children[@start + @i]
+            @result = @result + json_stringify_pretty(@doc, @child, @indent + 1)
+            if @i < @count - 1
+                @result = @result + ","
+            @result = @result + "\n"
+        return @result + @pad + "]"
+    if @node.kind == JSON_OBJECT
+        @start = @node.children_start
+        @count = @node.children_count
+        @pair_count = @count / 2
+        if @pair_count == 0
+            return "{}"
+        @result = "{\n"
+        orbit @i in 0..@pair_count
+            @result = @result + @inner_pad
+            @key_node = @doc.children[@start + @i * 2]
+            @val_node = @doc.children[@start + @i * 2 + 1]
+            @result = @result + json_stringify(@doc, @key_node)
+            @result = @result + ": "
+            @result = @result + json_stringify_pretty(@doc, @val_node, @indent + 1)
+            if @i < @pair_count - 1
+                @result = @result + ","
+            @result = @result + "\n"
+        return @result + @pad + "}"
+    return "null"
+
+# =============================================================================
+# SECTION 14: BUILDER API
+# =============================================================================
+
+fn json_null(@doc: JsonDoc) -> int
+    return doc_alloc_node(@doc, JSON_NULL)
+
+fn json_bool(@doc: JsonDoc, @val: int) -> int
+    @idx = doc_alloc_node(@doc, JSON_BOOL)
+    if @idx >= 0
+        @doc.nodes[@idx].int_val = @val
+    return @idx
+
+fn json_int(@doc: JsonDoc, @val: int) -> int
+    @idx = doc_alloc_node(@doc, JSON_INT)
+    if @idx >= 0
+        @doc.nodes[@idx].int_val = @val
+    return @idx
+
+fn json_float(@doc: JsonDoc, @val: float) -> int
+    @idx = doc_alloc_node(@doc, JSON_FLOAT)
+    if @idx >= 0
+        @doc.nodes[@idx].float_val = @val
+    return @idx
+
+fn json_string(@doc: JsonDoc, @val: str) -> int
+    @idx = doc_alloc_node(@doc, JSON_STRING)
+    if @idx >= 0
+        @str_idx = doc_intern_string(@doc, @val)
+        @doc.nodes[@idx].str_idx = @str_idx
+    return @idx
+
+fn json_array(@doc: JsonDoc, @items: [int; 256], @count: int) -> int
+    @idx = doc_alloc_node(@doc, JSON_ARRAY)
+    if @idx >= 0
+        doc_add_children(@doc, @idx, @items, @count)
+    return @idx
+
+fn json_object(@doc: JsonDoc, @pairs: [int; 256], @count: int) -> int
+    @idx = doc_alloc_node(@doc, JSON_OBJECT)
+    if @idx >= 0
+        doc_add_children(@doc, @idx, @pairs, @count)
+    return @idx
+
+# =============================================================================
+# SECTION 15: SELF-TESTS
+# =============================================================================
+
+fn test_parse_null()
+    shine("  [test] Parse null...")
+    @doc = json_parse("null")
+    guard @doc.has_error == 0 else
+        shine("    FAIL: " + @doc.error)
+        return
+    guard @doc.nodes[0].kind == JSON_NULL else
+        shine("    FAIL: expected null kind")
+        return
+    shine("    PASS")
+
+fn test_parse_bool()
+    shine("  [test] Parse bool...")
+    @doc = json_parse("true")
+    guard @doc.has_error == 0 else
+        shine("    FAIL: " + @doc.error)
+        return
+    guard @doc.nodes[0].kind == JSON_BOOL else
+        shine("    FAIL: expected bool kind")
+        return
+    guard @doc.nodes[0].int_val == 1 else
+        shine("    FAIL: expected true (1)")
+        return
+    @doc2 = json_parse("false")
+    guard @doc2.nodes[0].int_val == 0 else
+        shine("    FAIL: expected false (0)")
+        return
+    shine("    PASS")
+
+fn test_parse_number()
+    shine("  [test] Parse number...")
+    @doc = json_parse("42")
+    guard @doc.has_error == 0 else
+        shine("    FAIL: " + @doc.error)
+        return
+    guard @doc.nodes[0].kind == JSON_INT else
+        shine("    FAIL: expected int kind")
+        return
+    guard @doc.nodes[0].int_val == 42 else
+        shine("    FAIL: expected 42")
+        return
+    @doc2 = json_parse("3.14")
+    guard @doc2.nodes[0].kind == JSON_FLOAT else
+        shine("    FAIL: expected float kind")
+        return
+    @doc3 = json_parse("-7")
+    guard @doc3.nodes[0].int_val == -7 else
+        shine("    FAIL: expected -7")
+        return
+    shine("    PASS")
+
+fn test_parse_string()
+    shine("  [test] Parse string...")
+    @doc = json_parse("\"hello world\"")
+    guard @doc.has_error == 0 else
+        shine("    FAIL: " + @doc.error)
+        return
+    guard @doc.nodes[0].kind == JSON_STRING else
+        shine("    FAIL: expected string kind")
+        return
+    @val = json_get_string(@doc, 0)
+    guard @val == "hello world" else
+        shine("    FAIL: expected 'hello world', got '" + @val + "'")
+        return
+    shine("    PASS")
+
+fn test_parse_array()
+    shine("  [test] Parse array...")
+    @doc = json_parse("[1, 2, 3]")
+    guard @doc.has_error == 0 else
+        shine("    FAIL: " + @doc.error)
+        return
+    guard @doc.nodes[0].kind == JSON_ARRAY else
+        shine("    FAIL: expected array kind")
+        return
+    guard json_array_len(@doc, 0) == 3 else
+        shine("    FAIL: expected 3 items")
+        return
+    @first = json_get_index(@doc, 0, 0)
+    guard @first >= 0 else
+        shine("    FAIL: first element not found")
+        return
+    guard json_get_int(@doc, @first) == 1 else
+        shine("    FAIL: first element != 1")
+        return
+    shine("    PASS")
+
+fn test_parse_object()
+    shine("  [test] Parse object...")
+    @doc = json_parse("{\"name\": \"Luna\", \"version\": 4}")
+    guard @doc.has_error == 0 else
+        shine("    FAIL: " + @doc.error)
+        return
+    guard @doc.nodes[0].kind == JSON_OBJECT else
+        shine("    FAIL: expected object kind")
+        return
+    @name_idx = json_get(@doc, 0, "name")
+    guard @name_idx >= 0 else
+        shine("    FAIL: key 'name' not found")
+        return
+    @name_val = json_get_string(@doc, @name_idx)
+    guard @name_val == "Luna" else
+        shine("    FAIL: expected 'Luna', got '" + @name_val + "'")
+        return
+    @ver_idx = json_get(@doc, 0, "version")
+    guard @ver_idx >= 0 else
+        shine("    FAIL: key 'version' not found")
+        return
+    guard json_get_int(@doc, @ver_idx) == 4 else
+        shine("    FAIL: expected version 4")
+        return
+    shine("    PASS")
+
+fn test_parse_nested()
+    shine("  [test] Parse nested...")
+    @doc = json_parse("{\"items\": [1, 2], \"meta\": {\"count\": 2}}")
+    guard @doc.has_error == 0 else
+        shine("    FAIL: " + @doc.error)
+        return
+    @items_idx = json_get(@doc, 0, "items")
+    guard @items_idx >= 0 else
+        shine("    FAIL: items not found")
+        return
+    guard json_array_len(@doc, @items_idx) == 2 else
+        shine("    FAIL: expected 2 items")
+        return
+    @meta_idx = json_get(@doc, 0, "meta")
+    guard @meta_idx >= 0 else
+        shine("    FAIL: meta not found")
+        return
+    @count_idx = json_get(@doc, @meta_idx, "count")
+    guard @count_idx >= 0 else
+        shine("    FAIL: count not found in meta")
+        return
+    guard json_get_int(@doc, @count_idx) == 2 else
+        shine("    FAIL: expected count 2")
+        return
+    shine("    PASS")
+
+fn test_stringify()
+    shine("  [test] Stringify...")
+    @doc = json_parse("[1, 2, 3]")
+    guard @doc.has_error == 0 else
+        shine("    FAIL: parse error")
+        return
+    @s = json_stringify(@doc, 0)
+    guard @s == "[1,2,3]" else
+        shine("    FAIL: expected '[1,2,3]', got '" + @s + "'")
+        return
+    shine("    PASS")
+
+fn test_roundtrip()
+    shine("  [test] Round-trip...")
+    @input = "{\"a\":1,\"b\":true,\"c\":null}"
+    @doc = json_parse(@input)
+    guard @doc.has_error == 0 else
+        shine("    FAIL: parse error: " + @doc.error)
+        return
+    @output = json_stringify(@doc, 0)
+    @doc2 = json_parse(@output)
+    guard @doc2.has_error == 0 else
+        shine("    FAIL: re-parse error: " + @doc2.error)
+        return
+    @output2 = json_stringify(@doc2, 0)
+    guard @output == @output2 else
+        shine("    FAIL: round-trip mismatch")
+        return
+    shine("    PASS")
+
+fn test_invalid()
+    shine("  [test] Invalid JSON detection...")
+    guard json_is_valid("{") == 0 else
+        shine("    FAIL: '{' should be invalid")
+        return
+    guard json_is_valid("") == 0 else
+        shine("    FAIL: empty should be invalid")
+        return
+    guard json_is_valid("42") == 1 else
+        shine("    FAIL: 42 should be valid")
+        return
+    shine("    PASS")
+
+fn test_builder()
+    shine("  [test] Builder API...")
+    @doc = json_doc_new()
+    @items: [int; 256] = [0; 256]
+    @items[0] = json_int(@doc, 10)
+    @items[1] = json_int(@doc, 20)
+    @items[2] = json_string(@doc, "hello")
+    @arr = json_array(@doc, @items, 3)
+    @s = json_stringify(@doc, @arr)
+    guard @s == "[10,20,\"hello\"]" else
+        shine("    FAIL: expected '[10,20,\"hello\"]', got '" + @s + "'")
+        return
+    shine("    PASS")
+
+fn run_self_tests()
+    shine("=== JSON Standard Library Self-Tests ===")
+    test_parse_null()
+    test_parse_bool()
+    test_parse_number()
+    test_parse_string()
+    test_parse_array()
+    test_parse_object()
+    test_parse_nested()
+    test_stringify()
+    test_roundtrip()
+    test_invalid()
+    test_builder()
+    shine("=== All JSON Tests Done ===")
+
+# Run self-tests when executed directly
+run_self_tests()

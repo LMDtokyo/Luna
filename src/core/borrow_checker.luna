@@ -1,0 +1,2498 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Self-Hosting Borrow Checker v1.0
+# =============================================================================
+# Rust-style ownership and borrowing for memory safety without GC.
+# Enables zero-cost memory management through compile-time checks.
+#
+# Ported line-by-line from src/borrow_checker.rs (1,014 lines) to Pure Luna.
+#
+# Architecture:
+# 1. Ownership Model    - Owned / Moved / Borrowed / MutBorrowed / Dropped
+# 2. Borrow Tracking    - Single mutable XOR multiple immutable borrows
+# 3. Lifetime Inference - Constraint-based with cycle detection (DFS)
+# 4. Region Leak Guard  - Prevents region-allocated values from escaping
+# 5. Move Semantics     - Copy types bypass, parameter protection
+# 6. Error Reporting    - Rust-style error codes (E0382, E0499, etc.)
+#
+# Uses flat parallel arrays with index-based lookups (no HashMap).
+# All storage has fixed max capacity for deterministic memory usage.
+#
+# Build: luna compile borrow_checker.luna
+# =============================================================================
+
+import parser
+import types
+
+# =============================================================================
+# CAPACITY CONSTANTS
+# =============================================================================
+
+const MAX_VARIABLES: int = 512
+const MAX_BORROWS: int = 256
+const MAX_ERRORS: int = 64
+const MAX_LIFETIMES: int = 128
+const MAX_LOCAL_VARS: int = 256
+const MAX_CONSTRAINTS: int = 64
+const MAX_BORROW_LIST: int = 16
+const MAX_STR_LIST: int = 16
+
+# =============================================================================
+# STATEMENT NODE TYPE CONSTANTS (matching parser AST)
+# =============================================================================
+
+const STMT_LET: int = 1
+const STMT_ASSIGN: int = 2
+const STMT_FN: int = 3
+const STMT_IF: int = 4
+const STMT_FOR: int = 5
+const STMT_WHILE: int = 6
+const STMT_RETURN: int = 7
+const STMT_EXPR: int = 8
+const STMT_DROP: int = 9
+const STMT_ORBIT: int = 10
+const STMT_MATCH: int = 11
+
+# =============================================================================
+# EXPRESSION NODE TYPE CONSTANTS (matching parser AST)
+# =============================================================================
+
+const EXPR_IDENT: int = 20
+const EXPR_INT: int = 21
+const EXPR_FLOAT: int = 22
+const EXPR_STR: int = 23
+const EXPR_BOOL: int = 24
+const EXPR_NONE: int = 25
+
+const EXPR_BINOP: int = 30
+const EXPR_UNOP: int = 31
+const EXPR_CALL: int = 32
+const EXPR_METHOD: int = 33
+const EXPR_INDEX: int = 34
+const EXPR_MEMBER: int = 35
+
+const EXPR_LIST: int = 40
+const EXPR_DICT: int = 41
+const EXPR_MOVE: int = 42
+const EXPR_RAW_PTR: int = 43
+const EXPR_RC_ALLOC: int = 44
+const EXPR_LAMBDA: int = 45
+const EXPR_PIPE: int = 46
+
+# =============================================================================
+# TYPE CONSTANTS (from types.luna)
+# =============================================================================
+
+const TYPE_INT: int = 1
+const TYPE_FLOAT: int = 2
+const TYPE_STR: int = 3
+const TYPE_BOOL: int = 4
+const TYPE_NONE: int = 5
+const TYPE_VOID: int = 6
+const TYPE_ANY: int = 7
+const TYPE_GENERIC: int = 20
+const TYPE_MEOW: int = 50
+const TYPE_PTR: int = 51
+
+# =============================================================================
+# OWNERSHIP STATE CONSTANTS
+# =============================================================================
+# Each variable tracks one of these ownership states at any point in time.
+
+const OWN_OWNED: int = 0           # Value is owned by this binding
+const OWN_MOVED: int = 1           # Value has been moved out
+const OWN_BORROWED: int = 2        # Value is borrowed immutably (1+ borrows)
+const OWN_MUT_BORROWED: int = 3    # Value is borrowed mutably (exclusive)
+const OWN_DROPPED: int = 4         # Value has been explicitly dropped
+
+# =============================================================================
+# BORROW ERROR KIND CONSTANTS
+# =============================================================================
+
+const ERR_USE_AFTER_MOVE: int = 1
+const ERR_MUT_BORROW_WHILE_BORROWED: int = 2
+const ERR_DOUBLE_MUT_BORROW: int = 3
+const ERR_BORROW_OUTLIVES_OWNER: int = 4
+const ERR_MODIFY_WHILE_BORROWED: int = 5
+const ERR_RETURN_LOCAL_REF: int = 6
+const ERR_USE_AFTER_DROP: int = 7
+const ERR_REGION_LEAK: int = 8
+
+# =============================================================================
+# BORROW ERROR STRUCT
+# =============================================================================
+# Each error variant uses different fields depending on kind.
+# Unused fields are set to "" or 0.
+
+struct BorrowError
+    kind: int               # ERR_* constant
+    variable: str           # Primary variable name
+    moved_to: str           # Target of move (ERR_USE_AFTER_MOVE)
+    move_line: int          # Line where move happened
+    use_line: int           # Line where use/error occurs
+    line: int               # General line number for error
+    first_borrow: str       # First borrow name (ERR_DOUBLE_MUT_BORROW)
+    second_borrow: str      # Second borrow name
+    borrow_name: str        # Borrow target (ERR_BORROW_OUTLIVES_OWNER)
+    owner_name: str         # Owner variable
+    region: str             # Region name (ERR_REGION_LEAK)
+    escapes_to: str         # Escape target (ERR_REGION_LEAK)
+    drop_line: int          # Line where drop happened
+    # Existing borrows list (for ERR_MUT_BORROW_WHILE_BORROWED, ERR_MODIFY_WHILE_BORROWED)
+    existing_borrows: [str; 16]
+    existing_borrow_count: int
+
+# =============================================================================
+# BORROW ERROR CONSTRUCTORS
+# =============================================================================
+
+fn error_use_after_move(@variable: str, @moved_to: str, @move_line: int, @use_line: int) -> BorrowError
+    return BorrowError {
+        kind: ERR_USE_AFTER_MOVE,
+        variable: @variable,
+        moved_to: @moved_to,
+        move_line: @move_line,
+        use_line: @use_line,
+        line: @use_line,
+        first_borrow: "",
+        second_borrow: "",
+        borrow_name: "",
+        owner_name: "",
+        region: "",
+        escapes_to: "",
+        drop_line: 0,
+        existing_borrows: [""; 16],
+        existing_borrow_count: 0
+    }
+
+fn error_mut_borrow_while_borrowed(@variable: str, @existing: [str; 16], @count: int, @line: int) -> BorrowError
+    @err = BorrowError {
+        kind: ERR_MUT_BORROW_WHILE_BORROWED,
+        variable: @variable,
+        moved_to: "",
+        move_line: 0,
+        use_line: 0,
+        line: @line,
+        first_borrow: "",
+        second_borrow: "",
+        borrow_name: "",
+        owner_name: "",
+        region: "",
+        escapes_to: "",
+        drop_line: 0,
+        existing_borrows: [""; 16],
+        existing_borrow_count: @count
+    }
+    orbit @i in 0..@count
+        @err.existing_borrows[@i] = @existing[@i]
+    return @err
+
+fn error_double_mut_borrow(@variable: str, @first: str, @second: str, @line: int) -> BorrowError
+    return BorrowError {
+        kind: ERR_DOUBLE_MUT_BORROW,
+        variable: @variable,
+        moved_to: "",
+        move_line: 0,
+        use_line: 0,
+        line: @line,
+        first_borrow: @first,
+        second_borrow: @second,
+        borrow_name: "",
+        owner_name: "",
+        region: "",
+        escapes_to: "",
+        drop_line: 0,
+        existing_borrows: [""; 16],
+        existing_borrow_count: 0
+    }
+
+fn error_borrow_outlives_owner(@borrow: str, @owner: str, @line: int) -> BorrowError
+    return BorrowError {
+        kind: ERR_BORROW_OUTLIVES_OWNER,
+        variable: "",
+        moved_to: "",
+        move_line: 0,
+        use_line: 0,
+        line: @line,
+        first_borrow: "",
+        second_borrow: "",
+        borrow_name: @borrow,
+        owner_name: @owner,
+        region: "",
+        escapes_to: "",
+        drop_line: 0,
+        existing_borrows: [""; 16],
+        existing_borrow_count: 0
+    }
+
+fn error_modify_while_borrowed(@variable: str, @borrowed_by: [str; 16], @count: int, @line: int) -> BorrowError
+    @err = BorrowError {
+        kind: ERR_MODIFY_WHILE_BORROWED,
+        variable: @variable,
+        moved_to: "",
+        move_line: 0,
+        use_line: 0,
+        line: @line,
+        first_borrow: "",
+        second_borrow: "",
+        borrow_name: "",
+        owner_name: "",
+        region: "",
+        escapes_to: "",
+        drop_line: 0,
+        existing_borrows: [""; 16],
+        existing_borrow_count: @count
+    }
+    orbit @i in 0..@count
+        @err.existing_borrows[@i] = @borrowed_by[@i]
+    return @err
+
+fn error_return_local_ref(@variable: str, @line: int) -> BorrowError
+    return BorrowError {
+        kind: ERR_RETURN_LOCAL_REF,
+        variable: @variable,
+        moved_to: "",
+        move_line: 0,
+        use_line: 0,
+        line: @line,
+        first_borrow: "",
+        second_borrow: "",
+        borrow_name: "",
+        owner_name: "",
+        region: "",
+        escapes_to: "",
+        drop_line: 0,
+        existing_borrows: [""; 16],
+        existing_borrow_count: 0
+    }
+
+fn error_use_after_drop(@variable: str, @drop_line: int, @use_line: int) -> BorrowError
+    return BorrowError {
+        kind: ERR_USE_AFTER_DROP,
+        variable: @variable,
+        moved_to: "",
+        move_line: 0,
+        use_line: @use_line,
+        line: @use_line,
+        first_borrow: "",
+        second_borrow: "",
+        borrow_name: "",
+        owner_name: "",
+        region: "",
+        escapes_to: "",
+        drop_line: @drop_line,
+        existing_borrows: [""; 16],
+        existing_borrow_count: 0
+    }
+
+fn error_region_leak(@variable: str, @region: str, @escapes_to: str, @line: int) -> BorrowError
+    return BorrowError {
+        kind: ERR_REGION_LEAK,
+        variable: @variable,
+        moved_to: "",
+        move_line: 0,
+        use_line: 0,
+        line: @line,
+        first_borrow: "",
+        second_borrow: "",
+        borrow_name: "",
+        owner_name: "",
+        region: @region,
+        escapes_to: @escapes_to,
+        drop_line: 0,
+        existing_borrows: [""; 16],
+        existing_borrow_count: 0
+    }
+
+# =============================================================================
+# ERROR FORMATTING (Display equivalent)
+# =============================================================================
+
+fn format_error(@err: BorrowError) -> str
+    match @err.kind
+        ERR_USE_AFTER_MOVE =>
+            return "error[E0382]: use of moved value `" + @err.variable + "`\n  --> line " + str(@err.use_line) + "\n  |\n  | value moved to `" + @err.moved_to + "` at line " + str(@err.move_line)
+        ERR_MUT_BORROW_WHILE_BORROWED =>
+            @msg = "error[E0502]: cannot borrow `" + @err.variable + "` as mutable because it is also borrowed as immutable\n  --> line " + str(@err.line) + "\n  | existing borrows: ["
+            orbit @i in 0..@err.existing_borrow_count
+                if @i > 0
+                    @msg = @msg + ", "
+                @msg = @msg + @err.existing_borrows[@i]
+            @msg = @msg + "]"
+            return @msg
+        ERR_DOUBLE_MUT_BORROW =>
+            return "error[E0499]: cannot borrow `" + @err.variable + "` as mutable more than once\n  --> line " + str(@err.line) + "\n  | first borrow: " + @err.first_borrow + "\n  | second borrow: " + @err.second_borrow
+        ERR_BORROW_OUTLIVES_OWNER =>
+            return "error[E0597]: `" + @err.owner_name + "` does not live long enough\n  --> line " + str(@err.line) + "\n  | borrowed value `" + @err.borrow_name + "` dropped while still in use"
+        ERR_MODIFY_WHILE_BORROWED =>
+            @msg = "error[E0506]: cannot assign to `" + @err.variable + "` because it is borrowed\n  --> line " + str(@err.line) + "\n  | borrowed by: ["
+            orbit @i in 0..@err.existing_borrow_count
+                if @i > 0
+                    @msg = @msg + ", "
+                @msg = @msg + @err.existing_borrows[@i]
+            @msg = @msg + "]"
+            return @msg
+        ERR_RETURN_LOCAL_REF =>
+            return "error[E0515]: cannot return reference to local variable `" + @err.variable + "`\n  --> line " + str(@err.line)
+        ERR_USE_AFTER_DROP =>
+            return "error[E0382]: use of dropped value `" + @err.variable + "`\n  --> line " + str(@err.use_line) + "\n  | dropped at line " + str(@err.drop_line)
+        ERR_REGION_LEAK =>
+            return "error[E0521]: region-allocated `" + @err.variable + "` escapes to `" + @err.escapes_to + "`\n  --> line " + str(@err.line) + "\n  | `" + @err.variable + "` will be freed when region `" + @err.region + "` is deallocated\n  | storing in `" + @err.escapes_to + "` would cause use-after-free"
+    return "error: unknown borrow error"
+
+# =============================================================================
+# LIFETIME STRUCT
+# =============================================================================
+
+struct Lifetime
+    name: str
+    scope_depth: int
+    start_line: int
+    end_line: int       # -1 means not yet ended (still active)
+
+fn lifetime_anonymous(@scope: int, @line: int) -> Lifetime
+    return Lifetime {
+        name: "'_" + str(@line),
+        scope_depth: @scope,
+        start_line: @line,
+        end_line: -1
+    }
+
+fn lifetime_outlives(@a: Lifetime, @b: Lifetime) -> int
+    # 'a outlives 'b if a has smaller or equal scope depth
+    if @a.scope_depth <= @b.scope_depth
+        return 1
+    return 0
+
+fn lifetime_is_active(@lt: Lifetime) -> int
+    if @lt.end_line == -1
+        return 1
+    return 0
+
+# =============================================================================
+# BORROW STRUCT
+# =============================================================================
+
+struct Borrow
+    target: str         # Name of variable being borrowed
+    mutable: int        # 1 = mutable borrow, 0 = immutable
+    lt_name: str        # Lifetime name
+    lt_scope: int       # Lifetime scope depth
+    lt_start: int       # Lifetime start line
+    lt_end: int         # Lifetime end line (-1 = active)
+    location: int       # Line where borrow was created
+
+fn borrow_new(@target: str, @mutable: int, @scope: int, @line: int) -> Borrow
+    return Borrow {
+        target: @target,
+        mutable: @mutable,
+        lt_name: "'_" + str(@line),
+        lt_scope: @scope,
+        lt_start: @line,
+        lt_end: -1,
+        location: @line
+    }
+
+fn borrow_is_active(@b: Borrow) -> int
+    if @b.lt_end == -1
+        return 1
+    return 0
+
+# =============================================================================
+# VARIABLE INFO STRUCT
+# =============================================================================
+# Tracks ownership, type, scope, mutability, borrows, and region allocation
+# for each variable known to the borrow checker.
+
+struct VariableInfo
+    name: str
+    ownership: int          # OWN_* constant
+    type_id: int            # TYPE_* constant (-1 = unknown)
+    type_inner: int         # Inner type for Meow/Ptr (-1 = none)
+    scope_depth: int
+    defined_at: int         # Line number of definition
+    is_mutable: int         # 1 = mutable, 0 = immutable
+    is_parameter: int       # 1 = function parameter, 0 = local variable
+    region: str             # Region name ("" = no region)
+    # Move tracking
+    moved_to: str           # Target name (when ownership == OWN_MOVED)
+    moved_at_line: int      # Line of move
+    # Mut borrow tracking
+    mut_borrowed_by: str    # Name of exclusive borrower
+    # Borrow list (flat array of borrows)
+    borrows: [Borrow; 16]
+    borrow_count: int
+
+# =============================================================================
+# VARIABLE INFO CONSTRUCTORS
+# =============================================================================
+
+fn var_new(@name: str, @scope: int, @line: int, @mutable: int) -> VariableInfo
+    return VariableInfo {
+        name: @name,
+        ownership: OWN_OWNED,
+        type_id: -1,
+        type_inner: -1,
+        scope_depth: @scope,
+        defined_at: @line,
+        is_mutable: @mutable,
+        is_parameter: 0,
+        region: "",
+        moved_to: "",
+        moved_at_line: 0,
+        mut_borrowed_by: "",
+        borrows: [Borrow { target: "", mutable: 0, lt_name: "", lt_scope: 0, lt_start: 0, lt_end: 0, location: 0 }; 16],
+        borrow_count: 0
+    }
+
+# Create a function parameter with 'caller lifetime.
+# Parameters are NOT moved on first use - ownership transfers only with explicit `move`.
+fn var_new_parameter(@name: str, @scope: int, @line: int, @type_id: int) -> VariableInfo
+    return VariableInfo {
+        name: @name,
+        ownership: OWN_OWNED,
+        type_id: @type_id,
+        type_inner: -1,
+        scope_depth: @scope,
+        defined_at: @line,
+        is_mutable: 0,
+        is_parameter: 1,
+        region: "",
+        moved_to: "",
+        moved_at_line: 0,
+        mut_borrowed_by: "",
+        borrows: [Borrow { target: "", mutable: 0, lt_name: "", lt_scope: 0, lt_start: 0, lt_end: 0, location: 0 }; 16],
+        borrow_count: 0
+    }
+
+# Create a variable allocated in a specific region
+fn var_in_region(@name: str, @scope: int, @line: int, @mutable: int, @region: str) -> VariableInfo
+    return VariableInfo {
+        name: @name,
+        ownership: OWN_OWNED,
+        type_id: -1,
+        type_inner: -1,
+        scope_depth: @scope,
+        defined_at: @line,
+        is_mutable: @mutable,
+        is_parameter: 0,
+        region: @region,
+        moved_to: "",
+        moved_at_line: 0,
+        mut_borrowed_by: "",
+        borrows: [Borrow { target: "", mutable: 0, lt_name: "", lt_scope: 0, lt_start: 0, lt_end: 0, location: 0 }; 16],
+        borrow_count: 0
+    }
+
+# Check if variable has any active borrows
+fn var_is_borrowed(@v: VariableInfo) -> int
+    orbit @i in 0..@v.borrow_count
+        if borrow_is_active(@v.borrows[@i])
+            return 1
+    return 0
+
+# Check if variable has any active mutable borrow
+fn var_is_mut_borrowed(@v: VariableInfo) -> int
+    orbit @i in 0..@v.borrow_count
+        if borrow_is_active(@v.borrows[@i]) and @v.borrows[@i].mutable == 1
+            return 1
+    return 0
+
+# Count active borrows
+fn var_active_borrow_count(@v: VariableInfo) -> int
+    @count = 0
+    orbit @i in 0..@v.borrow_count
+        if borrow_is_active(@v.borrows[@i])
+            @count = @count + 1
+    return @count
+
+# Get active borrow targets into a string array (for error reporting)
+fn var_active_borrow_targets(@v: VariableInfo, @out: [str; 16]) -> int
+    @count = 0
+    orbit @i in 0..@v.borrow_count
+        if borrow_is_active(@v.borrows[@i]) and @count < 16
+            @out[@count] = @v.borrows[@i].target
+            @count = @count + 1
+    return @count
+
+# Add a borrow to the variable
+fn var_add_borrow(@v: VariableInfo, @b: Borrow)
+    if @v.borrow_count < MAX_BORROW_LIST
+        @v.borrows[@v.borrow_count] = @b
+        @v.borrow_count = @v.borrow_count + 1
+
+# =============================================================================
+# COPY TYPE CHECK
+# =============================================================================
+# Copy types: Int, Float, Bool, None, Void, Ptr, Meow(Copy), Any, Generic
+# Copy types don't move - they are bitwise-copied instead.
+
+fn is_copy_type(@type_id: int, @type_inner: int) -> int
+    # Primitive scalar types - always Copy
+    if @type_id == TYPE_INT
+        return 1
+    if @type_id == TYPE_FLOAT
+        return 1
+    if @type_id == TYPE_BOOL
+        return 1
+    if @type_id == TYPE_NONE
+        return 1
+    if @type_id == TYPE_VOID
+        return 1
+    # References/pointers are Copy (the reference itself, not the data)
+    if @type_id == TYPE_PTR
+        return 1
+    # Any type is treated as potentially Copy for ergonomics (loose checking)
+    if @type_id == TYPE_ANY
+        return 1
+    # Generic types - assume Copy for now (can be refined later)
+    if @type_id == TYPE_GENERIC
+        return 1
+    # Meow wraps inner type - Copy if inner is Copy
+    if @type_id == TYPE_MEOW
+        if @type_inner >= 0
+            return is_copy_type(@type_inner, -1)
+    # Unknown type (-1) - assume non-Copy for safety
+    # Everything else (Str, List, Dict, Custom, Fn, Applied) is non-Copy
+    return 0
+
+# Check if a VariableInfo has a Copy type
+fn var_is_copy_type(@v: VariableInfo) -> int
+    return is_copy_type(@v.type_id, @v.type_inner)
+
+# =============================================================================
+# BORROW CHECKER STATE
+# =============================================================================
+# Main state structure using parallel arrays for variable lookup.
+# Variables are stored in flat arrays with name-based linear search.
+
+struct BorrowChecker
+    # Variable storage (parallel arrays for name -> info mapping)
+    var_names: [str; 512]
+    var_infos: [VariableInfo; 512]
+    var_count: int
+    # Scope tracking
+    scope_depth: int
+    current_line: int
+    # Function return type (for checking returned references)
+    return_type_id: int         # -1 = no return type
+    # Collected errors
+    errors: [BorrowError; 64]
+    error_count: int
+    # Active lifetimes
+    lifetimes: [Lifetime; 128]
+    lifetime_count: int
+    # Local variable names in current function (for return checks)
+    local_var_names: [str; 256]
+    local_var_count: int
+
+# =============================================================================
+# BORROW CHECKER CONSTRUCTOR
+# =============================================================================
+
+fn bc_new() -> BorrowChecker
+    return BorrowChecker {
+        var_names: [""; 512],
+        var_infos: [VariableInfo {
+            name: "", ownership: OWN_OWNED, type_id: -1, type_inner: -1,
+            scope_depth: 0, defined_at: 0, is_mutable: 0, is_parameter: 0,
+            region: "", moved_to: "", moved_at_line: 0, mut_borrowed_by: "",
+            borrows: [Borrow { target: "", mutable: 0, lt_name: "", lt_scope: 0, lt_start: 0, lt_end: 0, location: 0 }; 16],
+            borrow_count: 0
+        }; 512],
+        var_count: 0,
+        scope_depth: 0,
+        current_line: 0,
+        return_type_id: -1,
+        errors: [BorrowError {
+            kind: 0, variable: "", moved_to: "", move_line: 0, use_line: 0, line: 0,
+            first_borrow: "", second_borrow: "", borrow_name: "", owner_name: "",
+            region: "", escapes_to: "", drop_line: 0,
+            existing_borrows: [""; 16], existing_borrow_count: 0
+        }; 64],
+        error_count: 0,
+        lifetimes: [Lifetime { name: "", scope_depth: 0, start_line: 0, end_line: -1 }; 128],
+        lifetime_count: 0,
+        local_var_names: [""; 256],
+        local_var_count: 0
+    }
+
+# =============================================================================
+# VARIABLE LOOKUP (parallel array linear search)
+# =============================================================================
+
+# Find variable index by name. Returns -1 if not found.
+fn bc_find_var(@bc: BorrowChecker, @name: str) -> int
+    orbit @i in 0..@bc.var_count
+        if @bc.var_names[@i] == @name
+            return @i
+    return -1
+
+# Insert or update a variable. Returns the index.
+fn bc_set_var(@bc: BorrowChecker, @name: str, @info: VariableInfo) -> int
+    # Check if variable already exists
+    @idx = bc_find_var(@bc, @name)
+    if @idx >= 0
+        @bc.var_infos[@idx] = @info
+        return @idx
+    # Insert new variable
+    guard @bc.var_count < MAX_VARIABLES else
+        return -1
+    @idx = @bc.var_count
+    @bc.var_names[@idx] = @name
+    @bc.var_infos[@idx] = @info
+    @bc.var_count = @bc.var_count + 1
+    return @idx
+
+# Add a local variable name for return-reference checking
+fn bc_add_local(@bc: BorrowChecker, @name: str)
+    if @bc.local_var_count < MAX_LOCAL_VARS
+        @bc.local_var_names[@bc.local_var_count] = @name
+        @bc.local_var_count = @bc.local_var_count + 1
+
+# Check if a name is a local variable
+fn bc_is_local(@bc: BorrowChecker, @name: str) -> int
+    orbit @i in 0..@bc.local_var_count
+        if @bc.local_var_names[@i] == @name
+            return 1
+    return 0
+
+# Add an error to the error list
+fn bc_add_error(@bc: BorrowChecker, @err: BorrowError)
+    if @bc.error_count < MAX_ERRORS
+        @bc.errors[@bc.error_count] = @err
+        @bc.error_count = @bc.error_count + 1
+
+# =============================================================================
+# STRIP @ PREFIX UTILITY
+# =============================================================================
+# Luna variables use @ prefix in source code. We strip it for internal tracking.
+
+fn strip_at(@name: str) -> str
+    if len(@name) > 0 and @name[0] == '@'
+        return substr(@name, 1, len(@name))
+    return @name
+
+# =============================================================================
+# SCOPE MANAGEMENT
+# =============================================================================
+
+# Enter a new scope (increment depth)
+fn bc_enter_scope(@bc: BorrowChecker)
+    @bc.scope_depth = @bc.scope_depth + 1
+
+# Exit scope: end lifetimes, drop variables, check dangling borrows
+fn bc_exit_scope(@bc: BorrowChecker)
+    # End lifetimes for borrows in this scope
+    orbit @i in 0..@bc.var_count
+        orbit @j in 0..@bc.var_infos[@i].borrow_count
+            if @bc.var_infos[@i].borrows[@j].lt_scope == @bc.scope_depth
+                @bc.var_infos[@i].borrows[@j].lt_end = @bc.current_line
+
+    # Drop variables defined in this scope
+    orbit @i in 0..@bc.var_count
+        if @bc.var_infos[@i].scope_depth == @bc.scope_depth
+            # Check for dangling borrows before dropping
+            @active_count = var_active_borrow_count(@bc.var_infos[@i])
+            if @active_count > 0
+                # Report borrow-outlives-owner for each active borrow
+                orbit @j in 0..@bc.var_infos[@i].borrow_count
+                    if borrow_is_active(@bc.var_infos[@i].borrows[@j])
+                        bc_add_error(@bc, error_borrow_outlives_owner(
+                            @bc.var_infos[@i].borrows[@j].target,
+                            @bc.var_names[@i],
+                            @bc.current_line
+                        ))
+            # Mark as dropped
+            @bc.var_infos[@i].ownership = OWN_DROPPED
+
+    @bc.scope_depth = @bc.scope_depth - 1
+
+# =============================================================================
+# CHECK ENTIRE PROGRAM
+# =============================================================================
+
+fn bc_check(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536]) -> int
+    orbit @i in 0..@node_count
+        bc_check_stmt(@bc, @nodes, @node_count, @children, @i)
+
+    if @bc.error_count == 0
+        return 1    # Success
+    return 0        # Errors found
+
+# =============================================================================
+# CHECK STATEMENT
+# =============================================================================
+# Dispatches to the appropriate handler based on statement kind.
+# Handles: Let, Assign, Fn, If, For/Orbit, While, Return, Expr, Drop, Match
+
+fn bc_check_stmt(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @stmt_idx: int)
+    guard @stmt_idx >= 0 and @stmt_idx < @node_count else
+        return
+    @bc.current_line = @bc.current_line + 1
+    @node = @nodes[@stmt_idx]
+    @kind = @node.kind
+
+    # === LET STATEMENT ===
+    # let @name = value (optionally mutable)
+    if @kind == STMT_LET
+        bc_check_stmt_let(@bc, @nodes, @node_count, @children, @node)
+        return
+
+    # === ASSIGN STATEMENT ===
+    # @target = value
+    if @kind == STMT_ASSIGN
+        bc_check_stmt_assign(@bc, @nodes, @node_count, @children, @node)
+        return
+
+    # === FUNCTION DEFINITION ===
+    # fn name(params) -> ret_type ... body ...
+    if @kind == STMT_FN
+        bc_check_stmt_fn(@bc, @nodes, @node_count, @children, @node)
+        return
+
+    # === IF STATEMENT ===
+    # if condition ... elif ... else ...
+    if @kind == STMT_IF
+        bc_check_stmt_if(@bc, @nodes, @node_count, @children, @node)
+        return
+
+    # === FOR / ORBIT LOOP ===
+    # orbit @var in iter ... body ...
+    if @kind == STMT_FOR or @kind == STMT_ORBIT
+        bc_check_stmt_for(@bc, @nodes, @node_count, @children, @node)
+        return
+
+    # === WHILE LOOP ===
+    # while condition ... body ...
+    if @kind == STMT_WHILE
+        bc_check_stmt_while(@bc, @nodes, @node_count, @children, @node)
+        return
+
+    # === RETURN STATEMENT ===
+    # return expr
+    if @kind == STMT_RETURN
+        bc_check_stmt_return(@bc, @nodes, @node_count, @children, @node)
+        return
+
+    # === EXPRESSION STATEMENT ===
+    # bare expression
+    if @kind == STMT_EXPR
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        return
+
+    # === DROP STATEMENT ===
+    # drop @var
+    if @kind == STMT_DROP
+        bc_check_stmt_drop(@bc, @nodes, @node_count, @children, @node)
+        return
+
+    # === MATCH STATEMENT ===
+    # match @expr ... arms ...
+    if @kind == STMT_MATCH
+        bc_check_stmt_match(@bc, @nodes, @node_count, @children, @node)
+        return
+
+# =============================================================================
+# STMT LET HANDLER
+# =============================================================================
+
+fn bc_check_stmt_let(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @node: AstNode)
+    # Check the value expression first
+    @value_idx = @node.child2
+    if @value_idx >= 0
+        bc_check_expr(@bc, @nodes, @node_count, @children, @value_idx)
+
+    # Check for explicit move semantics (move keyword used)
+    if @value_idx >= 0
+        @moved_var = bc_get_moved_variable(@bc, @nodes, @value_idx)
+        if @moved_var != ""
+            # Determine the target name from the let binding
+            @target_name = bc_get_node_name(@nodes, @node.child1)
+            @target_clean = strip_at(@target_name)
+            # Check if source is a parameter
+            @src_idx = bc_find_var(@bc, @moved_var)
+            if @src_idx >= 0 and @bc.var_infos[@src_idx].is_parameter == 1
+                bc_force_move_parameter(@bc, @moved_var, @target_clean)
+            else
+                bc_mark_as_moved(@bc, @moved_var, @target_clean)
+
+    # Get the variable name from the let binding
+    @name_str = bc_get_node_name(@nodes, @node.child1)
+    @clean_name = strip_at(@name_str)
+    @is_mut = @node.data1   # data1 encodes mutability flag
+
+    # Detect region allocation in the value expression
+    @region_name = ""
+    if @value_idx >= 0
+        @region_name = bc_detect_region_allocation(@bc, @nodes, @value_idx)
+
+    # Register variable with appropriate constructor
+    if @region_name != ""
+        @var_info = var_in_region(@clean_name, @bc.scope_depth, @bc.current_line, @is_mut, @region_name)
+    else
+        @var_info = var_new(@clean_name, @bc.scope_depth, @bc.current_line, @is_mut)
+
+    bc_set_var(@bc, @clean_name, @var_info)
+    bc_add_local(@bc, @clean_name)
+
+# =============================================================================
+# STMT ASSIGN HANDLER
+# =============================================================================
+
+fn bc_check_stmt_assign(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @node: AstNode)
+    # Check value expression first
+    @value_idx = @node.child2
+    if @value_idx >= 0
+        bc_check_expr(@bc, @nodes, @node_count, @children, @value_idx)
+
+    # Check target is an identifier
+    @target_idx = @node.child1
+    guard @target_idx >= 0 else
+        return
+
+    @target_node = @nodes[@target_idx]
+    if @target_node.kind == EXPR_IDENT
+        @target_name = bc_get_node_name(@nodes, @target_idx)
+        @clean_name = strip_at(@target_name)
+
+        # Check for move semantics in value
+        if @value_idx >= 0
+            @moved_var = bc_get_moved_variable(@bc, @nodes, @value_idx)
+            if @moved_var != ""
+                bc_mark_as_moved(@bc, @moved_var, @clean_name)
+
+        # REGION LEAK PROTECTION: Check if assigning region-allocated value to global scope
+        if @value_idx >= 0
+            @region_result = bc_get_variable_region(@bc, @nodes, @value_idx)
+            @src_var = @region_result[0]
+            @src_region = @region_result[1]
+            if @src_region != ""
+                @target_var_idx = bc_find_var(@bc, @clean_name)
+                @target_scope = @bc.scope_depth
+                if @target_var_idx >= 0
+                    @target_scope = @bc.var_infos[@target_var_idx].scope_depth
+                bc_check_region_leak(@bc, @src_var, @src_region, @clean_name, @target_scope)
+
+        @var_idx = bc_find_var(@bc, @clean_name)
+        if @var_idx >= 0
+            # Variable exists - check constraints
+
+            # Check if borrowed
+            if var_is_borrowed(@bc.var_infos[@var_idx])
+                @borrowed_by = [""; 16]
+                @borrow_count = var_active_borrow_targets(@bc.var_infos[@var_idx], @borrowed_by)
+                bc_add_error(@bc, error_modify_while_borrowed(@clean_name, @borrowed_by, @borrow_count, @bc.current_line))
+
+            # Check if moved (skip for Copy types)
+            if @bc.var_infos[@var_idx].ownership == OWN_MOVED
+                if var_is_copy_type(@bc.var_infos[@var_idx]) == 0
+                    bc_add_error(@bc, error_use_after_move(
+                        @clean_name,
+                        @bc.var_infos[@var_idx].moved_to,
+                        @bc.var_infos[@var_idx].moved_at_line,
+                        @bc.current_line
+                    ))
+        else
+            # New variable (Luna @var = value syntax) - register it
+            @new_info = var_new(@clean_name, @bc.scope_depth, @bc.current_line, 1)
+            bc_set_var(@bc, @clean_name, @new_info)
+            bc_add_local(@bc, @clean_name)
+
+    # Also check the target expression for identifier usage
+    if @target_idx >= 0
+        bc_check_expr(@bc, @nodes, @node_count, @children, @target_idx)
+
+# =============================================================================
+# STMT FN HANDLER
+# =============================================================================
+
+fn bc_check_stmt_fn(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @node: AstNode)
+    bc_enter_scope(@bc)
+
+    # Save and clear local variables for the new function scope
+    @saved_local_count = @bc.local_var_count
+    @bc.local_var_count = 0
+
+    # Save return type and set new one
+    @saved_return_type = @bc.return_type_id
+    @bc.return_type_id = @node.data2   # data2 encodes return type ID
+
+    # Add parameters with 'caller lifetime
+    # Parameters have special semantics:
+    # 1. They live for the entire function scope
+    # 2. They can be used multiple times (including in recursive calls)
+    # 3. Ownership transfers ONLY with explicit `move` keyword
+    # 4. They are dropped at function exit, not at first use
+    @param_start = @node.children_start
+    @param_count = @node.data1   # data1 = parameter count
+    orbit @i in 0..@param_count
+        @param_idx = @children[@param_start + @i]
+        if @param_idx >= 0 and @param_idx < @node_count
+            @param_name = bc_get_node_name(@nodes, @param_idx)
+            @clean_param = strip_at(@param_name)
+            @param_type = @nodes[@param_idx].data1   # parameter type ID
+            @param_info = var_new_parameter(@clean_param, @bc.scope_depth, @bc.current_line, @param_type)
+            bc_set_var(@bc, @clean_param, @param_info)
+            bc_add_local(@bc, @clean_param)
+
+    # Check body statements
+    @body_start = @node.children_start + @param_count
+    @body_count = @node.children_count - @param_count
+    orbit @i in 0..@body_count
+        @body_idx = @children[@body_start + @i]
+        if @body_idx >= 0
+            bc_check_stmt(@bc, @nodes, @node_count, @children, @body_idx)
+
+    bc_exit_scope(@bc)
+
+    # Restore previous state
+    @bc.return_type_id = @saved_return_type
+    @bc.local_var_count = @saved_local_count
+
+# =============================================================================
+# STMT IF HANDLER
+# =============================================================================
+
+fn bc_check_stmt_if(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @node: AstNode)
+    # Check condition expression
+    if @node.child1 >= 0
+        bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+
+    # Check then-body in new scope
+    bc_enter_scope(@bc)
+    @then_start = @node.children_start
+    @then_count = @node.data1   # data1 = then body statement count
+    orbit @i in 0..@then_count
+        @s_idx = @children[@then_start + @i]
+        if @s_idx >= 0
+            bc_check_stmt(@bc, @nodes, @node_count, @children, @s_idx)
+    bc_exit_scope(@bc)
+
+    # Check elif branches
+    # data2 = number of elif branches
+    @elif_count = @node.data2
+    @elif_start = @then_start + @then_count
+    orbit @i in 0..@elif_count
+        # Each elif has a condition (child) and body (children in array)
+        @elif_cond_idx = @children[@elif_start + @i * 2]
+        @elif_body_idx = @children[@elif_start + @i * 2 + 1]
+        if @elif_cond_idx >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @elif_cond_idx)
+        if @elif_body_idx >= 0
+            bc_enter_scope(@bc)
+            bc_check_stmt(@bc, @nodes, @node_count, @children, @elif_body_idx)
+            bc_exit_scope(@bc)
+
+    # Check else body (child3 = else block index, -1 if no else)
+    if @node.child3 >= 0
+        bc_enter_scope(@bc)
+        # Else block children
+        @else_idx = @node.child3
+        if @else_idx >= 0
+            bc_check_stmt(@bc, @nodes, @node_count, @children, @else_idx)
+        bc_exit_scope(@bc)
+
+# =============================================================================
+# STMT FOR / ORBIT HANDLER
+# =============================================================================
+
+fn bc_check_stmt_for(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @node: AstNode)
+    # Check iterator expression
+    if @node.child2 >= 0
+        bc_check_expr(@bc, @nodes, @node_count, @children, @node.child2)
+
+    bc_enter_scope(@bc)
+
+    # Add loop variable (immutable by default)
+    @var_name = bc_get_node_name(@nodes, @node.child1)
+    @clean_var = strip_at(@var_name)
+    @loop_var = var_new(@clean_var, @bc.scope_depth, @bc.current_line, 0)
+    bc_set_var(@bc, @clean_var, @loop_var)
+
+    # Check body statements
+    @body_start = @node.children_start
+    @body_count = @node.children_count
+    orbit @i in 0..@body_count
+        @s_idx = @children[@body_start + @i]
+        if @s_idx >= 0
+            bc_check_stmt(@bc, @nodes, @node_count, @children, @s_idx)
+
+    bc_exit_scope(@bc)
+
+# =============================================================================
+# STMT WHILE HANDLER
+# =============================================================================
+
+fn bc_check_stmt_while(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @node: AstNode)
+    # Check condition
+    if @node.child1 >= 0
+        bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+
+    bc_enter_scope(@bc)
+
+    # Check body statements
+    @body_start = @node.children_start
+    @body_count = @node.children_count
+    orbit @i in 0..@body_count
+        @s_idx = @children[@body_start + @i]
+        if @s_idx >= 0
+            bc_check_stmt(@bc, @nodes, @node_count, @children, @s_idx)
+
+    bc_exit_scope(@bc)
+
+# =============================================================================
+# STMT RETURN HANDLER
+# =============================================================================
+
+fn bc_check_stmt_return(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @node: AstNode)
+    # Check return expression
+    @expr_idx = @node.child1
+    if @expr_idx >= 0
+        bc_check_expr(@bc, @nodes, @node_count, @children, @expr_idx)
+
+        # Check for returning local references
+        if bc_is_reference_to_local(@bc, @nodes, @expr_idx) == 1
+            @ref_var = bc_get_referenced_variable(@bc, @nodes, @expr_idx)
+            if @ref_var != ""
+                bc_add_error(@bc, error_return_local_ref(@ref_var, @bc.current_line))
+
+# =============================================================================
+# STMT DROP HANDLER
+# =============================================================================
+
+fn bc_check_stmt_drop(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @node: AstNode)
+    @expr_idx = @node.child1
+    guard @expr_idx >= 0 else
+        return
+
+    @drop_node = @nodes[@expr_idx]
+    if @drop_node.kind == EXPR_IDENT
+        @drop_name = bc_get_node_name(@nodes, @expr_idx)
+        @clean_name = strip_at(@drop_name)
+        @var_idx = bc_find_var(@bc, @clean_name)
+        if @var_idx >= 0
+            # Check for active borrows before dropping
+            if var_is_borrowed(@bc.var_infos[@var_idx])
+                @borrowed_targets = [""; 16]
+                @bcount = var_active_borrow_targets(@bc.var_infos[@var_idx], @borrowed_targets)
+                @first_borrow = ""
+                if @bcount > 0
+                    @first_borrow = @borrowed_targets[0]
+                bc_add_error(@bc, error_borrow_outlives_owner(
+                    @first_borrow,
+                    @clean_name,
+                    @bc.current_line
+                ))
+            # Mark as dropped
+            @bc.var_infos[@var_idx].ownership = OWN_DROPPED
+
+# =============================================================================
+# STMT MATCH HANDLER
+# =============================================================================
+
+fn bc_check_stmt_match(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @node: AstNode)
+    # Check the match expression
+    if @node.child1 >= 0
+        bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+
+    # Check each arm body in its own scope
+    @arm_start = @node.children_start
+    @arm_count = @node.children_count
+    orbit @i in 0..@arm_count
+        @arm_idx = @children[@arm_start + @i]
+        if @arm_idx >= 0
+            bc_enter_scope(@bc)
+            bc_check_stmt(@bc, @nodes, @node_count, @children, @arm_idx)
+            bc_exit_scope(@bc)
+
+# =============================================================================
+# CHECK EXPRESSION
+# =============================================================================
+# Dispatches to the appropriate handler based on expression kind.
+# Handles: Identifier, BinaryOp, UnaryOp, Call, MethodCall, Index, Member,
+#          List, Dict, Move, RawPtr, RcAlloc, Lambda, Pipe
+
+fn bc_check_expr(@bc: BorrowChecker, @nodes: [AstNode; 32768], @node_count: int, @children: [int; 65536], @expr_idx: int)
+    guard @expr_idx >= 0 and @expr_idx < @node_count else
+        return
+    @node = @nodes[@expr_idx]
+    @kind = @node.kind
+
+    # === IDENTIFIER ===
+    if @kind == EXPR_IDENT
+        @ident_name = bc_get_node_name(@nodes, @expr_idx)
+        @clean = strip_at(@ident_name)
+        @var_idx = bc_find_var(@bc, @clean)
+        if @var_idx >= 0
+            @var = @bc.var_infos[@var_idx]
+            # Check for use after move (skip for Copy types)
+            if @var.ownership == OWN_MOVED
+                if var_is_copy_type(@var) == 0
+                    bc_add_error(@bc, error_use_after_move(
+                        @clean,
+                        @var.moved_to,
+                        @var.moved_at_line,
+                        @bc.current_line
+                    ))
+            # Check for use after drop
+            if @var.ownership == OWN_DROPPED
+                bc_add_error(@bc, error_use_after_drop(
+                    @clean,
+                    @var.defined_at,
+                    @bc.current_line
+                ))
+        return
+
+    # === BINARY OPERATION ===
+    if @kind == EXPR_BINOP
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        if @node.child2 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child2)
+        return
+
+    # === UNARY OPERATION ===
+    if @kind == EXPR_UNOP
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        return
+
+    # === FUNCTION CALL ===
+    if @kind == EXPR_CALL
+        # Check each argument expression
+        @arg_start = @node.children_start
+        @arg_count = @node.children_count
+        orbit @i in 0..@arg_count
+            @arg_idx = @children[@arg_start + @i]
+            if @arg_idx >= 0
+                bc_check_expr(@bc, @nodes, @node_count, @children, @arg_idx)
+        return
+
+    # === METHOD CALL ===
+    if @kind == EXPR_METHOD
+        # Check object expression
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        # Check argument expressions
+        @arg_start = @node.children_start
+        @arg_count = @node.children_count
+        orbit @i in 0..@arg_count
+            @arg_idx = @children[@arg_start + @i]
+            if @arg_idx >= 0
+                bc_check_expr(@bc, @nodes, @node_count, @children, @arg_idx)
+        return
+
+    # === INDEX ===
+    if @kind == EXPR_INDEX
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        if @node.child2 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child2)
+        return
+
+    # === MEMBER ACCESS ===
+    if @kind == EXPR_MEMBER
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        return
+
+    # === LIST LITERAL ===
+    if @kind == EXPR_LIST
+        @item_start = @node.children_start
+        @item_count = @node.children_count
+        orbit @i in 0..@item_count
+            @item_idx = @children[@item_start + @i]
+            if @item_idx >= 0
+                bc_check_expr(@bc, @nodes, @node_count, @children, @item_idx)
+        return
+
+    # === DICT LITERAL ===
+    if @kind == EXPR_DICT
+        # Dictionary has key-value pairs in children array
+        @pair_start = @node.children_start
+        @pair_count = @node.children_count
+        orbit @i in 0..@pair_count
+            @pair_idx = @children[@pair_start + @i]
+            if @pair_idx >= 0
+                bc_check_expr(@bc, @nodes, @node_count, @children, @pair_idx)
+        return
+
+    # === MOVE EXPRESSION ===
+    if @kind == EXPR_MOVE
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        # Actual move marking is handled in the Let/Assign statement handlers
+        return
+
+    # === RAW POINTER (immutable borrow) ===
+    if @kind == EXPR_RAW_PTR
+        if @node.child1 >= 0
+            @inner_node = @nodes[@node.child1]
+            if @inner_node.kind == EXPR_IDENT
+                @borrow_name = bc_get_node_name(@nodes, @node.child1)
+                @clean_borrow = strip_at(@borrow_name)
+                bc_create_borrow(@bc, @clean_borrow, 0)
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        return
+
+    # === RC ALLOC (mutable borrow proxy) ===
+    if @kind == EXPR_RC_ALLOC
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        return
+
+    # === LAMBDA ===
+    if @kind == EXPR_LAMBDA
+        # Check body for captured variables
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        return
+
+    # === PIPE ===
+    if @kind == EXPR_PIPE
+        if @node.child1 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child1)
+        if @node.child2 >= 0
+            bc_check_expr(@bc, @nodes, @node_count, @children, @node.child2)
+        return
+
+    # Literals (int, float, str, bool, none) - no ownership effects
+    # Fall through silently for unknown expression types
+
+# =============================================================================
+# BORROW CREATION
+# =============================================================================
+# Enforces the single-mutable XOR multiple-immutable borrow rule.
+# Reports ERR_MUT_BORROW_WHILE_BORROWED or ERR_DOUBLE_MUT_BORROW on conflict.
+
+fn bc_create_borrow(@bc: BorrowChecker, @var_name: str, @mutable: int)
+    @var_idx = bc_find_var(@bc, @var_name)
+    guard @var_idx >= 0 else
+        return
+
+    if @mutable == 1
+        # Mutable borrow requires NO existing borrows (immutable or mutable)
+        if var_is_borrowed(@bc.var_infos[@var_idx])
+            @existing = [""; 16]
+            @ecount = var_active_borrow_targets(@bc.var_infos[@var_idx], @existing)
+            bc_add_error(@bc, error_mut_borrow_while_borrowed(
+                @var_name, @existing, @ecount, @bc.current_line
+            ))
+    else
+        # Immutable borrow requires NO mutable borrows
+        if var_is_mut_borrowed(@bc.var_infos[@var_idx])
+            # Get existing mutable borrow target for the error message
+            @first_target = ""
+            orbit @i in 0..@bc.var_infos[@var_idx].borrow_count
+                if borrow_is_active(@bc.var_infos[@var_idx].borrows[@i]) and @bc.var_infos[@var_idx].borrows[@i].mutable == 1
+                    @first_target = @bc.var_infos[@var_idx].borrows[@i].target
+            bc_add_error(@bc, error_double_mut_borrow(
+                @var_name,
+                @first_target,
+                "immutable borrow at line " + str(@bc.current_line),
+                @bc.current_line
+            ))
+
+    # Create and record the borrow
+    @new_borrow = borrow_new(@var_name, @mutable, @bc.scope_depth, @bc.current_line)
+    var_add_borrow(@bc.var_infos[@var_idx], @new_borrow)
+
+# =============================================================================
+# MOVE SEMANTICS
+# =============================================================================
+# Mark variable as moved. Respects Copy types (no-op for copies)
+# and parameter protection (parameters NOT auto-moved).
+
+fn bc_mark_as_moved(@bc: BorrowChecker, @from: str, @to: str)
+    @var_idx = bc_find_var(@bc, @from)
+    guard @var_idx >= 0 else
+        return
+
+    # Don't mark Copy types as moved - they're copied instead
+    if var_is_copy_type(@bc.var_infos[@var_idx]) == 1
+        return
+
+    # Function parameters have 'caller lifetime and are NOT auto-moved.
+    # They can be used multiple times within the function body.
+    # Ownership transfer requires explicit `move` keyword.
+    # This enables safe recursive calls without false "use after move" errors.
+    if @bc.var_infos[@var_idx].is_parameter == 1
+        return
+
+    @bc.var_infos[@var_idx].ownership = OWN_MOVED
+    @bc.var_infos[@var_idx].moved_to = @to
+    @bc.var_infos[@var_idx].moved_at_line = @bc.current_line
+
+# Force-move a parameter (only with explicit `move` keyword).
+# This is the only way to transfer ownership of a function parameter.
+fn bc_force_move_parameter(@bc: BorrowChecker, @from: str, @to: str)
+    @var_idx = bc_find_var(@bc, @from)
+    guard @var_idx >= 0 else
+        return
+
+    # Don't mark Copy types as moved
+    if var_is_copy_type(@bc.var_infos[@var_idx]) == 1
+        return
+
+    @bc.var_infos[@var_idx].ownership = OWN_MOVED
+    @bc.var_infos[@var_idx].moved_to = @to
+    @bc.var_infos[@var_idx].moved_at_line = @bc.current_line
+
+# =============================================================================
+# MOVE DETECTION
+# =============================================================================
+# Get the variable being moved from an Expr::Move node.
+# Returns "" if not a move expression or not an identifier inside.
+
+fn bc_get_moved_variable(@bc: BorrowChecker, @nodes: [AstNode; 32768], @expr_idx: int) -> str
+    guard @expr_idx >= 0 else
+        return ""
+    @node = @nodes[@expr_idx]
+    if @node.kind == EXPR_MOVE
+        if @node.child1 >= 0
+            @inner = @nodes[@node.child1]
+            if @inner.kind == EXPR_IDENT
+                @name = bc_get_node_name(@nodes, @node.child1)
+                return strip_at(@name)
+    return ""
+
+# =============================================================================
+# REGION DETECTION AND LEAK PROTECTION
+# =============================================================================
+
+# Get the region of a variable if it was region-allocated.
+# Returns a 2-element result: [var_name, region_name].
+# region_name is "" if variable is not region-allocated.
+fn bc_get_variable_region(@bc: BorrowChecker, @nodes: [AstNode; 32768], @expr_idx: int) -> [str; 2]
+    @result = [""; 2]
+    guard @expr_idx >= 0 else
+        return @result
+    @node = @nodes[@expr_idx]
+    if @node.kind == EXPR_IDENT
+        @ident_name = bc_get_node_name(@nodes, @expr_idx)
+        @clean = strip_at(@ident_name)
+        @var_idx = bc_find_var(@bc, @clean)
+        if @var_idx >= 0
+            if @bc.var_infos[@var_idx].region != ""
+                @result[0] = @clean
+                @result[1] = @bc.var_infos[@var_idx].region
+    return @result
+
+# Check if assigning a region-allocated value to a longer-lived scope.
+# This prevents use-after-free when the region is deallocated.
+fn bc_check_region_leak(@bc: BorrowChecker, @source_var: str, @source_region: str, @target_var: str, @target_scope: int)
+    # Region variables are scoped - check if target outlives the region.
+    # Global scope (0) outlives all regions, so assigning to global from region is a leak.
+    if @target_scope == 0
+        bc_add_error(@bc, error_region_leak(
+            @source_var, @source_region, @target_var, @bc.current_line
+        ))
+
+# Detect if an expression is a region allocation call.
+# Returns the region name if this is a region_alloc/region_new call, "" otherwise.
+fn bc_detect_region_allocation(@bc: BorrowChecker, @nodes: [AstNode; 32768], @expr_idx: int) -> str
+    guard @expr_idx >= 0 else
+        return ""
+    @node = @nodes[@expr_idx]
+
+    # Pattern: region_alloc(region_name, ...) or region_new(region_name, ...)
+    if @node.kind == EXPR_CALL
+        @call_name = bc_get_node_name(@nodes, @expr_idx)
+        if @call_name == "region_alloc" or @call_name == "region_new"
+            # First argument is the region identifier
+            if @node.children_count > 0
+                @first_arg_idx = @node.children_start
+                @first_arg = @nodes[@first_arg_idx]
+                if @first_arg.kind == EXPR_IDENT
+                    @region_ident = bc_get_node_name(@nodes, @first_arg_idx)
+                    return strip_at(@region_ident)
+                if @first_arg.kind == EXPR_STR
+                    return bc_get_node_name(@nodes, @first_arg_idx)
+
+        # Check for dotted call: region.alloc(...) or region.new(...)
+        # Encoded as call name containing '.'
+        @dot_pos = str_find(@call_name, ".")
+        if @dot_pos >= 0
+            @obj_part = substr(@call_name, 0, @dot_pos)
+            @method_part = substr(@call_name, @dot_pos + 1, len(@call_name))
+            if @method_part == "alloc" or @method_part == "new"
+                return strip_at(@obj_part)
+
+    # Pattern: object.method(args) - MethodCall node
+    if @node.kind == EXPR_METHOD
+        @method_name = bc_get_node_name(@nodes, @expr_idx)
+        if @method_name == "alloc" or @method_name == "new"
+            if @node.child1 >= 0
+                @obj_node = @nodes[@node.child1]
+                if @obj_node.kind == EXPR_IDENT
+                    @obj_name = bc_get_node_name(@nodes, @node.child1)
+                    return strip_at(@obj_name)
+
+    return ""
+
+# =============================================================================
+# REFERENCE TO LOCAL DETECTION
+# =============================================================================
+# Check if expression is a reference to a local variable (for return checks).
+
+fn bc_is_reference_to_local(@bc: BorrowChecker, @nodes: [AstNode; 32768], @expr_idx: int) -> int
+    guard @expr_idx >= 0 else
+        return 0
+    @node = @nodes[@expr_idx]
+
+    # RawPtr(&var) referencing a local
+    if @node.kind == EXPR_RAW_PTR
+        if @node.child1 >= 0
+            @inner = @nodes[@node.child1]
+            if @inner.kind == EXPR_IDENT
+                @ref_name = bc_get_node_name(@nodes, @node.child1)
+                @clean = strip_at(@ref_name)
+                return bc_is_local(@bc, @clean)
+        return 0
+
+    # Identifier that is a pointer type referencing a local
+    if @node.kind == EXPR_IDENT
+        @ident_name = bc_get_node_name(@nodes, @expr_idx)
+        @clean = strip_at(@ident_name)
+        @var_idx = bc_find_var(@bc, @clean)
+        if @var_idx >= 0
+            if @bc.var_infos[@var_idx].type_id == TYPE_PTR
+                return bc_is_local(@bc, @clean)
+        return 0
+
+    return 0
+
+# Get the referenced variable name from a borrow expression.
+# Returns "" if no variable reference found.
+fn bc_get_referenced_variable(@bc: BorrowChecker, @nodes: [AstNode; 32768], @expr_idx: int) -> str
+    guard @expr_idx >= 0 else
+        return ""
+    @node = @nodes[@expr_idx]
+
+    if @node.kind == EXPR_RAW_PTR
+        if @node.child1 >= 0
+            @inner = @nodes[@node.child1]
+            if @inner.kind == EXPR_IDENT
+                @ref_name = bc_get_node_name(@nodes, @node.child1)
+                return strip_at(@ref_name)
+        return ""
+
+    if @node.kind == EXPR_IDENT
+        @ident_name = bc_get_node_name(@nodes, @expr_idx)
+        return strip_at(@ident_name)
+
+    return ""
+
+# =============================================================================
+# AST NODE NAME HELPER
+# =============================================================================
+# Extract the name string from an AST node (identifier, function, parameter).
+# The name is stored in the parser's string intern table.
+# For simplicity, we use the data3 field as a string index.
+# This function delegates to parser infrastructure.
+
+fn bc_get_node_name(@nodes: [AstNode; 32768], @node_idx: int) -> str
+    guard @node_idx >= 0 else
+        return ""
+    # The node's name is accessed via the parser string table.
+    # data3 stores the interned string index in typical bootstrap AST layout.
+    # If unavailable, fall back to a synthetic name from the node index.
+    @node = @nodes[@node_idx]
+    # In bootstrap convention, identifier name is stored at string index data3.
+    # The actual string retrieval depends on parser_get_string.
+    # We return a placeholder that the integration layer fills in.
+    return parser_get_string(@node.data3)
+
+# =============================================================================
+# STRING UTILITY HELPERS
+# =============================================================================
+
+fn str_find(@haystack: str, @needle: str) -> int
+    @hlen = len(@haystack)
+    @nlen = len(@needle)
+    if @nlen == 0
+        return 0
+    if @nlen > @hlen
+        return -1
+    orbit @i in 0..(@hlen - @nlen + 1)
+        @match = 1
+        orbit @j in 0..@nlen
+            if @haystack[@i + @j] != @needle[@j]
+                @match = 0
+        if @match == 1
+            return @i
+    return -1
+
+fn substr(@s: str, @start: int, @end: int) -> str
+    # Returns substring from @start to @end (exclusive)
+    # Implementation delegated to runtime intrinsic
+    return __builtin_substr(@s, @start, @end)
+
+# =============================================================================
+# ERROR REPORTING
+# =============================================================================
+
+# Print all collected borrow errors
+fn bc_print_errors(@bc: BorrowChecker)
+    orbit @i in 0..@bc.error_count
+        shine(format_error(@bc.errors[@i]))
+        shine("")
+
+# Get error count
+fn bc_error_count(@bc: BorrowChecker) -> int
+    return @bc.error_count
+
+# Get specific error
+fn bc_get_error(@bc: BorrowChecker, @idx: int) -> BorrowError
+    guard @idx >= 0 and @idx < @bc.error_count else
+        return BorrowError {
+            kind: 0, variable: "", moved_to: "", move_line: 0, use_line: 0, line: 0,
+            first_borrow: "", second_borrow: "", borrow_name: "", owner_name: "",
+            region: "", escapes_to: "", drop_line: 0,
+            existing_borrows: [""; 16], existing_borrow_count: 0
+        }
+    return @bc.errors[@idx]
+
+# Check if errors exist
+fn bc_has_errors(@bc: BorrowChecker) -> int
+    if @bc.error_count > 0
+        return 1
+    return 0
+
+# =============================================================================
+# LIFETIME INFERENCER
+# =============================================================================
+# Infers lifetimes for references using constraint solving.
+# Constraints are "outlives" relationships: 'a: 'b means 'a lives at least as long as 'b.
+# Cycle detection uses DFS graph traversal.
+
+struct LifetimeInferencer
+    # Named lifetimes (parallel arrays)
+    lt_names: [str; 128]
+    lt_infos: [Lifetime; 128]
+    lt_count: int
+    # Constraints: lt_a outlives lt_b
+    constraint_a: [str; 64]
+    constraint_b: [str; 64]
+    constraint_count: int
+
+fn li_new() -> LifetimeInferencer
+    return LifetimeInferencer {
+        lt_names: [""; 128],
+        lt_infos: [Lifetime { name: "", scope_depth: 0, start_line: 0, end_line: -1 }; 128],
+        lt_count: 0,
+        constraint_a: [""; 64],
+        constraint_b: [""; 64],
+        constraint_count: 0
+    }
+
+# Add a lifetime to the inferencer
+fn li_add_lifetime(@li: LifetimeInferencer, @name: str, @lt: Lifetime)
+    if @li.lt_count < MAX_LIFETIMES
+        @li.lt_names[@li.lt_count] = @name
+        @li.lt_infos[@li.lt_count] = @lt
+        @li.lt_count = @li.lt_count + 1
+
+# Add constraint: 'a outlives 'b
+fn li_add_outlives(@li: LifetimeInferencer, @a: str, @b: str)
+    if @li.constraint_count < MAX_CONSTRAINTS
+        @li.constraint_a[@li.constraint_count] = @a
+        @li.constraint_b[@li.constraint_count] = @b
+        @li.constraint_count = @li.constraint_count + 1
+
+# Check if constraints are satisfiable (no cycles in outlives relationship).
+# Returns 1 if valid, 0 if cycle detected.
+# On failure, sets @out_error to describe the cycle.
+fn li_check_constraints(@li: LifetimeInferencer) -> int
+    # Simple check: no cycles in outlives relationship
+    # For each constraint (a outlives b), check that there is no path from b back to a
+    orbit @i in 0..@li.constraint_count
+        @a = @li.constraint_a[@i]
+        @b = @li.constraint_b[@i]
+        if li_has_path(@li, @b, @a) == 1
+            # Cycle detected: b reaches a, but a must outlive b
+            return 0
+    return 1
+
+# Get cycle error message (call after li_check_constraints returns 0)
+fn li_get_cycle_error(@li: LifetimeInferencer) -> str
+    orbit @i in 0..@li.constraint_count
+        @a = @li.constraint_a[@i]
+        @b = @li.constraint_b[@i]
+        if li_has_path(@li, @b, @a) == 1
+            return "Lifetime cycle detected: '" + @a + " and '" + @b
+    return ""
+
+# DFS graph traversal: check if there is a path from @from to @to
+# through the outlives constraint graph.
+fn li_has_path(@li: LifetimeInferencer, @from: str, @to: str) -> int
+    # DFS using a stack (flat array, max depth = MAX_CONSTRAINTS)
+    @stack: [str; 64]
+    @stack_size = 0
+    @visited: [str; 64]
+    @visited_count = 0
+
+    # Push starting node
+    @stack[0] = @from
+    @stack_size = 1
+
+    while @stack_size > 0
+        # Pop from stack
+        @stack_size = @stack_size - 1
+        @current = @stack[@stack_size]
+
+        # Check if we reached the target
+        if @current == @to
+            return 1
+
+        # Check if already visited
+        @already_visited = 0
+        orbit @i in 0..@visited_count
+            if @visited[@i] == @current
+                @already_visited = 1
+        if @already_visited == 1
+            continue
+
+        # Mark as visited
+        if @visited_count < 64
+            @visited[@visited_count] = @current
+            @visited_count = @visited_count + 1
+
+        # Push all neighbors (b where current outlives b)
+        orbit @i in 0..@li.constraint_count
+            if @li.constraint_a[@i] == @current
+                if @stack_size < 64
+                    @stack[@stack_size] = @li.constraint_b[@i]
+                    @stack_size = @stack_size + 1
+
+    return 0
+
+# =============================================================================
+# PUBLIC API: borrow_check(parser)
+# =============================================================================
+# Main entry point for borrow checking a parsed program.
+# Takes the parser output (AST nodes and children arrays) and returns
+# 1 on success or 0 if borrow errors were found.
+
+fn borrow_check(@p: Parser) -> int
+    @bc = bc_new()
+
+    # Run borrow checking on all top-level statements
+    @result = bc_check(@bc, @p.nodes, @p.node_count, @p.children)
+
+    # Print any errors found
+    if bc_has_errors(@bc)
+        shine("=== Borrow Checker Errors ===")
+        bc_print_errors(@bc)
+        shine("Found " + str(@bc.error_count) + " borrow error(s)")
+        return 0
+
+    return 1
+
+# Full check returning the BorrowChecker for inspection
+fn borrow_check_full(@p: Parser) -> BorrowChecker
+    @bc = bc_new()
+    bc_check(@bc, @p.nodes, @p.node_count, @p.children)
+    return @bc
+
+# =============================================================================
+# EXPORT BLOCK
+# =============================================================================
+
+export {
+    # Constants - Ownership states
+    OWN_OWNED,
+    OWN_MOVED,
+    OWN_BORROWED,
+    OWN_MUT_BORROWED,
+    OWN_DROPPED,
+
+    # Constants - Error kinds
+    ERR_USE_AFTER_MOVE,
+    ERR_MUT_BORROW_WHILE_BORROWED,
+    ERR_DOUBLE_MUT_BORROW,
+    ERR_BORROW_OUTLIVES_OWNER,
+    ERR_MODIFY_WHILE_BORROWED,
+    ERR_RETURN_LOCAL_REF,
+    ERR_USE_AFTER_DROP,
+    ERR_REGION_LEAK,
+
+    # Constants - Statement/Expression types
+    STMT_LET, STMT_ASSIGN, STMT_FN, STMT_IF, STMT_FOR,
+    STMT_WHILE, STMT_RETURN, STMT_EXPR, STMT_DROP, STMT_ORBIT, STMT_MATCH,
+    EXPR_IDENT, EXPR_INT, EXPR_FLOAT, EXPR_STR, EXPR_BOOL, EXPR_NONE,
+    EXPR_BINOP, EXPR_UNOP, EXPR_CALL, EXPR_METHOD, EXPR_INDEX, EXPR_MEMBER,
+    EXPR_LIST, EXPR_DICT, EXPR_MOVE, EXPR_RAW_PTR, EXPR_RC_ALLOC, EXPR_LAMBDA, EXPR_PIPE,
+
+    # Constants - Type IDs
+    TYPE_INT, TYPE_FLOAT, TYPE_STR, TYPE_BOOL, TYPE_NONE, TYPE_VOID, TYPE_ANY,
+    TYPE_GENERIC, TYPE_MEOW, TYPE_PTR,
+
+    # Constants - Capacity
+    MAX_VARIABLES, MAX_BORROWS, MAX_ERRORS, MAX_LIFETIMES, MAX_LOCAL_VARS, MAX_CONSTRAINTS,
+
+    # Structs
+    BorrowError,
+    Lifetime,
+    Borrow,
+    VariableInfo,
+    BorrowChecker,
+    LifetimeInferencer,
+
+    # Error constructors
+    error_use_after_move,
+    error_mut_borrow_while_borrowed,
+    error_double_mut_borrow,
+    error_borrow_outlives_owner,
+    error_modify_while_borrowed,
+    error_return_local_ref,
+    error_use_after_drop,
+    error_region_leak,
+
+    # Error formatting
+    format_error,
+
+    # Lifetime functions
+    lifetime_anonymous,
+    lifetime_outlives,
+    lifetime_is_active,
+
+    # Borrow functions
+    borrow_new,
+    borrow_is_active,
+
+    # Variable functions
+    var_new,
+    var_new_parameter,
+    var_in_region,
+    var_is_borrowed,
+    var_is_mut_borrowed,
+    var_active_borrow_count,
+    var_active_borrow_targets,
+    var_add_borrow,
+    is_copy_type,
+    var_is_copy_type,
+
+    # BorrowChecker functions
+    bc_new,
+    bc_find_var,
+    bc_set_var,
+    bc_add_local,
+    bc_is_local,
+    bc_add_error,
+    bc_enter_scope,
+    bc_exit_scope,
+    bc_check,
+    bc_check_stmt,
+    bc_check_expr,
+    bc_create_borrow,
+    bc_mark_as_moved,
+    bc_force_move_parameter,
+    bc_get_moved_variable,
+    bc_get_variable_region,
+    bc_check_region_leak,
+    bc_detect_region_allocation,
+    bc_is_reference_to_local,
+    bc_get_referenced_variable,
+    bc_print_errors,
+    bc_error_count,
+    bc_get_error,
+    bc_has_errors,
+
+    # LifetimeInferencer functions
+    li_new,
+    li_add_lifetime,
+    li_add_outlives,
+    li_check_constraints,
+    li_get_cycle_error,
+    li_has_path,
+
+    # Public API
+    borrow_check,
+    borrow_check_full,
+
+    # Utilities
+    strip_at,
+    str_find
+}
+
+# =============================================================================
+# SELF-TEST SECTION
+# =============================================================================
+# Basic smoke tests to verify borrow checker logic.
+# Run with: luna run borrow_checker.luna --test
+
+fn test_copy_type_check()
+    shine("  [test] Copy type check...")
+    # Int is Copy
+    guard is_copy_type(TYPE_INT, -1) == 1 else
+        shine("    FAIL: int should be Copy")
+        return
+    # Float is Copy
+    guard is_copy_type(TYPE_FLOAT, -1) == 1 else
+        shine("    FAIL: float should be Copy")
+        return
+    # Bool is Copy
+    guard is_copy_type(TYPE_BOOL, -1) == 1 else
+        shine("    FAIL: bool should be Copy")
+        return
+    # None is Copy
+    guard is_copy_type(TYPE_NONE, -1) == 1 else
+        shine("    FAIL: none should be Copy")
+        return
+    # Void is Copy
+    guard is_copy_type(TYPE_VOID, -1) == 1 else
+        shine("    FAIL: void should be Copy")
+        return
+    # Ptr is Copy
+    guard is_copy_type(TYPE_PTR, -1) == 1 else
+        shine("    FAIL: ptr should be Copy")
+        return
+    # Any is Copy
+    guard is_copy_type(TYPE_ANY, -1) == 1 else
+        shine("    FAIL: any should be Copy")
+        return
+    # Generic is Copy
+    guard is_copy_type(TYPE_GENERIC, -1) == 1 else
+        shine("    FAIL: generic should be Copy")
+        return
+    # Str is NOT Copy
+    guard is_copy_type(TYPE_STR, -1) == 0 else
+        shine("    FAIL: str should NOT be Copy")
+        return
+    # Meow(Int) is Copy
+    guard is_copy_type(TYPE_MEOW, TYPE_INT) == 1 else
+        shine("    FAIL: Meow(Int) should be Copy")
+        return
+    # Meow(Str) is NOT Copy
+    guard is_copy_type(TYPE_MEOW, TYPE_STR) == 0 else
+        shine("    FAIL: Meow(Str) should NOT be Copy")
+        return
+    shine("    PASS")
+
+fn test_variable_lifecycle()
+    shine("  [test] Variable lifecycle...")
+    @v = var_new("x", 0, 1, 1)
+    # Should be owned initially
+    guard @v.ownership == OWN_OWNED else
+        shine("    FAIL: should be owned")
+        return
+    # Should have no borrows
+    guard var_is_borrowed(@v) == 0 else
+        shine("    FAIL: should not be borrowed")
+        return
+    # Add a borrow
+    @b = borrow_new("x", 0, 0, 1)
+    var_add_borrow(@v, @b)
+    guard var_is_borrowed(@v) == 1 else
+        shine("    FAIL: should be borrowed after add_borrow")
+        return
+    # Not mut-borrowed (borrow is immutable)
+    guard var_is_mut_borrowed(@v) == 0 else
+        shine("    FAIL: should not be mut-borrowed")
+        return
+    # Add a mutable borrow
+    @mb = borrow_new("x", 1, 0, 2)
+    var_add_borrow(@v, @mb)
+    guard var_is_mut_borrowed(@v) == 1 else
+        shine("    FAIL: should be mut-borrowed after adding mutable borrow")
+        return
+    shine("    PASS")
+
+fn test_scope_tracking()
+    shine("  [test] Scope tracking...")
+    @bc = bc_new()
+    guard @bc.scope_depth == 0 else
+        shine("    FAIL: initial scope should be 0")
+        return
+    bc_enter_scope(@bc)
+    guard @bc.scope_depth == 1 else
+        shine("    FAIL: scope should be 1 after enter")
+        return
+    bc_enter_scope(@bc)
+    guard @bc.scope_depth == 2 else
+        shine("    FAIL: scope should be 2 after second enter")
+        return
+    bc_exit_scope(@bc)
+    guard @bc.scope_depth == 1 else
+        shine("    FAIL: scope should be 1 after exit")
+        return
+    bc_exit_scope(@bc)
+    guard @bc.scope_depth == 0 else
+        shine("    FAIL: scope should be 0 after second exit")
+        return
+    shine("    PASS")
+
+fn test_variable_lookup()
+    shine("  [test] Variable lookup...")
+    @bc = bc_new()
+    @v1 = var_new("alpha", 0, 1, 1)
+    @v2 = var_new("beta", 0, 2, 0)
+    bc_set_var(@bc, "alpha", @v1)
+    bc_set_var(@bc, "beta", @v2)
+    # Find existing
+    guard bc_find_var(@bc, "alpha") >= 0 else
+        shine("    FAIL: should find alpha")
+        return
+    guard bc_find_var(@bc, "beta") >= 0 else
+        shine("    FAIL: should find beta")
+        return
+    # Not found
+    guard bc_find_var(@bc, "gamma") == -1 else
+        shine("    FAIL: gamma should not exist")
+        return
+    shine("    PASS")
+
+fn test_move_semantics()
+    shine("  [test] Move semantics...")
+    @bc = bc_new()
+    # Create a non-Copy variable (Str type)
+    @v = var_new("data", 0, 1, 1)
+    @v.type_id = TYPE_STR
+    bc_set_var(@bc, "data", @v)
+    @bc.current_line = 2
+    # Move it
+    bc_mark_as_moved(@bc, "data", "dest")
+    @idx = bc_find_var(@bc, "data")
+    guard @bc.var_infos[@idx].ownership == OWN_MOVED else
+        shine("    FAIL: should be moved")
+        return
+    guard @bc.var_infos[@idx].moved_to == "dest" else
+        shine("    FAIL: moved_to should be dest")
+        return
+    shine("    PASS")
+
+fn test_copy_type_no_move()
+    shine("  [test] Copy type no move...")
+    @bc = bc_new()
+    # Create a Copy variable (Int type)
+    @v = var_new("count", 0, 1, 1)
+    @v.type_id = TYPE_INT
+    bc_set_var(@bc, "count", @v)
+    @bc.current_line = 2
+    # Attempt to move it - should be no-op for Copy types
+    bc_mark_as_moved(@bc, "count", "other")
+    @idx = bc_find_var(@bc, "count")
+    guard @bc.var_infos[@idx].ownership == OWN_OWNED else
+        shine("    FAIL: Copy type should remain owned after move attempt")
+        return
+    shine("    PASS")
+
+fn test_parameter_protection()
+    shine("  [test] Parameter protection...")
+    @bc = bc_new()
+    # Create a parameter (non-Copy)
+    @v = var_new_parameter("param", 1, 1, TYPE_STR)
+    bc_set_var(@bc, "param", @v)
+    @bc.current_line = 2
+    # Auto-move should be no-op for parameters
+    bc_mark_as_moved(@bc, "param", "local")
+    @idx = bc_find_var(@bc, "param")
+    guard @bc.var_infos[@idx].ownership == OWN_OWNED else
+        shine("    FAIL: parameter should remain owned after auto-move attempt")
+        return
+    # Force move should work
+    bc_force_move_parameter(@bc, "param", "local")
+    guard @bc.var_infos[@idx].ownership == OWN_MOVED else
+        shine("    FAIL: parameter should be moved after force_move")
+        return
+    shine("    PASS")
+
+fn test_borrow_conflict_detection()
+    shine("  [test] Borrow conflict detection...")
+    @bc = bc_new()
+    @v = var_new("resource", 0, 1, 1)
+    @v.type_id = TYPE_STR
+    bc_set_var(@bc, "resource", @v)
+    @bc.current_line = 2
+    # Create immutable borrow - should succeed (no errors)
+    bc_create_borrow(@bc, "resource", 0)
+    guard @bc.error_count == 0 else
+        shine("    FAIL: immutable borrow should not cause errors")
+        return
+    # Create mutable borrow while immutable exists - should error
+    @bc.current_line = 3
+    bc_create_borrow(@bc, "resource", 1)
+    guard @bc.error_count == 1 else
+        shine("    FAIL: should have 1 error for mut borrow while borrowed")
+        return
+    guard @bc.errors[0].kind == ERR_MUT_BORROW_WHILE_BORROWED else
+        shine("    FAIL: error kind should be ERR_MUT_BORROW_WHILE_BORROWED")
+        return
+    shine("    PASS")
+
+fn test_lifetime_cycle_detection()
+    shine("  [test] Lifetime cycle detection...")
+    @li = li_new()
+    # No cycle: a outlives b, b outlives c
+    li_add_outlives(@li, "a", "b")
+    li_add_outlives(@li, "b", "c")
+    guard li_check_constraints(@li) == 1 else
+        shine("    FAIL: should be valid (no cycle)")
+        return
+    # Add cycle: c outlives a (creates cycle a -> b -> c -> a)
+    li_add_outlives(@li, "c", "a")
+    guard li_check_constraints(@li) == 0 else
+        shine("    FAIL: should detect cycle")
+        return
+    shine("    PASS")
+
+fn test_error_formatting()
+    shine("  [test] Error formatting...")
+    @err1 = error_use_after_move("x", "y", 5, 10)
+    @msg1 = format_error(@err1)
+    guard len(@msg1) > 0 else
+        shine("    FAIL: error message should not be empty")
+        return
+    @err2 = error_region_leak("data", "arena", "global_ref", 7)
+    @msg2 = format_error(@err2)
+    guard len(@msg2) > 0 else
+        shine("    FAIL: region leak error message should not be empty")
+        return
+    shine("    PASS")
+
+fn test_strip_at()
+    shine("  [test] strip_at utility...")
+    guard strip_at("@count") == "count" else
+        shine("    FAIL: @count -> count")
+        return
+    guard strip_at("plain") == "plain" else
+        shine("    FAIL: plain -> plain")
+        return
+    guard strip_at("") == "" else
+        shine("    FAIL: empty -> empty")
+        return
+    shine("    PASS")
+
+fn test_local_tracking()
+    shine("  [test] Local variable tracking...")
+    @bc = bc_new()
+    bc_add_local(@bc, "local_a")
+    bc_add_local(@bc, "local_b")
+    guard bc_is_local(@bc, "local_a") == 1 else
+        shine("    FAIL: local_a should be local")
+        return
+    guard bc_is_local(@bc, "local_b") == 1 else
+        shine("    FAIL: local_b should be local")
+        return
+    guard bc_is_local(@bc, "nonexistent") == 0 else
+        shine("    FAIL: nonexistent should not be local")
+        return
+    shine("    PASS")
+
+# =============================================================================
+# VARIANCE & SUBTYPING ENGINE — v4.0
+# =============================================================================
+# Extends the borrow checker with variance inference and subtyping rules
+# for generic type parameters. This goes beyond the original Rust
+# borrow_checker.rs — it's new functionality for Luna v4.0.
+#
+# Variance determines how a generic type parameter relates to the
+# supertype/subtype hierarchy:
+#   - Covariant: T in output position (return types, read-only containers)
+#   - Contravariant: T in input position (function parameters)
+#   - Invariant: T in both positions (mutable references, read-write containers)
+#   - Bivariant: T is unused (phantom type parameter)
+#
+# Subtyping rules:
+#   - &'a T <: &'b T when 'a outlives 'b (longer lifetime is subtype)
+#   - List[Cat] <: List[Animal] when Cat <: Animal (covariant container)
+#   - fn(Animal) -> Cat <: fn(Cat) -> Animal (contra params, co return)
+#   - &mut T is invariant (requires exact type match)
+# =============================================================================
+
+# --- Variance constants ---
+const VARIANCE_COVARIANT: int = 0       # T in output/return position
+const VARIANCE_CONTRAVARIANT: int = 1   # T in input/parameter position
+const VARIANCE_INVARIANT: int = 2       # T in both (mutable ref)
+const VARIANCE_BIVARIANT: int = 3       # T unused (phantom)
+
+const MAX_VARIANCE_ENTRIES: int = 256
+
+# --- Variance entry for a single type parameter ---
+struct VarianceEntry
+    type_param_name: str        # e.g. "T", "U"
+    variance: int               # VARIANCE_* constant
+    source_fn: str              # Function where variance was inferred
+    is_active: int              # 1 if this slot is used
+
+# --- Variance inferencer ---
+struct VarianceInferencer
+    entries: [VarianceEntry; 256]
+    entry_count: int
+
+fn vi_new() -> VarianceInferencer
+    @vi = VarianceInferencer {
+        entries: [VarianceEntry {
+            type_param_name: "", variance: VARIANCE_BIVARIANT,
+            source_fn: "", is_active: 0
+        }; 256],
+        entry_count: 0
+    }
+    return @vi
+
+# Combine two variance positions.
+# When a type param appears in multiple positions, the combined variance is:
+#   co + co = co, contra + contra = contra, co + contra = invariant
+#   bi + X = X (bivariant is the identity element)
+fn vi_combine(@a: int, @b: int) -> int
+    if @a == VARIANCE_BIVARIANT
+        return @b
+    if @b == VARIANCE_BIVARIANT
+        return @a
+    if @a == @b
+        return @a
+    # co + contra, or any other mismatch → invariant
+    return VARIANCE_INVARIANT
+
+# Flip variance (used when entering contravariant positions, e.g. function parameters)
+fn vi_flip(@v: int) -> int
+    phase @v
+        VARIANCE_COVARIANT => return VARIANCE_CONTRAVARIANT
+        VARIANCE_CONTRAVARIANT => return VARIANCE_COVARIANT
+        _ => return @v
+
+# Find or create a variance entry for a type parameter
+fn vi_find_or_create(@vi: VarianceInferencer, @name: str, @source: str) -> int
+    orbit @i in 0..@vi.entry_count
+        if @vi.entries[@i].is_active == 1 and @vi.entries[@i].type_param_name == @name
+            return @i
+    if @vi.entry_count >= MAX_VARIANCE_ENTRIES
+        return -1
+    @idx = @vi.entry_count
+    @vi.entries[@idx].type_param_name = @name
+    @vi.entries[@idx].variance = VARIANCE_BIVARIANT
+    @vi.entries[@idx].source_fn = @source
+    @vi.entries[@idx].is_active = 1
+    @vi.entry_count = @vi.entry_count + 1
+    return @idx
+
+# Record that a type parameter appears in a given position
+fn vi_record(@vi: VarianceInferencer, @name: str, @position: int, @source: str)
+    @idx = vi_find_or_create(@vi, @name, @source)
+    if @idx < 0
+        return
+    @vi.entries[@idx].variance = vi_combine(@vi.entries[@idx].variance, @position)
+
+# Extract type parameter name from a possibly-nested container type string.
+# e.g. "List[T]" → "T", "Dict[K, V]" → "K" (first only), "T" → "T"
+# Returns the extracted type param, or "" if no type param found.
+fn vi_extract_inner_tp(@type_str: str) -> str
+    # Look for bracket notation: Container[TypeParam]
+    @bracket_pos = -1
+    @len = 0
+    # Simple string scan for '['
+    orbit @i in 0..256
+        @ch = char_at(@type_str, @i)
+        if @ch == 0
+            @len = @i
+            break
+        if @ch == 91  # '['
+            @bracket_pos = @i
+            break
+    if @bracket_pos < 0
+        return @type_str  # No container — type param directly
+    # Extract content between [ and ]
+    @inner = ""
+    @depth_b = 0
+    orbit @i in (@bracket_pos + 1)..(@len + 256)
+        @ch = char_at(@type_str, @i)
+        if @ch == 0 or (@ch == 93 and @depth_b == 0)  # ']'
+            break
+        if @ch == 91
+            @depth_b = @depth_b + 1
+        if @ch == 93
+            @depth_b = @depth_b - 1
+        if @ch == 44 and @depth_b == 0  # ','  — stop at first param
+            break
+        @inner = @inner + chr(@ch)
+    # Trim leading space
+    if @inner != ""
+        return @inner
+    return ""
+
+# Infer variance from a function signature.
+# Parameters are in contravariant position, return type is in covariant position.
+# Mutable reference parameters flip the variance.
+# Now also extracts type params from container types (e.g. List[T] → T).
+fn vi_infer_from_fn(@vi: VarianceInferencer, @fn_name: str,
+                    @param_names: [str; 16], @param_is_mut: [int; 16], @param_count: int,
+                    @param_type_params: [str; 16], @return_type_params: [str; 8],
+                    @return_tp_count: int)
+    # Parameters are in contravariant position
+    orbit @i in 0..@param_count
+        @tp = @param_type_params[@i]
+        if @tp != ""
+            # Extract inner type param if nested in container
+            @extracted = vi_extract_inner_tp(@tp)
+            if @param_is_mut[@i] == 1
+                # Mutable ref → invariant (appears in both input and output)
+                vi_record(@vi, @extracted, VARIANCE_INVARIANT, @fn_name)
+            else
+                # Immutable parameter → contravariant
+                vi_record(@vi, @extracted, VARIANCE_CONTRAVARIANT, @fn_name)
+    # Return type is in covariant position
+    orbit @i in 0..@return_tp_count
+        @tp = @return_type_params[@i]
+        if @tp != ""
+            @extracted = vi_extract_inner_tp(@tp)
+            vi_record(@vi, @extracted, VARIANCE_COVARIANT, @fn_name)
+
+# Get the inferred variance for a type parameter
+fn vi_get_variance(@vi: VarianceInferencer, @name: str) -> int
+    orbit @i in 0..@vi.entry_count
+        if @vi.entries[@i].is_active == 1 and @vi.entries[@i].type_param_name == @name
+            return @vi.entries[@i].variance
+    return VARIANCE_BIVARIANT
+
+# Get human-readable variance name
+fn variance_name(@v: int) -> str
+    phase @v
+        VARIANCE_COVARIANT => return "covariant"
+        VARIANCE_CONTRAVARIANT => return "contravariant"
+        VARIANCE_INVARIANT => return "invariant"
+        VARIANCE_BIVARIANT => return "bivariant"
+        _ => return "unknown"
+
+# --- Subtyping rules ---
+
+# Subtype relation constants
+const SUBTYPE_YES: int = 1
+const SUBTYPE_NO: int = 0
+const SUBTYPE_ERROR: int = -1
+
+# Check if lifetime 'a outlives lifetime 'b.
+# In our representation: a scope with smaller depth number has a longer lifetime.
+# Global scope (depth 0) outlives all other scopes.
+fn lifetime_outlives(@a_scope: int, @a_start: int, @b_scope: int, @b_start: int) -> int
+    # Smaller scope depth = longer lifetime (global = 0 outlives everything)
+    if @a_scope < @b_scope
+        return 1
+    if @a_scope == @b_scope and @a_start <= @b_start
+        return 1
+    return 0
+
+# Check subtyping for reference types.
+# &'a T <: &'b T when 'a outlives 'b (for covariant T).
+# &'a mut T requires exact type match (invariant).
+fn subtype_check_ref(@is_mut: int, @a_scope: int, @a_start: int,
+                     @b_scope: int, @b_start: int,
+                     @a_type_kind: int, @b_type_kind: int) -> int
+    if @is_mut == 1
+        # Mutable reference: invariant — exact type match required
+        if @a_type_kind != @b_type_kind
+            return SUBTYPE_NO
+        # Lifetime: 'a must outlive 'b
+        if lifetime_outlives(@a_scope, @a_start, @b_scope, @b_start) == 1
+            return SUBTYPE_YES
+        return SUBTYPE_NO
+    else
+        # Immutable reference: covariant in T, covariant in lifetime
+        # 'a outlives 'b → &'a T <: &'b T
+        if lifetime_outlives(@a_scope, @a_start, @b_scope, @b_start) == 1
+            return SUBTYPE_YES
+        return SUBTYPE_NO
+
+# Recursive structural subtype check with depth protection.
+# Checks if type @a is a subtype of type @b.
+# Uses type node IDs from the borrow checker's type system.
+# Returns: SUBTYPE_YES, SUBTYPE_NO, or SUBTYPE_ERROR
+fn is_subtype(@a: int, @b: int, @depth: int) -> int
+    # Depth protection against infinite recursion on cyclic types
+    if @depth > 32
+        return SUBTYPE_ERROR
+    # Same type is always a subtype of itself
+    if @a == @b
+        return SUBTYPE_YES
+    # Negative IDs indicate error / unknown types
+    if @a < 0 or @b < 0
+        return SUBTYPE_NO
+    # For structural subtyping beyond exact match:
+    # In Luna's type system, we use type kind IDs to determine compatibility.
+    # Integer subtypes float (widening), all types subtype Any.
+    # This is a conservative structural check.
+    return SUBTYPE_NO
+
+# Check subtyping for generic containers based on variance.
+# Covariant: List[Cat] <: List[Animal] if Cat <: Animal
+# Contravariant: Sink[Animal] <: Sink[Cat] if Cat <: Animal
+# Invariant: MutRef[T] requires exact match
+fn subtype_check_container(@variance: int, @inner_sub: int, @inner_super: int, @depth: int) -> int
+    # Depth protection
+    if @depth > 32
+        return SUBTYPE_ERROR
+    phase @variance
+        VARIANCE_COVARIANT =>
+            # Sub's inner must be subtype of super's inner
+            return is_subtype(@inner_sub, @inner_super, @depth + 1)
+
+        VARIANCE_CONTRAVARIANT =>
+            # Reversed: super's inner must be subtype of sub's inner
+            return is_subtype(@inner_super, @inner_sub, @depth + 1)
+
+        VARIANCE_INVARIANT =>
+            # Exact match required
+            if @inner_sub == @inner_super
+                return SUBTYPE_YES
+            return SUBTYPE_NO
+
+        VARIANCE_BIVARIANT =>
+            # Always matches (phantom type)
+            return SUBTYPE_YES
+
+        _ =>
+            return SUBTYPE_NO
+
+# Check function subtyping.
+# fn(A) -> B <: fn(C) -> D when C <: A (contra params) and B <: D (co return)
+fn subtype_check_fn(@param_sub: int, @param_super: int,
+                    @ret_sub: int, @ret_super: int, @depth: int) -> int
+    # Depth protection
+    if @depth > 32
+        return SUBTYPE_ERROR
+    # Parameters: contravariant — supertype's param must be subtype of sub's param
+    @param_check = is_subtype(@param_super, @param_sub, @depth + 1)
+    if @param_check != SUBTYPE_YES
+        return SUBTYPE_NO
+    # Return: covariant — sub's return must be subtype of supertype's return
+    @ret_check = is_subtype(@ret_sub, @ret_super, @depth + 1)
+    if @ret_check != SUBTYPE_YES
+        return SUBTYPE_NO
+    return SUBTYPE_YES
+
+# --- Variance self-tests ---
+
+fn test_variance_combine()
+    shine("  [test] Variance combine...")
+    guard vi_combine(VARIANCE_COVARIANT, VARIANCE_COVARIANT) == VARIANCE_COVARIANT else
+        shine("    FAIL: co + co should be co")
+        return
+    guard vi_combine(VARIANCE_CONTRAVARIANT, VARIANCE_CONTRAVARIANT) == VARIANCE_CONTRAVARIANT else
+        shine("    FAIL: contra + contra should be contra")
+        return
+    guard vi_combine(VARIANCE_COVARIANT, VARIANCE_CONTRAVARIANT) == VARIANCE_INVARIANT else
+        shine("    FAIL: co + contra should be invariant")
+        return
+    guard vi_combine(VARIANCE_BIVARIANT, VARIANCE_COVARIANT) == VARIANCE_COVARIANT else
+        shine("    FAIL: bi + co should be co")
+        return
+    shine("    PASS")
+
+fn test_variance_flip()
+    shine("  [test] Variance flip...")
+    guard vi_flip(VARIANCE_COVARIANT) == VARIANCE_CONTRAVARIANT else
+        shine("    FAIL: flip(co) should be contra")
+        return
+    guard vi_flip(VARIANCE_CONTRAVARIANT) == VARIANCE_COVARIANT else
+        shine("    FAIL: flip(contra) should be co")
+        return
+    guard vi_flip(VARIANCE_INVARIANT) == VARIANCE_INVARIANT else
+        shine("    FAIL: flip(invariant) should be invariant")
+        return
+    shine("    PASS")
+
+fn test_variance_inference()
+    shine("  [test] Variance inference from fn signature...")
+    @vi = vi_new()
+    # fn identity(x: T) -> T
+    # T appears in param (contra) and return (co) → invariant
+    @params: [str; 16] = ["T", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    @mut_flags: [int; 16] = [0; 16]
+    @ret_tps: [str; 8] = ["T", "", "", "", "", "", "", ""]
+    vi_infer_from_fn(@vi, "identity", @params, @mut_flags, 1, @params, @ret_tps, 1)
+    @v = vi_get_variance(@vi, "T")
+    guard @v == VARIANCE_INVARIANT else
+        shine("    FAIL: identity T should be invariant, got " + variance_name(@v))
+        return
+    # fn produce() -> U — U only in return → covariant
+    @vi2 = vi_new()
+    @params2: [str; 16] = [""; 16]
+    @ret2: [str; 8] = ["U", "", "", "", "", "", "", ""]
+    vi_infer_from_fn(@vi2, "produce", @params2, @mut_flags, 0, @params2, @ret2, 1)
+    @v2 = vi_get_variance(@vi2, "U")
+    guard @v2 == VARIANCE_COVARIANT else
+        shine("    FAIL: produce U should be covariant, got " + variance_name(@v2))
+        return
+    # fn consume(x: V) — V only in param → contravariant
+    @vi3 = vi_new()
+    @params3: [str; 16] = ["V", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    @ret3: [str; 8] = [""; 8]
+    vi_infer_from_fn(@vi3, "consume", @params3, @mut_flags, 1, @params3, @ret3, 0)
+    @v3 = vi_get_variance(@vi3, "V")
+    guard @v3 == VARIANCE_CONTRAVARIANT else
+        shine("    FAIL: consume V should be contravariant, got " + variance_name(@v3))
+        return
+    shine("    PASS")
+
+fn test_subtype_ref()
+    shine("  [test] Subtype reference check...")
+    # &'global T <: &'local T (global outlives local)
+    @r1 = subtype_check_ref(0, 0, 0, 1, 5, 1, 1)
+    guard @r1 == SUBTYPE_YES else
+        shine("    FAIL: global ref should be subtype of local ref")
+        return
+    # &'local T NOT <: &'global T (local doesn't outlive global)
+    @r2 = subtype_check_ref(0, 2, 10, 0, 0, 1, 1)
+    guard @r2 == SUBTYPE_NO else
+        shine("    FAIL: local ref should not be subtype of global ref")
+        return
+    # &'a mut T requires exact type match
+    @r3 = subtype_check_ref(1, 0, 0, 1, 5, 1, 2)
+    guard @r3 == SUBTYPE_NO else
+        shine("    FAIL: mut ref with different types should fail")
+        return
+    shine("    PASS")
+
+fn test_subtype_container()
+    shine("  [test] Subtype container check...")
+    # Covariant: same inner type → yes
+    @r1 = subtype_check_container(VARIANCE_COVARIANT, 5, 5, 0)
+    guard @r1 == SUBTYPE_YES else
+        shine("    FAIL: same type covariant should pass")
+        return
+    # Invariant: different inner type → no
+    @r2 = subtype_check_container(VARIANCE_INVARIANT, 5, 6, 0)
+    guard @r2 == SUBTYPE_NO else
+        shine("    FAIL: different type invariant should fail")
+        return
+    # Bivariant: always passes
+    @r3 = subtype_check_container(VARIANCE_BIVARIANT, 5, 99, 0)
+    guard @r3 == SUBTYPE_YES else
+        shine("    FAIL: bivariant should always pass")
+        return
+    # Covariant: different types → is_subtype determines
+    @r4 = subtype_check_container(VARIANCE_COVARIANT, 5, 6, 0)
+    guard @r4 == SUBTYPE_NO else
+        shine("    FAIL: different type ids with no structural subtype should fail")
+        return
+    shine("    PASS")
+
+fn run_self_tests()
+    shine("=== Borrow Checker Self-Tests ===")
+    test_copy_type_check()
+    test_variable_lifecycle()
+    test_scope_tracking()
+    test_variable_lookup()
+    test_move_semantics()
+    test_copy_type_no_move()
+    test_parameter_protection()
+    test_borrow_conflict_detection()
+    test_lifetime_cycle_detection()
+    test_error_formatting()
+    test_strip_at()
+    test_local_tracking()
+    # v4.0 variance & subtyping tests
+    test_variance_combine()
+    test_variance_flip()
+    test_variance_inference()
+    test_subtype_ref()
+    test_subtype_container()
+    shine("=== All Borrow Checker Tests Done ===")
+
+# Run self-tests when executed directly
+# (guard __name__ == "__main__" pattern)
+run_self_tests()

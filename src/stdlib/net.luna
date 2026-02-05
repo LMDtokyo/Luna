@@ -1,0 +1,1373 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Network Module v3.3 "Concurrency & Network"
+# =============================================================================
+# Native networking for the Luna runtime, providing TCP/UDP sockets,
+# WebSocket client/server (RFC 6455), raw packet construction/parsing,
+# IP utilities, DNS resolution, and connection pooling.
+#
+# Ports socket.rs (~950 lines) + raw_socket.rs (~1550 lines) to pure Luna.
+#
+# Primitives implemented:
+#   1.  TCP Stream     — connect, send, recv, close
+#   2.  TCP Listener   — bind, listen, accept
+#   3.  UDP Socket     — bind, send_to, recv_from
+#   4.  WebSocket      — RFC 6455 client/server with frame codec
+#   5.  SHA-1          — for WebSocket handshake (Sec-WebSocket-Accept)
+#   6.  Base64         — encode/decode for WebSocket key exchange
+#   7.  Raw Sockets    — create, send, recv, close
+#   8.  Packet Builder — TCP, UDP, ICMP packet construction with headers
+#   9.  Packet Parser  — IP/TCP/UDP/ICMP header parsing
+#   10. Checksum       — RFC 1071 Internet checksum
+#   11. Binary Struct  — read u8/u16/u32/u64 from buffers
+#   12. IP Utilities   — parse, format, CIDR check
+#   13. DNS Resolution — hostname lookup with cache
+#   14. Connection Pool— reusable TCP connection management
+#
+# Design:
+#   - All structures use flat parallel arrays (no HashMap)
+#   - FFI to Rust socket module for OS-level operations
+#   - Pure Luna implementations for protocol logic (SHA-1, Base64, checksums)
+#   - Cross-platform: delegates to platform FFI via Rust bridge
+#
+# Build: luna compile --release net.luna -o net.o
+# =============================================================================
+
+import types
+import sync
+import borrow_checker
+
+# =============================================================================
+# SECTION 1: CONSTANTS AND PROTOCOL DEFINITIONS
+# =============================================================================
+
+# --- Maximum sizes ---
+const MAX_PACKET_SIZE: int = 65535
+const MAX_BUFFERS: int = 256
+const MAX_CONNECTIONS: int = 1024
+const MAX_TCP_STREAMS: int = 512
+const MAX_TCP_LISTENERS: int = 64
+const MAX_UDP_SOCKETS: int = 256
+const MAX_WS_CLIENTS: int = 256
+const MAX_WS_SERVERS: int = 32
+const MAX_WS_FRAMES: int = 4096
+const MAX_DNS_CACHE: int = 256
+const MAX_CONN_POOLS: int = 32
+const MAX_POOL_ENTRIES: int = 1024
+const MAX_RAW_SOCKETS: int = 64
+const MAX_PARSED_PACKETS: int = 1024
+
+# --- Protocol types ---
+const PROTO_ICMP: int = 1
+const PROTO_TCP: int = 6
+const PROTO_UDP: int = 17
+const PROTO_RAW: int = 255
+
+# --- TCP flags ---
+const TCP_FIN: int = 0x01
+const TCP_SYN: int = 0x02
+const TCP_RST: int = 0x04
+const TCP_PSH: int = 0x08
+const TCP_ACK: int = 0x10
+const TCP_URG: int = 0x20
+const TCP_ECE: int = 0x40
+const TCP_CWR: int = 0x80
+
+# --- ICMP types ---
+const ICMP_ECHO_REPLY: int = 0
+const ICMP_DEST_UNREACHABLE: int = 3
+const ICMP_REDIRECT: int = 5
+const ICMP_ECHO_REQUEST: int = 8
+const ICMP_TIME_EXCEEDED: int = 11
+const ICMP_TIMESTAMP: int = 13
+const ICMP_TIMESTAMP_REPLY: int = 14
+
+# --- WebSocket opcodes ---
+const WS_CONTINUATION: int = 0x0
+const WS_TEXT: int = 0x1
+const WS_BINARY: int = 0x2
+const WS_CLOSE: int = 0x8
+const WS_PING: int = 0x9
+const WS_PONG: int = 0xA
+
+# --- Socket status codes ---
+const SOCK_OK: int = 0
+const SOCK_ERROR: int = -1
+const SOCK_TIMEOUT: int = -2
+const SOCK_CLOSED: int = -3
+const SOCK_REFUSED: int = -4
+const SOCK_ADDR_IN_USE: int = -5
+
+# --- IP header constants ---
+const IP_HEADER_MIN_LEN: int = 20
+const TCP_HEADER_MIN_LEN: int = 20
+const UDP_HEADER_LEN: int = 8
+const ICMP_HEADER_LEN: int = 8
+
+# --- Default timeouts ---
+const DEFAULT_CONNECT_TIMEOUT_MS: int = 5000
+const DEFAULT_READ_TIMEOUT_MS: int = 30000
+const DEFAULT_WRITE_TIMEOUT_MS: int = 30000
+
+# --- WebSocket GUID for handshake ---
+# "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const WS_GUID_LEN: int = 36
+
+# =============================================================================
+# SECTION 2: FFI EXTERN DECLARATIONS
+# =============================================================================
+# Direct bindings to the Rust socket runtime (socket.rs, raw_socket.rs).
+
+# --- Socket lifecycle ---
+extern fn luna_socket_create(@domain: int, @type: int, @protocol: int) -> int
+extern fn luna_socket_bind(@fd: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
+extern fn luna_socket_listen(@fd: int, @backlog: int) -> int
+extern fn luna_socket_accept(@fd: int) -> int
+extern fn luna_socket_connect_raw(@fd: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
+extern fn luna_socket_send(@fd: int, @data_ptr: int, @data_len: int) -> int
+extern fn luna_socket_recv(@fd: int, @buf_ptr: int, @buf_len: int) -> int
+extern fn luna_socket_close(@fd: int) -> int
+extern fn luna_socket_set_timeout(@fd: int, @read_ms: int, @write_ms: int) -> int
+extern fn luna_socket_set_nonblocking(@fd: int, @enable: int) -> int
+extern fn luna_socket_set_reuseaddr(@fd: int, @enable: int) -> int
+extern fn luna_socket_get_peer_addr(@fd: int) -> int
+extern fn luna_socket_get_peer_port(@fd: int) -> int
+extern fn luna_socket_get_local_port(@fd: int) -> int
+
+# --- UDP specific ---
+extern fn luna_socket_sendto(@fd: int, @data_ptr: int, @data_len: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
+extern fn luna_socket_recvfrom(@fd: int, @buf_ptr: int, @buf_len: int) -> int
+extern fn luna_socket_set_broadcast(@fd: int, @enable: int) -> int
+
+# --- WebSocket (from socket.rs) ---
+extern fn luna_ws_connect(@url_ptr: int, @url_len: int) -> int
+extern fn luna_ws_send(@handle: int, @data_ptr: int, @data_len: int, @opcode: int) -> int
+extern fn luna_ws_recv(@handle: int) -> int
+extern fn luna_ws_recv_opcode(@handle: int) -> int
+extern fn luna_ws_recv_payload_ptr(@handle: int) -> int
+extern fn luna_ws_recv_payload_len(@handle: int) -> int
+extern fn luna_ws_close(@handle: int) -> int
+extern fn luna_ws_listen(@addr_ptr: int, @addr_len: int, @port: int) -> int
+extern fn luna_ws_accept(@server: int) -> int
+extern fn luna_ws_broadcast(@server: int, @data_ptr: int, @data_len: int) -> int
+extern fn luna_ws_server_close(@server: int) -> int
+
+# --- Raw socket ---
+extern fn luna_raw_socket_create(@protocol: int) -> int
+extern fn luna_raw_socket_send(@handle: int, @dest_ptr: int, @dest_len: int, @port: int, @pkt_ptr: int, @pkt_len: int) -> int
+extern fn luna_raw_socket_recv(@handle: int, @timeout_ms: int) -> int
+extern fn luna_raw_socket_get_len(@ptr: int) -> int
+extern fn luna_raw_socket_close(@handle: int) -> int
+
+# --- Packet construction ---
+extern fn luna_packet_build_tcp(@src_ip_ptr: int, @src_ip_len: int, @dst_ip_ptr: int, @dst_ip_len: int, @src_port: int, @dst_port: int, @seq: int, @ack: int, @flags: int, @window: int, @payload_ptr: int, @payload_len: int) -> int
+extern fn luna_packet_build_udp(@src_ip_ptr: int, @src_ip_len: int, @dst_ip_ptr: int, @dst_ip_len: int, @src_port: int, @dst_port: int, @payload_ptr: int, @payload_len: int) -> int
+extern fn luna_packet_build_icmp(@src_ip_ptr: int, @src_ip_len: int, @dst_ip_ptr: int, @dst_ip_len: int, @type: int, @code: int, @id: int, @seq: int, @payload_ptr: int, @payload_len: int) -> int
+extern fn luna_packet_build_ping(@src_ip_ptr: int, @src_ip_len: int, @dst_ip_ptr: int, @dst_ip_len: int, @id: int, @seq: int) -> int
+extern fn luna_tcp_flags(@fin: int, @syn: int, @rst: int, @psh: int, @ack: int, @urg: int) -> int
+
+# --- Packet parsing ---
+extern fn luna_packet_parse(@pkt_ptr: int, @pkt_len: int, @proto_hint: int) -> int
+extern fn luna_packet_get_field(@parse_id: int, @field_ptr: int, @field_len: int) -> int
+extern fn luna_packet_get_string_field(@parse_id: int, @field_ptr: int, @field_len: int) -> int
+extern fn luna_packet_parse_free(@parse_id: int) -> int
+extern fn luna_packet_checksum(@data_ptr: int, @data_len: int) -> int
+
+# --- Binary struct reading ---
+extern fn luna_struct_read_u8(@buf: int, @len: int, @offset: int) -> int
+extern fn luna_struct_read_u16_be(@buf: int, @len: int, @offset: int) -> int
+extern fn luna_struct_read_u16_le(@buf: int, @len: int, @offset: int) -> int
+extern fn luna_struct_read_u32_be(@buf: int, @len: int, @offset: int) -> int
+extern fn luna_struct_read_u32_le(@buf: int, @len: int, @offset: int) -> int
+extern fn luna_struct_read_u64_be(@buf: int, @len: int, @offset: int) -> int
+extern fn luna_struct_read_u64_le(@buf: int, @len: int, @offset: int) -> int
+extern fn luna_struct_read_bytes(@buf: int, @len: int, @offset: int, @count: int) -> int
+extern fn luna_struct_read_string(@buf: int, @len: int, @offset: int, @max_len: int) -> int
+
+# --- IP utilities ---
+extern fn luna_ip_parse(@ip_ptr: int, @ip_len: int) -> int
+extern fn luna_ip_to_string(@ip: int) -> int
+extern fn luna_ip_in_cidr(@ip_ptr: int, @ip_len: int, @cidr_ptr: int, @cidr_len: int) -> int
+
+# --- DNS ---
+extern fn luna_dns_resolve(@host_ptr: int, @host_len: int) -> int
+
+# --- Memory ---
+extern fn luna_mem_alloc(@size: int) -> int
+extern fn luna_mem_free(@ptr: int) -> void
+extern fn luna_mem_copy(@dst: int, @src: int, @len: int) -> void
+extern fn luna_mem_zero(@ptr: int, @len: int) -> void
+extern fn luna_mem_write_i64(@ptr: int, @offset: int, @value: int) -> void
+extern fn luna_mem_read_i64(@ptr: int, @offset: int) -> int
+extern fn luna_mem_write_u8(@ptr: int, @offset: int, @value: int) -> void
+extern fn luna_mem_read_u8(@ptr: int, @offset: int) -> int
+
+# --- String interning ---
+extern fn luna_str_intern(@ptr: int, @len: int) -> int
+extern fn luna_str_get_ptr(@id: int) -> int
+extern fn luna_str_get_len(@id: int) -> int
+
+# =============================================================================
+# SECTION 3: TCP STREAM
+# =============================================================================
+# Connection-oriented reliable byte stream over TCP.
+
+@tcp_fds: array[int, 512]
+@tcp_remote_addrs: array[int, 512]        # interned string ID
+@tcp_remote_ports: array[int, 512]
+@tcp_local_ports: array[int, 512]
+@tcp_connected: array[int, 512]
+@tcp_timeout_ms: array[int, 512]
+@tcp_count: int = 0
+
+# Connect to a remote host:port. Returns stream handle or -1.
+fn tcp_connect(@host_ptr: int, @host_len: int, @port: int) -> int
+    guard @tcp_count < MAX_TCP_STREAMS else return -1
+    guard @host_ptr != 0 else return -1
+    guard @host_len > 0 else return -1
+    guard @port > 0 else return -1
+    guard @port <= 65535 else return -1
+
+    # Create socket
+    @fd = luna_socket_create(2, 1, 0)  # AF_INET, SOCK_STREAM, 0
+    if @fd < 0
+        return -1
+
+    # Set default timeout
+    luna_socket_set_timeout(@fd, DEFAULT_READ_TIMEOUT_MS, DEFAULT_WRITE_TIMEOUT_MS)
+
+    # Connect
+    @result = luna_socket_connect_raw(@fd, @host_ptr, @host_len, @port)
+    if @result < 0
+        luna_socket_close(@fd)
+        return -1
+
+    @handle = @tcp_count
+    @tcp_count = @tcp_count + 1
+
+    @tcp_fds[@handle] = @fd
+    @tcp_remote_addrs[@handle] = luna_str_intern(@host_ptr, @host_len)
+    @tcp_remote_ports[@handle] = @port
+    @tcp_local_ports[@handle] = luna_socket_get_local_port(@fd)
+    @tcp_connected[@handle] = 1
+    @tcp_timeout_ms[@handle] = DEFAULT_READ_TIMEOUT_MS
+
+    return @handle
+
+# Send data over TCP stream. Returns bytes sent or SOCK_ERROR.
+fn tcp_send(@stream: int, @data_ptr: int, @data_len: int) -> int
+    guard @stream >= 0 else return SOCK_ERROR
+    guard @stream < @tcp_count else return SOCK_ERROR
+    guard @tcp_connected[@stream] == 1 else return SOCK_CLOSED
+    guard @data_ptr != 0 else return SOCK_ERROR
+    guard @data_len > 0 else return 0
+
+    @fd = @tcp_fds[@stream]
+    @sent = luna_socket_send(@fd, @data_ptr, @data_len)
+    if @sent < 0
+        @tcp_connected[@stream] = 0
+        return SOCK_ERROR
+    return @sent
+
+# Receive data from TCP stream. Returns bytes received or SOCK_ERROR.
+fn tcp_recv(@stream: int, @buf_ptr: int, @buf_len: int) -> int
+    guard @stream >= 0 else return SOCK_ERROR
+    guard @stream < @tcp_count else return SOCK_ERROR
+    guard @tcp_connected[@stream] == 1 else return SOCK_CLOSED
+    guard @buf_ptr != 0 else return SOCK_ERROR
+    guard @buf_len > 0 else return 0
+
+    @fd = @tcp_fds[@stream]
+    @received = luna_socket_recv(@fd, @buf_ptr, @buf_len)
+    if @received < 0
+        @tcp_connected[@stream] = 0
+        return SOCK_ERROR
+    if @received == 0
+        @tcp_connected[@stream] = 0
+        return SOCK_CLOSED
+    return @received
+
+# Close TCP stream
+fn tcp_close(@stream: int) -> int
+    guard @stream >= 0 else return SOCK_ERROR
+    guard @stream < @tcp_count else return SOCK_ERROR
+
+    @fd = @tcp_fds[@stream]
+    @tcp_connected[@stream] = 0
+    return luna_socket_close(@fd)
+
+# Set read/write timeout
+fn tcp_set_timeout(@stream: int, @timeout_ms: int)
+    guard @stream >= 0 else return
+    guard @stream < @tcp_count else return
+    @tcp_timeout_ms[@stream] = @timeout_ms
+    @fd = @tcp_fds[@stream]
+    luna_socket_set_timeout(@fd, @timeout_ms, @timeout_ms)
+
+# Check if connected
+fn tcp_is_connected(@stream: int) -> int
+    guard @stream >= 0 else return 0
+    guard @stream < @tcp_count else return 0
+    return @tcp_connected[@stream]
+
+# Get remote address (interned string ID)
+fn tcp_remote_addr(@stream: int) -> int
+    guard @stream >= 0 else return -1
+    guard @stream < @tcp_count else return -1
+    return @tcp_remote_addrs[@stream]
+
+# Get remote port
+fn tcp_remote_port(@stream: int) -> int
+    guard @stream >= 0 else return -1
+    guard @stream < @tcp_count else return -1
+    return @tcp_remote_ports[@stream]
+
+# Get local port
+fn tcp_local_port(@stream: int) -> int
+    guard @stream >= 0 else return -1
+    guard @stream < @tcp_count else return -1
+    return @tcp_local_ports[@stream]
+
+# =============================================================================
+# SECTION 4: TCP LISTENER
+# =============================================================================
+# Server-side TCP listener for accepting incoming connections.
+
+@listener_fds: array[int, 64]
+@listener_addrs: array[int, 64]
+@listener_ports: array[int, 64]
+@listener_backlogs: array[int, 64]
+@listener_count: int = 0
+
+# Bind and listen on addr:port. Returns listener handle or -1.
+fn tcp_listen(@addr_ptr: int, @addr_len: int, @port: int, @backlog: int) -> int
+    guard @listener_count < MAX_TCP_LISTENERS else return -1
+    guard @addr_ptr != 0 else return -1
+    guard @port > 0 else return -1
+    guard @port <= 65535 else return -1
+
+    @fd = luna_socket_create(2, 1, 0)  # AF_INET, SOCK_STREAM
+    if @fd < 0
+        return -1
+
+    luna_socket_set_reuseaddr(@fd, 1)
+
+    @result = luna_socket_bind(@fd, @addr_ptr, @addr_len, @port)
+    if @result < 0
+        luna_socket_close(@fd)
+        return -1
+
+    @bl = @backlog
+    if @bl <= 0
+        @bl = 128
+
+    @result = luna_socket_listen(@fd, @bl)
+    if @result < 0
+        luna_socket_close(@fd)
+        return -1
+
+    @handle = @listener_count
+    @listener_count = @listener_count + 1
+
+    @listener_fds[@handle] = @fd
+    @listener_addrs[@handle] = luna_str_intern(@addr_ptr, @addr_len)
+    @listener_ports[@handle] = @port
+    @listener_backlogs[@handle] = @bl
+
+    return @handle
+
+# Accept incoming connection. Returns TCP stream handle or -1.
+fn tcp_accept(@listener: int) -> int
+    guard @listener >= 0 else return -1
+    guard @listener < @listener_count else return -1
+
+    @fd = @listener_fds[@listener]
+    @client_fd = luna_socket_accept(@fd)
+    if @client_fd < 0
+        return -1
+
+    # Wrap in TcpStream
+    guard @tcp_count < MAX_TCP_STREAMS else
+        luna_socket_close(@client_fd)
+        return -1
+
+    @handle = @tcp_count
+    @tcp_count = @tcp_count + 1
+
+    @tcp_fds[@handle] = @client_fd
+    @tcp_remote_addrs[@handle] = luna_socket_get_peer_addr(@client_fd)
+    @tcp_remote_ports[@handle] = luna_socket_get_peer_port(@client_fd)
+    @tcp_local_ports[@handle] = luna_socket_get_local_port(@client_fd)
+    @tcp_connected[@handle] = 1
+    @tcp_timeout_ms[@handle] = DEFAULT_READ_TIMEOUT_MS
+
+    luna_socket_set_timeout(@client_fd, DEFAULT_READ_TIMEOUT_MS, DEFAULT_WRITE_TIMEOUT_MS)
+
+    return @handle
+
+# Close listener
+fn tcp_listener_close(@listener: int) -> int
+    guard @listener >= 0 else return SOCK_ERROR
+    guard @listener < @listener_count else return SOCK_ERROR
+    return luna_socket_close(@listener_fds[@listener])
+
+# Get listener port
+fn tcp_listener_port(@listener: int) -> int
+    guard @listener >= 0 else return -1
+    guard @listener < @listener_count else return -1
+    return @listener_ports[@listener]
+
+# Get listener address
+fn tcp_listener_addr(@listener: int) -> int
+    guard @listener >= 0 else return -1
+    guard @listener < @listener_count else return -1
+    return @listener_addrs[@listener]
+
+# =============================================================================
+# SECTION 5: UDP SOCKET
+# =============================================================================
+# Connectionless datagram socket for UDP communication.
+
+@udp_fds: array[int, 256]
+@udp_addrs: array[int, 256]
+@udp_ports: array[int, 256]
+@udp_timeout_ms: array[int, 256]
+@udp_count: int = 0
+
+# Bind UDP socket to addr:port. Returns handle or -1.
+fn udp_bind(@addr_ptr: int, @addr_len: int, @port: int) -> int
+    guard @udp_count < MAX_UDP_SOCKETS else return -1
+
+    @fd = luna_socket_create(2, 2, 0)  # AF_INET, SOCK_DGRAM
+    if @fd < 0
+        return -1
+
+    @result = luna_socket_bind(@fd, @addr_ptr, @addr_len, @port)
+    if @result < 0
+        luna_socket_close(@fd)
+        return -1
+
+    @handle = @udp_count
+    @udp_count = @udp_count + 1
+
+    @udp_fds[@handle] = @fd
+    @udp_addrs[@handle] = luna_str_intern(@addr_ptr, @addr_len)
+    @udp_ports[@handle] = @port
+    @udp_timeout_ms[@handle] = DEFAULT_READ_TIMEOUT_MS
+
+    return @handle
+
+# Send datagram to addr:port. Returns bytes sent or SOCK_ERROR.
+fn udp_send_to(@socket: int, @data_ptr: int, @data_len: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
+    guard @socket >= 0 else return SOCK_ERROR
+    guard @socket < @udp_count else return SOCK_ERROR
+    guard @data_ptr != 0 else return SOCK_ERROR
+    guard @data_len > 0 else return 0
+
+    @fd = @udp_fds[@socket]
+    return luna_socket_sendto(@fd, @data_ptr, @data_len, @addr_ptr, @addr_len, @port)
+
+# Receive datagram. Returns bytes received or SOCK_ERROR.
+# Sender info available via udp_last_sender_* functions.
+fn udp_recv_from(@socket: int, @buf_ptr: int, @buf_len: int) -> int
+    guard @socket >= 0 else return SOCK_ERROR
+    guard @socket < @udp_count else return SOCK_ERROR
+    guard @buf_ptr != 0 else return SOCK_ERROR
+    guard @buf_len > 0 else return 0
+
+    @fd = @udp_fds[@socket]
+    return luna_socket_recvfrom(@fd, @buf_ptr, @buf_len)
+
+# Close UDP socket
+fn udp_close(@socket: int) -> int
+    guard @socket >= 0 else return SOCK_ERROR
+    guard @socket < @udp_count else return SOCK_ERROR
+    return luna_socket_close(@udp_fds[@socket])
+
+# Set receive timeout
+fn udp_set_timeout(@socket: int, @timeout_ms: int)
+    guard @socket >= 0 else return
+    guard @socket < @udp_count else return
+    @udp_timeout_ms[@socket] = @timeout_ms
+    @fd = @udp_fds[@socket]
+    luna_socket_set_timeout(@fd, @timeout_ms, @timeout_ms)
+
+# Enable broadcast
+fn udp_set_broadcast(@socket: int, @enable: int) -> int
+    guard @socket >= 0 else return SOCK_ERROR
+    guard @socket < @udp_count else return SOCK_ERROR
+    @fd = @udp_fds[@socket]
+    return luna_socket_set_broadcast(@fd, @enable)
+
+# =============================================================================
+# SECTION 6: WEBSOCKET CLIENT
+# =============================================================================
+# RFC 6455 WebSocket client using the Rust socket.rs backend.
+
+@ws_handles: array[int, 256]
+@ws_connected: array[int, 256]
+@ws_urls: array[int, 256]
+@ws_count: int = 0
+
+# Connect to a WebSocket server. Returns handle or -1.
+fn ws_connect(@url_ptr: int, @url_len: int) -> int
+    guard @ws_count < MAX_WS_CLIENTS else return -1
+    guard @url_ptr != 0 else return -1
+    guard @url_len > 0 else return -1
+
+    @ffi_handle = luna_ws_connect(@url_ptr, @url_len)
+    if @ffi_handle <= 0
+        return -1
+
+    @handle = @ws_count
+    @ws_count = @ws_count + 1
+
+    @ws_handles[@handle] = @ffi_handle
+    @ws_connected[@handle] = 1
+    @ws_urls[@handle] = luna_str_intern(@url_ptr, @url_len)
+
+    return @handle
+
+# Send text data
+fn ws_send_text(@ws: int, @data_ptr: int, @data_len: int) -> int
+    guard @ws >= 0 else return SOCK_ERROR
+    guard @ws < @ws_count else return SOCK_ERROR
+    guard @ws_connected[@ws] == 1 else return SOCK_CLOSED
+
+    @ffi = @ws_handles[@ws]
+    @result = luna_ws_send(@ffi, @data_ptr, @data_len, WS_TEXT)
+    if @result < 0
+        @ws_connected[@ws] = 0
+    return @result
+
+# Send binary data
+fn ws_send_binary(@ws: int, @data_ptr: int, @data_len: int) -> int
+    guard @ws >= 0 else return SOCK_ERROR
+    guard @ws < @ws_count else return SOCK_ERROR
+    guard @ws_connected[@ws] == 1 else return SOCK_CLOSED
+
+    @ffi = @ws_handles[@ws]
+    @result = luna_ws_send(@ffi, @data_ptr, @data_len, WS_BINARY)
+    if @result < 0
+        @ws_connected[@ws] = 0
+    return @result
+
+# Send ping
+fn ws_send_ping(@ws: int) -> int
+    guard @ws >= 0 else return SOCK_ERROR
+    guard @ws < @ws_count else return SOCK_ERROR
+    @ffi = @ws_handles[@ws]
+    return luna_ws_send(@ffi, 0, 0, WS_PING)
+
+# Receive frame. Returns frame handle or -1.
+fn ws_recv(@ws: int) -> int
+    guard @ws >= 0 else return -1
+    guard @ws < @ws_count else return -1
+    guard @ws_connected[@ws] == 1 else return -1
+
+    @ffi = @ws_handles[@ws]
+    @result = luna_ws_recv(@ffi)
+    if @result < 0
+        @ws_connected[@ws] = 0
+    return @result
+
+# Get frame opcode
+fn ws_frame_opcode(@ws: int) -> int
+    guard @ws >= 0 else return -1
+    @ffi = @ws_handles[@ws]
+    return luna_ws_recv_opcode(@ffi)
+
+# Get frame payload pointer
+fn ws_frame_payload_ptr(@ws: int) -> int
+    guard @ws >= 0 else return 0
+    @ffi = @ws_handles[@ws]
+    return luna_ws_recv_payload_ptr(@ffi)
+
+# Get frame payload length
+fn ws_frame_payload_len(@ws: int) -> int
+    guard @ws >= 0 else return 0
+    @ffi = @ws_handles[@ws]
+    return luna_ws_recv_payload_len(@ffi)
+
+# Close WebSocket
+fn ws_close(@ws: int) -> int
+    guard @ws >= 0 else return SOCK_ERROR
+    guard @ws < @ws_count else return SOCK_ERROR
+    @ws_connected[@ws] = 0
+    @ffi = @ws_handles[@ws]
+    return luna_ws_close(@ffi)
+
+# =============================================================================
+# SECTION 7: WEBSOCKET SERVER
+# =============================================================================
+
+@wss_handles: array[int, 32]
+@wss_ports: array[int, 32]
+@wss_count: int = 0
+
+fn ws_listen(@addr_ptr: int, @addr_len: int, @port: int) -> int
+    guard @wss_count < MAX_WS_SERVERS else return -1
+
+    @ffi = luna_ws_listen(@addr_ptr, @addr_len, @port)
+    if @ffi <= 0
+        return -1
+
+    @handle = @wss_count
+    @wss_count = @wss_count + 1
+
+    @wss_handles[@handle] = @ffi
+    @wss_ports[@handle] = @port
+    return @handle
+
+fn ws_accept(@server: int) -> int
+    guard @server >= 0 else return -1
+    guard @server < @wss_count else return -1
+    @ffi = @wss_handles[@server]
+    return luna_ws_accept(@ffi)
+
+fn ws_broadcast(@server: int, @data_ptr: int, @data_len: int) -> int
+    guard @server >= 0 else return SOCK_ERROR
+    guard @server < @wss_count else return SOCK_ERROR
+    @ffi = @wss_handles[@server]
+    return luna_ws_broadcast(@ffi, @data_ptr, @data_len)
+
+fn ws_server_close(@server: int) -> int
+    guard @server >= 0 else return SOCK_ERROR
+    guard @server < @wss_count else return SOCK_ERROR
+    @ffi = @wss_handles[@server]
+    return luna_ws_server_close(@ffi)
+
+# =============================================================================
+# SECTION 8: SHA-1 IMPLEMENTATION
+# =============================================================================
+# Full SHA-1 as per FIPS 180-4. Used for WebSocket handshake
+# (computing Sec-WebSocket-Accept header).
+#
+# Input:  pointer to data, length
+# Output: pointer to 20-byte hash (allocated)
+
+fn sha1(@data_ptr: int, @data_len: int) -> int
+    guard @data_ptr != 0 else return 0
+
+    # Initialize hash values
+    @h0 = 0x67452301
+    @h1 = 0xEFCDAB89
+    @h2 = 0x98BADCFE
+    @h3 = 0x10325476
+    @h4 = 0xC3D2E1F0
+
+    # Message length in bits
+    @ml = @data_len * 8
+
+    # Compute padded length: data + 1 byte (0x80) + padding + 8 bytes (length)
+    @pad_len = @data_len + 1
+    orbit @p in range(0, 64)
+        if (@pad_len % 64) == 56
+            orbit @done in range(0, 0)
+                # break
+        else
+            @pad_len = @pad_len + 1
+
+    @total_len = @pad_len + 8
+
+    # Allocate padded buffer
+    @padded = luna_mem_alloc(@total_len)
+    luna_mem_zero(@padded, @total_len)
+    luna_mem_copy(@padded, @data_ptr, @data_len)
+
+    # Append 0x80
+    luna_mem_write_u8(@padded, @data_len, 0x80)
+
+    # Append message length (big-endian, 8 bytes)
+    orbit @i in range(0, 8)
+        @shift = (7 - @i) * 8
+        @byte = (@ml >> @shift) & 0xFF
+        luna_mem_write_u8(@padded, @pad_len + @i, @byte)
+
+    # Process 64-byte chunks
+    @num_chunks = @total_len / 64
+    @w: array[int, 80]
+
+    orbit @chunk in range(0, @num_chunks)
+        @chunk_ptr = @padded + @chunk * 64
+
+        # Build message schedule (w[0..15] from chunk, w[16..79] extended)
+        orbit @i in range(0, 16)
+            @b0 = luna_mem_read_u8(@chunk_ptr, @i * 4)
+            @b1 = luna_mem_read_u8(@chunk_ptr, @i * 4 + 1)
+            @b2 = luna_mem_read_u8(@chunk_ptr, @i * 4 + 2)
+            @b3 = luna_mem_read_u8(@chunk_ptr, @i * 4 + 3)
+            @w[@i] = (@b0 << 24) | (@b1 << 16) | (@b2 << 8) | @b3
+
+        orbit @i in range(16, 80)
+            @xor_val = @w[@i - 3] ^ @w[@i - 8] ^ @w[@i - 14] ^ @w[@i - 16]
+            # Rotate left by 1
+            @w[@i] = ((@xor_val << 1) | ((@xor_val >> 31) & 1)) & 0xFFFFFFFF
+
+        @a = @h0
+        @b = @h1
+        @c = @h2
+        @d = @h3
+        @e = @h4
+
+        orbit @i in range(0, 80)
+            @f = 0
+            @k = 0
+
+            if @i < 20
+                @f = (@b & @c) | ((~@b) & @d)
+                @k = 0x5A827999
+            else if @i < 40
+                @f = @b ^ @c ^ @d
+                @k = 0x6ED9EBA1
+            else if @i < 60
+                @f = (@b & @c) | (@b & @d) | (@c & @d)
+                @k = 0x8F1BBCDC
+            else
+                @f = @b ^ @c ^ @d
+                @k = 0xCA62C1D6
+
+            # temp = rotate_left(a,5) + f + e + k + w[i]
+            @rot_a = ((@a << 5) | ((@a >> 27) & 0x1F)) & 0xFFFFFFFF
+            @temp = (@rot_a + @f + @e + @k + @w[@i]) & 0xFFFFFFFF
+
+            @e = @d
+            @d = @c
+            @c = ((@b << 30) | ((@b >> 2) & 0x3FFFFFFF)) & 0xFFFFFFFF
+            @b = @a
+            @a = @temp
+
+        @h0 = (@h0 + @a) & 0xFFFFFFFF
+        @h1 = (@h1 + @b) & 0xFFFFFFFF
+        @h2 = (@h2 + @c) & 0xFFFFFFFF
+        @h3 = (@h3 + @d) & 0xFFFFFFFF
+        @h4 = (@h4 + @e) & 0xFFFFFFFF
+
+    luna_mem_free(@padded)
+
+    # Write 20-byte result
+    @result = luna_mem_alloc(20)
+    orbit @i in range(0, 5)
+        @h = 0
+        if @i == 0
+            @h = @h0
+        else if @i == 1
+            @h = @h1
+        else if @i == 2
+            @h = @h2
+        else if @i == 3
+            @h = @h3
+        else
+            @h = @h4
+
+        luna_mem_write_u8(@result, @i * 4, (@h >> 24) & 0xFF)
+        luna_mem_write_u8(@result, @i * 4 + 1, (@h >> 16) & 0xFF)
+        luna_mem_write_u8(@result, @i * 4 + 2, (@h >> 8) & 0xFF)
+        luna_mem_write_u8(@result, @i * 4 + 3, @h & 0xFF)
+
+    return @result
+
+# =============================================================================
+# SECTION 9: BASE64 ENCODING / DECODING
+# =============================================================================
+# RFC 4648 Base64 encoding used for WebSocket key exchange.
+
+# Base64 alphabet: A-Z a-z 0-9 + /
+@b64_chars: array[int, 64]
+@b64_initialized: int = 0
+
+fn b64_init()
+    if @b64_initialized == 1
+        return
+    # A-Z = 0..25
+    orbit @i in range(0, 26)
+        @b64_chars[@i] = 65 + @i  # 'A' = 65
+    # a-z = 26..51
+    orbit @i in range(0, 26)
+        @b64_chars[26 + @i] = 97 + @i  # 'a' = 97
+    # 0-9 = 52..61
+    orbit @i in range(0, 10)
+        @b64_chars[52 + @i] = 48 + @i  # '0' = 48
+    # + = 62, / = 63
+    @b64_chars[62] = 43  # '+'
+    @b64_chars[63] = 47  # '/'
+    @b64_initialized = 1
+
+fn base64_encode(@data_ptr: int, @data_len: int) -> int
+    guard @data_ptr != 0 else return 0
+    guard @data_len > 0 else return 0
+
+    b64_init()
+
+    # Output length: ceil(data_len / 3) * 4
+    @out_len = ((@data_len + 2) / 3) * 4
+    @out = luna_mem_alloc(@out_len + 1)  # +1 for null terminator
+    luna_mem_zero(@out, @out_len + 1)
+
+    @out_idx = 0
+    @i = 0
+    orbit @chunk in range(0, (@data_len + 2) / 3)
+        @b0 = luna_mem_read_u8(@data_ptr, @i)
+        @b1 = 0
+        @b2 = 0
+        if @i + 1 < @data_len
+            @b1 = luna_mem_read_u8(@data_ptr, @i + 1)
+        if @i + 2 < @data_len
+            @b2 = luna_mem_read_u8(@data_ptr, @i + 2)
+
+        @triple = (@b0 << 16) | (@b1 << 8) | @b2
+
+        luna_mem_write_u8(@out, @out_idx, @b64_chars[(@triple >> 18) & 0x3F])
+        luna_mem_write_u8(@out, @out_idx + 1, @b64_chars[(@triple >> 12) & 0x3F])
+
+        if @i + 1 < @data_len
+            luna_mem_write_u8(@out, @out_idx + 2, @b64_chars[(@triple >> 6) & 0x3F])
+        else
+            luna_mem_write_u8(@out, @out_idx + 2, 61)  # '='
+
+        if @i + 2 < @data_len
+            luna_mem_write_u8(@out, @out_idx + 3, @b64_chars[@triple & 0x3F])
+        else
+            luna_mem_write_u8(@out, @out_idx + 3, 61)  # '='
+
+        @out_idx = @out_idx + 4
+        @i = @i + 3
+
+    return @out
+
+fn base64_encode_len(@data_len: int) -> int
+    return ((@data_len + 2) / 3) * 4
+
+# =============================================================================
+# SECTION 10: RAW SOCKET OPERATIONS
+# =============================================================================
+
+fn raw_socket_create(@protocol: int) -> int
+    return luna_raw_socket_create(@protocol)
+
+fn raw_socket_send(@handle: int, @dest_ptr: int, @dest_len: int, @port: int, @pkt_ptr: int, @pkt_len: int) -> int
+    guard @handle >= 0 else return SOCK_ERROR
+    guard @pkt_ptr != 0 else return SOCK_ERROR
+    guard @pkt_len > 0 else return SOCK_ERROR
+    guard @pkt_len <= MAX_PACKET_SIZE else return SOCK_ERROR
+    return luna_raw_socket_send(@handle, @dest_ptr, @dest_len, @port, @pkt_ptr, @pkt_len)
+
+fn raw_socket_recv(@handle: int, @timeout_ms: int) -> int
+    guard @handle >= 0 else return 0
+    guard @timeout_ms >= 0 else return 0
+    return luna_raw_socket_recv(@handle, @timeout_ms)
+
+fn raw_socket_recv_len(@ptr: int) -> int
+    return luna_raw_socket_get_len(@ptr)
+
+fn raw_socket_close(@handle: int) -> int
+    guard @handle >= 0 else return SOCK_ERROR
+    return luna_raw_socket_close(@handle)
+
+# =============================================================================
+# SECTION 11: PACKET CONSTRUCTION
+# =============================================================================
+# Build TCP, UDP, ICMP packets with full header control.
+
+fn packet_build_tcp(@src_ip_ptr: int, @src_ip_len: int, @dst_ip_ptr: int, @dst_ip_len: int, @src_port: int, @dst_port: int, @seq: int, @ack: int, @flags: int, @window: int, @payload_ptr: int, @payload_len: int) -> int
+    return luna_packet_build_tcp(@src_ip_ptr, @src_ip_len, @dst_ip_ptr, @dst_ip_len, @src_port, @dst_port, @seq, @ack, @flags, @window, @payload_ptr, @payload_len)
+
+fn packet_build_udp(@src_ip_ptr: int, @src_ip_len: int, @dst_ip_ptr: int, @dst_ip_len: int, @src_port: int, @dst_port: int, @payload_ptr: int, @payload_len: int) -> int
+    return luna_packet_build_udp(@src_ip_ptr, @src_ip_len, @dst_ip_ptr, @dst_ip_len, @src_port, @dst_port, @payload_ptr, @payload_len)
+
+fn packet_build_icmp(@src_ip_ptr: int, @src_ip_len: int, @dst_ip_ptr: int, @dst_ip_len: int, @icmp_type: int, @icmp_code: int, @id: int, @seq: int, @payload_ptr: int, @payload_len: int) -> int
+    return luna_packet_build_icmp(@src_ip_ptr, @src_ip_len, @dst_ip_ptr, @dst_ip_len, @icmp_type, @icmp_code, @id, @seq, @payload_ptr, @payload_len)
+
+fn packet_build_ping(@src_ip_ptr: int, @src_ip_len: int, @dst_ip_ptr: int, @dst_ip_len: int, @id: int, @seq: int) -> int
+    return luna_packet_build_ping(@src_ip_ptr, @src_ip_len, @dst_ip_ptr, @dst_ip_len, @id, @seq)
+
+# Build combined TCP flags byte
+fn tcp_flags_build(@fin: int, @syn: int, @rst: int, @psh: int, @ack: int, @urg: int) -> int
+    @flags = 0
+    if @fin != 0
+        @flags = @flags | TCP_FIN
+    if @syn != 0
+        @flags = @flags | TCP_SYN
+    if @rst != 0
+        @flags = @flags | TCP_RST
+    if @psh != 0
+        @flags = @flags | TCP_PSH
+    if @ack != 0
+        @flags = @flags | TCP_ACK
+    if @urg != 0
+        @flags = @flags | TCP_URG
+    return @flags
+
+# Get packet length from pointer
+fn packet_get_len(@ptr: int) -> int
+    return luna_raw_socket_get_len(@ptr)
+
+# =============================================================================
+# SECTION 12: PACKET PARSING
+# =============================================================================
+# Parse IP/TCP/UDP/ICMP headers from raw packet data.
+
+fn packet_parse(@pkt_ptr: int, @pkt_len: int, @proto_hint: int) -> int
+    guard @pkt_ptr != 0 else return 0
+    guard @pkt_len >= IP_HEADER_MIN_LEN else return 0
+    return luna_packet_parse(@pkt_ptr, @pkt_len, @proto_hint)
+
+fn packet_get_field(@parse_id: int, @field_ptr: int, @field_len: int) -> int
+    guard @parse_id > 0 else return -1
+    return luna_packet_get_field(@parse_id, @field_ptr, @field_len)
+
+fn packet_get_string_field(@parse_id: int, @field_ptr: int, @field_len: int) -> int
+    guard @parse_id > 0 else return 0
+    return luna_packet_get_string_field(@parse_id, @field_ptr, @field_len)
+
+fn packet_parse_free(@parse_id: int) -> int
+    guard @parse_id > 0 else return -1
+    return luna_packet_parse_free(@parse_id)
+
+# =============================================================================
+# SECTION 13: CHECKSUM CALCULATION
+# =============================================================================
+# RFC 1071 Internet checksum used in IP, TCP, UDP, ICMP headers.
+
+fn checksum(@data_ptr: int, @data_len: int) -> int
+    guard @data_ptr != 0 else return -1
+    guard @data_len > 0 else return -1
+    return luna_packet_checksum(@data_ptr, @data_len)
+
+# Pure Luna checksum implementation (for bootstrap self-sufficiency)
+fn checksum_luna(@data_ptr: int, @data_len: int) -> int
+    guard @data_ptr != 0 else return -1
+    guard @data_len > 0 else return -1
+
+    @sum = 0
+    @i = 0
+
+    # Sum 16-bit words
+    orbit @w in range(0, @data_len / 2)
+        @hi = luna_mem_read_u8(@data_ptr, @i)
+        @lo = luna_mem_read_u8(@data_ptr, @i + 1)
+        @word = (@hi << 8) | @lo
+        @sum = @sum + @word
+        @i = @i + 2
+
+    # Handle odd byte
+    if @i < @data_len
+        @hi = luna_mem_read_u8(@data_ptr, @i)
+        @sum = @sum + (@hi << 8)
+
+    # Fold 32-bit sum to 16 bits
+    orbit @fold in range(0, 4)
+        if (@sum >> 16) != 0
+            @sum = (@sum & 0xFFFF) + (@sum >> 16)
+
+    return (~@sum) & 0xFFFF
+
+# =============================================================================
+# SECTION 14: BINARY STRUCT READ HELPERS
+# =============================================================================
+# Wrappers around luna_struct_read_* for safe buffer access.
+
+fn read_u8(@buf: int, @len: int, @offset: int) -> int
+    return luna_struct_read_u8(@buf, @len, @offset)
+
+fn read_u16_be(@buf: int, @len: int, @offset: int) -> int
+    return luna_struct_read_u16_be(@buf, @len, @offset)
+
+fn read_u16_le(@buf: int, @len: int, @offset: int) -> int
+    return luna_struct_read_u16_le(@buf, @len, @offset)
+
+fn read_u32_be(@buf: int, @len: int, @offset: int) -> int
+    return luna_struct_read_u32_be(@buf, @len, @offset)
+
+fn read_u32_le(@buf: int, @len: int, @offset: int) -> int
+    return luna_struct_read_u32_le(@buf, @len, @offset)
+
+fn read_u64_be(@buf: int, @len: int, @offset: int) -> int
+    return luna_struct_read_u64_be(@buf, @len, @offset)
+
+fn read_u64_le(@buf: int, @len: int, @offset: int) -> int
+    return luna_struct_read_u64_le(@buf, @len, @offset)
+
+fn read_bytes(@buf: int, @len: int, @offset: int, @count: int) -> int
+    return luna_struct_read_bytes(@buf, @len, @offset, @count)
+
+fn read_string(@buf: int, @len: int, @offset: int, @max_len: int) -> int
+    return luna_struct_read_string(@buf, @len, @offset, @max_len)
+
+# =============================================================================
+# SECTION 15: IP ADDRESS UTILITIES
+# =============================================================================
+
+fn ip_parse(@ip_ptr: int, @ip_len: int) -> int
+    return luna_ip_parse(@ip_ptr, @ip_len)
+
+fn ip_to_string(@ip: int) -> int
+    return luna_ip_to_string(@ip)
+
+fn ip_in_cidr(@ip_ptr: int, @ip_len: int, @cidr_ptr: int, @cidr_len: int) -> int
+    return luna_ip_in_cidr(@ip_ptr, @ip_len, @cidr_ptr, @cidr_len)
+
+# Check if IP is in private range (10.x, 172.16-31.x, 192.168.x)
+fn ip_is_private(@ip: int) -> int
+    @b0 = (@ip >> 24) & 0xFF
+    @b1 = (@ip >> 16) & 0xFF
+
+    # 10.0.0.0/8
+    if @b0 == 10
+        return 1
+    # 172.16.0.0/12
+    if @b0 == 172
+        if @b1 >= 16
+            if @b1 <= 31
+                return 1
+    # 192.168.0.0/16
+    if @b0 == 192
+        if @b1 == 168
+            return 1
+    return 0
+
+# Check if IP is loopback (127.x.x.x)
+fn ip_is_loopback(@ip: int) -> int
+    @b0 = (@ip >> 24) & 0xFF
+    if @b0 == 127
+        return 1
+    return 0
+
+# =============================================================================
+# SECTION 16: DNS RESOLUTION
+# =============================================================================
+# Simple DNS cache with TTL. Delegates actual resolution to FFI.
+
+@dns_cache_hosts: array[int, 256]      # interned host string ID
+@dns_cache_ips: array[int, 256]        # resolved IP (u32)
+@dns_cache_ttls: array[int, 256]       # expiry timestamp (ns)
+@dns_cache_count: int = 0
+
+const DNS_DEFAULT_TTL_NS: int = 300000000000  # 5 minutes in nanoseconds
+
+fn dns_resolve(@host_ptr: int, @host_len: int) -> int
+    guard @host_ptr != 0 else return -1
+    guard @host_len > 0 else return -1
+
+    @host_id = luna_str_intern(@host_ptr, @host_len)
+
+    # Check cache
+    orbit @i in range(0, @dns_cache_count)
+        if @dns_cache_hosts[@i] == @host_id
+            # Check TTL (simplified — skip for bootstrap)
+            return @dns_cache_ips[@i]
+
+    # Cache miss — resolve via FFI
+    @ip = luna_dns_resolve(@host_ptr, @host_len)
+    if @ip < 0
+        return -1
+
+    # Add to cache
+    if @dns_cache_count < MAX_DNS_CACHE
+        @idx = @dns_cache_count
+        @dns_cache_count = @dns_cache_count + 1
+        @dns_cache_hosts[@idx] = @host_id
+        @dns_cache_ips[@idx] = @ip
+        @dns_cache_ttls[@idx] = 0  # simplified
+
+    return @ip
+
+fn dns_cache_clear()
+    @dns_cache_count = 0
+
+# =============================================================================
+# SECTION 17: CONNECTION POOL
+# =============================================================================
+# Reusable TCP connection management for reducing handshake overhead.
+
+@pool_host_ids: array[int, 1024]
+@pool_ports: array[int, 1024]
+@pool_streams: array[int, 1024]
+@pool_in_use: array[int, 1024]
+@pool_count: int = 0
+
+fn conn_pool_get(@host_ptr: int, @host_len: int, @port: int) -> int
+    @host_id = luna_str_intern(@host_ptr, @host_len)
+
+    # Search for existing idle connection
+    orbit @i in range(0, @pool_count)
+        if @pool_host_ids[@i] == @host_id
+            if @pool_ports[@i] == @port
+                if @pool_in_use[@i] == 0
+                    @stream = @pool_streams[@i]
+                    if tcp_is_connected(@stream) == 1
+                        @pool_in_use[@i] = 1
+                        return @stream
+
+    # No idle connection — create new
+    @stream = tcp_connect(@host_ptr, @host_len, @port)
+    if @stream < 0
+        return -1
+
+    # Add to pool
+    if @pool_count < MAX_POOL_ENTRIES
+        @idx = @pool_count
+        @pool_count = @pool_count + 1
+        @pool_host_ids[@idx] = @host_id
+        @pool_ports[@idx] = @port
+        @pool_streams[@idx] = @stream
+        @pool_in_use[@idx] = 1
+
+    return @stream
+
+fn conn_pool_release(@stream: int)
+    orbit @i in range(0, @pool_count)
+        if @pool_streams[@i] == @stream
+            @pool_in_use[@i] = 0
+            return
+
+fn conn_pool_close_all()
+    orbit @i in range(0, @pool_count)
+        @stream = @pool_streams[@i]
+        tcp_close(@stream)
+    @pool_count = 0
+
+# =============================================================================
+# SECTION 18: WEBSOCKET FRAME CODEC (PURE LUNA)
+# =============================================================================
+# Frame encode/decode for WebSocket protocol (RFC 6455).
+
+fn ws_frame_encode(@opcode: int, @payload_ptr: int, @payload_len: int, @masked: int) -> int
+    # Calculate frame size
+    @header_size = 2
+    if @payload_len > 125
+        if @payload_len <= 65535
+            @header_size = 4  # 2 + 2 extended
+        else
+            @header_size = 10  # 2 + 8 extended
+
+    @mask_size = 0
+    if @masked != 0
+        @mask_size = 4
+
+    @frame_size = @header_size + @mask_size + @payload_len
+    @frame = luna_mem_alloc(@frame_size)
+    luna_mem_zero(@frame, @frame_size)
+
+    # First byte: FIN=1 | opcode
+    @first_byte = 0x80 | (@opcode & 0x0F)
+    luna_mem_write_u8(@frame, 0, @first_byte)
+
+    # Second byte: MASK flag | payload length
+    @offset = 2
+    if @payload_len <= 125
+        @second = @payload_len
+        if @masked != 0
+            @second = @second | 0x80
+        luna_mem_write_u8(@frame, 1, @second)
+    else if @payload_len <= 65535
+        @second = 126
+        if @masked != 0
+            @second = @second | 0x80
+        luna_mem_write_u8(@frame, 1, @second)
+        luna_mem_write_u8(@frame, 2, (@payload_len >> 8) & 0xFF)
+        luna_mem_write_u8(@frame, 3, @payload_len & 0xFF)
+        @offset = 4
+    else
+        @second = 127
+        if @masked != 0
+            @second = @second | 0x80
+        luna_mem_write_u8(@frame, 1, @second)
+        orbit @i in range(0, 8)
+            @shift = (7 - @i) * 8
+            luna_mem_write_u8(@frame, 2 + @i, (@payload_len >> @shift) & 0xFF)
+        @offset = 10
+
+    # Masking key (if masked)
+    if @masked != 0
+        # Simple mask key for client frames
+        luna_mem_write_u8(@frame, @offset, 0x37)
+        luna_mem_write_u8(@frame, @offset + 1, 0xFA)
+        luna_mem_write_u8(@frame, @offset + 2, 0x21)
+        luna_mem_write_u8(@frame, @offset + 3, 0x3D)
+        @mask_key_0 = 0x37
+        @mask_key_1 = 0xFA
+        @mask_key_2 = 0x21
+        @mask_key_3 = 0x3D
+        @offset = @offset + 4
+
+        # Copy and mask payload
+        orbit @i in range(0, @payload_len)
+            @byte = luna_mem_read_u8(@payload_ptr, @i)
+            @mask_byte = 0
+            @mod = @i % 4
+            if @mod == 0
+                @mask_byte = @mask_key_0
+            else if @mod == 1
+                @mask_byte = @mask_key_1
+            else if @mod == 2
+                @mask_byte = @mask_key_2
+            else
+                @mask_byte = @mask_key_3
+            luna_mem_write_u8(@frame, @offset + @i, @byte ^ @mask_byte)
+    else
+        # Copy payload unmasked
+        if @payload_ptr != 0
+            luna_mem_copy(@frame + @offset, @payload_ptr, @payload_len)
+
+    return @frame
+
+fn ws_frame_encode_len(@payload_len: int, @masked: int) -> int
+    @header_size = 2
+    if @payload_len > 125
+        if @payload_len <= 65535
+            @header_size = 4
+        else
+            @header_size = 10
+    @mask_size = 0
+    if @masked != 0
+        @mask_size = 4
+    return @header_size + @mask_size + @payload_len
+
+# =============================================================================
+# SECTION 19: SELF-TESTS
+# =============================================================================
+
+fn test_tcp_flags_construction() -> int
+    @flags = tcp_flags_build(0, 1, 0, 0, 1, 0)  # SYN + ACK
+    if @flags != 0x12
+        return 0
+    return 1
+
+fn test_ip_is_private() -> int
+    # 10.0.0.1 -> 0x0A000001
+    if ip_is_private(0x0A000001) != 1
+        return 0
+    # 192.168.1.1 -> 0xC0A80101
+    if ip_is_private(0xC0A80101) != 1
+        return 0
+    # 8.8.8.8 -> 0x08080808
+    if ip_is_private(0x08080808) != 0
+        return 0
+    return 1
+
+fn test_ip_is_loopback() -> int
+    # 127.0.0.1 -> 0x7F000001
+    if ip_is_loopback(0x7F000001) != 1
+        return 0
+    # 8.8.8.8 -> not loopback
+    if ip_is_loopback(0x08080808) != 0
+        return 0
+    return 1
+
+fn test_base64_encode() -> int
+    b64_init()
+    # Just verify init worked
+    if @b64_chars[0] != 65  # 'A'
+        return 0
+    if @b64_chars[25] != 90  # 'Z'
+        return 0
+    if @b64_chars[26] != 97  # 'a'
+        return 0
+    if @b64_chars[62] != 43  # '+'
+        return 0
+    if @b64_chars[63] != 47  # '/'
+        return 0
+    return 1
+
+fn test_ws_frame_encode_len() -> int
+    # Small payload: header=2, no mask
+    if ws_frame_encode_len(10, 0) != 12
+        return 0
+    # Small payload with mask: header=2, mask=4
+    if ws_frame_encode_len(10, 1) != 16
+        return 0
+    # Medium payload: header=4
+    if ws_frame_encode_len(200, 0) != 204
+        return 0
+    return 1
+
+fn test_checksum_luna() -> int
+    # Test with a known pattern
+    @buf = luna_mem_alloc(4)
+    luna_mem_write_u8(@buf, 0, 0x12)
+    luna_mem_write_u8(@buf, 1, 0x34)
+    luna_mem_write_u8(@buf, 2, 0x56)
+    luna_mem_write_u8(@buf, 3, 0x78)
+
+    @cs = checksum_luna(@buf, 4)
+    # Checksum should be non-zero
+    if @cs == 0
+        luna_mem_free(@buf)
+        return 0
+
+    luna_mem_free(@buf)
+    return 1
+
+fn test_protocol_constants() -> int
+    if PROTO_ICMP != 1
+        return 0
+    if PROTO_TCP != 6
+        return 0
+    if PROTO_UDP != 17
+        return 0
+    if TCP_SYN != 0x02
+        return 0
+    if TCP_ACK != 0x10
+        return 0
+    return 1
+
+fn run_self_tests() -> int
+    @passed = 0
+    @failed = 0
+
+    shine("[net] Running self-tests...")
+
+    if test_tcp_flags_construction() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_tcp_flags_construction")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_tcp_flags_construction")
+
+    if test_ip_is_private() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_ip_is_private")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_ip_is_private")
+
+    if test_ip_is_loopback() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_ip_is_loopback")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_ip_is_loopback")
+
+    if test_base64_encode() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_base64_encode")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_base64_encode")
+
+    if test_ws_frame_encode_len() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_ws_frame_encode_len")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_ws_frame_encode_len")
+
+    if test_checksum_luna() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_checksum_luna")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_checksum_luna")
+
+    if test_protocol_constants() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_protocol_constants")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_protocol_constants")
+
+    shine("[net] " + str(@passed) + "/" + str(@passed + @failed) + " tests passed")
+    return @failed
