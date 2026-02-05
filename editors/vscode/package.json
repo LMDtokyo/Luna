@@ -5,14 +5,14 @@
     "version": "1.7.0",
     "publisher": "luna-team",
     "icon": "icons/luna.png",
-    "license": "MIT",
+    "license": "GPL-3.0",
     "repository": {
         "type": "git",
-        "url": "https://github.com/luna-lang/luna"
+        "url": "https://github.com/LMDtokyo/Luna"
     },
-    "homepage": "https://luna-lang.dev",
+    "homepage": "https://github.com/LMDtokyo/Luna",
     "bugs": {
-        "url": "https://github.com/luna-lang/luna/issues"
+        "url": "https://github.com/LMDtokyo/Luna/issues"
     },
     "engines": {
         "vscode": "^1.74.0"

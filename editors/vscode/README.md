@@ -15,11 +15,11 @@
   <a href="https://marketplace.visualstudio.com/items?itemName=luna-team.luna-language">
     <img src="https://img.shields.io/visual-studio-marketplace/d/luna-team.luna-language?style=flat-square&color=green" alt="Downloads">
   </a>
-  <a href="https://github.com/luna-lang/luna/blob/main/LICENSE">
-    <img src="https://img.shields.io/badge/license-MIT-orange?style=flat-square" alt="License">
+  <a href="https://github.com/LMDtokyo/Luna/blob/main/LICENSE">
+    <img src="https://img.shields.io/badge/license-GPLv3-orange?style=flat-square" alt="License">
   </a>
-  <a href="https://github.com/luna-lang/luna">
-    <img src="https://img.shields.io/github/stars/luna-lang/luna?style=flat-square&color=yellow" alt="Stars">
+  <a href="https://github.com/LMDtokyo/Luna">
+    <img src="https://img.shields.io/github/stars/LMDtokyo/Luna?style=flat-square&color=yellow" alt="Stars">
   </a>
 </p>
 
