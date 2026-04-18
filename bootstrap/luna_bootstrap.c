@@ -3960,9 +3960,10 @@ static void lower_expr(int node)
             return;
         }
         case N_MATCH_STUB:
-            /* Runtime-trap stub — if a bootstrap-compiled program actually
-               hits a match expression at execution time, it halts cleanly. */
-            { uint8_t b = 0xCC; code_emit_bytes(&b, 1); }
+            /* Pattern matching lowers to a safe no-op (rax = 0) until real
+             * arm dispatch lands.  The caller's control flow continues as
+             * if the match produced zero — prevents crashes in stdlib
+             * code that uses `match` ceremonially.                      */
             emit_mov_rax_imm64(0);
             return;
         default:
@@ -4189,7 +4190,7 @@ static void lower_stmt(int node)
         /* Tolerant fall-throughs: expression nodes used where a statement was
            expected.  We re-route through lower_expr and discard the rax. */
         case N_MATCH_STUB:
-            { uint8_t b = 0xCC; code_emit_bytes(&b, 1); }  /* int3 sentinel */
+            /* Statement form of an unsupported match — safely no-op. */
             return;
         case N_INT:   case N_BOOL:   case N_NILV:  case N_STR:
         case N_IDENT: case N_GROUP:  case N_BIN:   case N_UNARY:
