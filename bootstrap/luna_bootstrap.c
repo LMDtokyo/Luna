@@ -3115,6 +3115,74 @@ static void lower_call(int node)
     }
     int si = sym_find(c->s, c->slen);
     if (si < 0) {
+        /* --- Inline string intrinsics --------------------------------
+         * These emit a handful of bytes each; callers use them as
+         * building blocks for the Luna-level string helpers in
+         * bootstrap/prelude.luna.                                       */
+
+        /* str_len(s) — length lives 8 bytes before the data pointer. */
+        if (c->slen == 7 && memcmp(c->s, "str_len", 7) == 0 && n->nkids >= 2) {
+            lower_expr(n->kids[1]);
+            emit_mov_r_mem_rax_disp8(REG_RAX, -8);
+            return;
+        }
+
+        /* str_byte(s, i) — unsigned byte at s[i].                       */
+        if (c->slen == 8 && memcmp(c->s, "str_byte", 8) == 0 && n->nkids >= 3) {
+            lower_expr(n->kids[1]);                    /* rax = s        */
+            emit_push_rax();
+            lower_expr(n->kids[2]);                    /* rax = i        */
+            emit_mov_rcx_rax2();                       /* rcx = i        */
+            emit_pop_r(REG_RAX);                       /* rax = s        */
+            /* add rax, rcx  -> 48 01 c8                                 */
+            { uint8_t b[] = { 0x48, 0x01, 0xc8 }; code_emit_bytes(b, 3); }
+            /* movzx rax, byte [rax] -> 48 0F B6 00                      */
+            { uint8_t b[] = { 0x48, 0x0f, 0xb6, 0x00 }; code_emit_bytes(b, 4); }
+            return;
+        }
+
+        /* str_set_byte(s, i, b) — write low byte of b to s[i].         */
+        if (c->slen == 12 && memcmp(c->s, "str_set_byte", 12) == 0 && n->nkids >= 4) {
+            lower_expr(n->kids[1]);                    /* rax = s        */
+            emit_push_rax();
+            lower_expr(n->kids[2]);                    /* rax = i        */
+            emit_push_rax();
+            lower_expr(n->kids[3]);                    /* rax = b        */
+            emit_pop_r(REG_RCX);                       /* rcx = i        */
+            emit_pop_rdx();                            /* rdx = s        */
+            /* add rdx, rcx  -> 48 01 ca                                 */
+            { uint8_t b[] = { 0x48, 0x01, 0xca }; code_emit_bytes(b, 3); }
+            /* mov [rdx], al -> 88 02                                    */
+            { uint8_t b[] = { 0x88, 0x02 }; code_emit_bytes(b, 2); }
+            emit_mov_rax_imm64(0);
+            return;
+        }
+
+        /* new_str(len) — bump-allocate (len + 8) bytes on the heap,
+         * write the length as a qword prefix, return pointer to the
+         * first data byte (past the prefix).                            */
+        if (c->slen == 7 && memcmp(c->s, "new_str", 7) == 0 && n->nkids >= 2) {
+            lower_expr(n->kids[1]);                    /* rax = len      */
+            emit_push_rax();                           /* save len       */
+            /* compute aligned alloc size: (len + 8 + 7) & ~7            */
+            emit_add_rax_imm32(8 + 7);
+            /* and rax, -8 -> 48 83 e0 f8                                */
+            { uint8_t b[] = { 0x48, 0x83, 0xe0, 0xf8 }; code_emit_bytes(b, 4); }
+            emit_mov_rcx_rax2();                       /* rcx = alloc sz */
+            emit_mov_rax_mem_rip_bss(BSS_HEAP_TOP_OFF);/* rax = heap_top */
+            emit_push_rax();                           /* save base      */
+            /* add rax, rcx -> 48 01 c8                                  */
+            { uint8_t b[] = { 0x48, 0x01, 0xc8 }; code_emit_bytes(b, 3); }
+            emit_mov_mem_rip_rax_bss(BSS_HEAP_TOP_OFF);/* new top        */
+            emit_pop_r(REG_RAX);                       /* rax = base     */
+            emit_pop_rdx();                            /* rdx = len      */
+            /* mov [rax], rdx -> 48 89 10                                */
+            { uint8_t b[] = { 0x48, 0x89, 0x10 }; code_emit_bytes(b, 3); }
+            /* add rax, 8 -> 48 83 c0 08                                 */
+            { uint8_t b[] = { 0x48, 0x83, 0xc0, 0x08 }; code_emit_bytes(b, 4); }
+            return;
+        }
+
         /* `shine(x)` — first real I/O intrinsic.  Takes one string argument
          * (pointer from N_STR / string-typed variable) and writes it to
          * stdout followed by a newline.  On Linux we inline the write(2)

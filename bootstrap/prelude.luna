@@ -42,3 +42,99 @@ fn shine_int(@n: int) -> int
     print_int(@n)
     shine("")
     return 0
+
+fn str_eq(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    if @la != @lb
+        return 0
+    @i = 0
+    while @i < @la
+        if str_byte(@a, @i) != str_byte(@b, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+fn str_concat(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    @c = new_str(@la + @lb)
+    @i = 0
+    while @i < @la
+        str_set_byte(@c, @i, str_byte(@a, @i))
+        @i = @i + 1
+    @j = 0
+    while @j < @lb
+        str_set_byte(@c, @la + @j, str_byte(@b, @j))
+        @j = @j + 1
+    return @c
+
+fn int_to_str(@n: int) -> int
+    if @n == 0
+        @s0 = new_str(1)
+        str_set_byte(@s0, 0, 48)
+        return @s0
+    @neg = 0
+    if @n < 0
+        @neg = 1
+        @n = 0 - @n
+    @cnt = 0
+    @t = @n
+    while @t > 0
+        @cnt = @cnt + 1
+        @t = @t / 10
+    @len = @cnt
+    if @neg == 1
+        @len = @len + 1
+    @s = new_str(@len)
+    @pos = @len - 1
+    while @n > 0
+        str_set_byte(@s, @pos, 48 + @n % 10)
+        @pos = @pos - 1
+        @n = @n / 10
+    if @neg == 1
+        str_set_byte(@s, 0, 45)
+    return @s
+
+fn parse_int(@s: int) -> int
+    @len = str_len(@s)
+    @i = 0
+    @neg = 0
+    if @len > 0
+        @first = str_byte(@s, 0)
+        if @first == 45
+            @neg = 1
+            @i = 1
+        if @first == 43
+            @i = 1
+    @n = 0
+    while @i < @len
+        @c = str_byte(@s, @i)
+        if @c >= 48
+            if @c <= 57
+                @n = @n * 10 + (@c - 48)
+        @i = @i + 1
+    if @neg == 1
+        return 0 - @n
+    return @n
+
+fn str_find(@s: int, @needle: int) -> int
+    @ls = str_len(@s)
+    @ln = str_len(@needle)
+    if @ln == 0
+        return 0
+    if @ln > @ls
+        return 0 - 1
+    @i = 0
+    while @i <= @ls - @ln
+        @match = 1
+        @j = 0
+        while @j < @ln
+            if str_byte(@s, @i + @j) != str_byte(@needle, @j)
+                @match = 0
+                @j = @ln
+            @j = @j + 1
+        if @match == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1

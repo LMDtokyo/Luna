@@ -1,0 +1,40 @@
+fn main() -> int
+    @hello = "Hello, "
+    @world = "world!"
+    @greet = str_concat(@hello, @world)
+    shine(@greet)
+
+    shine("str_len tests:")
+    print("len hello = ")
+    println_int(str_len(@hello))
+    print("len world = ")
+    println_int(str_len(@world))
+    print("len greet = ")
+    println_int(str_len(@greet))
+
+    shine("str_eq tests:")
+    print("hello == hello: ")
+    println_int(str_eq(@hello, @hello))
+    print("hello == world: ")
+    println_int(str_eq(@hello, @world))
+
+    shine("int_to_str tests:")
+    shine(int_to_str(42))
+    shine(int_to_str(0))
+    shine(int_to_str(0 - 17))
+    shine(int_to_str(1000000))
+
+    shine("parse_int tests:")
+    println_int(parse_int("123"))
+    println_int(parse_int("-456"))
+    println_int(parse_int("0"))
+
+    shine("str_find tests:")
+    print("find 'world' in greet: ")
+    println_int(str_find(@greet, "world"))
+    print("find 'xxx' in greet: ")
+    println_int(str_find(@greet, "xxx"))
+
+    @concat_nums = str_concat(str_concat("answer = ", int_to_str(42)), "!")
+    shine(@concat_nums)
+    return 0
