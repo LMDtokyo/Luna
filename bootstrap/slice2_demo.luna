@@ -1,0 +1,22 @@
+# Portable Luna demo — compiles to Linux ELF or Windows EXE
+# via the C bootstrap.  Uses only shine() for output so it runs
+# on both kernels without any toolchain-specific intrinsics.
+
+fn main() -> int
+    shine("Luna running natively.")
+    shine("")
+    shine("Counting in an orbit loop:")
+    orbit @i in 1..6
+        if @i == 1
+            shine("  1")
+        if @i == 2
+            shine("  2")
+        if @i == 3
+            shine("  3")
+        if @i == 4
+            shine("  4")
+        if @i == 5
+            shine("  5")
+    shine("")
+    shine("Done.")
+    return 0

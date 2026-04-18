@@ -2678,6 +2678,79 @@ static void emit_lea_rax_rip_rodata(int rodata_off)
     g_nrodrelocs++;
 }
 
+/* ------------------------------------------------------------------------
+ * Windows-target: import-address-table relocations
+ *
+ * The PE backend routes every WinAPI call through the IAT with
+ *     call qword ptr [rip + disp32]           (FF 15 xx xx xx xx)
+ * For each emission we record the 4-byte slot and which IAT entry it
+ * points at; the PE writer patches disp once final RVAs are known.    */
+enum {
+    IAT_GETSTDHANDLE = 0,
+    IAT_WRITEFILE,
+    IAT_EXITPROCESS,
+    IAT_COUNT
+};
+
+typedef struct {
+    int code_off;   /* offset of the disp32 slot                           */
+    int iat_slot;   /* which entry in the IAT (0 .. IAT_COUNT-1)           */
+} IatReloc;
+
+#define MAX_IAT_RELOCS 8192
+static IatReloc g_iatrelocs[MAX_IAT_RELOCS];
+static int      g_niatrelocs;
+
+static void emit_call_iat(int iat_slot)
+{
+    code_emit_byte(0xff);          /* call [rip + disp32] opcode */
+    code_emit_byte(0x15);
+    int slot = g_code_len;
+    code_emit_u32(0);
+    if (g_niatrelocs >= MAX_IAT_RELOCS) {
+        fprintf(stderr, "luna-boot: too many IAT relocs\n"); exit(1);
+    }
+    g_iatrelocs[g_niatrelocs].code_off = slot;
+    g_iatrelocs[g_niatrelocs].iat_slot = iat_slot;
+    g_niatrelocs++;
+}
+
+/* --- Stack / argument helpers used when emitting Win64 calls --- */
+
+/* sub rsp, imm8  (imm8 in range -128..127) — 48 83 EC xx */
+static void emit_sub_rsp_imm8(int8_t v)
+{
+    uint8_t b[] = { 0x48, 0x83, 0xec, (uint8_t)v };
+    code_emit_bytes(b, 4);
+}
+/* add rsp, imm8 — 48 83 C4 xx */
+static void emit_add_rsp_imm8(int8_t v)
+{
+    uint8_t b[] = { 0x48, 0x83, 0xc4, (uint8_t)v };
+    code_emit_bytes(b, 4);
+}
+/* lea r9, [rsp + disp8]  — 4C 8D 4C 24 xx */
+static void emit_lea_r9_rsp_disp8(int8_t disp)
+{
+    uint8_t b[] = { 0x4c, 0x8d, 0x4c, 0x24, (uint8_t)disp };
+    code_emit_bytes(b, 5);
+}
+/* mov qword ptr [rsp + disp8], 0  — 48 C7 44 24 xx 00 00 00 00 */
+static void emit_mov_qword_rsp_disp8_imm0(int8_t disp)
+{
+    uint8_t b[] = { 0x48, 0xc7, 0x44, 0x24, (uint8_t)disp, 0, 0, 0, 0 };
+    code_emit_bytes(b, 9);
+}
+/* mov r8, [rbx - disp8]  — used by Win64 shine(): load string length.
+ * Encoding: REX.WR + 8B + ModRM(mod=01, reg=R8-ext=000, rm=RBX) + disp8
+ *     4C 8B 43 disp8   (42 R/M base) — actually RBX has r/m=3:
+ *     4C 8B 43 F8      = mov r8, [rbx - 8]                              */
+static void emit_mov_r8_mem_rbx_disp8(int8_t disp)
+{
+    uint8_t b[] = { 0x4c, 0x8b, 0x43, (uint8_t)disp };
+    code_emit_bytes(b, 4);
+}
+
 /* ========================================================================= */
 /* 8. LOWERER                                                                 */
 /* ========================================================================= */
@@ -2873,8 +2946,51 @@ static void lower_call(int node)
                 emit_mov_rax_imm64(0);
                 return;
             }
-            /* TARGET_WINDOWS: not yet wired — fall through to tolerant
-             * builtin (no-op) until Slice 2 lands the PE64 backend.       */
+            if (g_target == TARGET_WINDOWS) {
+                /* Windows shine(): evaluate argument so rax = str ptr, then
+                 * shuttle through rbx (non-volatile under Win64) while we
+                 * call GetStdHandle(STD_OUTPUT_HANDLE) followed by
+                 * WriteFile(h, buf, len, &bytesWritten, NULL).  We reserve
+                 * 56 bytes of stack for: 32-byte shadow (required before
+                 * every WinAPI call), 8 for the 5th arg (lpOverlapped=NULL),
+                 * 8 for lpNumberOfBytesWritten scratch, 8 keeping rsp
+                 * 16-byte aligned after `push rbx`.                        */
+                lower_expr(n->kids[1]);                      /* rax = str */
+                emit_push_r(3 /* rbx */);                    /* save rbx */
+                emit_mov_r_r(3 /* rbx */, REG_RAX);          /* rbx = str */
+                emit_sub_rsp_imm8(56);
+                /* GetStdHandle(-11) — STD_OUTPUT_HANDLE */
+                emit_mov_r_imm64(REG_RCX, (uint64_t)(int64_t)-11);
+                emit_call_iat(IAT_GETSTDHANDLE);
+                /* WriteFile(rax, rbx, [rbx-8], &[rsp+40], 0) */
+                emit_mov_r_r(REG_RCX, REG_RAX);              /* hFile */
+                emit_mov_r_r(REG_RDX, 3 /* rbx */);          /* buf */
+                emit_mov_r8_mem_rbx_disp8(-8);               /* r8 = len */
+                emit_lea_r9_rsp_disp8(40);                   /* r9 = &wrote */
+                emit_mov_qword_rsp_disp8_imm0(32);           /* [rsp+32]=0 */
+                emit_call_iat(IAT_WRITEFILE);
+                /* Print newline: WriteFile(handle_from_GSH, nl, 1, ...)
+                 * We could call GetStdHandle again, but simpler: stash
+                 * the handle from the first call.  After WriteFile, rax
+                 * holds its boolean return — handle is lost.  Recall via
+                 * another GetStdHandle call — Windows caches it, cheap.  */
+                emit_mov_r_imm64(REG_RCX, (uint64_t)(int64_t)-11);
+                emit_call_iat(IAT_GETSTDHANDLE);
+                if (g_newline_str_idx < 0) {
+                    g_newline_str_idx = strpool_add("\n", 1);
+                }
+                emit_mov_r_r(REG_RCX, REG_RAX);              /* hFile */
+                emit_lea_rax_rip_rodata(g_strs[g_newline_str_idx].off);
+                emit_mov_r_r(REG_RDX, REG_RAX);              /* buf */
+                emit_mov_r_imm64(8 /* r8 */, 1);             /* len = 1 */
+                emit_lea_r9_rsp_disp8(40);
+                emit_mov_qword_rsp_disp8_imm0(32);
+                emit_call_iat(IAT_WRITEFILE);
+                emit_add_rsp_imm8(56);
+                emit_pop_r(3 /* rbx */);
+                emit_mov_rax_imm64(0);
+                return;
+            }
         }
         if (is_boot_builtin(c->s, c->slen)) {
             /* Tolerant builtin: evaluate each arg for side-effects and
@@ -3403,22 +3519,42 @@ static void lower_all(void)
     int main_sym = sym_find("main", 4);
     int call_slot = -1, main_code = -1;
 
-    /* Emit _start. */
+    /* Emit _start.  The shape depends on the output target: Linux uses the
+     * exit_group syscall, Windows routes through ExitProcess in the IAT.  */
     int start_off = g_code_len;
-    if (main_sym >= 0) {
-        call_slot = emit_call_rel32();
-        /* mov rdi, rax */
-        { uint8_t b[] = { 0x48, 0x89, 0xc7 }; code_emit_bytes(b, 3); }
-    } else if (g_allow_no_main) {
-        /* No main — emit `mov rdi, 0` then fall through to exit */
-        emit_mov_rax_imm64(0);
-        { uint8_t b[] = { 0x48, 0x89, 0xc7 }; code_emit_bytes(b, 3); }
+    if (g_target == TARGET_WINDOWS) {
+        /* Win64 _start: sub rsp,40 (align+shadow) ; call main ; mov rcx,rax
+         *               ; call [iat_ExitProcess]                            */
+        emit_sub_rsp_imm8(40);
+        if (main_sym >= 0) {
+            call_slot = emit_call_rel32();
+            /* mov rcx, rax — pass main's return as exit code */
+            { uint8_t b[] = { 0x48, 0x89, 0xc1 }; code_emit_bytes(b, 3); }
+        } else if (g_allow_no_main) {
+            emit_mov_r_imm64(REG_RCX, 0);
+        } else {
+            fprintf(stderr, "luna-boot: no 'main' function defined (use --lib to allow)\n");
+            exit(1);
+        }
+        emit_call_iat(IAT_EXITPROCESS);
+        /* ExitProcess is noreturn — trap if we fall through anyway.        */
+        emit_int3();
     } else {
-        fprintf(stderr, "luna-boot: no 'main' function defined (use --lib to allow)\n");
-        exit(1);
+        /* Linux: call main (if any), then exit_group(rax_from_main).       */
+        if (main_sym >= 0) {
+            call_slot = emit_call_rel32();
+            /* mov rdi, rax */
+            { uint8_t b[] = { 0x48, 0x89, 0xc7 }; code_emit_bytes(b, 3); }
+        } else if (g_allow_no_main) {
+            emit_mov_rax_imm64(0);
+            { uint8_t b[] = { 0x48, 0x89, 0xc7 }; code_emit_bytes(b, 3); }
+        } else {
+            fprintf(stderr, "luna-boot: no 'main' function defined (use --lib to allow)\n");
+            exit(1);
+        }
+        emit_mov_rax_imm64((uint64_t)SYS_EXIT_GROUP);
+        emit_syscall();
     }
-    emit_mov_rax_imm64((uint64_t)SYS_EXIT_GROUP);
-    emit_syscall();
 
     /* Emit main first so call_slot is easy to patch. */
     if (main_sym >= 0) {
@@ -3558,6 +3694,266 @@ static void write_elf64(const char *out_path)
 }
 
 /* ========================================================================= */
+/* 9b. MINIMAL PE64 WRITER (Windows x86-64 executable)                        */
+/* ========================================================================= */
+/*
+ * File layout:
+ *     +0x000   DOS header (0x40 bytes, sets e_lfanew = 0x40)
+ *     +0x040   "PE\0\0"
+ *     +0x044   COFF header (20 bytes)
+ *     +0x058   Optional PE32+ header (240 bytes: 112 std/win + 128 data dirs)
+ *     +0x148   Section headers: .text (40) + .rdata (40)
+ *     +0x1a0   padding to FILE_ALIGNMENT
+ *     +0x200   .text   (code, padded to FILE_ALIGNMENT)
+ *     +X       .rdata  (rodata || IAT || ILT || hint/name || DLL name || import dir)
+ *
+ * Virtual layout:
+ *     ImageBase = 0x140000000
+ *     .text  at RVA 0x1000
+ *     .rdata at RVA 0x1000 + round_up(text_vsize, SECTION_ALIGNMENT)
+ *
+ * Subsystem: IMAGE_SUBSYSTEM_WINDOWS_CUI (console).
+ * Imports:   kernel32.dll — GetStdHandle, WriteFile, ExitProcess.
+ */
+
+#define PE_IMAGE_BASE     0x140000000ULL
+#define PE_FILE_ALIGN     0x200
+#define PE_SECTION_ALIGN  0x1000
+
+static uint32_t pe_align_up(uint32_t v, uint32_t a)
+{
+    return (v + a - 1) & ~(a - 1);
+}
+
+static void write_pe64(const char *out_path)
+{
+    /* ---- Build .rdata contents (rodata | imports).  We need to know the
+     * final .rdata RVA before patching any code relocs, but the IAT slot
+     * offsets within .rdata are static given the layout below.          */
+    const char *imp_names[IAT_COUNT] = {
+        "GetStdHandle", "WriteFile", "ExitProcess"
+    };
+
+    /* The length-prefixed user rodata already lives in g_rodata[0..g_rodata_len).
+     * Append: IAT, ILT, hint/name entries, DLL name, import directory.   */
+    int user_rod_size = g_rodata_len;
+    int cur = pe_align_up((uint32_t)user_rod_size, 8);
+
+    int iat_off = cur;
+    cur += (IAT_COUNT + 1) * 8;   /* 3 thunks + terminator */
+    int ilt_off = cur;
+    cur += (IAT_COUNT + 1) * 8;
+
+    int hint_off[IAT_COUNT];
+    for (int i = 0; i < IAT_COUNT; i++) {
+        hint_off[i] = cur;
+        int nl = (int)strlen(imp_names[i]);
+        int size = 2 + nl + 1;       /* hint + ASCIIZ */
+        if (size & 1) size++;        /* 2-byte align */
+        cur += size;
+    }
+    int dll_name_off = cur;
+    const char *dll_name = "KERNEL32.DLL";
+    cur += (int)strlen(dll_name) + 1;
+    cur = pe_align_up((uint32_t)cur, 4);
+
+    int import_dir_off = cur;
+    cur += 40;                       /* one descriptor + zero terminator */
+
+    int total_rdata = cur;
+
+    /* Make sure rodata buffer has room, then write the extra bytes.      */
+    if (g_rodata_len + total_rdata - user_rod_size > RODATA_CAP) {
+        fprintf(stderr, "luna-boot: rodata overflow in PE writer\n"); exit(1);
+    }
+    /* Zero-fill any padding between user rodata and IAT.                 */
+    for (int i = user_rod_size; i < iat_off; i++) g_rodata[i] = 0;
+
+    /* Section RVAs. */
+    int text_len = g_code_len;
+    uint32_t text_file_off   = PE_FILE_ALIGN;
+    uint32_t text_file_size  = pe_align_up((uint32_t)text_len, PE_FILE_ALIGN);
+    uint32_t text_vsize      = pe_align_up((uint32_t)text_len, PE_SECTION_ALIGN);
+    uint32_t text_rva        = PE_SECTION_ALIGN;      /* 0x1000 */
+    uint32_t rdata_rva       = text_rva + text_vsize;
+    uint32_t rdata_file_off  = text_file_off + text_file_size;
+    uint32_t rdata_file_size = pe_align_up((uint32_t)total_rdata, PE_FILE_ALIGN);
+    uint32_t rdata_vsize     = pe_align_up((uint32_t)total_rdata, PE_SECTION_ALIGN);
+
+    uint32_t iat_rva    = rdata_rva + iat_off;
+    uint32_t ilt_rva    = rdata_rva + ilt_off;
+    uint32_t import_dir_rva = rdata_rva + import_dir_off;
+
+    /* ---- Fill IAT / ILT / hint-name / DLL-name / import-dir in g_rodata ---- */
+
+    /* IAT and ILT entries point at the hint/name RVAs.  Bit 63 = 0 so they
+     * are "by name" imports, not ordinals.                              */
+    for (int i = 0; i < IAT_COUNT; i++) {
+        uint64_t ptr_by_name = (uint64_t)(rdata_rva + hint_off[i]);
+        uint8_t *p = g_rodata + iat_off + i * 8;
+        for (int b = 0; b < 8; b++) p[b] = (uint8_t)(ptr_by_name >> (b * 8));
+        uint8_t *q = g_rodata + ilt_off + i * 8;
+        for (int b = 0; b < 8; b++) q[b] = (uint8_t)(ptr_by_name >> (b * 8));
+    }
+    /* Terminators */
+    for (int b = 0; b < 8; b++) {
+        g_rodata[iat_off + IAT_COUNT * 8 + b] = 0;
+        g_rodata[ilt_off + IAT_COUNT * 8 + b] = 0;
+    }
+
+    /* Hint/name entries */
+    for (int i = 0; i < IAT_COUNT; i++) {
+        uint8_t *p = g_rodata + hint_off[i];
+        p[0] = 0; p[1] = 0;                     /* hint = 0 */
+        int nl = (int)strlen(imp_names[i]);
+        memcpy(p + 2, imp_names[i], (size_t)nl);
+        p[2 + nl] = 0;
+        if ((2 + nl + 1) & 1) p[2 + nl + 1] = 0;  /* padding byte */
+    }
+
+    /* DLL name */
+    {
+        int nl = (int)strlen(dll_name);
+        memcpy(g_rodata + dll_name_off, dll_name, (size_t)nl);
+        g_rodata[dll_name_off + nl] = 0;
+    }
+
+    /* Import directory: one entry + zero terminator.                     */
+    {
+        uint8_t *d = g_rodata + import_dir_off;
+        /* OriginalFirstThunk (RVA of ILT) */
+        uint32_t v = ilt_rva;    for (int b = 0; b < 4; b++) d[b]     = (uint8_t)(v >> (b*8));
+        /* TimeDateStamp */
+                                 for (int b = 0; b < 4; b++) d[4 + b] = 0;
+        /* ForwarderChain */
+                                 for (int b = 0; b < 4; b++) d[8 + b] = 0;
+        /* Name RVA */
+        v = rdata_rva + dll_name_off;
+                                 for (int b = 0; b < 4; b++) d[12 + b] = (uint8_t)(v >> (b*8));
+        /* FirstThunk (RVA of IAT) */
+        v = iat_rva;             for (int b = 0; b < 4; b++) d[16 + b] = (uint8_t)(v >> (b*8));
+        /* Zero terminator (20 bytes) */
+        for (int b = 0; b < 20; b++) d[20 + b] = 0;
+    }
+
+    /* Patch rodata rip-relative loads (`lea rax, [rip + disp]`) against
+     * the rdata_rva base.                                                */
+    for (int i = 0; i < g_nrodrelocs; i++) {
+        RodataReloc *r = &g_rodrelocs[i];
+        uint32_t rip   = text_rva + r->from_rip;
+        uint32_t target = rdata_rva + r->rodata_off;
+        int32_t disp  = (int32_t)(target - rip);
+        code_patch_u32(r->code_off, (uint32_t)disp);
+    }
+    /* Patch IAT call-through-pointer relocs.                             */
+    for (int i = 0; i < g_niatrelocs; i++) {
+        IatReloc *r = &g_iatrelocs[i];
+        uint32_t rip   = text_rva + r->code_off + 4;
+        uint32_t target = iat_rva + r->iat_slot * 8;
+        int32_t disp  = (int32_t)(target - rip);
+        code_patch_u32(r->code_off, (uint32_t)disp);
+    }
+
+    uint32_t size_of_headers = pe_align_up((uint32_t)0x1a0, PE_FILE_ALIGN);
+    uint32_t size_of_image   = rdata_rva + rdata_vsize;
+    uint32_t addr_of_entry   = text_rva;   /* entry is at offset 0 of .text */
+
+    FILE *f = fopen(out_path, "wb");
+    if (!f) { fprintf(stderr, "luna-boot: cannot open '%s'\n", out_path); exit(1); }
+
+    /* ---- DOS header (64 bytes) ---------------------------------------- */
+    write_u8(f, 'M'); write_u8(f, 'Z');
+    for (int i = 2; i < 0x3c; i++) write_u8(f, 0);
+    write_u32(f, 0x40);            /* e_lfanew — pointer to PE signature */
+
+    /* ---- PE signature "PE\0\0" ---------------------------------------- */
+    write_u8(f, 'P'); write_u8(f, 'E'); write_u8(f, 0); write_u8(f, 0);
+
+    /* ---- COFF header (20 bytes) --------------------------------------- */
+    write_u16(f, 0x8664);          /* Machine = IMAGE_FILE_MACHINE_AMD64  */
+    write_u16(f, 2);               /* NumberOfSections                    */
+    write_u32(f, 0);               /* TimeDateStamp                       */
+    write_u32(f, 0);               /* PointerToSymbolTable                */
+    write_u32(f, 0);               /* NumberOfSymbols                     */
+    write_u16(f, 240);             /* SizeOfOptionalHeader                */
+    write_u16(f, 0x0022);          /* Characteristics: EXECUTABLE | LARGE_ADDRESS_AWARE */
+
+    /* ---- Optional header PE32+ (240 bytes) ---------------------------- */
+    write_u16(f, 0x020b);          /* Magic = PE32+                       */
+    write_u8 (f, 14);              /* MajorLinkerVersion                  */
+    write_u8 (f, 0);               /* MinorLinkerVersion                  */
+    write_u32(f, text_file_size);  /* SizeOfCode                          */
+    write_u32(f, rdata_file_size); /* SizeOfInitializedData               */
+    write_u32(f, 0);               /* SizeOfUninitializedData             */
+    write_u32(f, addr_of_entry);   /* AddressOfEntryPoint (RVA)           */
+    write_u32(f, text_rva);        /* BaseOfCode (RVA)                    */
+    write_u64(f, PE_IMAGE_BASE);   /* ImageBase                           */
+    write_u32(f, PE_SECTION_ALIGN);
+    write_u32(f, PE_FILE_ALIGN);
+    write_u16(f, 6); write_u16(f, 0);   /* OS version 6.0                 */
+    write_u16(f, 0); write_u16(f, 0);   /* Image version                  */
+    write_u16(f, 6); write_u16(f, 0);   /* Subsystem version 6.0          */
+    write_u32(f, 0);                     /* Win32VersionValue             */
+    write_u32(f, size_of_image);         /* SizeOfImage                   */
+    write_u32(f, size_of_headers);       /* SizeOfHeaders                 */
+    write_u32(f, 0);                     /* CheckSum                      */
+    write_u16(f, 3);                     /* Subsystem = Windows CUI       */
+    write_u16(f, 0);                     /* DllCharacteristics            */
+    write_u64(f, 0x100000);              /* SizeOfStackReserve            */
+    write_u64(f, 0x1000);                /* SizeOfStackCommit             */
+    write_u64(f, 0x100000);              /* SizeOfHeapReserve             */
+    write_u64(f, 0x1000);                /* SizeOfHeapCommit              */
+    write_u32(f, 0);                     /* LoaderFlags                   */
+    write_u32(f, 16);                    /* NumberOfRvaAndSizes           */
+    /* Data Directories (16 * 8 = 128) — all zero except Import [1] & IAT [12] */
+    for (int i = 0; i < 16; i++) {
+        uint32_t rva = 0, size = 0;
+        if (i == 1) { rva = import_dir_rva; size = 20; }       /* Import table */
+        if (i == 12){ rva = iat_rva;        size = (IAT_COUNT + 1) * 8; } /* IAT */
+        write_u32(f, rva);
+        write_u32(f, size);
+    }
+
+    /* ---- Section headers ---------------------------------------------- */
+    /* .text */
+    write_u8(f, '.'); write_u8(f, 't'); write_u8(f, 'e'); write_u8(f, 'x');
+    write_u8(f, 't'); write_u8(f, 0);   write_u8(f, 0);   write_u8(f, 0);
+    write_u32(f, (uint32_t)text_len);   /* VirtualSize     */
+    write_u32(f, text_rva);             /* VirtualAddress  */
+    write_u32(f, text_file_size);       /* SizeOfRawData   */
+    write_u32(f, text_file_off);        /* PointerToRawData*/
+    write_u32(f, 0);                    /* PointerToRelocations */
+    write_u32(f, 0);                    /* PointerToLineNumbers */
+    write_u16(f, 0); write_u16(f, 0);   /* NumRelocs, NumLine   */
+    write_u32(f, 0x60000020);           /* CODE | EXECUTE | READ */
+    /* .rdata */
+    write_u8(f, '.'); write_u8(f, 'r'); write_u8(f, 'd'); write_u8(f, 'a');
+    write_u8(f, 't'); write_u8(f, 'a'); write_u8(f, 0);   write_u8(f, 0);
+    write_u32(f, (uint32_t)total_rdata);
+    write_u32(f, rdata_rva);
+    write_u32(f, rdata_file_size);
+    write_u32(f, rdata_file_off);
+    write_u32(f, 0);
+    write_u32(f, 0);
+    write_u16(f, 0); write_u16(f, 0);
+    write_u32(f, 0x40000040);           /* READ | INITIALIZED_DATA */
+
+    /* ---- Pad to text_file_off ---------------------------------------- */
+    long pos = ftell(f);
+    for (long p = pos; p < (long)text_file_off; p++) fputc(0, f);
+
+    /* ---- .text ------------------------------------------------------- */
+    fwrite(g_code, 1, (size_t)text_len, f);
+    for (uint32_t p = (uint32_t)text_len; p < text_file_size; p++) fputc(0, f);
+
+    /* ---- .rdata ------------------------------------------------------ */
+    fwrite(g_rodata, 1, (size_t)total_rdata, f);
+    for (uint32_t p = (uint32_t)total_rdata; p < rdata_file_size; p++) fputc(0, f);
+
+    fclose(f);
+}
+
+/* ========================================================================= */
 /* 10. MAIN + DRIVER                                                          */
 /* ========================================================================= */
 
@@ -3668,13 +4064,10 @@ int main(int argc, char **argv)
     lower_all();
 
     if (g_target == TARGET_WINDOWS) {
-        fprintf(stderr,
-            "luna-boot: --target windows not yet implemented in this build\n"
-            "          (PE64 backend landing in Slice 2).  Use --target linux\n"
-            "          to produce an ELF that runs under WSL.\n");
-        return 1;
+        write_pe64(output);
+    } else {
+        write_elf64(output);
     }
-    write_elf64(output);
 
     if (g_verbose) {
         fprintf(stderr,
