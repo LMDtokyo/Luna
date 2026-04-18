@@ -945,6 +945,7 @@ static Tok *peek_n(int n) { return &g_toks[g_tpos + n]; }
 
 /* Forward declarations for helpers defined later. */
 static int ffi_register(const char *name, int len);
+static int ffi_register_linux(const char *name, int len);
 
 /* Human-readable name for a token kind — turns "kind=72" into "','". */
 static const char *tok_name(int k)
@@ -2625,10 +2626,13 @@ static void tc_collect_decl(int d)
                         n->slen, n->s);
             }
         }
-        if (n->i2 == 2) {  /* extern "C" — Windows FFI via IAT          */
+        if (n->i2 == 2) {  /* extern "C" — platform FFI                 */
             if (g_target == TARGET_WINDOWS) {
                 int slot = ffi_register(n->s, n->slen);
-                g_syms[s].syscall_nr = slot;   /* reuse field as IAT idx */
+                g_syms[s].syscall_nr = slot;   /* IAT index on Windows   */
+            } else if (g_target == TARGET_LINUX) {
+                int slot = ffi_register_linux(n->s, n->slen);
+                g_syms[s].syscall_nr = slot;   /* GOT index on Linux     */
             }
         }
     } else if (n->kind == N_CONST) {
@@ -3113,6 +3117,59 @@ typedef struct {
 #define MAX_IAT_RELOCS 8192
 static IatReloc g_iatrelocs[MAX_IAT_RELOCS];
 static int      g_niatrelocs;
+
+/* ------------------------------------------------------------------------
+ * Linux FFI — dynamic linking against libc.so.6
+ *
+ * Every `extern "C" fn NAME(...)` that is called when targeting Linux
+ * gets registered here and ends up as an undefined symbol in the
+ * output's .dynsym table.  ld.so resolves it at load time by writing
+ * the real libc address into the matching .got slot; our emitted code
+ * uses `call qword ptr [rip + disp32]` — one six-byte indirect call
+ * per invocation, same shape as the Windows IAT path.                  */
+#define MAX_LINUX_IMPORTS 128
+static const char *g_linux_imports[MAX_LINUX_IMPORTS];
+static int         g_nlinux_imports;
+
+static int ffi_register_linux(const char *name, int len)
+{
+    for (int i = 0; i < g_nlinux_imports; i++) {
+        if ((int)strlen(g_linux_imports[i]) == len &&
+            memcmp(g_linux_imports[i], name, len) == 0) {
+            return i;
+        }
+    }
+    if (g_nlinux_imports >= MAX_LINUX_IMPORTS) {
+        fprintf(stderr, "luna-boot: too many Linux FFI imports\n"); exit(1);
+    }
+    g_linux_imports[g_nlinux_imports] = arena_strndup(name, len);
+    return g_nlinux_imports++;
+}
+
+typedef struct {
+    int code_off;       /* disp32 slot inside emitted code              */
+    int got_slot;       /* 0..g_nlinux_imports-1                        */
+} GotReloc;
+
+#define MAX_GOT_RELOCS 8192
+static GotReloc g_gotrelocs[MAX_GOT_RELOCS];
+static int      g_ngotrelocs;
+
+/* Same bytes as emit_call_iat (FF 15 disp32) — the instruction is
+ * identical, only the patch source differs.                           */
+static void emit_call_got(int got_slot)
+{
+    code_emit_byte(0xff);
+    code_emit_byte(0x15);
+    int slot = g_code_len;
+    code_emit_u32(0);
+    if (g_ngotrelocs >= MAX_GOT_RELOCS) {
+        fprintf(stderr, "luna-boot: too many GOT relocs\n"); exit(1);
+    }
+    g_gotrelocs[g_ngotrelocs].code_off = slot;
+    g_gotrelocs[g_ngotrelocs].got_slot = got_slot;
+    g_ngotrelocs++;
+}
 
 static void emit_call_iat(int iat_slot)
 {
@@ -3712,18 +3769,24 @@ static void lower_call(int node)
     if (is_extern_c) {
         if (g_target == TARGET_WINDOWS && s->syscall_nr >= 0) {
             /* extern "C" fn via IAT.  Args arrived in sysv order — shuffle
-             * to Win64 order (rcx,rdx,r8,r9) before the call.  Reverse
-             * order so sources aren't clobbered before use.             */
+             * to Win64 order (rcx,rdx,r8,r9) before the call.            */
             if (reg_args >= 4) emit_mov_r_r(9 /* r9 */,  REG_RCX);
             if (reg_args >= 3) emit_mov_r_r(8 /* r8 */,  REG_RDX);
             if (reg_args >= 2) emit_mov_r_r(REG_RDX,     REG_RSI);
             if (reg_args >= 1) emit_mov_r_r(REG_RCX,     REG_RDI);
-            emit_sub_rsp_imm8(32);                /* shadow space         */
+            emit_sub_rsp_imm8(32);
             emit_call_iat(s->syscall_nr);
             emit_add_rsp_imm8(32);
             return;
         }
-        /* Linux / unresolved: trap.  Full ELF dynamic linking pending.  */
+        if (g_target == TARGET_LINUX && s->syscall_nr >= 0) {
+            /* extern "C" fn on Linux uses the sysv ABI natively — args
+             * are already in rdi/rsi/rdx/rcx/r8/r9 from the generic
+             * push/pop loop above.  Call via the GOT so ld.so resolves
+             * the symbol at load time.                                  */
+            emit_call_got(s->syscall_nr);
+            return;
+        }
         emit_int3();
         return;
     }
@@ -4618,9 +4681,15 @@ static void write_u64(FILE *f, uint64_t v) {
     for (int i = 0; i < 8; i++) fputc((v >> (8*i)) & 0xff, f);
 }
 
+/* Round up `v` to a multiple of `a` (a must be a power of two). */
+static uint64_t round_up_u64(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
+
 static void write_elf64(const char *out_path)
 {
     int text_len = g_code_len;
+    int has_ffi  = (g_nlinux_imports > 0);
+
+    /* Patch RIP-relative rodata references.                           */
     int rodata_off_in_file = text_len;
     for (int i = 0; i < g_nrodrelocs; i++) {
         RodataReloc *r = &g_rodrelocs[i];
@@ -4629,8 +4698,7 @@ static void write_elf64(const char *out_path)
         int32_t disp = rodata_vaddr - text_vaddr_of_rip;
         code_patch_u32(r->code_off, (uint32_t)disp);
     }
-    /* Patch BSS relocs — the bump-allocator pointer and heap base live
-     * in a second PT_LOAD anchored at V_BSS.                           */
+    /* Patch BSS references (heap top/base).                           */
     for (int i = 0; i < g_nbssrelocs; i++) {
         BssReloc *r = &g_bssrelocs[i];
         int rip    = V_TEXT + r->code_off + 4;
@@ -4644,18 +4712,189 @@ static void write_elf64(const char *out_path)
     uint64_t text_file_off = 0x1000;
     uint64_t total_text_rod = (uint64_t)text_len + (uint64_t)g_rodata_len;
 
+    /* ---------- Static-link fast path (no libc, no dynamic segment) ---------- */
+    if (!has_ffi) {
+        FILE *f = fopen(out_path, "wb");
+        if (!f) { fprintf(stderr, "luna-boot: cannot open '%s'\n", out_path); exit(1); }
+
+        write_u8(f, 0x7f); write_u8(f, 'E'); write_u8(f, 'L'); write_u8(f, 'F');
+        write_u8(f, 2); write_u8(f, 1); write_u8(f, 1);
+        write_u8(f, 0); write_u8(f, 0);
+        for (int i = 0; i < 7; i++) write_u8(f, 0);
+        write_u16(f, 2); write_u16(f, 62); write_u32(f, 1);
+        write_u64(f, V_TEXT); write_u64(f, ehdr_size); write_u64(f, 0); write_u32(f, 0);
+        write_u16(f, (uint16_t)ehdr_size); write_u16(f, (uint16_t)phdr_size);
+        write_u16(f, 2); write_u16(f, 0); write_u16(f, 0); write_u16(f, 0);
+
+        /* PT_LOAD text + rodata */
+        write_u32(f, 1); write_u32(f, 5);
+        write_u64(f, text_file_off); write_u64(f, V_TEXT); write_u64(f, V_TEXT);
+        write_u64(f, total_text_rod); write_u64(f, total_text_rod); write_u64(f, 0x1000);
+
+        /* PT_LOAD bss */
+        write_u32(f, 1); write_u32(f, 6);
+        write_u64(f, 0); write_u64(f, V_BSS); write_u64(f, V_BSS);
+        write_u64(f, 0); write_u64(f, BSS_BYTES); write_u64(f, 0x1000);
+
+        long pos = ftell(f);
+        for (long p = pos; p < (long)text_file_off; p++) fputc(0, f);
+        fwrite(g_code, 1, (size_t)text_len, f);
+        if (g_rodata_len > 0) fwrite(g_rodata, 1, (size_t)g_rodata_len, f);
+        fclose(f);
+        if (chmod(out_path, 0755) != 0) { /* non-fatal */ }
+        return;
+    }
+
+    /* ---------- Dynamic-link path: libc.so.6 via DT_NEEDED ---------- */
+
+    /* Build .dynstr: index 0 is a NUL terminator, then library name,
+     * then every imported symbol name.                                 */
+    static uint8_t dynstr_buf[4096];
+    int dynstr_len = 1;                                /* [0] = '\0'    */
+    dynstr_buf[0] = 0;
+    int libc_name_off = dynstr_len;
+    const char *LIBC_NAME = "libc.so.6";
+    int libc_name_len = (int)strlen(LIBC_NAME);
+    memcpy(dynstr_buf + dynstr_len, LIBC_NAME, (size_t)libc_name_len);
+    dynstr_len += libc_name_len;
+    dynstr_buf[dynstr_len++] = 0;
+    int sym_name_off[MAX_LINUX_IMPORTS];
+    for (int i = 0; i < g_nlinux_imports; i++) {
+        sym_name_off[i] = dynstr_len;
+        int nl = (int)strlen(g_linux_imports[i]);
+        if (dynstr_len + nl + 1 > (int)sizeof(dynstr_buf)) {
+            fprintf(stderr, "luna-boot: .dynstr overflow\n"); exit(1);
+        }
+        memcpy(dynstr_buf + dynstr_len, g_linux_imports[i], (size_t)nl);
+        dynstr_len += nl;
+        dynstr_buf[dynstr_len++] = 0;
+    }
+
+    /* Build .dynsym.  Entry 0 is the reserved null symbol; entries
+     * 1..N describe each imported function — undefined, global, func. */
+    int nsyms = 1 + g_nlinux_imports;
+    static uint8_t dynsym_buf[4096];
+    memset(dynsym_buf, 0, 24);                         /* null symbol  */
+    for (int i = 0; i < g_nlinux_imports; i++) {
+        uint8_t *p = dynsym_buf + 24 + i * 24;
+        /* st_name (4), st_info (1), st_other (1), st_shndx (2),
+         * st_value (8), st_size (8)                                   */
+        uint32_t name_off = (uint32_t)sym_name_off[i];
+        for (int b = 0; b < 4; b++) p[b] = (uint8_t)(name_off >> (b * 8));
+        p[4] = 0x12;          /* (STB_GLOBAL << 4) | STT_FUNC          */
+        p[5] = 0;             /* st_other                              */
+        p[6] = 0; p[7] = 0;   /* st_shndx = SHN_UNDEF                  */
+        for (int b = 0; b < 16; b++) p[8 + b] = 0;     /* value + size */
+    }
+    int dynsym_size = nsyms * 24;
+
+    /* Build .rela.dyn: one R_X86_64_GLOB_DAT per import, pointing at
+     * the matching GOT slot.                                           */
+    static uint8_t rela_buf[4096];
+    int rela_entries = g_nlinux_imports;
+    /* Each entry: r_offset (8) + r_info (8) + r_addend (8)            */
+    int rela_size = rela_entries * 24;
+
+    /* Minimal DT_GNU_HASH stub — we export nothing, so nbuckets=1 and
+     * the single bucket contains 0 (no exported symbols here).         */
+    static uint8_t hash_buf[64];
+    memset(hash_buf, 0, 32);
+    /* nbuckets = 1  */  hash_buf[0] = 1;
+    /* symndx    = nsyms */
+    {
+        uint32_t sx = (uint32_t)nsyms;
+        for (int b = 0; b < 4; b++) hash_buf[4 + b] = (uint8_t)(sx >> (b * 8));
+    }
+    /* maskwords = 1 */  hash_buf[8] = 1;
+    /* shift2    = 0 */
+    /* bloom[0]  = 0 (matches nothing) — already zero */
+    /* bucket[0] = 0 (empty bucket) — already zero */
+    int hash_size = 16 + 8 + 4;                         /* 28 bytes    */
+
+    /* Lay out the dynamic segment.  Offsets inside the RW page.       */
+    int dynstr_rel   = 0;
+    int dynsym_rel   = (int)round_up_u64((uint64_t)(dynstr_rel + dynstr_len), 8);
+    int rela_rel     = (int)round_up_u64((uint64_t)(dynsym_rel + dynsym_size), 8);
+    int hash_rel     = (int)round_up_u64((uint64_t)(rela_rel + rela_size), 8);
+    int dynamic_rel  = (int)round_up_u64((uint64_t)(hash_rel + hash_size), 8);
+    int ndyn = 11;                                      /* see below    */
+    int dynamic_size = ndyn * 16;
+    int got_rel      = (int)round_up_u64((uint64_t)(dynamic_rel + dynamic_size), 8);
+    int got_size     = g_nlinux_imports * 8;
+    int rw_total     = got_rel + got_size;
+
+    /* Place everything at page boundaries.  RW page comes after text. */
+    uint64_t text_end_file = text_file_off + total_text_rod;
+    uint64_t rw_file_off   = round_up_u64(text_end_file, 0x1000);
+    uint64_t rw_va         = V_BASE + rw_file_off;
+    uint64_t dynstr_va     = rw_va + dynstr_rel;
+    uint64_t dynsym_va     = rw_va + dynsym_rel;
+    uint64_t rela_va       = rw_va + rela_rel;
+    uint64_t hash_va       = rw_va + hash_rel;
+    uint64_t dynamic_va    = rw_va + dynamic_rel;
+    uint64_t got_va        = rw_va + got_rel;
+
+    /* Fill .rela.dyn now that we know got_va.                          */
+    for (int i = 0; i < rela_entries; i++) {
+        uint8_t *p = rela_buf + i * 24;
+        uint64_t off = got_va + (uint64_t)i * 8;
+        for (int b = 0; b < 8; b++) p[b] = (uint8_t)(off >> (b * 8));
+        /* r_info = (sym_idx << 32) | R_X86_64_GLOB_DAT(6)              */
+        uint64_t info = ((uint64_t)(i + 1) << 32) | 6;
+        for (int b = 0; b < 8; b++) p[8 + b] = (uint8_t)(info >> (b * 8));
+        /* r_addend = 0 */
+        for (int b = 0; b < 8; b++) p[16 + b] = 0;
+    }
+
+    /* Build .dynamic buffer.                                           */
+    static uint8_t dynamic_buf[256];
+    int dyi = 0;
+    #define DT_ENTRY(tag, val) do { \
+        uint64_t t = (uint64_t)(tag); \
+        uint64_t v = (uint64_t)(val); \
+        for (int b = 0; b < 8; b++) dynamic_buf[dyi + b] = (uint8_t)(t >> (b * 8)); \
+        for (int b = 0; b < 8; b++) dynamic_buf[dyi + 8 + b] = (uint8_t)(v >> (b * 8)); \
+        dyi += 16; \
+    } while (0)
+    DT_ENTRY(1,  libc_name_off);        /* DT_NEEDED                    */
+    DT_ENTRY(5,  dynstr_va);            /* DT_STRTAB                    */
+    DT_ENTRY(10, dynstr_len);           /* DT_STRSZ                     */
+    DT_ENTRY(6,  dynsym_va);            /* DT_SYMTAB                    */
+    DT_ENTRY(11, 24);                   /* DT_SYMENT                    */
+    DT_ENTRY(7,  rela_va);              /* DT_RELA                      */
+    DT_ENTRY(8,  rela_size);            /* DT_RELASZ                    */
+    DT_ENTRY(9,  24);                   /* DT_RELAENT                   */
+    DT_ENTRY(0x6ffffef5, hash_va);      /* DT_GNU_HASH                  */
+    DT_ENTRY(0x6ffffff9, 0);            /* DT_RELACOUNT = 0             */
+    DT_ENTRY(0,  0);                    /* DT_NULL                      */
+    #undef DT_ENTRY
+
+    /* Patch GOT relocations in code.                                   */
+    for (int i = 0; i < g_ngotrelocs; i++) {
+        GotReloc *r = &g_gotrelocs[i];
+        uint64_t rip    = V_TEXT + r->code_off + 4;
+        uint64_t target = got_va + (uint64_t)r->got_slot * 8;
+        int32_t disp = (int32_t)((int64_t)target - (int64_t)rip);
+        code_patch_u32(r->code_off, (uint32_t)disp);
+    }
+
+    /* ---- Header layout ---- */
+    const char *INTERP = "/lib64/ld-linux-x86-64.so.2";
+    int interp_len = (int)strlen(INTERP) + 1;
+    int nphdrs = 6;                     /* INTERP + 3 LOAD + BSS + DYN */
+    uint64_t phdrs_size = phdr_size * nphdrs;
+    uint64_t interp_file_off = ehdr_size + phdrs_size;
+    uint64_t interp_va = V_BASE + interp_file_off;
+
     FILE *f = fopen(out_path, "wb");
-    if (!f) { fprintf(stderr, "luna-boot: cannot open '%s' for writing\n", out_path); exit(1); }
+    if (!f) { fprintf(stderr, "luna-boot: cannot open '%s'\n", out_path); exit(1); }
 
+    /* ELF header. */
     write_u8(f, 0x7f); write_u8(f, 'E'); write_u8(f, 'L'); write_u8(f, 'F');
-    write_u8(f, 2);     /* ELFCLASS64     */
-    write_u8(f, 1);     /* little-endian  */
-    write_u8(f, 1);     /* EI_VERSION     */
-    write_u8(f, 0);     /* SysV ABI       */
-    write_u8(f, 0);     /* ABI version    */
+    write_u8(f, 2); write_u8(f, 1); write_u8(f, 1);
+    write_u8(f, 0); write_u8(f, 0);
     for (int i = 0; i < 7; i++) write_u8(f, 0);
-
-    write_u16(f, 2);
+    write_u16(f, 2);                    /* e_type = ET_EXEC             */
     write_u16(f, 62);
     write_u32(f, 1);
     write_u64(f, V_TEXT);
@@ -4664,12 +4903,30 @@ static void write_elf64(const char *out_path)
     write_u32(f, 0);
     write_u16(f, (uint16_t)ehdr_size);
     write_u16(f, (uint16_t)phdr_size);
-    write_u16(f, 2);                    /* e_phnum: text + bss        */
-    write_u16(f, 0);
-    write_u16(f, 0);
-    write_u16(f, 0);
+    write_u16(f, (uint16_t)nphdrs);
+    write_u16(f, 0); write_u16(f, 0); write_u16(f, 0);
 
-    /* PT_LOAD 0: .text + .rodata (R-X).                               */
+    /* PT_INTERP */
+    write_u32(f, 3);                     /* PT_INTERP                    */
+    write_u32(f, 4);                     /* PF_R                         */
+    write_u64(f, interp_file_off);
+    write_u64(f, interp_va);
+    write_u64(f, interp_va);
+    write_u64(f, (uint64_t)interp_len);
+    write_u64(f, (uint64_t)interp_len);
+    write_u64(f, 1);
+
+    /* PT_LOAD: headers + .interp (R--) — covers the first page        */
+    write_u32(f, 1);
+    write_u32(f, 4);                     /* PF_R                         */
+    write_u64(f, 0);
+    write_u64(f, V_BASE);
+    write_u64(f, V_BASE);
+    write_u64(f, text_file_off);         /* everything before 0x1000    */
+    write_u64(f, text_file_off);
+    write_u64(f, 0x1000);
+
+    /* PT_LOAD: .text + .rodata (R-X)                                   */
     write_u32(f, 1);
     write_u32(f, 5);
     write_u64(f, text_file_off);
@@ -4679,30 +4936,69 @@ static void write_elf64(const char *out_path)
     write_u64(f, total_text_rod);
     write_u64(f, 0x1000);
 
-    /* PT_LOAD 1: .bss (RW-).  filesz=0 — kernel zero-fills memsz bytes.
-     * Placed at V_BSS regardless of the .text end so bss_off arithmetic
-     * is predictable.                                                  */
+    /* PT_LOAD: dynamic segment (RW)                                    */
     write_u32(f, 1);
-    write_u32(f, 6);                   /* PF_R | PF_W                  */
-    write_u64(f, 0);                   /* p_offset — no file content   */
-    write_u64(f, V_BSS);
-    write_u64(f, V_BSS);
-    write_u64(f, 0);                   /* p_filesz                     */
-    write_u64(f, BSS_BYTES);           /* p_memsz                      */
+    write_u32(f, 6);                     /* PF_R | PF_W                  */
+    write_u64(f, rw_file_off);
+    write_u64(f, rw_va);
+    write_u64(f, rw_va);
+    write_u64(f, (uint64_t)rw_total);
+    write_u64(f, (uint64_t)rw_total);
     write_u64(f, 0x1000);
 
+    /* PT_LOAD: .bss heap (RW) — same as the static path.               */
+    write_u32(f, 1);
+    write_u32(f, 6);
+    write_u64(f, 0);
+    write_u64(f, V_BSS);
+    write_u64(f, V_BSS);
+    write_u64(f, 0);
+    write_u64(f, BSS_BYTES);
+    write_u64(f, 0x1000);
+
+    /* PT_DYNAMIC */
+    write_u32(f, 2);                     /* PT_DYNAMIC                   */
+    write_u32(f, 6);
+    write_u64(f, rw_file_off + (uint64_t)dynamic_rel);
+    write_u64(f, dynamic_va);
+    write_u64(f, dynamic_va);
+    write_u64(f, (uint64_t)dynamic_size);
+    write_u64(f, (uint64_t)dynamic_size);
+    write_u64(f, 8);
+
+    /* .interp data and padding to text page. */
+    fwrite(INTERP, 1, (size_t)interp_len, f);
     long pos = ftell(f);
-    if (pos < 0) { fprintf(stderr, "luna-boot: ftell failed\n"); exit(1); }
     for (long p = pos; p < (long)text_file_off; p++) fputc(0, f);
 
+    /* Text + rodata. */
     fwrite(g_code, 1, (size_t)text_len, f);
     if (g_rodata_len > 0) fwrite(g_rodata, 1, (size_t)g_rodata_len, f);
 
-    fclose(f);
+    /* Pad to RW page. */
+    pos = ftell(f);
+    for (long p = pos; p < (long)rw_file_off; p++) fputc(0, f);
 
-    if (chmod(out_path, 0755) != 0) {
-        /* non-fatal */
-    }
+    /* Emit dynamic segment contents in laid-out order. */
+    fwrite(dynstr_buf, 1, (size_t)dynstr_len, f);
+    pos = ftell(f);
+    for (long p = pos; p < (long)(rw_file_off + (uint64_t)dynsym_rel); p++) fputc(0, f);
+    fwrite(dynsym_buf, 1, (size_t)dynsym_size, f);
+    pos = ftell(f);
+    for (long p = pos; p < (long)(rw_file_off + (uint64_t)rela_rel); p++) fputc(0, f);
+    fwrite(rela_buf, 1, (size_t)rela_size, f);
+    pos = ftell(f);
+    for (long p = pos; p < (long)(rw_file_off + (uint64_t)hash_rel); p++) fputc(0, f);
+    fwrite(hash_buf, 1, (size_t)hash_size, f);
+    pos = ftell(f);
+    for (long p = pos; p < (long)(rw_file_off + (uint64_t)dynamic_rel); p++) fputc(0, f);
+    fwrite(dynamic_buf, 1, (size_t)dynamic_size, f);
+    pos = ftell(f);
+    for (long p = pos; p < (long)(rw_file_off + (uint64_t)got_rel); p++) fputc(0, f);
+    for (int i = 0; i < got_size; i++) fputc(0, f);
+
+    fclose(f);
+    if (chmod(out_path, 0755) != 0) { /* non-fatal */ }
 }
 
 /* ========================================================================= */
