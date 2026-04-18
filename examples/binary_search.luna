@@ -1,0 +1,35 @@
+fn bsearch(@xs: int, @n: int, @target: int) -> int
+    @lo = 0
+    @hi = @n - 1
+    while @lo <= @hi
+        @mid = (@lo + @hi) / 2
+        @v = @xs[@mid]
+        if @v == @target
+            return @mid
+        if @v < @target
+            @lo = @mid + 1
+        else
+            @hi = @mid - 1
+    return 0 - 1
+
+fn lookup(@xs: int, @n: int, @target: int) -> int
+    @pos = bsearch(@xs, @n, @target)
+    print("  ")
+    print_int(@target)
+    if @pos >= 0
+        print(" found at index ")
+        println_int(@pos)
+    else
+        shine(" not found")
+    return 0
+
+fn main() -> int
+    @sorted = [1, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987]
+    shine("binary search in sorted Fibonacci numbers:")
+    lookup(@sorted, 14, 1)
+    lookup(@sorted, 14, 233)
+    lookup(@sorted, 14, 610)
+    lookup(@sorted, 14, 987)
+    lookup(@sorted, 14, 100)
+    lookup(@sorted, 14, 0)
+    return 0

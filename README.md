@@ -25,17 +25,19 @@ via a C99 bootstrap compiler**:
 
 | Component | State |
 |---|---|
-| Bootstrap compiler (`bootstrap/luna_bootstrap.c`) | ~3.4 KLOC C99, x86-64 codegen, ELF64 output |
-| Core modules compiled through bootstrap | 19 / 19 |
-| Stdlib modules compiled through bootstrap | partial |
+| Bootstrap compiler (`bootstrap/luna_bootstrap.c`) | ~3.7 KLOC C99, x86-64 codegen |
+| Targets | Linux ELF64 + native Windows PE64, one source → two binaries |
+| Core modules compiled through bootstrap | 19 / 19 (both targets) |
+| Working runtime: `shine`, `print`, `print_int`, `exit` | ✓ both targets |
+| Arrays: `[a, b, c]` / `[v; N]`, index read/write | ✓ both targets |
+| Structs: declaration, literals, field read/write | ✓ both targets |
 | Self-hosted compiler (compile Luna with Luna) | in progress |
-| `luna` CLI / package manager | not yet |
-| VS Code extension | [editors/vscode](editors/vscode) — v0.1.3 |
+| VS Code extension | [editors/vscode](editors/vscode) — v0.1.4 |
 
-The language, grammar, and core modules are complete enough that the
-bootstrap can parse, lower, and emit running Linux binaries from all
-19 core files — a working foundation to replace with a Luna-in-Luna
-compiler.
+Real programs that build and run on both platforms today:
+
+- [examples/stats.luna](examples/stats.luna) — struct-based count / sum / min / max / mean
+- [examples/binary_search.luna](examples/binary_search.luna) — classic bsearch over a sorted array
 
 ## Cosmic syntax
 

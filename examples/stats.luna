@@ -1,0 +1,56 @@
+struct Stats
+    count: int
+    sum:   int
+    min:   int
+    max:   int
+
+fn fill_stats(@s: Stats, @xs: int, @n: int) -> int
+    @s.count = @n
+    @s.sum = 0
+    if @n == 0
+        @s.min = 0
+        @s.max = 0
+        return 0
+    @s.min = @xs[0]
+    @s.max = @xs[0]
+    orbit @i in 0..@n
+        @v = @xs[@i]
+        @s.sum = @s.sum + @v
+        if @v < @s.min
+            @s.min = @v
+        if @v > @s.max
+            @s.max = @v
+    return 0
+
+fn show(@s: Stats) -> int
+    shine("stats:")
+    print("  count = ")
+    println_int(@s.count)
+    print("  sum   = ")
+    println_int(@s.sum)
+    print("  min   = ")
+    println_int(@s.min)
+    print("  max   = ")
+    println_int(@s.max)
+    print("  range = ")
+    println_int(@s.max - @s.min)
+    if @s.count > 0
+        print("  mean  = ")
+        println_int(@s.sum / @s.count)
+    return 0
+
+fn main() -> int
+    @s = Stats { count: 0, sum: 0, min: 0, max: 0 }
+
+    @xs = [7, 2, 9, 4, 6, 1, 8, 3, 5, 10]
+    fill_stats(@s, @xs, 10)
+    show(@s)
+
+    @ys = [42, 42, 42, 42, 42]
+    fill_stats(@s, @ys, 5)
+    show(@s)
+
+    @zs = [1000000, 0 - 500, 17, 8192, 0 - 9999]
+    fill_stats(@s, @zs, 5)
+    show(@s)
+    return 0
