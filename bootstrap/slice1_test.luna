@@ -1,0 +1,6 @@
+fn main()
+    shine("First line")
+    shine("Second line")
+    shine("Luna — cosmic systems language")
+    shine("")
+    shine("Bytes: @mix!#$%")

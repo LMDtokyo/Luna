@@ -301,6 +301,15 @@ static int         g_ninclude = 0;
 
 static int      g_verbose = 0;
 
+/* Output target.  Auto-detected from the host OS at startup; overridable
+ * via `--target {linux,windows}` on the command line.                     */
+enum { TARGET_LINUX = 1, TARGET_WINDOWS = 2 };
+static int      g_target = 0;
+
+/* Cached rodata index of the "\n" literal used by shine().  Lazily
+ * allocated the first time shine emits a print sequence.                  */
+static int      g_newline_str_idx = -1;
+
 /* Current function codegen state. */
 static Local    g_locals[256];
 static int      g_nlocals;
@@ -422,15 +431,31 @@ static void code_patch_u32(int off, uint32_t v)
     g_code[off+3] = (uint8_t)((v>>24) & 0xff);
 }
 
-/* Add a string literal to rodata, return pool index. */
+/* Add a string literal to rodata, return pool index.
+ *
+ * Layout per string (so `shine(s)` and any future string op can read the
+ * length at runtime without a separate parameter):
+ *
+ *     [ 8-byte little-endian length ] [ string bytes ] [ NUL ]
+ *
+ * The returned `off` points at the first byte of the string data (past the
+ * length prefix). To read the length of a string whose address is in rax,
+ * emit `mov rdx, [rax - 8]`. The trailing NUL is cosmetic — keeps C-style
+ * interop possible, but the length is authoritative.
+ */
 static int strpool_add(const char *s, int len)
 {
     if (g_nstrs >= MAX_STRS) { fprintf(stderr, "luna-boot: string pool full\n"); exit(1); }
-    if (g_rodata_len + len + 1 > RODATA_CAP) {
+    if (g_rodata_len + 8 + len + 1 > RODATA_CAP) {
         fprintf(stderr, "luna-boot: rodata overflow\n"); exit(1);
     }
     int idx = g_nstrs++;
-    g_strs[idx].off = g_rodata_len;
+    uint64_t llen = (uint64_t)(uint32_t)len;
+    for (int i = 0; i < 8; i++) {
+        g_rodata[g_rodata_len + i] = (uint8_t)(llen >> (i * 8));
+    }
+    g_rodata_len += 8;
+    g_strs[idx].off = g_rodata_len;          /* points past the length prefix */
     g_strs[idx].len = len;
     memcpy(g_rodata + g_rodata_len, s, (size_t)len);
     g_rodata_len += len;
@@ -1298,11 +1323,15 @@ static int parse_primary(void)
     }
     /* Cosmic-keyword unary expressions: `nova EXPR`, `move EXPR`, `freeze EXPR`,
        `box EXPR`, `rc EXPR`, `weak EXPR`, `drop EXPR`.  Bootstrap evaluates the
-       inner expression for side-effects and returns its value unchanged. */
-    if (t->kind == TK_KW_NOVA || t->kind == TK_KW_MOVE ||
+       inner expression for side-effects and returns its value unchanged.
+       Exception: if the keyword is immediately followed by `(`, it is a
+       function call of that name (e.g. `shine("hello")`) — fall through to
+       the identifier-as-call path so the call is lowered properly.        */
+    if ((t->kind == TK_KW_NOVA || t->kind == TK_KW_MOVE ||
         t->kind == TK_KW_FREEZE || t->kind == TK_KW_BOX ||
         t->kind == TK_KW_RC || t->kind == TK_KW_WEAK ||
-        t->kind == TK_KW_DROP || t->kind == TK_KW_SHINE) {
+        t->kind == TK_KW_DROP || t->kind == TK_KW_SHINE)
+        && peek_n(1)->kind != TK_LPAREN) {
         g_tpos++;
         return parse_primary();
     }
@@ -1763,13 +1792,16 @@ static int parse_stmt(void)
         }
         return node_new(N_PASS, t);
     }
-    if (t->kind == TK_KW_SPAWN || t->kind == TK_KW_SEND  ||
+    if ((t->kind == TK_KW_SPAWN || t->kind == TK_KW_SEND  ||
         t->kind == TK_KW_DEFER || t->kind == TK_KW_NOVA  ||
         t->kind == TK_KW_DROP  || t->kind == TK_KW_SHINE ||
-        t->kind == TK_KW_ATOMIC) {
+        t->kind == TK_KW_ATOMIC)
+        && peek_n(1)->kind != TK_LPAREN) {
         /* `spawn EXPR`, `send T, M`, `defer EXPR`, `nova EXPR`, `drop @v`,
            `shine EXPR`, `atomic { BLOCK }`, AND bare `nova` / `shine` on
-           their own — tolerant parse.                                     */
+           their own — tolerant parse.
+           If followed by `(`, fall through: `shine(x)` / `nova(x)` are
+           actual function calls and must be lowered as such.             */
         g_tpos++;
         int next_k = peek()->kind;
         if (next_k == TK_LBRACE) {
@@ -2597,6 +2629,14 @@ static void emit_mov_rax_rax_plus_8(void)
     uint8_t b[] = { 0x48, 0x8b, 0x40, 0x08 };
     code_emit_bytes(b, 4);
 }
+/* mov reg, [rax + disp8]  (reg 0..7, signed 8-bit disp) */
+static void emit_mov_r_mem_rax_disp8(int reg, int8_t disp)
+{
+    code_emit_byte(0x48);
+    code_emit_byte(0x8B);
+    code_emit_byte((uint8_t)(0x40 | ((reg & 7) << 3)));
+    code_emit_byte((uint8_t)disp);
+}
 /* mov rax, [rax + imm32] (struct field load) */
 static void emit_mov_rax_rax_plus_imm32(int32_t disp)
 {
@@ -2807,6 +2847,35 @@ static void lower_call(int node)
     }
     int si = sym_find(c->s, c->slen);
     if (si < 0) {
+        /* `shine(x)` — first real I/O intrinsic.  Takes one string argument
+         * (pointer from N_STR / string-typed variable) and writes it to
+         * stdout followed by a newline.  On Linux we inline the write(2)
+         * syscall; on Windows the PE backend translates the same three-
+         * step "write string / write newline / fall through" sequence into
+         * two WriteFile calls via the import table (Slice 2).             */
+        if (c->slen == 5 && memcmp(c->s, "shine", 5) == 0 && n->nkids >= 2) {
+            if (g_target == TARGET_LINUX) {
+                lower_expr(n->kids[1]);                  /* rax = str ptr  */
+                emit_mov_r_r(REG_RSI, REG_RAX);          /* rsi = ptr      */
+                emit_mov_r_mem_rax_disp8(REG_RDX, -8);   /* rdx = len      */
+                emit_mov_r_imm64(REG_RDI, 1);            /* rdi = stdout   */
+                emit_mov_rax_imm64(SYS_WRITE);           /* rax = 1        */
+                emit_syscall();
+                if (g_newline_str_idx < 0) {
+                    g_newline_str_idx = strpool_add("\n", 1);
+                }
+                emit_lea_rax_rip_rodata(g_strs[g_newline_str_idx].off);
+                emit_mov_r_r(REG_RSI, REG_RAX);
+                emit_mov_r_imm64(REG_RDX, 1);
+                emit_mov_r_imm64(REG_RDI, 1);
+                emit_mov_rax_imm64(SYS_WRITE);
+                emit_syscall();
+                emit_mov_rax_imm64(0);
+                return;
+            }
+            /* TARGET_WINDOWS: not yet wired — fall through to tolerant
+             * builtin (no-op) until Slice 2 lands the PE64 backend.       */
+        }
         if (is_boot_builtin(c->s, c->slen)) {
             /* Tolerant builtin: evaluate each arg for side-effects and
                return 0.  Real semantics live in the self-hosted compiler. */
@@ -3524,12 +3593,29 @@ static void add_default_include_paths(const char *input_path)
 static void usage(void)
 {
     fprintf(stderr,
-        "usage: luna-boot <input.luna> [-o <output>] [-v]\n"
+        "usage: luna-boot <input.luna> [-o <output>] [--target linux|windows] [-v]\n"
         "\n"
         "Minimal C bootstrap for Luna.  Compiles a limited subset of the\n"
-        "language into a Linux x86-64 ELF64 executable.  Used exactly once,\n"
-        "to produce the self-hosted `luna` binary.\n");
+        "language into a native x86-64 executable.\n"
+        "\n"
+        "  --target linux    emit Linux ELF64 (default on Linux / WSL)\n"
+        "  --target windows  emit Windows PE64 (default on Windows)\n"
+        "  -o <output>       output file path (default: a.out / a.exe)\n"
+        "  --lib             allow input with no `main` function\n"
+        "  -v                verbose progress\n");
     exit(2);
+}
+
+/* Detect host OS at program startup so `--target` defaults to a sensible
+ * value.  Respect the compile-time #define so cross-compiling a Luna
+ * binary (e.g. building a Windows exe from WSL) is just a flag.         */
+static int detect_host_target(void)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    return TARGET_WINDOWS;
+#else
+    return TARGET_LINUX;
+#endif
 }
 
 int g_allow_no_main = 0;
@@ -3537,12 +3623,20 @@ int g_allow_no_main = 0;
 int main(int argc, char **argv)
 {
     const char *input = NULL;
-    const char *output = "a.out";
+    const char *output = NULL;
+    g_target = detect_host_target();
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (a[0] != '-') { if (!input) input = a; else usage(); continue; }
         if (strcmp(a, "-o") == 0 && i + 1 < argc) { output = argv[++i]; continue; }
+        if (strcmp(a, "--target") == 0 && i + 1 < argc) {
+            const char *t = argv[++i];
+            if (strcmp(t, "linux") == 0) g_target = TARGET_LINUX;
+            else if (strcmp(t, "windows") == 0) g_target = TARGET_WINDOWS;
+            else { fprintf(stderr, "luna-boot: unknown target '%s'\n", t); usage(); }
+            continue;
+        }
         if (strcmp(a, "-v") == 0) { g_verbose = 1; continue; }
         if (strcmp(a, "--lib") == 0) { g_allow_no_main = 1; continue; }
         if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) usage();
@@ -3550,6 +3644,7 @@ int main(int argc, char **argv)
         usage();
     }
     if (!input) usage();
+    if (!output) output = (g_target == TARGET_WINDOWS) ? "a.exe" : "a.out";
 
     arena_init();
     g_toks    = (Tok *)malloc(sizeof(Tok) * MAX_TOKENS);
@@ -3572,6 +3667,13 @@ int main(int argc, char **argv)
 
     lower_all();
 
+    if (g_target == TARGET_WINDOWS) {
+        fprintf(stderr,
+            "luna-boot: --target windows not yet implemented in this build\n"
+            "          (PE64 backend landing in Slice 2).  Use --target linux\n"
+            "          to produce an ELF that runs under WSL.\n");
+        return 1;
+    }
     write_elf64(output);
 
     if (g_verbose) {
