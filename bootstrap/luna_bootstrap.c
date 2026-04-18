@@ -47,7 +47,7 @@
 #define MAX_RELOCS        (1 << 15)
 #define MAX_INCLUDE_PATHS 8
 #define ARENA_BYTES       (16 * 1024 * 1024)
-#define CODE_CAP          (4 * 1024 * 1024)
+#define CODE_CAP          (16 * 1024 * 1024)
 #define RODATA_CAP        (1 * 1024 * 1024)
 
 /* Luna syscall numbers we care about. */
@@ -2677,11 +2677,114 @@ static void emit_mov_rax_mem_rcx_rax_x8(void)
     uint8_t b[] = { 0x48, 0x8b, 0x04, 0xc1 };
     code_emit_bytes(b, 4);
 }
+/* ------------------------------------------------------------------------
+ * Heap allocator relocations
+ *
+ * The compiled program ships with a 16 MiB zero-initialised BSS region:
+ *     [ bss_base + 0  .. + 8 )   _luna_heap_top pointer (writable)
+ *     [ bss_base + 64 .. + 16M)  bump-allocated heap area
+ *
+ * A `BssReloc` records a RIP-relative displacement in the emitted code
+ * that must be patched once the BSS's virtual address is decided at
+ * file-write time.  Both N_STRUCT_LIT and N_ARRAY_LIT route through
+ * this machinery so their memory outlives the enclosing call frame.    */
+typedef struct {
+    int code_off;       /* offset of the disp32 slot                 */
+    int bss_off;        /* byte offset within BSS the slot points at */
+} BssReloc;
+
+#define MAX_BSS_RELOCS 8192
+static BssReloc g_bssrelocs[MAX_BSS_RELOCS];
+static int      g_nbssrelocs;
+
+#define BSS_BYTES          (16 * 1024 * 1024 + 64)
+#define BSS_HEAP_TOP_OFF   0
+#define BSS_HEAP_BASE_OFF  64
+
+/* Emit `lea rax, [rip + bss_disp]` with deferred patching. */
+static void emit_lea_rax_rip_bss(int bss_off)
+{
+    uint8_t b[] = { 0x48, 0x8d, 0x05 };
+    code_emit_bytes(b, 3);
+    int slot = g_code_len;
+    code_emit_u32(0);
+    if (g_nbssrelocs >= MAX_BSS_RELOCS) {
+        fprintf(stderr, "luna-boot: too many BSS relocs\n"); exit(1);
+    }
+    g_bssrelocs[g_nbssrelocs].code_off = slot;
+    g_bssrelocs[g_nbssrelocs].bss_off  = bss_off;
+    g_nbssrelocs++;
+}
+
+/* mov [rip + disp32], rax  — 48 89 05 xx xx xx xx  */
+static void emit_mov_mem_rip_rax_bss(int bss_off)
+{
+    uint8_t b[] = { 0x48, 0x89, 0x05 };
+    code_emit_bytes(b, 3);
+    int slot = g_code_len;
+    code_emit_u32(0);
+    if (g_nbssrelocs >= MAX_BSS_RELOCS) {
+        fprintf(stderr, "luna-boot: too many BSS relocs\n"); exit(1);
+    }
+    g_bssrelocs[g_nbssrelocs].code_off = slot;
+    g_bssrelocs[g_nbssrelocs].bss_off  = bss_off;
+    g_nbssrelocs++;
+}
+/* mov rax, [rip + disp32]  — 48 8B 05 xx xx xx xx  */
+static void emit_mov_rax_mem_rip_bss(int bss_off)
+{
+    uint8_t b[] = { 0x48, 0x8b, 0x05 };
+    code_emit_bytes(b, 3);
+    int slot = g_code_len;
+    code_emit_u32(0);
+    if (g_nbssrelocs >= MAX_BSS_RELOCS) {
+        fprintf(stderr, "luna-boot: too many BSS relocs\n"); exit(1);
+    }
+    g_bssrelocs[g_nbssrelocs].code_off = slot;
+    g_bssrelocs[g_nbssrelocs].bss_off  = bss_off;
+    g_nbssrelocs++;
+}
+/* add rax, imm32 (sign-extended) — 48 05 imm32 */
+static void emit_add_rax_imm32(int32_t v)
+{
+    code_emit_byte(0x48);
+    code_emit_byte(0x05);
+    code_emit_u32((uint32_t)v);
+}
+
+/* Emit a bump-allocation of `bytes`.  On return rax holds the pointer
+ * to the freshly-allocated `bytes`-byte block, bumped off the heap.
+ * The block is NOT zero-initialised — callers that need that should
+ * clear it themselves (or let a later str_alloc / array_lit do it). */
+static void emit_bump_alloc(int bytes)
+{
+    /* round up to 8-byte alignment */
+    int aligned = (bytes + 7) & ~7;
+    emit_mov_rax_mem_rip_bss(BSS_HEAP_TOP_OFF); /* rax = current top */
+    emit_push_rax();                            /* save pointer      */
+    emit_add_rax_imm32(aligned);                /* rax = top + size  */
+    emit_mov_mem_rip_rax_bss(BSS_HEAP_TOP_OFF); /* store new top     */
+    emit_pop_r(REG_RAX);                        /* rax = old top     */
+}
+
 /* mov [rcx + rax*8], rdx  (48 89 14 c1) — array write */
 static void emit_mov_mem_rcx_rax_x8_rdx(void)
 {
     uint8_t b[] = { 0x48, 0x89, 0x14, 0xc1 };
     code_emit_bytes(b, 4);
+}
+/* mov [rbx + disp32], rax — store element into a heap-allocated array /
+ * struct whose base we parked in rbx (48 89 83 xx xx xx xx).           */
+static void emit_mov_mem_rbx_disp32_rax(int32_t disp)
+{
+    if (disp >= -128 && disp <= 127) {
+        uint8_t b[] = { 0x48, 0x89, 0x43, (uint8_t)disp };
+        code_emit_bytes(b, 4);
+        return;
+    }
+    uint8_t b[] = { 0x48, 0x89, 0x83 };
+    code_emit_bytes(b, 3);
+    code_emit_u32((uint32_t)disp);
 }
 /* mov rcx, rax  (48 89 c1) */
 static void emit_mov_rcx_rax2(void) { uint8_t b[]={0x48,0x89,0xc1}; code_emit_bytes(b,3); }
@@ -3217,6 +3320,23 @@ static int field_type(int sn, const char *fname, int flen)
     }
     return -1;
 }
+/* Helper: find the declared return type (as an N_STRUCT index) of a
+ * function symbol, or -1 if not a struct.                              */
+static int fn_return_struct(int sym_idx)
+{
+    if (sym_idx < 0 || sym_idx >= g_nsyms) return -1;
+    AstNode *fn = &g_nodes[g_syms[sym_idx].node];
+    if (fn->kind != N_FN && fn->kind != N_EXTERN_FN) return -1;
+    /* Return type is the last N_TYPE child among kids[], just before body. */
+    for (int i = fn->nkids - 1; i >= 0; i--) {
+        AstNode *c = &g_nodes[fn->kids[i]];
+        if (c->kind == N_TYPE && c->s && c->slen > 0) {
+            return find_struct(c->s, c->slen);
+        }
+    }
+    return -1;
+}
+
 static int type_of_expr(int node)
 {
     AstNode *n = &g_nodes[node];
@@ -3235,6 +3355,16 @@ static int type_of_expr(int node)
         int base_sn = type_of_expr(n->kids[0]);
         if (base_sn < 0) return -1;
         return field_type(base_sn, n->s, n->slen);
+    }
+    if (n->kind == N_CALL && n->nkids >= 1) {
+        AstNode *c = &g_nodes[n->kids[0]];
+        if (c->kind == N_IDENT) {
+            int si = sym_find(c->s, c->slen);
+            return fn_return_struct(si);
+        }
+    }
+    if (n->kind == N_GROUP && n->nkids >= 1) {
+        return type_of_expr(n->kids[0]);
     }
     return -1;
 }
@@ -3358,70 +3488,60 @@ static void lower_struct_lit(int node)
 {
     AstNode *n = &g_nodes[node];
     int sn = (n->s && n->slen > 0) ? find_struct(n->s, n->slen) : -1;
-    if (sn < 0) {
-        /* Unknown struct type (anonymous literal or forward reference).
-         * Allocate one slot per field, fill in declaration order.       */
-        int bytes = n->nkids * 8;
-        if (bytes <= 0 || bytes > 16384) {
-            for (int i = 0; i < n->nkids; i++) {
-                AstNode *fi = &g_nodes[n->kids[i]];
-                if (fi->nkids > 0) lower_expr(fi->kids[0]);
-            }
-            emit_mov_rax_imm64(0);
-            return;
+
+    int nfields = 0;
+    if (sn >= 0) nfields = g_nodes[sn].nkids;
+    else         nfields = n->nkids;
+
+    int bytes = nfields * 8;
+    if (bytes <= 0 || bytes > 1024 * 1024) {
+        for (int i = 0; i < n->nkids; i++) {
+            AstNode *fi = &g_nodes[n->kids[i]];
+            if (fi->nkids > 0) lower_expr(fi->kids[0]);
         }
-        emit_sub_rsp_imm32(bytes);
+        emit_mov_rax_imm64(0);
+        return;
+    }
+
+    /* Allocate on the heap so the pointer outlives the caller.  Park
+     * the base in rbx, push the caller's rbx first so nested literals
+     * nest cleanly — each level saves and restores its own copy.     */
+    emit_push_r(3 /* rbx */);
+    emit_bump_alloc(bytes);
+    emit_mov_r_r(3 /* rbx */, REG_RAX);
+
+    /* Zero every slot so missing initialisers read as 0 (the bump
+     * allocator does not zero fresh memory by default).              */
+    emit_mov_rax_imm64(0);
+    for (int i = 0; i < nfields; i++) {
+        emit_mov_mem_rbx_disp32_rax(i * 8);
+    }
+
+    if (sn < 0) {
+        /* Anonymous / unknown struct — fill in user-supplied order.   */
         for (int i = 0; i < n->nkids; i++) {
             AstNode *fi = &g_nodes[n->kids[i]];
             if (fi->nkids > 0) lower_expr(fi->kids[0]);
             else emit_mov_rax_imm64(0);
-            int32_t disp = i * 8;
-            if (disp >= -128 && disp <= 127)
-                emit_mov_rsp_disp8_rax((int8_t)disp);
-            else
-                emit_mov_rsp_disp32_rax(disp);
+            emit_mov_mem_rbx_disp32_rax(i * 8);
         }
-        emit_mov_rax_rsp();
-        return;
+    } else {
+        /* Known struct — each initialiser lands at its declared slot. */
+        for (int i = 0; i < n->nkids; i++) {
+            AstNode *fi = &g_nodes[n->kids[i]];
+            int fidx = struct_field_index(sn, fi->s, fi->slen);
+            if (fidx < 0) {
+                if (fi->nkids > 0) lower_expr(fi->kids[0]);
+                continue;
+            }
+            if (fi->nkids > 0) lower_expr(fi->kids[0]);
+            else emit_mov_rax_imm64(0);
+            emit_mov_mem_rbx_disp32_rax(fidx * 8);
+        }
     }
 
-    /* Known struct — use declared field order for offsets, fill in the
-     * user-supplied order.  Unmentioned fields stay zero (the slot is
-     * written only if the literal supplies a value for that field).    */
-    int bytes = struct_size(sn);
-    if (bytes > 16384) {
-        emit_mov_rax_imm64(0);
-        return;
-    }
-    emit_sub_rsp_imm32(bytes);
-    /* Zero every slot so missing initialisers are deterministic.       */
-    if (bytes > 0) {
-        emit_mov_rax_imm64(0);
-        for (int i = 0; i < g_nodes[sn].nkids; i++) {
-            int32_t disp = i * 8;
-            if (disp >= -128 && disp <= 127)
-                emit_mov_rsp_disp8_rax((int8_t)disp);
-            else
-                emit_mov_rsp_disp32_rax(disp);
-        }
-    }
-    for (int i = 0; i < n->nkids; i++) {
-        AstNode *fi = &g_nodes[n->kids[i]];
-        int fidx = struct_field_index(sn, fi->s, fi->slen);
-        if (fidx < 0) {
-            /* Field not in struct — tolerantly evaluate for side-effects. */
-            if (fi->nkids > 0) lower_expr(fi->kids[0]);
-            continue;
-        }
-        if (fi->nkids > 0) lower_expr(fi->kids[0]);
-        else emit_mov_rax_imm64(0);
-        int32_t disp = fidx * 8;
-        if (disp >= -128 && disp <= 127)
-            emit_mov_rsp_disp8_rax((int8_t)disp);
-        else
-            emit_mov_rsp_disp32_rax(disp);
-    }
-    emit_mov_rax_rsp();
+    emit_mov_r_r(REG_RAX, 3 /* rbx */);
+    emit_pop_r(3 /* rbx */);
 }
 
 static void lower_expr(int node)
@@ -3478,25 +3598,17 @@ static void lower_expr(int node)
              *   i1 == 0:  [v1, v2, ...]     — N elements, each evaluated
              *   i1 == 1:  [v; N]           — one value, repeated N times
              *
-             * Either way we allocate N*8 bytes on the current function's
-             * stack frame.  Two constraints keep this MVP usable without
-             * a real heap:
-             *   - N must be a compile-time int literal (the bootstrap has
-             *     no runtime alloca).  Non-literal counts fall back to
-             *     the old behaviour (evaluate for side-effects, return 0).
-             *   - Arrays can't escape — the pointer is valid only while
-             *     the enclosing function is on the stack.
-             *
-             * A further cap (MAX_ARRAY_BYTES) prevents a runaway literal
-             * like [0; 131072] from eating the whole default stack.     */
-            const int MAX_ARRAY_BYTES = 16384;    /* 2048 slots */
+             * Both forms bump-allocate N*8 bytes from the global heap.
+             * The heap pointer lives in a dedicated BSS slot; struct and
+             * array literals consume it directly so the returned pointer
+             * survives the enclosing function's return.                 */
+            const int MAX_ARRAY_BYTES = 1024 * 1024;    /* 128 Ki slots */
             int count = 0;
             int is_repeat = n->i1;
             if (is_repeat) {
                 if (n->nkids < 2) { emit_mov_rax_imm64(0); return; }
                 AstNode *cn = &g_nodes[n->kids[1]];
                 if (cn->kind != N_INT || cn->iv < 0) {
-                    /* Dynamic count — tolerant fallback. */
                     for (int i = 0; i < n->nkids; i++) lower_expr(n->kids[i]);
                     emit_mov_rax_imm64(0);
                     return;
@@ -3511,30 +3623,23 @@ static void lower_expr(int node)
                 emit_mov_rax_imm64(0);
                 return;
             }
-            emit_sub_rsp_imm32(bytes);
+            /* Save caller's rbx, park the fresh heap pointer there. */
+            emit_push_r(3 /* rbx */);
+            emit_bump_alloc(bytes);                /* rax = base */
+            emit_mov_r_r(3 /* rbx */, REG_RAX);    /* rbx = base */
             if (is_repeat) {
-                lower_expr(n->kids[0]);       /* rax = v */
-                /* Store same v into every slot. */
+                lower_expr(n->kids[0]);            /* rax = v */
                 for (int i = 0; i < count; i++) {
-                    int32_t disp = i * 8;
-                    if (disp >= -128 && disp <= 127) {
-                        emit_mov_rsp_disp8_rax((int8_t)disp);
-                    } else {
-                        emit_mov_rsp_disp32_rax(disp);
-                    }
+                    emit_mov_mem_rbx_disp32_rax(i * 8);
                 }
             } else {
                 for (int i = 0; i < count; i++) {
                     lower_expr(n->kids[i]);
-                    int32_t disp = i * 8;
-                    if (disp >= -128 && disp <= 127) {
-                        emit_mov_rsp_disp8_rax((int8_t)disp);
-                    } else {
-                        emit_mov_rsp_disp32_rax(disp);
-                    }
+                    emit_mov_mem_rbx_disp32_rax(i * 8);
                 }
             }
-            emit_mov_rax_rsp();               /* rax = array pointer */
+            emit_mov_r_r(REG_RAX, 3 /* rbx */);    /* rax = base */
+            emit_pop_r(3 /* rbx */);
             return;
         }
         case N_INDEX: {
@@ -3664,11 +3769,10 @@ static void lower_stmt(int node)
             emit_ret();
             return;
         case N_LET: {
-            /* child 0: type (may be placeholder), child 1: value */
             int li = local_add(n->s, n->slen, 0, 0);
             int val = n->kids[n->nkids - 1];
             /* Propagate the declared or inferred struct type so later
-             * field accesses can compute real offsets.                 */
+             * field accesses compute real offsets.                    */
             if (n->nkids >= 2) {
                 AstNode *ty = &g_nodes[n->kids[0]];
                 if (ty->kind == N_TYPE && ty->s && ty->slen > 0 &&
@@ -3677,11 +3781,12 @@ static void lower_stmt(int node)
                     g_locals[li].type_name_len = ty->slen;
                 }
             }
-            AstNode *vn = &g_nodes[val];
-            if (g_locals[li].type_name == NULL && vn->kind == N_STRUCT_LIT
-                && vn->s && vn->slen > 0) {
-                g_locals[li].type_name = vn->s;
-                g_locals[li].type_name_len = vn->slen;
+            if (g_locals[li].type_name == NULL) {
+                int sn = type_of_expr(val);
+                if (sn >= 0) {
+                    g_locals[li].type_name = g_nodes[sn].s;
+                    g_locals[li].type_name_len = g_nodes[sn].slen;
+                }
             }
             lower_expr(val);
             emit_mov_rbp_disp_rax(g_locals[li].offset);
@@ -3699,11 +3804,12 @@ static void lower_stmt(int node)
                        mirrors that rule to accept real Luna source. */
                     li = local_add(ln->s, ln->slen, 0, 0);
                 }
-                AstNode *rn = &g_nodes[rhs];
-                if (g_locals[li].type_name == NULL && rn->kind == N_STRUCT_LIT
-                    && rn->s && rn->slen > 0) {
-                    g_locals[li].type_name = rn->s;
-                    g_locals[li].type_name_len = rn->slen;
+                if (g_locals[li].type_name == NULL) {
+                    int sn = type_of_expr(rhs);
+                    if (sn >= 0) {
+                        g_locals[li].type_name = g_nodes[sn].s;
+                        g_locals[li].type_name_len = g_nodes[sn].slen;
+                    }
                 }
                 lower_expr(rhs);
                 emit_mov_rbp_disp_rax(g_locals[li].offset);
@@ -3884,6 +3990,11 @@ static void lower_all(void)
     /* Emit _start.  The shape depends on the output target: Linux uses the
      * exit_group syscall, Windows routes through ExitProcess in the IAT.  */
     int start_off = g_code_len;
+    /* Initialise the bump-allocator: _luna_heap_top = &_luna_heap_base.
+     * This runs before main() so every struct / array literal has a live
+     * heap to draw from.                                                */
+    emit_lea_rax_rip_bss(BSS_HEAP_BASE_OFF);
+    emit_mov_mem_rip_rax_bss(BSS_HEAP_TOP_OFF);
     if (g_target == TARGET_WINDOWS) {
         /* Win64 _start: sub rsp,40 (align+shadow) ; call main ; mov rcx,rax
          *               ; call [iat_ExitProcess]                            */
@@ -3969,6 +4080,7 @@ static void lower_all(void)
 
 #define V_BASE   0x400000
 #define V_TEXT   0x401000
+#define V_BSS    0x500000       /* second PT_LOAD — zero-filled heap    */
 
 static void write_u8 (FILE *f, uint8_t  v) { fputc(v, f); }
 static void write_u16(FILE *f, uint16_t v) {
@@ -3983,9 +4095,8 @@ static void write_u64(FILE *f, uint64_t v) {
 
 static void write_elf64(const char *out_path)
 {
-    /* Finalise rodata: append rodata to code buffer region and patch lea-rip. */
     int text_len = g_code_len;
-    int rodata_off_in_file = text_len;  /* placed right after .text */
+    int rodata_off_in_file = text_len;
     for (int i = 0; i < g_nrodrelocs; i++) {
         RodataReloc *r = &g_rodrelocs[i];
         int text_vaddr_of_rip = V_TEXT + r->from_rip;
@@ -3993,63 +4104,77 @@ static void write_elf64(const char *out_path)
         int32_t disp = rodata_vaddr - text_vaddr_of_rip;
         code_patch_u32(r->code_off, (uint32_t)disp);
     }
+    /* Patch BSS relocs — the bump-allocator pointer and heap base live
+     * in a second PT_LOAD anchored at V_BSS.                           */
+    for (int i = 0; i < g_nbssrelocs; i++) {
+        BssReloc *r = &g_bssrelocs[i];
+        int rip    = V_TEXT + r->code_off + 4;
+        int target = V_BSS  + r->bss_off;
+        int32_t disp = (int32_t)(target - rip);
+        code_patch_u32(r->code_off, (uint32_t)disp);
+    }
 
-    /* File layout */
     uint64_t ehdr_size = 64;
     uint64_t phdr_size = 56;
     uint64_t text_file_off = 0x1000;
     uint64_t total_text_rod = (uint64_t)text_len + (uint64_t)g_rodata_len;
-    uint64_t mem_size = total_text_rod;
 
     FILE *f = fopen(out_path, "wb");
     if (!f) { fprintf(stderr, "luna-boot: cannot open '%s' for writing\n", out_path); exit(1); }
 
-    /* ELF header */
     write_u8(f, 0x7f); write_u8(f, 'E'); write_u8(f, 'L'); write_u8(f, 'F');
     write_u8(f, 2);     /* ELFCLASS64     */
     write_u8(f, 1);     /* little-endian  */
     write_u8(f, 1);     /* EI_VERSION     */
     write_u8(f, 0);     /* SysV ABI       */
     write_u8(f, 0);     /* ABI version    */
-    for (int i = 0; i < 7; i++) write_u8(f, 0);   /* padding */
+    for (int i = 0; i < 7; i++) write_u8(f, 0);
 
-    write_u16(f, 2);            /* e_type = ET_EXEC    */
-    write_u16(f, 62);           /* e_machine = EM_X86_64 */
-    write_u32(f, 1);            /* e_version            */
-    write_u64(f, V_TEXT);       /* e_entry              */
-    write_u64(f, ehdr_size);    /* e_phoff              */
-    write_u64(f, 0);            /* e_shoff              */
-    write_u32(f, 0);            /* e_flags              */
-    write_u16(f, (uint16_t)ehdr_size); /* e_ehsize      */
-    write_u16(f, (uint16_t)phdr_size); /* e_phentsize   */
-    write_u16(f, 1);            /* e_phnum              */
-    write_u16(f, 0);            /* e_shentsize          */
-    write_u16(f, 0);            /* e_shnum              */
-    write_u16(f, 0);            /* e_shstrndx           */
+    write_u16(f, 2);
+    write_u16(f, 62);
+    write_u32(f, 1);
+    write_u64(f, V_TEXT);
+    write_u64(f, ehdr_size);
+    write_u64(f, 0);
+    write_u32(f, 0);
+    write_u16(f, (uint16_t)ehdr_size);
+    write_u16(f, (uint16_t)phdr_size);
+    write_u16(f, 2);                    /* e_phnum: text + bss        */
+    write_u16(f, 0);
+    write_u16(f, 0);
+    write_u16(f, 0);
 
-    /* Program header: PT_LOAD covering text (and rodata). */
-    write_u32(f, 1);                 /* PT_LOAD                */
-    write_u32(f, 5);                 /* PF_R | PF_X            */
-    write_u64(f, text_file_off);     /* p_offset               */
-    write_u64(f, V_TEXT);            /* p_vaddr                */
-    write_u64(f, V_TEXT);            /* p_paddr                */
-    write_u64(f, mem_size);          /* p_filesz               */
-    write_u64(f, mem_size);          /* p_memsz                */
-    write_u64(f, 0x1000);            /* p_align                */
+    /* PT_LOAD 0: .text + .rodata (R-X).                               */
+    write_u32(f, 1);
+    write_u32(f, 5);
+    write_u64(f, text_file_off);
+    write_u64(f, V_TEXT);
+    write_u64(f, V_TEXT);
+    write_u64(f, total_text_rod);
+    write_u64(f, total_text_rod);
+    write_u64(f, 0x1000);
 
-    /* Pad to text_file_off */
+    /* PT_LOAD 1: .bss (RW-).  filesz=0 — kernel zero-fills memsz bytes.
+     * Placed at V_BSS regardless of the .text end so bss_off arithmetic
+     * is predictable.                                                  */
+    write_u32(f, 1);
+    write_u32(f, 6);                   /* PF_R | PF_W                  */
+    write_u64(f, 0);                   /* p_offset — no file content   */
+    write_u64(f, V_BSS);
+    write_u64(f, V_BSS);
+    write_u64(f, 0);                   /* p_filesz                     */
+    write_u64(f, BSS_BYTES);           /* p_memsz                      */
+    write_u64(f, 0x1000);
+
     long pos = ftell(f);
     if (pos < 0) { fprintf(stderr, "luna-boot: ftell failed\n"); exit(1); }
     for (long p = pos; p < (long)text_file_off; p++) fputc(0, f);
 
-    /* Text */
     fwrite(g_code, 1, (size_t)text_len, f);
-    /* Rodata immediately after */
     if (g_rodata_len > 0) fwrite(g_rodata, 1, (size_t)g_rodata_len, f);
 
     fclose(f);
 
-    /* Make the result executable. */
     if (chmod(out_path, 0755) != 0) {
         /* non-fatal */
     }
@@ -4146,6 +4271,13 @@ static void write_pe64(const char *out_path)
     uint32_t ilt_rva    = rdata_rva + ilt_off;
     uint32_t import_dir_rva = rdata_rva + import_dir_off;
 
+    /* .bss — uninitialised, writable.  Placed immediately after .rdata.
+     * SizeOfRawData is zero so the file size doesn't blow up; the
+     * Windows loader zero-fills VirtualSize bytes in memory.          */
+    uint32_t bss_rva     = rdata_rva + rdata_vsize;
+    uint32_t bss_vsize   = (uint32_t)BSS_BYTES;
+    uint32_t bss_vsize_a = pe_align_up(bss_vsize, PE_SECTION_ALIGN);
+
     /* ---- Fill IAT / ILT / hint-name / DLL-name / import-dir in g_rodata ---- */
 
     /* IAT and ILT entries point at the hint/name RVAs.  Bit 63 = 0 so they
@@ -4215,9 +4347,17 @@ static void write_pe64(const char *out_path)
         int32_t disp  = (int32_t)(target - rip);
         code_patch_u32(r->code_off, (uint32_t)disp);
     }
+    /* Patch BSS relocs.                                                   */
+    for (int i = 0; i < g_nbssrelocs; i++) {
+        BssReloc *r = &g_bssrelocs[i];
+        uint32_t rip   = text_rva + r->code_off + 4;
+        uint32_t target = bss_rva + r->bss_off;
+        int32_t disp  = (int32_t)(target - rip);
+        code_patch_u32(r->code_off, (uint32_t)disp);
+    }
 
-    uint32_t size_of_headers = pe_align_up((uint32_t)0x1a0, PE_FILE_ALIGN);
-    uint32_t size_of_image   = rdata_rva + rdata_vsize;
+    uint32_t size_of_headers = pe_align_up((uint32_t)0x1c8, PE_FILE_ALIGN);
+    uint32_t size_of_image   = bss_rva + bss_vsize_a;
     uint32_t addr_of_entry   = text_rva;   /* entry is at offset 0 of .text */
 
     FILE *f = fopen(out_path, "wb");
@@ -4233,7 +4373,7 @@ static void write_pe64(const char *out_path)
 
     /* ---- COFF header (20 bytes) --------------------------------------- */
     write_u16(f, 0x8664);          /* Machine = IMAGE_FILE_MACHINE_AMD64  */
-    write_u16(f, 2);               /* NumberOfSections                    */
+    write_u16(f, 3);               /* NumberOfSections: text + rdata + bss */
     write_u32(f, 0);               /* TimeDateStamp                       */
     write_u32(f, 0);               /* PointerToSymbolTable                */
     write_u32(f, 0);               /* NumberOfSymbols                     */
@@ -4246,7 +4386,7 @@ static void write_pe64(const char *out_path)
     write_u8 (f, 0);               /* MinorLinkerVersion                  */
     write_u32(f, text_file_size);  /* SizeOfCode                          */
     write_u32(f, rdata_file_size); /* SizeOfInitializedData               */
-    write_u32(f, 0);               /* SizeOfUninitializedData             */
+    write_u32(f, bss_vsize);       /* SizeOfUninitializedData             */
     write_u32(f, addr_of_entry);   /* AddressOfEntryPoint (RVA)           */
     write_u32(f, text_rva);        /* BaseOfCode (RVA)                    */
     write_u64(f, PE_IMAGE_BASE);   /* ImageBase                           */
@@ -4299,6 +4439,19 @@ static void write_pe64(const char *out_path)
     write_u32(f, 0);
     write_u16(f, 0); write_u16(f, 0);
     write_u32(f, 0x40000040);           /* READ | INITIALIZED_DATA */
+    /* .bss — zero-filled heap.  SizeOfRawData = 0, PointerToRawData = 0
+     * means the loader commits bss_vsize bytes of zero-init memory at
+     * bss_rva without consuming any file bytes.                         */
+    write_u8(f, '.'); write_u8(f, 'b'); write_u8(f, 's'); write_u8(f, 's');
+    write_u8(f, 0);   write_u8(f, 0);   write_u8(f, 0);   write_u8(f, 0);
+    write_u32(f, bss_vsize);
+    write_u32(f, bss_rva);
+    write_u32(f, 0);
+    write_u32(f, 0);
+    write_u32(f, 0);
+    write_u32(f, 0);
+    write_u16(f, 0); write_u16(f, 0);
+    write_u32(f, 0xC0000080);           /* READ | WRITE | UNINITIALIZED_DATA */
 
     /* ---- Pad to text_file_off ---------------------------------------- */
     long pos = ftell(f);
