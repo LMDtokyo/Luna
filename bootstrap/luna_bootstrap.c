@@ -939,6 +939,9 @@ static Tok *tok_at(int i) { return &g_toks[i]; }
 static Tok *peek(void)    { return &g_toks[g_tpos]; }
 static Tok *peek_n(int n) { return &g_toks[g_tpos + n]; }
 
+/* Forward declarations for helpers defined later. */
+static int ffi_register(const char *name, int len);
+
 /* Human-readable name for a token kind — turns "kind=72" into "','". */
 static const char *tok_name(int k)
 {
@@ -2537,6 +2540,12 @@ static void tc_collect_decl(int d)
                         n->slen, n->s);
             }
         }
+        if (n->i2 == 2) {  /* extern "C" — Windows FFI via IAT          */
+            if (g_target == TARGET_WINDOWS) {
+                int slot = ffi_register(n->s, n->slen);
+                g_syms[s].syscall_nr = slot;   /* reuse field as IAT idx */
+            }
+        }
     } else if (n->kind == N_CONST) {
         sym_add(N_CONST, n->s, n->slen, d);
     } else if (n->kind == N_STRUCT) {
@@ -2969,16 +2978,51 @@ static void emit_lea_rax_rip_rodata(int rodata_off)
  *     call qword ptr [rip + disp32]           (FF 15 xx xx xx xx)
  * For each emission we record the 4-byte slot and which IAT entry it
  * points at; the PE writer patches disp once final RVAs are known.    */
+/* Named slots for the original handful of Windows imports shine() /
+ * print() / exit() rely on.  These correspond to the first entries in
+ * g_imports[] below.                                                  */
 enum {
     IAT_GETSTDHANDLE = 0,
-    IAT_WRITEFILE,
-    IAT_EXITPROCESS,
-    IAT_COUNT
+    IAT_WRITEFILE    = 1,
+    IAT_EXITPROCESS  = 2
 };
 
+/* Import descriptor.  The PE backend builds the IAT/ILT/hint-name
+ * tables from whatever ends up here by the time write_pe64 runs.
+ * Entries 0..2 above are pre-registered unconditionally so shine /
+ * print / exit can rely on them; further entries are added lazily by
+ * ffi_register() when the parser sees `extern "C" fn Foo(...)`.       */
+#define MAX_IMPORTS 256
+static const char *g_imports[MAX_IMPORTS];
+static int         g_nimports;
+
+static int ffi_register(const char *name, int len)
+{
+    for (int i = 0; i < g_nimports; i++) {
+        if ((int)strlen(g_imports[i]) == len &&
+            memcmp(g_imports[i], name, len) == 0) {
+            return i;
+        }
+    }
+    if (g_nimports >= MAX_IMPORTS) {
+        fprintf(stderr, "luna-boot: too many FFI imports\n"); exit(1);
+    }
+    char *buf = arena_strndup(name, len);
+    g_imports[g_nimports] = buf;
+    return g_nimports++;
+}
+
+/* Seed the core slots at startup so their enum positions are stable. */
+static void ffi_init_core(void)
+{
+    ffi_register("GetStdHandle", 12);
+    ffi_register("WriteFile",    9);
+    ffi_register("ExitProcess",  11);
+}
+
 typedef struct {
-    int code_off;   /* offset of the disp32 slot                           */
-    int iat_slot;   /* which entry in the IAT (0 .. IAT_COUNT-1)           */
+    int code_off;
+    int iat_slot;
 } IatReloc;
 
 #define MAX_IAT_RELOCS 8192
@@ -3581,7 +3625,20 @@ static void lower_call(int node)
         return;
     }
     if (is_extern_c) {
-        /* Phase A4 will route this through a generalized IAT / GOT.    */
+        if (g_target == TARGET_WINDOWS && s->syscall_nr >= 0) {
+            /* extern "C" fn via IAT.  Args arrived in sysv order — shuffle
+             * to Win64 order (rcx,rdx,r8,r9) before the call.  Reverse
+             * order so sources aren't clobbered before use.             */
+            if (reg_args >= 4) emit_mov_r_r(9 /* r9 */,  REG_RCX);
+            if (reg_args >= 3) emit_mov_r_r(8 /* r8 */,  REG_RDX);
+            if (reg_args >= 2) emit_mov_r_r(REG_RDX,     REG_RSI);
+            if (reg_args >= 1) emit_mov_r_r(REG_RCX,     REG_RDI);
+            emit_sub_rsp_imm8(32);                /* shadow space         */
+            emit_call_iat(s->syscall_nr);
+            emit_add_rsp_imm8(32);
+            return;
+        }
+        /* Linux / unresolved: trap.  Full ELF dynamic linking pending.  */
         emit_int3();
         return;
     }
@@ -4544,26 +4601,23 @@ static void write_pe64(const char *out_path)
     /* ---- Build .rdata contents (rodata | imports).  We need to know the
      * final .rdata RVA before patching any code relocs, but the IAT slot
      * offsets within .rdata are static given the layout below.          */
-    const char *imp_names[IAT_COUNT] = {
-        "GetStdHandle", "WriteFile", "ExitProcess"
-    };
+    int n_imports = g_nimports;
+    const char **imp_names = g_imports;
 
-    /* The length-prefixed user rodata already lives in g_rodata[0..g_rodata_len).
-     * Append: IAT, ILT, hint/name entries, DLL name, import directory.   */
     int user_rod_size = g_rodata_len;
     int cur = pe_align_up((uint32_t)user_rod_size, 8);
 
     int iat_off = cur;
-    cur += (IAT_COUNT + 1) * 8;   /* 3 thunks + terminator */
+    cur += (n_imports + 1) * 8;
     int ilt_off = cur;
-    cur += (IAT_COUNT + 1) * 8;
+    cur += (n_imports + 1) * 8;
 
-    int hint_off[IAT_COUNT];
-    for (int i = 0; i < IAT_COUNT; i++) {
+    int hint_off[MAX_IMPORTS];
+    for (int i = 0; i < n_imports; i++) {
         hint_off[i] = cur;
         int nl = (int)strlen(imp_names[i]);
-        int size = 2 + nl + 1;       /* hint + ASCIIZ */
-        if (size & 1) size++;        /* 2-byte align */
+        int size = 2 + nl + 1;
+        if (size & 1) size++;
         cur += size;
     }
     int dll_name_off = cur;
@@ -4609,27 +4663,25 @@ static void write_pe64(const char *out_path)
 
     /* IAT and ILT entries point at the hint/name RVAs.  Bit 63 = 0 so they
      * are "by name" imports, not ordinals.                              */
-    for (int i = 0; i < IAT_COUNT; i++) {
+    for (int i = 0; i < n_imports; i++) {
         uint64_t ptr_by_name = (uint64_t)(rdata_rva + hint_off[i]);
         uint8_t *p = g_rodata + iat_off + i * 8;
         for (int b = 0; b < 8; b++) p[b] = (uint8_t)(ptr_by_name >> (b * 8));
         uint8_t *q = g_rodata + ilt_off + i * 8;
         for (int b = 0; b < 8; b++) q[b] = (uint8_t)(ptr_by_name >> (b * 8));
     }
-    /* Terminators */
     for (int b = 0; b < 8; b++) {
-        g_rodata[iat_off + IAT_COUNT * 8 + b] = 0;
-        g_rodata[ilt_off + IAT_COUNT * 8 + b] = 0;
+        g_rodata[iat_off + n_imports * 8 + b] = 0;
+        g_rodata[ilt_off + n_imports * 8 + b] = 0;
     }
 
-    /* Hint/name entries */
-    for (int i = 0; i < IAT_COUNT; i++) {
+    for (int i = 0; i < n_imports; i++) {
         uint8_t *p = g_rodata + hint_off[i];
-        p[0] = 0; p[1] = 0;                     /* hint = 0 */
+        p[0] = 0; p[1] = 0;
         int nl = (int)strlen(imp_names[i]);
         memcpy(p + 2, imp_names[i], (size_t)nl);
         p[2 + nl] = 0;
-        if ((2 + nl + 1) & 1) p[2 + nl + 1] = 0;  /* padding byte */
+        if ((2 + nl + 1) & 1) p[2 + nl + 1] = 0;
     }
 
     /* DLL name */
@@ -4738,7 +4790,7 @@ static void write_pe64(const char *out_path)
     for (int i = 0; i < 16; i++) {
         uint32_t rva = 0, size = 0;
         if (i == 1) { rva = import_dir_rva; size = 20; }       /* Import table */
-        if (i == 12){ rva = iat_rva;        size = (IAT_COUNT + 1) * 8; } /* IAT */
+        if (i == 12){ rva = iat_rva;        size = (n_imports + 1) * 8; } /* IAT */
         write_u32(f, rva);
         write_u32(f, size);
     }
@@ -4896,6 +4948,7 @@ int main(int argc, char **argv)
     memset(g_code,   0, CODE_CAP);
     memset(g_rodata, 0, RODATA_CAP);
 
+    ffi_init_core();
     add_default_include_paths(input);
 
     /* Auto-load prelude.luna if available.  It lives next to the
