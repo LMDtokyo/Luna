@@ -1,304 +1,141 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/LMDtokyo/Luna/main/assets/luna-logo.svg" width="200" alt="Luna Logo">
+  <img src="https://raw.githubusercontent.com/LMDtokyo/Luna/main/editors/vscode/images/banner.jpg" width="420" alt="Luna programming language">
 </p>
 
 <h1 align="center">Luna</h1>
 
 <p align="center">
-  <strong>The Future of Systems Programming</strong>
+  A cosmic-themed systems programming language with an indent-based
+  syntax, a standalone C bootstrap compiler, and no dependency on Rust,
+  Cargo, or LLVM.
 </p>
 
 <p align="center">
-  <a href="#installation">Installation</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#features">Features</a> •
-  <a href="#documentation">Docs</a> •
-  <a href="#benchmarks">Benchmarks</a>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/version-4.2.0-blue?style=flat-square" alt="Version">
-  <img src="https://img.shields.io/badge/self--hosted-100%25-success?style=flat-square" alt="Self-Hosted">
-  <img src="https://img.shields.io/badge/license-GPLv3-green?style=flat-square" alt="License">
-  <img src="https://github.com/LMDtokyo/Luna/workflows/CI/badge.svg" alt="CI">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-blue?style=flat-square" alt="License"></a>
+  <img src="https://img.shields.io/badge/bootstrap-C99-orange?style=flat-square" alt="Bootstrap">
+  <img src="https://img.shields.io/badge/status-early-yellow?style=flat-square" alt="Status">
 </p>
 
 ---
 
-## What is Luna?
+## Status
 
-Luna is a modern systems programming language that combines:
+Luna is under active development. The current milestone is **self-hosting
+via a C99 bootstrap compiler**:
 
-- **Rust-level safety** — Ownership system prevents memory errors at compile time
-- **C-level performance** — Zero-cost abstractions, native compilation
-- **Python-level productivity** — Clean syntax, powerful type inference
+| Component | State |
+|---|---|
+| Bootstrap compiler (`bootstrap/luna_bootstrap.c`) | ~3.4 KLOC C99, x86-64 codegen, ELF64 output |
+| Core modules compiled through bootstrap | 19 / 19 |
+| Stdlib modules compiled through bootstrap | partial |
+| Self-hosted compiler (compile Luna with Luna) | in progress |
+| `luna` CLI / package manager | not yet |
+| VS Code extension | [editors/vscode](editors/vscode) — v0.1.3 |
+
+The language, grammar, and core modules are complete enough that the
+bootstrap can parse, lower, and emit running Linux binaries from all
+19 core files — a working foundation to replace with a Luna-in-Luna
+compiler.
+
+## Cosmic syntax
+
+Luna uses a deliberately distinct keyword set so programs look like
+Luna, not C or Rust dressed up:
+
+| Keyword | Role |
+|---|---|
+| `shine` | Print to stdout |
+| `orbit` | `for` loop, e.g. `orbit @i in 0..10` |
+| `eclipse` | `else` clause / match arm introducer |
+| `phase` | Pattern match |
+| `nova` | Break / early termination |
+| `guard` | Early-return guard |
+| `seal` | Immutable binding (like `let` in Rust) |
+| `meow` | Mutable / top-level binding |
+| `spawn` | Concurrent task |
+| `defer` | Schedule cleanup |
+| `actor` / `flow` | Message-passing primitives |
+
+Variables are `@`-prefixed (`@count`, `@buffer`); comments start with `#`;
+blocks are off-side (indentation-based) with no `{}` in source.
+
+## Building from source
+
+The bootstrap compiler is a single C99 translation unit with no
+external dependencies. Any modern C compiler works.
+
+**Linux / macOS:**
+
+```sh
+cc -O2 -std=c99 -o bootstrap/luna-boot bootstrap/luna_bootstrap.c
+```
+
+**Windows (MinGW-w64 / LLVM MinGW):**
+
+```sh
+x86_64-w64-mingw32-clang -O2 -std=c99 -o bootstrap/luna-boot.exe bootstrap/luna_bootstrap.c
+```
+
+## Hello, Luna
+
+`bootstrap/hello.luna`:
 
 ```luna
-# Hello World in Luna
 fn main()
-    shine "Hello, Luna!"
-
-# Concurrent HTTP server in 10 lines
-fn server()
-    @app = http.create()
-
-    orbit @req in @app.listen(8080)
-        phase @req.path
-            "/hello" -> http.json({"message": "Hello!"})
-            "/users" -> spawn fetch_users(@req)
-            _ -> http.text("Not found", 404)
+    shine("Hello from Luna!")
 ```
 
-## Key Features
+Compile and run:
 
-### 100% Self-Hosted
-
-Luna v4.2 compiles itself. The entire compiler (45,413 lines) is written in Luna:
-
-```
-src/
-├── core/           # Compiler core (6 files, ~14K lines)
-│   ├── lexer.luna
-│   ├── parser.luna
-│   ├── types.luna      # Hindley-Milner type system
-│   ├── borrow_checker.luna
-│   ├── titan_opt.luna  # 8-pass optimizer
-│   └── main.luna
-├── stdlib/         # Standard library (18 files, ~29K lines)
-│   ├── io.luna, net.luna, http.luna, json.luna
-│   ├── crypto.luna, sync.luna, collections.luna
-│   └── ...
-└── lsp/            # Language server (pure Luna)
-    └── lsp.luna
+```sh
+./bootstrap/luna-boot bootstrap/hello.luna
+./a.out
+# Hello from Luna!
 ```
 
-### Cosmic Syntax
-
-Luna's "cosmic" keywords make code intention explicit:
-
-| Keyword | Purpose | Example |
-|---------|---------|---------|
-| `shine` | Return/emit value | `shine @result` |
-| `eclipse` | Defer until scope exit | `eclipse close(@file)` |
-| `orbit` | Iterate with cleanup | `orbit @x in @items` |
-| `phase` | Pattern matching | `phase @value` |
-| `spawn` | Concurrent task | `spawn process(@data)` |
-| `nova` | Async boundary | `nova fetch(@url)` |
-| `guard` | Early return | `guard @x > 0` |
-| `seal` | Immutable binding | `seal @config` |
-
-### Type System
-
-Full Hindley-Milner inference with algebraic data types:
+## Iteration and control flow
 
 ```luna
-type Result<T, E>
-    Ok(T)
-    Err(E)
-
-fn divide(@a: int, @b: int) -> Result<int, str>
-    guard @b != 0 else shine Err("division by zero")
-    shine Ok(@a / @b)
-
-# Usage - types are inferred
-@result = divide(10, 2)
-phase @result
-    Ok(@v) -> print("Result: " + @v)
-    Err(@e) -> print("Error: " + @e)
-```
-
-### Memory Safety
-
-Ownership and borrowing without a garbage collector:
-
-```luna
-fn process(@data: &[u8]) -> int      # Immutable borrow
-fn modify(@data: &mut [u8])          # Mutable borrow
-
-# Compile-time guarantees:
-# - No buffer overflows
-# - No use-after-free
-# - No data races
-# - No null pointers
-```
-
-## Installation
-
-### Quick Install (Recommended)
-
-```bash
-# Download and run installer
-curl -fsSL https://luna-lang.org/install.sh | sh
-
-# Or with cargo
-cargo install luna-lang
-```
-
-### From Source
-
-```bash
-git clone https://github.com/LMDtokyo/Luna.git
-cd Luna
-cargo build --release
-
-# Install system-wide
-./target/release/luna --install-system
-```
-
-### Verify Installation
-
-```bash
-luna --version
-# Luna 4.2.0 (bootstrap: 25 files, 45,413 lines, 100% native)
-
-luna --self-compile
-# Self-compile successful: 25/25 files, 45,413 lines
-```
-
-## Quick Start
-
-### Hello World
-
-```luna
-# hello.luna
 fn main()
-    shine "Hello, World!"
+    orbit @i in 0..5
+        if @i % 2 == 0
+            shine(@i.show() + " even")
+        else
+            shine(@i.show() + " odd")
 ```
 
-```bash
-luna run hello.luna
-# Hello, World!
-```
-
-### Build Native Binary
-
-```bash
-luna build hello.luna -o hello
-./hello
-```
-
-### HTTP Server
-
-```luna
-# server.luna
-import http
-
-fn main()
-    @app = http.create()
-
-    @app.get("/", fn(@req) ->
-        http.html("<h1>Welcome to Luna!</h1>")
-    )
-
-    @app.get("/api/users", fn(@req) ->
-        @users = db.query("SELECT * FROM users")
-        http.json(@users)
-    )
-
-    print("Server running on :8080")
-    @app.listen(8080)
-```
-
-### Concurrency
-
-```luna
-import sync
-
-fn main()
-    @results: [int] = []
-    @mutex = sync.mutex()
-
-    orbit @i in 0..10
-        spawn
-            @value = expensive_computation(@i)
-            sync.lock(@mutex)
-            @results.push(@value)
-            sync.unlock(@mutex)
-
-    sync.wait_all()
-    print("Results: " + @results)
-```
-
-## Benchmarks
-
-Performance compared to other languages (lower is better):
-
-| Benchmark | Luna | Rust | C | Go | Python |
-|-----------|------|------|---|----|----- |
-| Fibonacci(45) | 1.0x | 1.0x | 1.0x | 1.8x | 45x |
-| JSON parse 1MB | 1.0x | 0.9x | 0.8x | 1.5x | 12x |
-| HTTP RPS | 850K | 900K | 920K | 450K | 15K |
-| Binary size | 1.2MB | 1.1MB | 0.8MB | 3.5MB | — |
-| Compile time | 3.5s | — | — | — | — |
-
-## VS Code Extension
-
-Install the Luna extension for full IDE support:
-
-```bash
-# From VS Code marketplace
-ext install luna-team.luna-language
-
-# Or from .vsix
-code --install-extension editors/vscode/luna-language-1.7.0.vsix
-```
-
-Features:
-- Syntax highlighting for cosmic keywords
-- Real-time error checking via native LSP
-- Code completion with type info
-- Go-to-definition, find references
-- Format on save
-
-## Project Structure
+## Repository layout
 
 ```
 Luna/
+├── bootstrap/          C bootstrap compiler + demos
+│   ├── luna_bootstrap.c
+│   ├── hello.luna, fizzbuzz.luna, smoketest.luna, ...
+│   └── make_icon.py    (build-time utility)
 ├── src/
-│   ├── core/           # Compiler (lexer, parser, types, optimizer)
-│   ├── stdlib/         # Standard library (31 modules)
-│   └── lsp/            # Language server
+│   ├── core/           Compiler core (lexer, parser, types,
+│   │                   forge, lower, luna_build, ...)
+│   └── stdlib/         Standard library (crypto, veil, http,
+│                       net, sync, x509_roots, runtime_core, ...)
 ├── editors/
-│   └── vscode/         # VS Code extension v1.7.0
-├── LUNA_SPEC.md        # Language specification
-├── LICENSE             # GPLv3
-└── README.md
+│   └── vscode/         VS Code extension (highlighting,
+│                       icons, snippets, LSP client)
+├── assets/             Logos and icons
+├── docs/               Language notes
+├── LUNA_SPEC.md        Language reference
+└── LICENSE             GPL-3.0-only
 ```
 
-## Documentation
+## VS Code extension
 
-- [Language Specification](LUNA_SPEC.md)
-- [Getting Started Guide](https://luna-lang.org/docs/getting-started)
-- [Standard Library Reference](https://luna-lang.org/docs/stdlib)
-- [Cosmic Keywords Guide](https://luna-lang.org/docs/cosmic)
-
-## Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-```bash
-# Run tests
-cargo test
-
-# Run self-compile check
-luna --self-compile
-
-# Format code
-luna fmt src/
+```sh
+code --install-extension editors/vscode/luna-language-0.1.3.vsix
 ```
+
+Provides syntax highlighting, the raven file icon, snippets, and an
+optional LSP client that activates only when a `luna` toolchain is on
+`PATH`.
 
 ## License
 
-Luna is licensed under the [GNU General Public License v3.0](LICENSE).
-
----
-
-<p align="center">
-  <strong>Luna — where safety meets performance</strong>
-</p>
-
-<p align="center">
-  <a href="https://luna-lang.org">Website</a> •
-  <a href="https://github.com/LMDtokyo/Luna/issues">Issues</a> •
-  <a href="https://discord.gg/luna-lang">Discord</a>
-</p>
+GPL-3.0-only. See [LICENSE](LICENSE).

@@ -2,7 +2,7 @@
     "name": "luna-language",
     "displayName": "Luna",
     "description": "Syntax highlighting, file icons, snippets and language-server support for the Luna programming language.",
-    "version": "0.1.3",
+    "version": "0.1.4",
     "publisher": "luna-team",
     "icon": "icons/luna-128.png",
     "license": "GPL-3.0-only",

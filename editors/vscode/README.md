@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/LMDtokyo/Luna/main/editors/vscode/images/banner.jpg" width="420" alt="Luna programming language">
+</p>
+
 # Luna for Visual Studio Code
 
 Syntax highlighting, file icons, snippets and an optional language server
