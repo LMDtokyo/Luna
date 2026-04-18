@@ -310,6 +310,25 @@ static int      g_target = 0;
  * allocated the first time shine emits a print sequence.                  */
 static int      g_newline_str_idx = -1;
 
+/* Offset in g_code of the lazily-emitted `_luna_print_int` helper, or -1
+ * if the helper hasn't been requested yet.  The helper converts an integer
+ * (passed in rdi on Linux, rcx on Windows) to decimal and writes it to
+ * stdout followed by a newline.  All print_int / shine_int call sites
+ * emit a regular `call rel32` — the reloc is recorded in g_helper_relocs
+ * and patched once the helper's final offset is known.                    */
+static int      g_print_int_helper_off = -1;
+
+typedef struct {
+    int code_off;     /* offset of the 4-byte disp slot                    */
+    int helper;       /* HELPER_PRINT_INT (room for more later)            */
+} HelperReloc;
+
+enum { HELPER_PRINT_INT = 0 };
+
+#define MAX_HELPER_RELOCS 4096
+static HelperReloc g_helper_relocs[MAX_HELPER_RELOCS];
+static int         g_nhelper_relocs;
+
 /* Current function codegen state. */
 static Local    g_locals[256];
 static int      g_nlocals;
@@ -2985,12 +3004,16 @@ static void lower_call(int node)
         if (c->slen == 4 && memcmp(c->s, "exit", 4) == 0 && n->nkids >= 2) {
             lower_expr(n->kids[1]);                  /* rax = code */
             if (g_target == TARGET_WINDOWS) {
-                emit_mov_r_r(REG_RCX, REG_RAX);      /* rcx = code */
-                emit_sub_rsp_imm8(40);               /* shadow + align  */
+                /* Win64: callee-reserved 32-byte shadow region immediately
+                 * above rsp is required; we start 16-byte aligned inside a
+                 * Luna function (prologue guarantees it), so subtracting
+                 * exactly 32 preserves alignment across the call.         */
+                emit_mov_r_r(REG_RCX, REG_RAX);
+                emit_sub_rsp_imm8(32);
                 emit_call_iat(IAT_EXITPROCESS);
-                emit_int3();                         /* unreachable     */
+                emit_int3();
             } else {
-                emit_mov_r_r(REG_RDI, REG_RAX);      /* rdi = code */
+                emit_mov_r_r(REG_RDI, REG_RAX);
                 emit_mov_rax_imm64((uint64_t)SYS_EXIT_GROUP);
                 emit_syscall();
                 emit_int3();
@@ -4092,6 +4115,24 @@ int main(int argc, char **argv)
     memset(g_rodata, 0, RODATA_CAP);
 
     add_default_include_paths(input);
+
+    /* Auto-load prelude.luna if available.  It lives next to the
+     * luna_bootstrap.c source tree (bootstrap/prelude.luna) or on any
+     * include path.  Provides print_int, println_int and other tiny
+     * helpers written in Luna itself using the print()/shine() intrinsics. */
+    {
+        static const char *PRELUDE_NAMES[] = {
+            "bootstrap/prelude.luna", "prelude.luna", NULL
+        };
+        for (int i = 0; PRELUDE_NAMES[i]; i++) {
+            FILE *fp = fopen(PRELUDE_NAMES[i], "rb");
+            if (fp) {
+                fclose(fp);
+                (void)load_file(PRELUDE_NAMES[i]);
+                break;
+            }
+        }
+    }
 
     int root_idx = load_file(input);
     resolve_imports(root_idx);

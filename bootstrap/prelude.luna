@@ -1,0 +1,44 @@
+fn _pd(@d: int) -> int
+    if @d == 0
+        print("0")
+    if @d == 1
+        print("1")
+    if @d == 2
+        print("2")
+    if @d == 3
+        print("3")
+    if @d == 4
+        print("4")
+    if @d == 5
+        print("5")
+    if @d == 6
+        print("6")
+    if @d == 7
+        print("7")
+    if @d == 8
+        print("8")
+    if @d == 9
+        print("9")
+    return 0
+
+fn print_int(@n: int) -> int
+    if @n == 0
+        print("0")
+        return 0
+    if @n < 0
+        print("-")
+        @n = 0 - @n
+    if @n >= 10
+        print_int(@n / 10)
+    _pd(@n % 10)
+    return 0
+
+fn println_int(@n: int) -> int
+    print_int(@n)
+    shine("")
+    return 0
+
+fn shine_int(@n: int) -> int
+    print_int(@n)
+    shine("")
+    return 0

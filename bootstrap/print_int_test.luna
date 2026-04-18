@@ -1,0 +1,10 @@
+fn main() -> int
+    shine("print_int demo:")
+    println_int(0)
+    println_int(42)
+    println_int(-17)
+    println_int(1000000)
+    println_int(-2147483648)
+    print("sum = ")
+    println_int(1 + 2 + 3)
+    return 0
