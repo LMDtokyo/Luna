@@ -1,0 +1,23 @@
+fn main() -> int
+    @a = [10, 20, 30, 40, 50]
+    shine("array literal:")
+    println_int(@a[0])
+    println_int(@a[1])
+    println_int(@a[4])
+
+    @sum = 0
+    orbit @i in 0..5
+        @sum = @sum + @a[i]
+    shine("sum:")
+    println_int(@sum)
+
+    @b = [7; 8]
+    shine("repeat array [7; 8]:")
+    println_int(@b[0])
+    println_int(@b[3])
+    println_int(@b[7])
+
+    shine("mutate:")
+    @a[2] = 999
+    println_int(@a[2])
+    return 0

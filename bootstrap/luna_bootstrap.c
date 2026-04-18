@@ -1233,12 +1233,14 @@ static int parse_primary(void)
            bootstrap doesn't materialise arrays; self-hosted compiler does). */
         g_tpos++;
         int al = node_new(N_ARRAY_LIT, t);
+        g_nodes[al].i1 = 0;          /* 0 = list form [a, b, c] */
         if (peek()->kind != TK_RBRACK) {
             int first = parse_expr();
             node_add(al, first);
             if (accept(TK_SEMI)) {
                 int cnt = parse_expr();
                 node_add(al, cnt);
+                g_nodes[al].i1 = 1;  /* 1 = repeat form [v; N] */
             } else {
                 /* Cap stored elements to avoid overflowing the AST node's
                    child list — very large literals (X.509 trust store has
@@ -2648,6 +2650,42 @@ static void emit_mov_rax_rax_plus_8(void)
     uint8_t b[] = { 0x48, 0x8b, 0x40, 0x08 };
     code_emit_bytes(b, 4);
 }
+/* mov rax, rsp  (48 89 e0) */
+static void emit_mov_rax_rsp(void)
+{
+    uint8_t b[] = { 0x48, 0x89, 0xe0 };
+    code_emit_bytes(b, 3);
+}
+/* mov [rsp + disp8], rax — store rax to [rsp+disp8]  (48 89 44 24 disp) */
+static void emit_mov_rsp_disp8_rax(int8_t disp)
+{
+    uint8_t b[] = { 0x48, 0x89, 0x44, 0x24, (uint8_t)disp };
+    code_emit_bytes(b, 5);
+}
+/* mov [rsp + disp32], rax  (48 89 84 24 disp32) */
+static void emit_mov_rsp_disp32_rax(int32_t disp)
+{
+    uint8_t b[] = { 0x48, 0x89, 0x84, 0x24 };
+    code_emit_bytes(b, 4);
+    for (int i = 0; i < 4; i++) code_emit_byte((uint8_t)(disp >> (i * 8)));
+}
+/* mov rax, [rcx + rax*8]  (48 8b 04 c1) — array read: base=rcx, index=rax */
+static void emit_mov_rax_mem_rcx_rax_x8(void)
+{
+    uint8_t b[] = { 0x48, 0x8b, 0x04, 0xc1 };
+    code_emit_bytes(b, 4);
+}
+/* mov [rcx + rax*8], rdx  (48 89 14 c1) — array write */
+static void emit_mov_mem_rcx_rax_x8_rdx(void)
+{
+    uint8_t b[] = { 0x48, 0x89, 0x14, 0xc1 };
+    code_emit_bytes(b, 4);
+}
+/* mov rcx, rax  (48 89 c1) */
+static void emit_mov_rcx_rax2(void) { uint8_t b[]={0x48,0x89,0xc1}; code_emit_bytes(b,3); }
+/* pop rdx  (5a) */
+static void emit_pop_rdx(void) { code_emit_byte(0x5a); }
+
 /* mov reg, [rax + disp8]  (reg 0..7, signed 8-bit disp) */
 static void emit_mov_r_mem_rax_disp8(int reg, int8_t disp)
 {
@@ -3301,18 +3339,80 @@ static void lower_expr(int node)
             return;
         }
         case N_STRUCT_LIT: lower_struct_lit(node); return;
-        case N_ARRAY_LIT:
-            /* Evaluate children for side-effects; return 0 (opaque handle). */
-            for (int i = 0; i < n->nkids; i++) lower_expr(n->kids[i]);
-            emit_mov_rax_imm64(0);
+        case N_ARRAY_LIT: {
+            /* Two forms, disambiguated by i1:
+             *   i1 == 0:  [v1, v2, ...]     — N elements, each evaluated
+             *   i1 == 1:  [v; N]           — one value, repeated N times
+             *
+             * Either way we allocate N*8 bytes on the current function's
+             * stack frame.  Two constraints keep this MVP usable without
+             * a real heap:
+             *   - N must be a compile-time int literal (the bootstrap has
+             *     no runtime alloca).  Non-literal counts fall back to
+             *     the old behaviour (evaluate for side-effects, return 0).
+             *   - Arrays can't escape — the pointer is valid only while
+             *     the enclosing function is on the stack.
+             *
+             * A further cap (MAX_ARRAY_BYTES) prevents a runaway literal
+             * like [0; 131072] from eating the whole default stack.     */
+            const int MAX_ARRAY_BYTES = 16384;    /* 2048 slots */
+            int count = 0;
+            int is_repeat = n->i1;
+            if (is_repeat) {
+                if (n->nkids < 2) { emit_mov_rax_imm64(0); return; }
+                AstNode *cn = &g_nodes[n->kids[1]];
+                if (cn->kind != N_INT || cn->iv < 0) {
+                    /* Dynamic count — tolerant fallback. */
+                    for (int i = 0; i < n->nkids; i++) lower_expr(n->kids[i]);
+                    emit_mov_rax_imm64(0);
+                    return;
+                }
+                count = (int)cn->iv;
+            } else {
+                count = n->nkids;
+            }
+            int bytes = count * 8;
+            if (bytes <= 0 || bytes > MAX_ARRAY_BYTES) {
+                for (int i = 0; i < n->nkids; i++) lower_expr(n->kids[i]);
+                emit_mov_rax_imm64(0);
+                return;
+            }
+            emit_sub_rsp_imm32(bytes);
+            if (is_repeat) {
+                lower_expr(n->kids[0]);       /* rax = v */
+                /* Store same v into every slot. */
+                for (int i = 0; i < count; i++) {
+                    int32_t disp = i * 8;
+                    if (disp >= -128 && disp <= 127) {
+                        emit_mov_rsp_disp8_rax((int8_t)disp);
+                    } else {
+                        emit_mov_rsp_disp32_rax(disp);
+                    }
+                }
+            } else {
+                for (int i = 0; i < count; i++) {
+                    lower_expr(n->kids[i]);
+                    int32_t disp = i * 8;
+                    if (disp >= -128 && disp <= 127) {
+                        emit_mov_rsp_disp8_rax((int8_t)disp);
+                    } else {
+                        emit_mov_rsp_disp32_rax(disp);
+                    }
+                }
+            }
+            emit_mov_rax_rsp();               /* rax = array pointer */
             return;
-        case N_INDEX:
-            /* Evaluate base and index for side-effects; return 0.  Real
-               memory math lives in the self-hosted compiler. */
-            lower_expr(n->kids[0]);
-            lower_expr(n->kids[1]);
-            emit_mov_rax_imm64(0);
+        }
+        case N_INDEX: {
+            /* arr[i] — read.  Evaluate base, push; evaluate index into rax;
+             * pop base into rcx; mov rax, [rcx + rax*8].                  */
+            lower_expr(n->kids[0]);           /* rax = base ptr           */
+            emit_push_rax();
+            lower_expr(n->kids[1]);           /* rax = index              */
+            emit_pop_r(REG_RCX);              /* rcx = base               */
+            emit_mov_rax_mem_rcx_rax_x8();    /* rax = [rcx + rax*8]      */
             return;
+        }
         case N_MATCH_STUB:
             /* Runtime-trap stub — if a bootstrap-compiled program actually
                hits a match expression at execution time, it halts cleanly. */
@@ -3453,10 +3553,23 @@ static void lower_stmt(int node)
                 emit_mov_rbp_disp_rax(g_locals[li].offset);
                 return;
             }
-            /* Assignment to field access or index: evaluate rhs for side-effects
-               and discard.  The bootstrap doesn't do real memory writes —
-               struct/array mutation runs under the self-hosted compiler. */
-            if (ln->kind == N_FIELD_ACCESS || ln->kind == N_INDEX) {
+            /* Index write `arr[i] = v`.  Evaluate rhs, push; evaluate base,
+             * push; evaluate index into rax; pop base into rcx; pop rhs
+             * into rdx; mov [rcx + rax*8], rdx.                         */
+            if (ln->kind == N_INDEX) {
+                lower_expr(rhs);
+                emit_push_rax();                         /* rhs on stack */
+                lower_expr(g_nodes[lhs].kids[0]);        /* rax = base   */
+                emit_push_rax();                         /* base on stack*/
+                lower_expr(g_nodes[lhs].kids[1]);        /* rax = index  */
+                emit_pop_r(REG_RCX);                     /* rcx = base   */
+                emit_pop_rdx();                          /* rdx = rhs    */
+                emit_mov_mem_rcx_rax_x8_rdx();           /* store        */
+                emit_mov_r_r(REG_RAX, REG_RDX);          /* rax = rhs    */
+                return;
+            }
+            /* Field-access writes still tolerant until struct layout lands. */
+            if (ln->kind == N_FIELD_ACCESS) {
                 lower_expr(rhs);
                 return;
             }
