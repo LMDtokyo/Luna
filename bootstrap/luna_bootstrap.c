@@ -3146,6 +3146,7 @@ static const char *winapi_dll(const char *name, int len)
         { "_open",   "msvcrt.dll" }, { "_read",   "msvcrt.dll" },
         { "_write",  "msvcrt.dll" }, { "_close",  "msvcrt.dll" },
         { "_lseek",  "msvcrt.dll" },
+        { "__getmainargs", "msvcrt.dll" },
         /* user32 — windowing                                         */
         { "MessageBoxA", "USER32.DLL" },
         { NULL, NULL }
@@ -3743,9 +3744,13 @@ static void lower_call(int node)
         }
 
         /* args_count() — number of command-line arguments (including
-         * argv[0], the program name).  0 on Windows until FFI lands.   */
+         * argv[0], the program name).                                 */
         if (c->slen == 10 && memcmp(c->s, "args_count", 10) == 0) {
             if (g_target == TARGET_LINUX) {
+                emit_mov_rax_mem_rip_bss(BSS_ARGC_OFF);
+            } else if (g_target == TARGET_WINDOWS) {
+                /* On Windows argc is materialised once by our startup
+                 * helper and cached in the BSS_ARGC_OFF slot.          */
                 emit_mov_rax_mem_rip_bss(BSS_ARGC_OFF);
             } else {
                 emit_mov_rax_imm64(0);
@@ -3757,11 +3762,19 @@ static void lower_call(int node)
          * arg(i) which converts to a proper Luna string.               */
         if (c->slen == 7 && memcmp(c->s, "arg_raw", 7) == 0 && n->nkids >= 2) {
             if (g_target == TARGET_LINUX) {
-                lower_expr(n->kids[1]);                 /* rax = i        */
+                lower_expr(n->kids[1]);
                 emit_push_rax();
-                emit_mov_rax_mem_rip_bss(BSS_ARGV_OFF); /* rax = argv     */
-                emit_pop_r(REG_RCX);                    /* rcx = i        */
-                emit_mov_rax_mem_rax_rcx_x8();          /* rax = argv[i]  */
+                emit_mov_rax_mem_rip_bss(BSS_ARGV_OFF);
+                emit_pop_r(REG_RCX);
+                emit_mov_rax_mem_rax_rcx_x8();
+            } else if (g_target == TARGET_WINDOWS) {
+                /* Windows stores parsed argv the same way (array of
+                 * char* in BSS).                                        */
+                lower_expr(n->kids[1]);
+                emit_push_rax();
+                emit_mov_rax_mem_rip_bss(BSS_ARGV_OFF);
+                emit_pop_r(REG_RCX);
+                emit_mov_rax_mem_rax_rcx_x8();
             } else {
                 emit_mov_rax_imm64(0);
             }
@@ -4786,6 +4799,40 @@ static void lower_all(void)
      * heap to draw from.                                                */
     emit_lea_rax_rip_bss(BSS_HEAP_BASE_OFF);
     emit_mov_mem_rip_rax_bss(BSS_HEAP_TOP_OFF);
+
+    /* On Windows populate argc / argv via msvcrt's __getmainargs.       */
+    if (g_target == TARGET_WINDOWS) {
+        int gma_slot = ffi_register("__getmainargs", 13);
+        /* Reserve 72 bytes: 32 shadow + 8 slot for 5th stack arg +
+         * 8 env out-param + 16 _startupinfo struct + 8 pad.  With no
+         * preceding push, rsp is 16-aligned inside the function; 72 %
+         * 16 == 8 so rsp stays 16-aligned for the call.                 */
+        emit_sub_rsp_imm8(72);
+        /* Zero scratch slots.                                          */
+        emit_mov_rax_imm64(0);
+        emit_mov_rsp_disp8_r(40, REG_RAX);     /* env              = 0 */
+        emit_mov_rsp_disp8_r(48, REG_RAX);     /* startupinfo.newmode=0*/
+        emit_mov_rsp_disp8_r(56, REG_RAX);
+
+        /* rcx = &argc_slot */
+        emit_lea_rax_rip_bss(BSS_ARGC_OFF);
+        emit_mov_r_r(REG_RCX, REG_RAX);
+        /* rdx = &argv_slot */
+        emit_lea_rax_rip_bss(BSS_ARGV_OFF);
+        emit_mov_r_r(REG_RDX, REG_RAX);
+        /* r8 = &env_slot (scratch at [rsp+40]) */
+        /* lea r8, [rsp+40] -> 4C 8D 44 24 28                            */
+        { uint8_t b[] = { 0x4c, 0x8d, 0x44, 0x24, 40 }; code_emit_bytes(b, 5); }
+        /* r9 = 0 (no wildcard expand) */
+        emit_mov_r_imm64(9, 0);
+        /* [rsp+32] = &startupinfo at [rsp+48]                          */
+        /* lea rax, [rsp+48] -> 48 8D 44 24 30                           */
+        { uint8_t b[] = { 0x48, 0x8d, 0x44, 0x24, 48 }; code_emit_bytes(b, 5); }
+        emit_mov_rsp_disp8_r(32, REG_RAX);
+        emit_call_iat(gma_slot);
+        emit_add_rsp_imm8(72);
+    }
+
     if (g_target == TARGET_WINDOWS) {
         /* Win64 _start: sub rsp,40 (align+shadow) ; call main ; mov rcx,rax
          *               ; call [iat_ExitProcess]                            */
