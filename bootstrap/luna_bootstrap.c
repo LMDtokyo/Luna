@@ -263,6 +263,8 @@ typedef struct {
     int  offset;       /* negative; relative to RBP                      */
     int  is_param;
     int  param_idx;
+    const char *type_name;   /* struct type name, or NULL if unknown     */
+    int  type_name_len;
 } Local;
 
 /* ========================================================================= */
@@ -2828,9 +2830,42 @@ static int local_add(const char *name, int len, int is_param, int pidx)
     g_locals[id].name_len = len;
     g_locals[id].is_param = is_param;
     g_locals[id].param_idx = pidx;
+    g_locals[id].type_name = NULL;
+    g_locals[id].type_name_len = 0;
     g_frame_size += 8;
     g_locals[id].offset = -g_frame_size;
     return id;
+}
+
+/* Find a struct declaration by name in the symbol table, return the AST
+ * node index of N_STRUCT or -1 if not found.                            */
+static int find_struct(const char *name, int len)
+{
+    int si = sym_find(name, len);
+    if (si < 0) return -1;
+    if (g_syms[si].kind != N_STRUCT) return -1;
+    return g_syms[si].node;
+}
+
+/* Look up field `fname` inside struct node `sn`; return the field index
+ * (0-based, which maps to offset fidx*8) or -1 if not found.            */
+static int struct_field_index(int sn, const char *fname, int flen)
+{
+    AstNode *s = &g_nodes[sn];
+    for (int i = 0; i < s->nkids; i++) {
+        AstNode *f = &g_nodes[s->kids[i]];
+        if (f->kind == N_FIELD && f->slen == flen &&
+            memcmp(f->s, fname, flen) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Total size in bytes of a struct: one 8-byte slot per field. */
+static int struct_size(int sn)
+{
+    return g_nodes[sn].nkids * 8;
 }
 
 /* Match @name -> bare name.  In this bootstrap we treat @x and x identically
@@ -3157,27 +3192,66 @@ static void lower_call(int node)
     g_nrelocs++;
 }
 
+/* Look up the struct type declared for the value produced by `obj` and
+ * return the N_STRUCT node index — or -1 if we can't tell.  Works for:
+ *   - N_IDENT pointing at a local with a known type_name
+ *   - N_STRUCT_LIT with a resolvable type name
+ *   - N_FIELD_ACCESS whose base type resolves and whose selected field
+ *     has a struct type (basic transitive case)                        */
+static int type_of_expr(int node);
+static int field_type(int sn, const char *fname, int flen)
+{
+    AstNode *s = &g_nodes[sn];
+    for (int i = 0; i < s->nkids; i++) {
+        AstNode *f = &g_nodes[s->kids[i]];
+        if (f->kind == N_FIELD && f->slen == flen &&
+            memcmp(f->s, fname, flen) == 0) {
+            if (f->nkids > 0) {
+                AstNode *ty = &g_nodes[f->kids[0]];
+                if (ty->kind == N_TYPE && ty->s && ty->slen > 0) {
+                    return find_struct(ty->s, ty->slen);
+                }
+            }
+            return -1;
+        }
+    }
+    return -1;
+}
+static int type_of_expr(int node)
+{
+    AstNode *n = &g_nodes[node];
+    if (n->kind == N_IDENT) {
+        int li = local_lookup(n->s, n->slen);
+        if (li >= 0 && g_locals[li].type_name) {
+            return find_struct(g_locals[li].type_name,
+                               g_locals[li].type_name_len);
+        }
+        return -1;
+    }
+    if (n->kind == N_STRUCT_LIT && n->slen > 0) {
+        return find_struct(n->s, n->slen);
+    }
+    if (n->kind == N_FIELD_ACCESS) {
+        int base_sn = type_of_expr(n->kids[0]);
+        if (base_sn < 0) return -1;
+        return field_type(base_sn, n->s, n->slen);
+    }
+    return -1;
+}
+
 static void lower_field_access(int node)
 {
     AstNode *n = &g_nodes[node];
     int obj = n->kids[0];
     lower_expr(obj);
-    /* We don't have proper type info; assume struct-like object with 8-byte
-       slots accessed by declaration order.  Fall back to offset 0 if we
-       can't resolve it.                                                   */
+
     int offset = 0;
-    /* Try: if obj is an @ident whose type was declared as a struct name,
-       look up the struct and find the field offset. */
-    AstNode *oc = &g_nodes[obj];
-    if (oc->kind == N_IDENT) {
-        int li = local_lookup(oc->s, oc->slen);
-        if (li >= 0) {
-            /* unknown — rely on best-effort */
-        }
+    int sn = type_of_expr(obj);
+    if (sn >= 0) {
+        int fidx = struct_field_index(sn, n->s, n->slen);
+        if (fidx >= 0) offset = fidx * 8;
     }
     emit_mov_rax_rax_plus_imm32(offset);
-    /* Field-name-aware offset lookup is a TODO for the bootstrap. */
-    (void)n;
 }
 
 static void lower_postfix_q(int node)
@@ -3283,11 +3357,71 @@ static void lower_bin(int node)
 static void lower_struct_lit(int node)
 {
     AstNode *n = &g_nodes[node];
+    int sn = (n->s && n->slen > 0) ? find_struct(n->s, n->slen) : -1;
+    if (sn < 0) {
+        /* Unknown struct type (anonymous literal or forward reference).
+         * Allocate one slot per field, fill in declaration order.       */
+        int bytes = n->nkids * 8;
+        if (bytes <= 0 || bytes > 16384) {
+            for (int i = 0; i < n->nkids; i++) {
+                AstNode *fi = &g_nodes[n->kids[i]];
+                if (fi->nkids > 0) lower_expr(fi->kids[0]);
+            }
+            emit_mov_rax_imm64(0);
+            return;
+        }
+        emit_sub_rsp_imm32(bytes);
+        for (int i = 0; i < n->nkids; i++) {
+            AstNode *fi = &g_nodes[n->kids[i]];
+            if (fi->nkids > 0) lower_expr(fi->kids[0]);
+            else emit_mov_rax_imm64(0);
+            int32_t disp = i * 8;
+            if (disp >= -128 && disp <= 127)
+                emit_mov_rsp_disp8_rax((int8_t)disp);
+            else
+                emit_mov_rsp_disp32_rax(disp);
+        }
+        emit_mov_rax_rsp();
+        return;
+    }
+
+    /* Known struct — use declared field order for offsets, fill in the
+     * user-supplied order.  Unmentioned fields stay zero (the slot is
+     * written only if the literal supplies a value for that field).    */
+    int bytes = struct_size(sn);
+    if (bytes > 16384) {
+        emit_mov_rax_imm64(0);
+        return;
+    }
+    emit_sub_rsp_imm32(bytes);
+    /* Zero every slot so missing initialisers are deterministic.       */
+    if (bytes > 0) {
+        emit_mov_rax_imm64(0);
+        for (int i = 0; i < g_nodes[sn].nkids; i++) {
+            int32_t disp = i * 8;
+            if (disp >= -128 && disp <= 127)
+                emit_mov_rsp_disp8_rax((int8_t)disp);
+            else
+                emit_mov_rsp_disp32_rax(disp);
+        }
+    }
     for (int i = 0; i < n->nkids; i++) {
         AstNode *fi = &g_nodes[n->kids[i]];
-        if (fi->nkids > 0) lower_expr(fi->kids[0]);  /* side-effects only */
+        int fidx = struct_field_index(sn, fi->s, fi->slen);
+        if (fidx < 0) {
+            /* Field not in struct — tolerantly evaluate for side-effects. */
+            if (fi->nkids > 0) lower_expr(fi->kids[0]);
+            continue;
+        }
+        if (fi->nkids > 0) lower_expr(fi->kids[0]);
+        else emit_mov_rax_imm64(0);
+        int32_t disp = fidx * 8;
+        if (disp >= -128 && disp <= 127)
+            emit_mov_rsp_disp8_rax((int8_t)disp);
+        else
+            emit_mov_rsp_disp32_rax(disp);
     }
-    emit_mov_rax_imm64(0);
+    emit_mov_rax_rsp();
 }
 
 static void lower_expr(int node)
@@ -3533,6 +3667,22 @@ static void lower_stmt(int node)
             /* child 0: type (may be placeholder), child 1: value */
             int li = local_add(n->s, n->slen, 0, 0);
             int val = n->kids[n->nkids - 1];
+            /* Propagate the declared or inferred struct type so later
+             * field accesses can compute real offsets.                 */
+            if (n->nkids >= 2) {
+                AstNode *ty = &g_nodes[n->kids[0]];
+                if (ty->kind == N_TYPE && ty->s && ty->slen > 0 &&
+                    find_struct(ty->s, ty->slen) >= 0) {
+                    g_locals[li].type_name = ty->s;
+                    g_locals[li].type_name_len = ty->slen;
+                }
+            }
+            AstNode *vn = &g_nodes[val];
+            if (g_locals[li].type_name == NULL && vn->kind == N_STRUCT_LIT
+                && vn->s && vn->slen > 0) {
+                g_locals[li].type_name = vn->s;
+                g_locals[li].type_name_len = vn->slen;
+            }
             lower_expr(val);
             emit_mov_rbp_disp_rax(g_locals[li].offset);
             return;
@@ -3548,6 +3698,12 @@ static void lower_stmt(int node)
                        required for `@`-prefixed identifiers).  The bootstrap
                        mirrors that rule to accept real Luna source. */
                     li = local_add(ln->s, ln->slen, 0, 0);
+                }
+                AstNode *rn = &g_nodes[rhs];
+                if (g_locals[li].type_name == NULL && rn->kind == N_STRUCT_LIT
+                    && rn->s && rn->slen > 0) {
+                    g_locals[li].type_name = rn->s;
+                    g_locals[li].type_name_len = rn->slen;
                 }
                 lower_expr(rhs);
                 emit_mov_rbp_disp_rax(g_locals[li].offset);
@@ -3568,9 +3724,32 @@ static void lower_stmt(int node)
                 emit_mov_r_r(REG_RAX, REG_RDX);          /* rax = rhs    */
                 return;
             }
-            /* Field-access writes still tolerant until struct layout lands. */
+            /* Field write `@p.x = v`.  Resolve the field offset from the
+             * base's known struct type, evaluate base -> rcx, evaluate rhs
+             * -> rax, store `mov [rcx + offset], rax`.                    */
             if (ln->kind == N_FIELD_ACCESS) {
+                int base = g_nodes[lhs].kids[0];
+                int sn = type_of_expr(base);
+                int offset = 0;
+                if (sn >= 0) {
+                    int fidx = struct_field_index(sn, g_nodes[lhs].s,
+                                                      g_nodes[lhs].slen);
+                    if (fidx >= 0) offset = fidx * 8;
+                }
                 lower_expr(rhs);
+                emit_push_rax();
+                lower_expr(base);
+                emit_mov_rcx_rax2();
+                emit_pop_r(REG_RAX);
+                /* mov [rcx + disp32], rax  -> 48 89 81 disp32           */
+                if (offset >= -128 && offset <= 127) {
+                    uint8_t b[] = { 0x48, 0x89, 0x41, (uint8_t)offset };
+                    code_emit_bytes(b, 4);
+                } else {
+                    uint8_t b[] = { 0x48, 0x89, 0x81 };
+                    code_emit_bytes(b, 3);
+                    code_emit_u32((uint32_t)offset);
+                }
                 return;
             }
             die_unsup("assign target", g_files[n->file].path, n->line);
@@ -3661,6 +3840,16 @@ static void lower_function(int sym_idx)
         AstNode *c = &g_nodes[fn->kids[i]];
         if (c->kind != N_PARAM) continue;
         int li = local_add(c->s, c->slen, 1, pi);
+        /* Carry the parameter's declared type so later @p.x field
+         * accesses can compute real offsets.                      */
+        if (c->nkids > 0) {
+            AstNode *ty = &g_nodes[c->kids[0]];
+            if (ty->kind == N_TYPE && ty->s && ty->slen > 0 &&
+                find_struct(ty->s, ty->slen) >= 0) {
+                g_locals[li].type_name = ty->s;
+                g_locals[li].type_name_len = ty->slen;
+            }
+        }
         int r = sysv_argreg(pi);
         emit_mov_rbp_disp_r(r, g_locals[li].offset);
         pi++;

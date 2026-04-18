@@ -1,0 +1,40 @@
+struct Point
+    x: int
+    y: int
+
+struct Line
+    start: Point
+    end:   Point
+    tag:   int
+
+fn dist_sq(@p: Point) -> int
+    return @p.x * @p.x + @p.y * @p.y
+
+fn main() -> int
+    @a = Point { x: 3, y: 4 }
+    shine("Point a:")
+    print("  x = ")
+    println_int(@a.x)
+    print("  y = ")
+    println_int(@a.y)
+    print("  |a|^2 = ")
+    println_int(dist_sq(@a))
+
+    @a.x = 100
+    shine("after @a.x = 100:")
+    print("  x = ")
+    println_int(@a.x)
+    print("  y still = ")
+    println_int(@a.y)
+
+    @p1 = Point { x: 1, y: 2 }
+    @p2 = Point { x: 5, y: 7 }
+    @ln = Line { start: @p1, end: @p2, tag: 42 }
+    shine("Line:")
+    print("  tag = ")
+    println_int(@ln.tag)
+    print("  start.x = ")
+    println_int(@ln.start.x)
+    print("  end.y = ")
+    println_int(@ln.end.y)
+    return 0
