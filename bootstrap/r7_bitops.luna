@@ -1,0 +1,6 @@
+fn main() -> int
+    let @a = 0xFF
+    let @b = 0x0F
+    let @x = @a ^ @b
+    let @y = @x << 2
+    return @y

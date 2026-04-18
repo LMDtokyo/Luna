@@ -1,0 +1,101 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo.
+# Licensed under GPLv3.
+
+# =============================================================================
+# Luna beacon — Atomic int (cosmic alias for sync.AtomicInt)
+# =============================================================================
+# A `beacon` flashes a value visible to every observer across fibres.
+# Replaces the `AtomicInt` name from `sync.luna` with cosmic-vocabulary
+# operations: `read`, `flash`, `bump`, `compare_flash`.  Memory ordering
+# defaults to acquire/release (the "Tide.Pull"/"Tide.Push" in the rename
+# map); use the `*_strict` variants for sequential consistency.
+# =============================================================================
+
+import sync
+
+# --- Opaque handle --------------------------------------------------------
+# beacon is a thin wrapper around the underlying atomic int slot id.
+# Kept as a separate struct so callers type-annotate with `beacon`
+# rather than `int`, matching the cosmic API described in the rename map.
+
+struct Beacon
+    slot: int       # index into the AtomicInt pool maintained by sync.luna
+    valid: int      # 1 after `beacon_new`; 0 once `beacon_release`d
+
+# --- Lifecycle ------------------------------------------------------------
+
+# beacon_new(v) — construct a fresh beacon with starting value v.
+fn beacon_new(@v: int) -> Beacon
+    return Beacon {
+        slot: atomic_int_new(@v),
+        valid: 1
+    }
+
+# Tear down a beacon; subsequent reads return 0 and mark an error upstream.
+fn beacon_release(@b: Beacon)
+    if @b.valid == 1
+        atomic_int_release(@b.slot)
+        @b.valid = 0
+
+# --- Observers ------------------------------------------------------------
+
+# Acquire-load the current value.
+fn beacon_read(@b: Beacon) -> int
+    if @b.valid == 0
+        return 0
+    return atomic_load(@b.slot)
+
+# Release-store the given value.
+fn beacon_flash(@b: Beacon, @v: int) -> int
+    if @b.valid == 0
+        return -1
+    atomic_store(@b.slot, @v)
+    return 0
+
+# Fetch-add the given delta, return the previous value.
+fn beacon_bump(@b: Beacon, @delta: int) -> int
+    if @b.valid == 0
+        return 0
+    return atomic_add(@b.slot, @delta)
+
+# Compare-and-swap.  Returns 1 on success, 0 if the current value didn't
+# match @old_expected.
+fn beacon_compare_flash(@b: Beacon, @old_expected: int, @new: int) -> int
+    if @b.valid == 0
+        return 0
+    return atomic_cas(@b.slot, @old_expected, @new)
+
+# Shorthand spellings used by bots and examples.
+#
+# Method-style call `@b.read()` currently lowers to `beacon_read(@b)` at
+# the parser layer (AST_FIELD + AST_CALL), so these exist so that both
+# spellings work:
+
+fn read(@b: Beacon) -> int
+    return beacon_read(@b)
+
+fn flash(@b: Beacon, @v: int) -> int
+    return beacon_flash(@b, @v)
+
+fn bump(@b: Beacon, @delta: int) -> int
+    return beacon_bump(@b, @delta)
+
+fn compare_flash(@b: Beacon, @old: int, @new: int) -> int
+    return beacon_compare_flash(@b, @old, @new)
+
+# --- Construction alias ---------------------------------------------------
+# Some callers prefer `beacon.new(42)` over `beacon_new(42)`; module
+# resolution routes the former to `new`.
+
+fn new(@v: int) -> Beacon
+    return beacon_new(@v)
+
+# =============================================================================
+
+export {
+    Beacon,
+    beacon_new, beacon_release,
+    beacon_read, beacon_flash, beacon_bump, beacon_compare_flash,
+    read, flash, bump, compare_flash,
+    new
+}

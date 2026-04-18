@@ -1,0 +1,28 @@
+Windows Registry Editor Version 5.00
+
+; Per-user association for .luna source files.
+; Applies to the current Windows user without requiring admin rights.
+; Installed under HKCU\Software\Classes (per-user override of HKCR).
+
+[HKEY_CURRENT_USER\Software\Classes\.luna]
+@="Luna.SourceFile"
+"Content Type"="text/x-luna"
+"PerceivedType"="text"
+
+[HKEY_CURRENT_USER\Software\Classes\.luna\OpenWithProgids]
+"Luna.SourceFile"=""
+
+[HKEY_CURRENT_USER\Software\Classes\Luna.SourceFile]
+@="Luna source file"
+
+[HKEY_CURRENT_USER\Software\Classes\Luna.SourceFile\DefaultIcon]
+@="C:\\Users\\vnaio\\Desktop\\Luna-main\\assets\\luna.ico,0"
+
+[HKEY_CURRENT_USER\Software\Classes\Luna.SourceFile\shell]
+@="open"
+
+[HKEY_CURRENT_USER\Software\Classes\Luna.SourceFile\shell\open]
+@="Open"
+
+[HKEY_CURRENT_USER\Software\Classes\Luna.SourceFile\shell\open\command]
+@="\"C:\\Windows\\System32\\notepad.exe\" \"%1\""

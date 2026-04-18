@@ -1,0 +1,140 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna beam — cosmic alias for the HTTP module (v4.3)
+# =============================================================================
+# `beam` is the cosmic role of the HTTP client+server pair.  A beam carries a
+# request outward and an echo returns back.  Per L4_RENAME_MAP §4.2 the shim
+# forwards to the existing `http` functions and introduces a small handful of
+# helpers that genuinely do not exist under the old name:
+#
+#   * `echo_is_ok(Echo) -> int`   — 200..=299 convenience
+#   * `push_lumen_with_auth(...)` — POST JSON with an Authorization header,
+#                                    needed by the Discord bot
+#
+# Everything else is a thin passthrough.  Old constants (`METHOD_GET`,
+# `STATUS_OK`, etc.) are re-exported under both their legacy names and the
+# cosmic `Method_Get` / `Status_Ok` spellings so existing code continues to
+# link while new code can read cleanly.
+# =============================================================================
+
+import http
+
+# --- Cosmic type aliases -----------------------------------------------------
+# type Echo       = HttpResponse   (the incoming reply to an outgoing beam)
+# type BeamTarget = ParsedUrl      (a parsed URL we are aiming at)
+
+# --- Constant re-exports -----------------------------------------------------
+# Method.* — cosmic spellings mirror the legacy METHOD_* table.
+
+const Method_Get:     int = METHOD_GET
+const Method_Post:    int = METHOD_POST
+const Method_Put:     int = METHOD_PUT
+const Method_Delete:  int = METHOD_DELETE
+const Method_Patch:   int = METHOD_PATCH
+const Method_Head:    int = METHOD_HEAD
+const Method_Options: int = METHOD_OPTIONS
+
+# Status.* — cosmic spellings mirror STATUS_*.
+
+const Status_Ok:               int = STATUS_OK
+const Status_Created:          int = STATUS_CREATED
+const Status_NoContent:        int = STATUS_NO_CONTENT
+const Status_BadRequest:       int = STATUS_BAD_REQUEST
+const Status_Unauthorized:     int = STATUS_UNAUTHORIZED
+const Status_Forbidden:        int = STATUS_FORBIDDEN
+const Status_NotFound:         int = STATUS_NOT_FOUND
+const Status_InternalError:    int = STATUS_INTERNAL_ERROR
+
+# --- Client: beam.* passthroughs --------------------------------------------
+
+fn fetch(@url: str, @url_len: int) -> HttpResponse
+    return http_get(@url, @url_len)
+
+fn push(@url: str, @url_len: int,
+        @body_ptr: int, @body_len: int,
+        @content_type: str, @ct_len: int) -> HttpResponse
+    return http_post(@url, @url_len, @body_ptr, @body_len, @content_type, @ct_len)
+
+fn push_lumen(@url: str, @url_len: int,
+              @json: str, @json_len: int) -> HttpResponse
+    return http_post_json(@url, @url_len, @json, @json_len)
+
+fn send(@method: int, @url: str, @url_len: int,
+        @body_ptr: int, @body_len: int,
+        @extra_headers: str, @extra_headers_len: int) -> HttpResponse
+    return http_request(@method, @url, @url_len,
+                        @body_ptr, @body_len,
+                        @extra_headers, @extra_headers_len)
+
+fn parse_url(@url: str, @url_len: int) -> ParsedUrl
+    return url_parse(@url, @url_len)
+
+fn read_echo(@resp: HttpResponse, @data: [int; 262144], @data_len: int) -> int
+    return http_parse_response(@resp, @data, @data_len)
+
+fn seal_url(@input: *u8, @in_len: int, @output: *u8, @max_out: int) -> int
+    return url_encode(@input, @in_len, @output, @max_out)
+
+fn unseal_url(@input: *u8, @in_len: int, @output: *u8, @max_out: int) -> int
+    return url_decode(@input, @in_len, @output, @max_out)
+
+# --- Genuine new helpers -----------------------------------------------------
+
+# Echo success check — 2xx statuses are "Bright".
+fn echo_is_ok(@e: HttpResponse) -> int
+    if @e.status >= 200 and @e.status < 300
+        return 1
+    return 0
+
+# POST JSON with an Authorization header.  Mirrors http_post_json but prepends
+# the auth line so `Content-Type: application/json` still lands on the wire.
+# @auth_str is the *value* ("Bot ABCxyz", "Bearer ...") — this fn builds the
+# full "Authorization: <value>\r\nContent-Type: application/json\r\n" header
+# block itself.
+fn push_lumen_with_auth(@url: str, @url_len: int,
+                        @body: str, @body_len: int,
+                        @auth_str: str, @auth_len: int) -> HttpResponse
+    meow @hdr: [int; 1024] = [0; 1024]
+    @o = 0
+    # "Authorization: "
+    @o = http_buf_write_str(@hdr, @o, "Authorization: ", 15)
+    orbit @i in 0..@auth_len
+        unsafe
+            @hdr[@o + @i] = volatile_read(@auth_str + @i)
+    @o = @o + @auth_len
+    @o = http_buf_write_str(@hdr, @o, "\r\n", 2)
+    # "Content-Type: application/json\r\n"
+    @o = http_buf_write_str(@hdr, @o, "Content-Type: application/json\r\n", 32)
+    return http_request(METHOD_POST, @url, @url_len, @body, @body_len, @hdr, @o)
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+export {
+    # Type re-exports
+    HttpResponse, ParsedUrl,
+
+    # Legacy constants (kept for bridge code)
+    METHOD_GET, METHOD_POST, METHOD_PUT, METHOD_DELETE,
+    METHOD_PATCH, METHOD_HEAD, METHOD_OPTIONS,
+    STATUS_OK, STATUS_CREATED, STATUS_NO_CONTENT,
+    STATUS_BAD_REQUEST, STATUS_UNAUTHORIZED, STATUS_FORBIDDEN,
+    STATUS_NOT_FOUND, STATUS_INTERNAL_ERROR,
+
+    # Cosmic constants
+    Method_Get, Method_Post, Method_Put, Method_Delete,
+    Method_Patch, Method_Head, Method_Options,
+    Status_Ok, Status_Created, Status_NoContent,
+    Status_BadRequest, Status_Unauthorized, Status_Forbidden,
+    Status_NotFound, Status_InternalError,
+
+    # Client passthroughs
+    fetch, push, push_lumen, send,
+    parse_url, read_echo, seal_url, unseal_url,
+
+    # New helpers
+    echo_is_ok, push_lumen_with_auth
+}

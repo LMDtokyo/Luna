@@ -1,0 +1,278 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Forge Reloc — Post-Layout Relocation Patching (v4.3, phase L1)
+# =============================================================================
+# When forge emits `call <extern>` or `call <later_symbol>`, the 32-bit
+# displacement field is written as zero plus a `ForgeReloc` record.  After
+# the ELF / PE writer has placed every section at a final virtual address,
+# we know:
+#
+#   * the RVA of every symbol (internal *or* extern)
+#   * the RVA of every call site that references it
+#
+# ...and so we can patch the 4-byte displacement in-place.  This file
+# runs that walk.  It's container-agnostic: callers pass in the resolved
+# symbol-RVA table, and we write back into `@f.code` directly.
+#
+# # Relocation kinds we handle
+#
+#   RELOC_PC32   — `call rel32` / `jmp rel32`:
+#                    disp = target_rva - (at_rva + 4)
+#   RELOC_IAT32  — `call [rip + disp32]` to a PE IAT slot:
+#                    disp = iat_slot_rva - (at_rva + 4)
+#   RELOC_ABS64  — 8-byte absolute address in .data or rodata:
+#                    write target_rva + image_base
+#   RELOC_PLT32  — PLT entry on ELF dynamic builds:
+#                    same math as PC32, target is the PLT stub RVA
+#   RELOC_GOT32  — PC-relative GOT slot fetch:
+#                    disp = got_slot_rva - (at_rva + 4)
+# =============================================================================
+
+import forge
+
+# =============================================================================
+# SECTION 1 — SYMBOL ADDRESS TABLE
+# =============================================================================
+# Parallel arrays indexed by symbol index.  Populated by the container
+# writer (forge_elf / forge_pe) after layout.  `addr` is an RVA (relative
+# virtual address); absolute addresses are `image_base + addr` at emit.
+
+const RELOC_MAX_SYMBOLS: int = 4096
+
+struct SymbolAddrs
+    addr:     [int; 4096]   # RVA for each symbol; 0 = unresolved (emits int3 patch)
+    resolved: [int; 4096]   # 1 if the RVA is known
+    count:    int
+
+fn symaddrs_new() -> SymbolAddrs
+    return SymbolAddrs {
+        addr: [0; 4096],
+        resolved: [0; 4096],
+        count: 0
+    }
+
+fn symaddrs_set(@t: SymbolAddrs, @idx: int, @rva: int)
+    if @idx < 0 or @idx >= RELOC_MAX_SYMBOLS
+        return
+    @t.addr[@idx] = @rva
+    @t.resolved[@idx] = 1
+    if @idx >= @t.count
+        @t.count = @idx + 1
+
+fn symaddrs_get(@t: SymbolAddrs, @idx: int) -> int
+    if @idx < 0 or @idx >= RELOC_MAX_SYMBOLS
+        return 0
+    return @t.addr[@idx]
+
+fn symaddrs_is_resolved(@t: SymbolAddrs, @idx: int) -> int
+    if @idx < 0 or @idx >= RELOC_MAX_SYMBOLS
+        return 0
+    return @t.resolved[@idx]
+
+# =============================================================================
+# SECTION 2 — RELOCATION APPLICATION
+# =============================================================================
+# Walk @f.relocs; for each, look up the symbol's final address and patch
+# the 4 or 8 bytes at `reloc.at_offset` in @f.code.  Unresolved symbols
+# get a loud placeholder (0xCCCCCCCC — the x86 int3 pattern) so
+# execution traps at the call site during debugging.
+
+# @text_rva is the RVA assigned to the beginning of the code section.
+# @at_offset in a ForgeReloc is measured from @f.code base; the RVA of
+# the patch site is `@text_rva + at_offset`.
+#
+# Returns the number of relocations applied.  Errors are counted onto
+# @f.errors so the container writer can refuse to finalise if any
+# remain unresolved.
+fn forge_apply_relocs(@f: Forge, @addrs: SymbolAddrs, @text_rva: int) -> int
+    meow @applied: int = 0
+    orbit @i in 0..@f.reloc_count
+        @r = @f.relocs[@i]
+        @sym_idx = @r.symbol_idx
+        if symaddrs_is_resolved(@addrs, @sym_idx) == 0
+            # Write the 0xCC.. placeholder — trap at runtime if we ever
+            # get here.  Still increment errors so the build fails.
+            @f.errors = @f.errors + 1
+            @f.code[@r.at_offset + 0] = 0xCC
+            @f.code[@r.at_offset + 1] = 0xCC
+            @f.code[@r.at_offset + 2] = 0xCC
+            @f.code[@r.at_offset + 3] = 0xCC
+            continue
+        @target_rva = symaddrs_get(@addrs, @sym_idx)
+        @site_rva   = @text_rva + @r.at_offset
+
+        match @r.kind
+            RELOC_PC32 =>
+                # disp32 = target - (site + 4)
+                seal @disp = @target_rva - (@site_rva + 4) + @r.addend
+                forge_patch_u32(@f, @r.at_offset, @disp)
+                @applied = @applied + 1
+
+            RELOC_IAT32 =>
+                # Same math as PC32 — the difference is that `target_rva`
+                # points at the IAT *slot* rather than the function itself.
+                seal @disp = @target_rva - (@site_rva + 4) + @r.addend
+                forge_patch_u32(@f, @r.at_offset, @disp)
+                @applied = @applied + 1
+
+            RELOC_PLT32 =>
+                seal @disp = @target_rva - (@site_rva + 4) + @r.addend
+                forge_patch_u32(@f, @r.at_offset, @disp)
+                @applied = @applied + 1
+
+            RELOC_GOT32 =>
+                seal @disp = @target_rva - (@site_rva + 4) + @r.addend
+                forge_patch_u32(@f, @r.at_offset, @disp)
+                @applied = @applied + 1
+
+            RELOC_ABS64 =>
+                # Write the full 8-byte absolute virtual address.  The
+                # container adds image_base; we assume @addrs[] is
+                # already image-base-inclusive for ABS64 entries.
+                seal @absolute = @target_rva + @r.addend
+                forge_patch_u64(@f, @r.at_offset, @absolute)
+                @applied = @applied + 1
+
+            _ =>
+                # Unknown reloc kind — leave a trap.
+                @f.errors = @f.errors + 1
+                @f.code[@r.at_offset + 0] = 0xCC
+                @f.code[@r.at_offset + 1] = 0xCC
+                @f.code[@r.at_offset + 2] = 0xCC
+                @f.code[@r.at_offset + 3] = 0xCC
+    return @applied
+
+# =============================================================================
+# SECTION 3 — IN-PLACE PATCHERS
+# =============================================================================
+# forge.luna doesn't expose generic patchers (only inline back-patches
+# for labels), so reloc gets its own.
+
+fn forge_patch_u32(@f: Forge, @at: int, @v: int)
+    if @at < 0 or @at + 4 > @f.code_len
+        @f.errors = @f.errors + 1
+        return
+    @f.code[@at + 0] = @v & 0xFF
+    @f.code[@at + 1] = (@v >> 8) & 0xFF
+    @f.code[@at + 2] = (@v >> 16) & 0xFF
+    @f.code[@at + 3] = (@v >> 24) & 0xFF
+
+fn forge_patch_u64(@f: Forge, @at: int, @v: int)
+    forge_patch_u32(@f, @at, @v & 0xFFFFFFFF)
+    forge_patch_u32(@f, @at + 4, (@v >> 32) & 0xFFFFFFFF)
+
+# =============================================================================
+# SECTION 4 — SYMBOL TABLE CONSTRUCTION HELPERS
+# =============================================================================
+# Build a SymbolAddrs from a Forge state plus a few container-provided
+# facts.  Internal (defined-in-this-object) symbols take their RVA from
+# `text_rva + sym.offset`.  Extern symbols are left unresolved until the
+# container writer binds them to their PE IAT slot / ELF PLT stub.
+
+fn forge_build_internal_addrs(@f: Forge, @text_rva: int) -> SymbolAddrs
+    @addrs = symaddrs_new()
+    orbit @i in 0..@f.symbol_count
+        @s = @f.symbols[@i]
+        if @s.is_extern == 0
+            symaddrs_set(@addrs, @i, @text_rva + @s.offset)
+    return @addrs
+
+# Bind a single extern symbol.  Called by forge_pe after IDT layout to
+# record the IAT slot RVA for each imported function.
+fn forge_bind_extern(@addrs: SymbolAddrs, @sym_idx: int, @slot_rva: int)
+    symaddrs_set(@addrs, @sym_idx, @slot_rva)
+
+# =============================================================================
+# SECTION 5 — SELF-TESTS
+# =============================================================================
+
+fn reloc_selftest_pc32() -> int
+    @f = forge_new()
+    # Pretend we emitted `call foo` at offset 0; disp32 starts at offset 1.
+    emit_u8(@f, 0xE8)
+    emit_u32(@f, 0)
+
+    # Symbol 0 = internal "foo" at offset 100.
+    @sym_foo = forge_define_symbol(@f, 0, 3)
+    @f.symbols[@sym_foo].offset = 100     # pretend "foo"'s body starts here
+
+    # Emit a PC32 reloc at the disp position (offset 1), pointing at foo.
+    forge_add_reloc(@f, 1, RELOC_PC32, @sym_foo, 0)
+
+    # Build address table with text_rva = 0x1000 (typical .text RVA).
+    @addrs = forge_build_internal_addrs(@f, 0x1000)
+    @applied = forge_apply_relocs(@f, @addrs, 0x1000)
+    if @applied != 1
+        return 1
+
+    # Expected disp = 100 - (0 + 4) = 96 = 0x60, little-endian: 60 00 00 00
+    if @f.code[1] != 0x60
+        return 2
+    if @f.code[2] != 0 or @f.code[3] != 0 or @f.code[4] != 0
+        return 3
+    return 0
+
+fn reloc_selftest_unresolved_traps() -> int
+    @f = forge_new()
+    emit_u8(@f, 0xE8)
+    emit_u32(@f, 0)
+    # Define an extern but don't resolve it.
+    @sym = forge_extern_symbol(@f, 0, 4, 0)
+    forge_add_reloc(@f, 1, RELOC_PC32, @sym, 0)
+    @addrs = symaddrs_new()    # empty
+    @applied = forge_apply_relocs(@f, @addrs, 0x1000)
+    if @applied != 0
+        return 1
+    if @f.errors == 0
+        return 2
+    # The 4 bytes should be CC CC CC CC (int3 pattern).
+    if @f.code[1] != 0xCC or @f.code[4] != 0xCC
+        return 3
+    return 0
+
+fn reloc_selftest_abs64() -> int
+    @f = forge_new()
+    # Write 8 zero bytes representing a 64-bit absolute placeholder.
+    orbit _ in 0..8
+        emit_u8(@f, 0)
+    @sym = forge_define_symbol(@f, 0, 3)
+    @f.symbols[@sym].offset = 0x20     # arbitrary
+    forge_add_reloc(@f, 0, RELOC_ABS64, @sym, 0)
+    @addrs = forge_build_internal_addrs(@f, 0x140001000)   # image base + text rva
+    @applied = forge_apply_relocs(@f, @addrs, 0x140001000)
+    if @applied != 1
+        return 1
+    # Expected absolute = 0x140001000 + 0x20 = 0x140001020, little-endian
+    if @f.code[0] != 0x20
+        return 2
+    if @f.code[1] != 0x10
+        return 3
+    if @f.code[2] != 0
+        return 4
+    if @f.code[3] != 0x01
+        return 5
+    return 0
+
+fn run_forge_reloc_selftests() -> int
+    @pass = 0
+    if reloc_selftest_pc32() == 0
+        @pass = @pass + 1
+    if reloc_selftest_unresolved_traps() == 0
+        @pass = @pass + 1
+    if reloc_selftest_abs64() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+
+export {
+    RELOC_MAX_SYMBOLS,
+    SymbolAddrs,
+    symaddrs_new, symaddrs_set, symaddrs_get, symaddrs_is_resolved,
+    forge_apply_relocs,
+    forge_patch_u32, forge_patch_u64,
+    forge_build_internal_addrs, forge_bind_extern,
+    run_forge_reloc_selftests
+}

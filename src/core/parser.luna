@@ -1,0 +1,1814 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Self-Hosting Parser v2.0
+# =============================================================================
+# Recursive descent parser for Luna language.
+# Produces an Abstract Syntax Tree (AST) from tokens.
+#
+# Grammar supports:
+# - Functions, structs, enums, traits
+# - Control flow: if/eclipse/else, orbit, while, match
+# - Expressions: binary ops, unary ops, calls, indexing
+# - Patterns: destructuring, guards
+# - Inline assembly
+# =============================================================================
+
+import lexer
+
+# === AST NODE TYPES ===
+
+const AST_PROGRAM: int = 1
+const AST_FUNCTION: int = 2
+const AST_STRUCT: int = 3
+const AST_ENUM: int = 4
+const AST_TRAIT: int = 5
+const AST_IMPL: int = 6
+
+# Statements
+const AST_LET: int = 10
+const AST_CONST: int = 11
+const AST_ASSIGN: int = 12
+const AST_RETURN: int = 13
+const AST_BREAK: int = 14
+const AST_CONTINUE: int = 15
+const AST_PASS: int = 16
+const AST_EXPR_STMT: int = 17
+
+# Control flow
+const AST_IF: int = 20
+const AST_WHILE: int = 21
+const AST_ORBIT: int = 22
+const AST_MATCH: int = 23
+const AST_BLOCK: int = 24
+
+# Expressions
+const AST_BINARY: int = 30
+const AST_UNARY: int = 31
+const AST_CALL: int = 32
+const AST_INDEX: int = 33
+const AST_FIELD: int = 34
+const AST_LITERAL: int = 35
+const AST_IDENT: int = 36
+const AST_ARRAY: int = 37
+const AST_STRUCT_LIT: int = 38
+const AST_LAMBDA: int = 39
+const AST_RANGE: int = 40
+
+# Extended Statements (v0.6+)
+const AST_UNLESS: int = 60
+const AST_GUARD: int = 61
+const AST_ECLIPSE: int = 62
+const AST_SEAL_STRUCT: int = 63
+const AST_ACTOR: int = 64
+const AST_FLOW: int = 65
+const AST_SPAWN: int = 66
+const AST_SEND: int = 67
+const AST_REQUIRE: int = 68
+const AST_ENSURE: int = 69
+const AST_EXTERN_FN: int = 70
+const AST_DEFER: int = 71
+const AST_ATOMIC: int = 72
+const AST_DROP: int = 73
+const AST_VOLATILE_READ: int = 74
+const AST_VOLATILE_WRITE: int = 75
+const AST_GLOBAL_ALLOC: int = 76
+
+# Extended Expressions (v0.6+)
+const AST_DICT: int = 80
+const AST_PIPE: int = 81
+const AST_NULL_COALESCE: int = 82
+const AST_MOVE: int = 83
+const AST_FREEZE: int = 84
+const AST_BOX_ALLOC: int = 85
+const AST_RC_ALLOC: int = 86
+const AST_WEAK_REF: int = 87
+const AST_RAW_PTR: int = 88
+
+# Special
+const AST_ASM: int = 50
+const AST_UNSAFE: int = 51
+const AST_ATTRIBUTE: int = 52
+
+# === LITERAL TYPES ===
+const LIT_INT: int = 1
+const LIT_FLOAT: int = 2
+const LIT_STRING: int = 3
+const LIT_BOOL: int = 4
+const LIT_NIL: int = 5
+
+# === BINARY OPERATORS ===
+const OP_ADD: int = 1
+const OP_SUB: int = 2
+const OP_MUL: int = 3
+const OP_DIV: int = 4
+const OP_MOD: int = 5
+const OP_AND: int = 6
+const OP_OR: int = 7
+const OP_XOR: int = 8
+const OP_SHL: int = 9
+const OP_SHR: int = 10
+const OP_EQ: int = 11
+const OP_NE: int = 12
+const OP_LT: int = 13
+const OP_LE: int = 14
+const OP_GT: int = 15
+const OP_GE: int = 16
+const OP_LOGICAL_AND: int = 17
+const OP_LOGICAL_OR: int = 18
+
+# === UNARY OPERATORS ===
+const UNOP_NEG: int = 1
+const UNOP_NOT: int = 2
+const UNOP_BITNOT: int = 3
+const UNOP_REF: int = 4
+const UNOP_DEREF: int = 5
+# Cosmic unary operators (v4.3)
+const UNOP_BRIGHTEN: int = 6      # postfix `?` — unwrap phase<T> Bright, early-return Dim
+const UNOP_SEEN_OR: int = 7       # postfix `??` — seen<T> fallback (later: binary form needs separate op)
+
+# === AST NODE STRUCTURE ===
+# Using a flat structure with indices for children
+
+struct AstNode
+    kind: int           # AST_* constant
+    token_start: int    # Start token index
+    token_end: int      # End token index
+    # Payload (meaning depends on kind)
+    data1: int          # Generic data field 1
+    data2: int          # Generic data field 2
+    data3: int          # Generic data field 3
+    # Children (indices into node array)
+    child1: int         # First child index (-1 if none)
+    child2: int         # Second child index
+    child3: int         # Third child index
+    child4: int         # Fourth child index
+    # For nodes with many children (blocks, args)
+    children_start: int # Start index in children array
+    children_count: int # Number of children
+
+fn ast_node_new(@kind: int, @tok_start: int) -> AstNode
+    return AstNode {
+        kind: @kind,
+        token_start: @tok_start,
+        token_end: @tok_start,
+        data1: 0,
+        data2: 0,
+        data3: 0,
+        child1: -1,
+        child2: -1,
+        child3: -1,
+        child4: -1,
+        children_start: 0,
+        children_count: 0
+    }
+
+# === PARSER STATE ===
+
+struct Parser
+    tokens: [Token; 65536]   # Token array from lexer
+    token_count: int         # Total tokens
+    pos: int                 # Current position
+    nodes: [AstNode; 32768]  # AST nodes
+    node_count: int          # Number of nodes
+    children: [int; 65536]   # Children indices for blocks/lists
+    children_count: int      # Children array usage
+    errors: [int; 256]       # Error positions
+    error_count: int         # Number of errors
+    source: str              # Original source text (for name resolution)
+    source_len: int          # Original source byte length
+
+# Module-level handle to the last-parsed source so downstream passes
+# (type checker, borrow checker) can resolve identifier names without
+# having to thread Parser through every helper signature.
+meow @g_last_source: str = ""
+meow @g_last_source_len: int = 0
+
+fn parser_new() -> Parser
+    return Parser {
+        tokens: [Token {}; 65536],
+        token_count: 0,
+        pos: 0,
+        nodes: [AstNode {}; 32768],
+        node_count: 0,
+        children: [0; 65536],
+        children_count: 0,
+        errors: [0; 256],
+        error_count: 0,
+        source: "",
+        source_len: 0
+    }
+
+# === PARSER HELPERS ===
+
+# Get current token
+#[inline]
+fn parser_current(@p: Parser) -> Token
+    if @p.pos >= @p.token_count
+        return token_new(TOKEN_EOF, 0, 0, 0, 0)
+    return @p.tokens[@p.pos]
+
+# Peek token at offset
+#[inline]
+fn parser_peek(@p: Parser, @offset: int) -> Token
+    @idx = @p.pos + @offset
+    if @idx >= @p.token_count
+        return token_new(TOKEN_EOF, 0, 0, 0, 0)
+    return @p.tokens[@idx]
+
+# Advance to next token
+#[inline]
+fn parser_advance(@p: Parser) -> Token
+    @tok = parser_current(@p)
+    if @p.pos < @p.token_count
+        @p.pos = @p.pos + 1
+    return @tok
+
+# Check if current token matches kind
+#[inline]
+fn parser_check(@p: Parser, @kind: int) -> int
+    return parser_current(@p).kind == @kind
+
+# Check if current token is keyword
+#[inline]
+fn parser_check_keyword(@p: Parser, @kw: int) -> int
+    @tok = parser_current(@p)
+    return @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == @kw
+
+# Match and consume token
+fn parser_expect(@p: Parser, @kind: int) -> int
+    if parser_check(@p, @kind)
+        parser_advance(@p)
+        return 1
+    # Record error
+    if @p.error_count < 256
+        @p.errors[@p.error_count] = @p.pos
+        @p.error_count = @p.error_count + 1
+    return 0
+
+# Match and consume keyword
+fn parser_expect_keyword(@p: Parser, @kw: int) -> int
+    if parser_check_keyword(@p, @kw)
+        parser_advance(@p)
+        return 1
+    if @p.error_count < 256
+        @p.errors[@p.error_count] = @p.pos
+        @p.error_count = @p.error_count + 1
+    return 0
+
+# Skip newlines
+fn parser_skip_newlines(@p: Parser)
+    orbit _ in 0..1000
+        if parser_check(@p, TOKEN_NEWLINE) == 0
+            break
+        parser_advance(@p)
+
+# Allocate new AST node
+fn parser_alloc_node(@p: Parser, @kind: int) -> int
+    @idx = @p.node_count
+    if @idx >= 32768
+        return -1  # Out of space
+    @p.nodes[@idx] = ast_node_new(@kind, @p.pos)
+    @p.node_count = @p.node_count + 1
+    return @idx
+
+# Add child to children array
+fn parser_add_child(@p: Parser, @child: int) -> int
+    @idx = @p.children_count
+    if @idx >= 65536
+        return -1
+    @p.children[@idx] = @child
+    @p.children_count = @p.children_count + 1
+    return @idx
+
+# === EXPRESSION PARSING ===
+# Using Pratt parser (precedence climbing)
+
+# Operator precedence levels
+fn get_precedence(@tok: Token) -> int
+    match @tok.kind
+        TOKEN_OR_OR => return 1
+        TOKEN_AND_AND => return 2
+        TOKEN_PIPE => return 3
+        TOKEN_CARET => return 4
+        TOKEN_AMPERSAND => return 5
+        TOKEN_EQ_EQ => return 6
+        TOKEN_BANG_EQ => return 6
+        TOKEN_LT => return 7
+        TOKEN_GT => return 7
+        TOKEN_LT_EQ => return 7
+        TOKEN_GT_EQ => return 7
+        TOKEN_LT_LT => return 8
+        TOKEN_GT_GT => return 8
+        TOKEN_PLUS => return 9
+        TOKEN_MINUS => return 9
+        TOKEN_STAR => return 10
+        TOKEN_SLASH => return 10
+        TOKEN_PERCENT => return 10
+        _ => return 0
+
+fn token_to_binop(@tok: Token) -> int
+    match @tok.kind
+        TOKEN_PLUS => return OP_ADD
+        TOKEN_MINUS => return OP_SUB
+        TOKEN_STAR => return OP_MUL
+        TOKEN_SLASH => return OP_DIV
+        TOKEN_PERCENT => return OP_MOD
+        TOKEN_AMPERSAND => return OP_AND
+        TOKEN_PIPE => return OP_OR
+        TOKEN_CARET => return OP_XOR
+        TOKEN_LT_LT => return OP_SHL
+        TOKEN_GT_GT => return OP_SHR
+        TOKEN_EQ_EQ => return OP_EQ
+        TOKEN_BANG_EQ => return OP_NE
+        TOKEN_LT => return OP_LT
+        TOKEN_LT_EQ => return OP_LE
+        TOKEN_GT => return OP_GT
+        TOKEN_GT_EQ => return OP_GE
+        TOKEN_AND_AND => return OP_LOGICAL_AND
+        TOKEN_OR_OR => return OP_LOGICAL_OR
+        _ => return 0
+
+# Parse primary expression (atoms)
+fn parse_primary(@p: Parser) -> int
+    @tok = parser_current(@p)
+
+    match @tok.kind
+        TOKEN_INT =>
+            @node = parser_alloc_node(@p, AST_LITERAL)
+            @p.nodes[@node].data1 = LIT_INT
+            @p.nodes[@node].data2 = @tok.int_value
+            parser_advance(@p)
+            return @node
+
+        TOKEN_FLOAT =>
+            @node = parser_alloc_node(@p, AST_LITERAL)
+            @p.nodes[@node].data1 = LIT_FLOAT
+            parser_advance(@p)
+            return @node
+
+        TOKEN_STRING =>
+            @node = parser_alloc_node(@p, AST_LITERAL)
+            @p.nodes[@node].data1 = LIT_STRING
+            @p.nodes[@node].data2 = @tok.start
+            @p.nodes[@node].data3 = @tok.length
+            parser_advance(@p)
+            return @node
+
+        TOKEN_BOOL =>
+            @node = parser_alloc_node(@p, AST_LITERAL)
+            @p.nodes[@node].data1 = LIT_BOOL
+            @p.nodes[@node].data2 = @tok.int_value
+            parser_advance(@p)
+            return @node
+
+        TOKEN_IDENT =>
+            @node = parser_alloc_node(@p, AST_IDENT)
+            @p.nodes[@node].data1 = @tok.start
+            @p.nodes[@node].data2 = @tok.length
+            parser_advance(@p)
+            return @node
+
+        TOKEN_LPAREN =>
+            parser_advance(@p)  # consume '('
+            @expr = parse_expression(@p, 0)
+            parser_expect(@p, TOKEN_RPAREN)
+            return @expr
+
+        TOKEN_LBRACKET =>
+            return parse_array_literal(@p)
+
+        TOKEN_KEYWORD =>
+            if @tok.keyword_id == KW_NIL
+                @node = parser_alloc_node(@p, AST_LITERAL)
+                @p.nodes[@node].data1 = LIT_NIL
+                parser_advance(@p)
+                return @node
+            if @tok.keyword_id == KW_FN
+                return parse_lambda(@p)
+            # self reference (as expression)
+            if @tok.keyword_id == KW_SELF
+                @node = parser_alloc_node(@p, AST_IDENT)
+                @p.nodes[@node].data1 = @tok.start
+                @p.nodes[@node].data2 = @tok.length
+                parser_advance(@p)
+                return @node
+            # Cosmic unary-like expressions: nova EXPR, move EXPR, freeze EXPR, drop EXPR
+            if @tok.keyword_id == KW_NOVA
+                parser_advance(@p)
+                @inner = parse_unary(@p)
+                @node = parser_alloc_node(@p, AST_UNARY)
+                @p.nodes[@node].data1 = UNOP_DEREF  # reuse for async marker (data2 distinguishes)
+                @p.nodes[@node].data2 = 1           # 1 = nova (async)
+                @p.nodes[@node].child1 = @inner
+                return @node
+            if @tok.keyword_id == KW_MOVE
+                parser_advance(@p)
+                @node = parser_alloc_node(@p, AST_MOVE)
+                @p.nodes[@node].child1 = parse_unary(@p)
+                return @node
+            if @tok.keyword_id == KW_FREEZE
+                parser_advance(@p)
+                @node = parser_alloc_node(@p, AST_FREEZE)
+                @p.nodes[@node].child1 = parse_unary(@p)
+                return @node
+            if @tok.keyword_id == KW_BOX
+                parser_advance(@p)
+                @node = parser_alloc_node(@p, AST_BOX_ALLOC)
+                @p.nodes[@node].child1 = parse_unary(@p)
+                return @node
+            if @tok.keyword_id == KW_RC
+                parser_advance(@p)
+                @node = parser_alloc_node(@p, AST_RC_ALLOC)
+                @p.nodes[@node].child1 = parse_unary(@p)
+                return @node
+            if @tok.keyword_id == KW_WEAK
+                parser_advance(@p)
+                @node = parser_alloc_node(@p, AST_WEAK_REF)
+                @p.nodes[@node].child1 = parse_unary(@p)
+                return @node
+            # `if X then A else B` — ternary expression
+            if @tok.keyword_id == KW_IF
+                parser_advance(@p)
+                @cond = parse_expression(@p, 0)
+                parser_expect_keyword(@p, KW_THEN)
+                @thn = parse_expression(@p, 0)
+                parser_expect_keyword(@p, KW_ELSE)
+                @els = parse_expression(@p, 0)
+                @ifn = parser_alloc_node(@p, AST_IF)
+                @p.nodes[@ifn].child1 = @cond
+                @p.nodes[@ifn].child2 = @thn
+                @p.nodes[@ifn].child3 = @els
+                @p.nodes[@ifn].data3 = 1  # marker: expression form
+                return @ifn
+            # `phase` expression: alias for match
+            if @tok.keyword_id == KW_PHASE
+                return parse_match(@p)
+
+    # Error - unexpected token
+    return -1
+
+# Parse postfix operations (calls, indexing, field access)
+fn parse_postfix(@p: Parser, @left: int) -> int
+    @result = @left
+
+    orbit _ in 0..100
+        @tok = parser_current(@p)
+
+        if @tok.kind == TOKEN_LPAREN
+            # Function call
+            @call = parser_alloc_node(@p, AST_CALL)
+            @p.nodes[@call].child1 = @result
+            parser_advance(@p)  # consume '('
+
+            # Parse arguments
+            @args_start = @p.children_count
+            @arg_count = 0
+
+            if parser_check(@p, TOKEN_RPAREN) == 0
+                orbit _ in 0..256
+                    @arg = parse_expression(@p, 0)
+                    if @arg >= 0
+                        parser_add_child(@p, @arg)
+                        @arg_count = @arg_count + 1
+
+                    if parser_check(@p, TOKEN_COMMA) == 0
+                        break
+                    parser_advance(@p)  # consume ','
+
+            parser_expect(@p, TOKEN_RPAREN)
+            @p.nodes[@call].children_start = @args_start
+            @p.nodes[@call].children_count = @arg_count
+            @result = @call
+
+        eclipse if @tok.kind == TOKEN_LBRACKET
+            # Index operation
+            @index = parser_alloc_node(@p, AST_INDEX)
+            @p.nodes[@index].child1 = @result
+            parser_advance(@p)  # consume '['
+            @idx_expr = parse_expression(@p, 0)
+            @p.nodes[@index].child2 = @idx_expr
+            parser_expect(@p, TOKEN_RBRACKET)
+            @result = @index
+
+        eclipse if @tok.kind == TOKEN_DOT
+            # Field access
+            @field = parser_alloc_node(@p, AST_FIELD)
+            @p.nodes[@field].child1 = @result
+            parser_advance(@p)  # consume '.'
+            @field_tok = parser_current(@p)
+            if @field_tok.kind == TOKEN_IDENT
+                @p.nodes[@field].data1 = @field_tok.start
+                @p.nodes[@field].data2 = @field_tok.length
+                parser_advance(@p)
+            @result = @field
+
+        eclipse if @tok.kind == TOKEN_QUESTION
+            # Postfix `?`: phase<T> propagator.
+            # EXPR? means "if EXPR is Bright(v), yield v; if Dim(e), early-return Dim(e)".
+            # Must appear inside a function that itself returns phase<_> — the
+            # type checker validates that constraint.
+            @brighten = parser_alloc_node(@p, AST_UNARY)
+            @p.nodes[@brighten].data1 = UNOP_BRIGHTEN
+            @p.nodes[@brighten].child1 = @result
+            parser_advance(@p)
+            @result = @brighten
+
+        else
+            break
+
+    return @result
+
+# Parse unary expression
+fn parse_unary(@p: Parser) -> int
+    @tok = parser_current(@p)
+
+    # Check for unary operators
+    match @tok.kind
+        TOKEN_MINUS =>
+            @node = parser_alloc_node(@p, AST_UNARY)
+            @p.nodes[@node].data1 = UNOP_NEG
+            parser_advance(@p)
+            @p.nodes[@node].child1 = parse_unary(@p)
+            return @node
+
+        TOKEN_BANG =>
+            @node = parser_alloc_node(@p, AST_UNARY)
+            @p.nodes[@node].data1 = UNOP_NOT
+            parser_advance(@p)
+            @p.nodes[@node].child1 = parse_unary(@p)
+            return @node
+
+        TOKEN_TILDE =>
+            @node = parser_alloc_node(@p, AST_UNARY)
+            @p.nodes[@node].data1 = UNOP_BITNOT
+            parser_advance(@p)
+            @p.nodes[@node].child1 = parse_unary(@p)
+            return @node
+
+        TOKEN_AMPERSAND =>
+            @node = parser_alloc_node(@p, AST_UNARY)
+            @p.nodes[@node].data1 = UNOP_REF
+            parser_advance(@p)
+            @p.nodes[@node].child1 = parse_unary(@p)
+            return @node
+
+        TOKEN_STAR =>
+            @node = parser_alloc_node(@p, AST_UNARY)
+            @p.nodes[@node].data1 = UNOP_DEREF
+            parser_advance(@p)
+            @p.nodes[@node].child1 = parse_unary(@p)
+            return @node
+
+    # Not a unary operator - parse primary
+    @primary = parse_primary(@p)
+    return parse_postfix(@p, @primary)
+
+# Parse expression with precedence climbing
+fn parse_expression(@p: Parser, @min_prec: int) -> int
+    @left = parse_unary(@p)
+    if @left < 0
+        return -1
+
+    orbit _ in 0..100
+        @tok = parser_current(@p)
+        @prec = get_precedence(@tok)
+
+        if @prec <= @min_prec
+            break
+
+        @op = token_to_binop(@tok)
+        parser_advance(@p)
+
+        # Handle range operator specially
+        if @tok.kind == TOKEN_DOT_DOT || @tok.kind == TOKEN_DOT_DOT_EQ
+            @range = parser_alloc_node(@p, AST_RANGE)
+            @p.nodes[@range].child1 = @left
+            @p.nodes[@range].data1 = if @tok.kind == TOKEN_DOT_DOT_EQ then 1 else 0
+            @p.nodes[@range].child2 = parse_expression(@p, @prec)
+            @left = @range
+        else
+            @right = parse_expression(@p, @prec)
+            @binary = parser_alloc_node(@p, AST_BINARY)
+            @p.nodes[@binary].data1 = @op
+            @p.nodes[@binary].child1 = @left
+            @p.nodes[@binary].child2 = @right
+            @left = @binary
+
+    return @left
+
+# Parse array literal
+fn parse_array_literal(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_ARRAY)
+    parser_expect(@p, TOKEN_LBRACKET)
+
+    @elems_start = @p.children_count
+    @elem_count = 0
+
+    if parser_check(@p, TOKEN_RBRACKET) == 0
+        orbit _ in 0..1024
+            @elem = parse_expression(@p, 0)
+            if @elem >= 0
+                parser_add_child(@p, @elem)
+                @elem_count = @elem_count + 1
+
+            if parser_check(@p, TOKEN_COMMA) == 0
+                break
+            parser_advance(@p)
+
+    parser_expect(@p, TOKEN_RBRACKET)
+    @p.nodes[@node].children_start = @elems_start
+    @p.nodes[@node].children_count = @elem_count
+    return @node
+
+# Parse lambda expression
+fn parse_lambda(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_LAMBDA)
+    parser_expect_keyword(@p, KW_FN)
+    parser_expect(@p, TOKEN_LPAREN)
+
+    # Parse parameters
+    @params_start = @p.children_count
+    @param_count = 0
+
+    if parser_check(@p, TOKEN_RPAREN) == 0
+        orbit _ in 0..64
+            @tok = parser_current(@p)
+            if @tok.kind == TOKEN_IDENT
+                parser_add_child(@p, @tok.start)  # Store identifier start
+                parser_add_child(@p, @tok.length)
+                parser_advance(@p)
+                @param_count = @param_count + 1
+
+            if parser_check(@p, TOKEN_COMMA) == 0
+                break
+            parser_advance(@p)
+
+    parser_expect(@p, TOKEN_RPAREN)
+    @p.nodes[@node].children_start = @params_start
+    @p.nodes[@node].children_count = @param_count
+
+    # Arrow and body
+    if parser_check(@p, TOKEN_ARROW)
+        parser_advance(@p)
+        @p.nodes[@node].child1 = parse_expression(@p, 0)
+
+    return @node
+
+# === STATEMENT PARSING ===
+
+# --- Binding forms (let / meow / seal) ---
+# Meow binding: mutable local. AST_LET with data3=1 distinguishes from plain let.
+fn parse_meow(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_LET)
+    @p.nodes[@node].data3 = 1  # 1 = meow (mutable)
+    parser_expect_keyword(@p, KW_MEOW)
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+    # Optional type annotation
+    if parser_check(@p, TOKEN_COLON)
+        parser_advance(@p)
+        parser_skip_type(@p)
+    # Initializer
+    if parser_check(@p, TOKEN_EQ)
+        parser_advance(@p)
+        @p.nodes[@node].child1 = parse_expression(@p, 0)
+    return @node
+
+# Seal binding: immutable after init. AST_LET with data3=2.
+fn parse_seal(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_LET)
+    @p.nodes[@node].data3 = 2  # 2 = seal
+    parser_expect_keyword(@p, KW_SEAL)
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+    if parser_check(@p, TOKEN_COLON)
+        parser_advance(@p)
+        parser_skip_type(@p)
+    # Seal REQUIRES initializer — it's the whole point
+    parser_expect(@p, TOKEN_EQ)
+    @p.nodes[@node].child1 = parse_expression(@p, 0)
+    return @node
+
+# Skip a type annotation — supports Ident, generic Ident<T,U>, function types, nullables, arrays, refs
+fn parser_skip_type(@p: Parser)
+    # Handle reference prefix
+    if parser_check(@p, TOKEN_AMPERSAND)
+        parser_advance(@p)
+        if parser_check_keyword(@p, KW_MUT)
+            parser_advance(@p)
+    # Handle pointer prefix
+    if parser_check(@p, TOKEN_STAR)
+        parser_advance(@p)
+        if parser_check_keyword(@p, KW_MUT) || parser_check_keyword(@p, KW_CONST)
+            parser_advance(@p)
+    # Array type [T; N] or [T]
+    if parser_check(@p, TOKEN_LBRACKET)
+        parser_advance(@p)
+        parser_skip_type(@p)
+        if parser_check(@p, TOKEN_SEMICOLON)
+            parser_advance(@p)
+            # Skip length expression
+            orbit _ in 0..32
+                if parser_check(@p, TOKEN_RBRACKET) || parser_check(@p, TOKEN_EOF)
+                    break
+                parser_advance(@p)
+        parser_expect(@p, TOKEN_RBRACKET)
+        return
+    # Function type: fn(T,U) -> R
+    if parser_check_keyword(@p, KW_FN)
+        parser_advance(@p)
+        if parser_check(@p, TOKEN_LPAREN)
+            parser_advance(@p)
+            orbit _ in 0..32
+                if parser_check(@p, TOKEN_RPAREN) || parser_check(@p, TOKEN_EOF)
+                    break
+                parser_skip_type(@p)
+                if parser_check(@p, TOKEN_COMMA)
+                    parser_advance(@p)
+                else
+                    break
+            parser_expect(@p, TOKEN_RPAREN)
+            if parser_check(@p, TOKEN_ARROW)
+                parser_advance(@p)
+                parser_skip_type(@p)
+        return
+    # Plain identifier type (possibly generic)
+    if parser_check(@p, TOKEN_IDENT)
+        parser_advance(@p)
+        # Generics: <T, U>
+        if parser_check(@p, TOKEN_LT)
+            parser_advance(@p)
+            orbit _ in 0..32
+                if parser_check(@p, TOKEN_GT) || parser_check(@p, TOKEN_EOF)
+                    break
+                parser_skip_type(@p)
+                if parser_check(@p, TOKEN_COMMA)
+                    parser_advance(@p)
+                else
+                    break
+            parser_expect(@p, TOKEN_GT)
+    # Nullable suffix T?
+    if parser_check(@p, TOKEN_BANG) == 0
+        # check for '?' (token 63)
+        @tok = parser_current(@p)
+        if @tok.kind == TOKEN_ERROR && @tok.length == 1
+            # may be '?' — let it pass for now
+            pass
+
+# --- guard COND else BLOCK ---
+fn parse_guard(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_GUARD)
+    parser_expect_keyword(@p, KW_GUARD)
+    @p.nodes[@node].child1 = parse_expression(@p, 0)
+    if parser_check_keyword(@p, KW_ELSE)
+        parser_advance(@p)
+        parser_skip_newlines(@p)
+        if parser_check(@p, TOKEN_INDENT)
+            parser_advance(@p)
+            @p.nodes[@node].child2 = parse_block(@p)
+        else
+            # Inline single-statement else branch (e.g. `guard x > 0 else return -1`)
+            @p.nodes[@node].child2 = parse_statement(@p)
+    return @node
+
+# --- unless COND BLOCK (syntactic sugar for `if !COND BLOCK`) ---
+fn parse_unless(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_UNLESS)
+    parser_expect_keyword(@p, KW_UNLESS)
+    @p.nodes[@node].child1 = parse_expression(@p, 0)
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child2 = parse_block(@p)
+    return @node
+
+# --- spawn EXPR | spawn INDENT BLOCK DEDENT ---
+fn parse_spawn(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_SPAWN)
+    parser_expect_keyword(@p, KW_SPAWN)
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child1 = parse_block(@p)
+    else
+        @p.nodes[@node].child1 = parse_expression(@p, 0)
+    return @node
+
+# --- send TARGET, MSG ---
+fn parse_send(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_SEND)
+    parser_expect_keyword(@p, KW_SEND)
+    @p.nodes[@node].child1 = parse_expression(@p, 0)  # target
+    parser_expect(@p, TOKEN_COMMA)
+    @p.nodes[@node].child2 = parse_expression(@p, 0)  # payload
+    return @node
+
+# --- defer EXPR | defer INDENT BLOCK DEDENT ---
+fn parse_defer(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_DEFER)
+    parser_expect_keyword(@p, KW_DEFER)
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child1 = parse_block(@p)
+    else
+        @p.nodes[@node].child1 = parse_expression(@p, 0)
+    return @node
+
+# --- drop EXPR ---
+fn parse_drop(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_DROP)
+    parser_expect_keyword(@p, KW_DROP)
+    @p.nodes[@node].child1 = parse_expression(@p, 0)
+    return @node
+
+fn parse_statement(@p: Parser) -> int
+    parser_skip_newlines(@p)
+    @tok = parser_current(@p)
+
+    # Let statement
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_LET
+        return parse_let(@p)
+
+    # Meow binding (mutable)
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_MEOW
+        return parse_meow(@p)
+
+    # Seal binding (immutable after init)
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_SEAL
+        return parse_seal(@p)
+
+    # Const statement
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_CONST
+        return parse_const(@p)
+
+    # Return statement
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_RETURN
+        @node = parser_alloc_node(@p, AST_RETURN)
+        parser_advance(@p)
+        if parser_check(@p, TOKEN_NEWLINE) == 0 && parser_check(@p, TOKEN_EOF) == 0
+            @p.nodes[@node].child1 = parse_expression(@p, 0)
+        return @node
+
+    # Break statement
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_BREAK
+        @node = parser_alloc_node(@p, AST_BREAK)
+        parser_advance(@p)
+        return @node
+
+    # Continue statement
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_CONTINUE
+        @node = parser_alloc_node(@p, AST_CONTINUE)
+        parser_advance(@p)
+        return @node
+
+    # Pass statement
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_PASS
+        @node = parser_alloc_node(@p, AST_PASS)
+        parser_advance(@p)
+        return @node
+
+    # If statement
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_IF
+        return parse_if(@p)
+
+    # While statement
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_WHILE
+        return parse_while(@p)
+
+    # Orbit (for) loop
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_ORBIT
+        return parse_orbit(@p)
+
+    # Match statement (and its cosmic alias "phase")
+    if @tok.kind == TOKEN_KEYWORD && (@tok.keyword_id == KW_MATCH || @tok.keyword_id == KW_PHASE)
+        return parse_match(@p)
+
+    # Unsafe block
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_UNSAFE
+        return parse_unsafe(@p)
+
+    # Guard / unless
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_GUARD
+        return parse_guard(@p)
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_UNLESS
+        return parse_unless(@p)
+
+    # Concurrency: spawn / send
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_SPAWN
+        return parse_spawn(@p)
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_SEND
+        return parse_send(@p)
+
+    # Resource management: defer / drop
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_DEFER
+        return parse_defer(@p)
+    if @tok.kind == TOKEN_KEYWORD && @tok.keyword_id == KW_DROP
+        return parse_drop(@p)
+
+    # Expression statement (or assignment)
+    @expr = parse_expression(@p, 0)
+    if @expr < 0
+        return -1
+
+    # Check for assignment
+    @next = parser_current(@p)
+    if @next.kind == TOKEN_EQ
+        @assign = parser_alloc_node(@p, AST_ASSIGN)
+        parser_advance(@p)
+        @p.nodes[@assign].child1 = @expr
+        @p.nodes[@assign].child2 = parse_expression(@p, 0)
+        return @assign
+
+    # Plain expression statement
+    @stmt = parser_alloc_node(@p, AST_EXPR_STMT)
+    @p.nodes[@stmt].child1 = @expr
+    return @stmt
+
+# Parse let statement (let [mut] NAME [: TYPE] [= EXPR])
+# data3 semantics: 0 = plain let (immutable), 1 = meow (mutable), 2 = seal,
+#                  3 = let mut (mutable via mut keyword)
+fn parse_let(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_LET)
+    @p.nodes[@node].data3 = 0  # plain immutable let
+    parser_expect_keyword(@p, KW_LET)
+
+    # Optional 'mut' modifier: let mut x = 5
+    if parser_check_keyword(@p, KW_MUT)
+        parser_advance(@p)
+        @p.nodes[@node].data3 = 3
+
+    # Variable name
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+
+    # Optional type annotation (handles generics, refs, arrays, function types)
+    if parser_check(@p, TOKEN_COLON)
+        parser_advance(@p)
+        parser_skip_type(@p)
+
+    # Initializer
+    if parser_check(@p, TOKEN_EQ)
+        parser_advance(@p)
+        @p.nodes[@node].child1 = parse_expression(@p, 0)
+
+    return @node
+
+# Parse const statement
+fn parse_const(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_CONST)
+    parser_expect_keyword(@p, KW_CONST)
+
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+
+    if parser_check(@p, TOKEN_COLON)
+        parser_advance(@p)
+        parser_skip_type(@p)
+
+    parser_expect(@p, TOKEN_EQ)
+    @p.nodes[@node].child1 = parse_expression(@p, 0)
+    return @node
+
+# Parse if statement
+fn parse_if(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_IF)
+    parser_expect_keyword(@p, KW_IF)
+
+    # Condition
+    @p.nodes[@node].child1 = parse_expression(@p, 0)
+
+    # Then block
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child2 = parse_block(@p)
+
+    # Else/eclipse branches
+    parser_skip_newlines(@p)
+    if parser_check_keyword(@p, KW_ECLIPSE) || parser_check_keyword(@p, KW_ELSE)
+        @kw = parser_current(@p).keyword_id
+        parser_advance(@p)
+
+        if @kw == KW_ECLIPSE
+            # eclipse if - chain
+            if parser_check_keyword(@p, KW_IF)
+                @p.nodes[@node].child3 = parse_if(@p)
+            else
+                parser_skip_newlines(@p)
+                if parser_check(@p, TOKEN_INDENT)
+                    parser_advance(@p)
+                    @p.nodes[@node].child3 = parse_block(@p)
+        else
+            # else
+            parser_skip_newlines(@p)
+            if parser_check(@p, TOKEN_INDENT)
+                parser_advance(@p)
+                @p.nodes[@node].child3 = parse_block(@p)
+
+    return @node
+
+# Parse while loop
+fn parse_while(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_WHILE)
+    parser_expect_keyword(@p, KW_WHILE)
+
+    @p.nodes[@node].child1 = parse_expression(@p, 0)
+
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child2 = parse_block(@p)
+
+    return @node
+
+# Parse orbit (for) loop
+fn parse_orbit(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_ORBIT)
+    parser_expect_keyword(@p, KW_ORBIT)
+
+    # Loop variable
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+
+    parser_expect_keyword(@p, KW_IN)
+
+    # Iterator expression
+    @p.nodes[@node].child1 = parse_expression(@p, 0)
+
+    # Body
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child2 = parse_block(@p)
+
+    return @node
+
+# Parse match statement
+fn parse_match(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_MATCH)
+    parser_expect_keyword(@p, KW_MATCH)
+
+    @p.nodes[@node].child1 = parse_expression(@p, 0)
+
+    # Match arms
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @arms_start = @p.children_count
+        @arm_count = 0
+
+        orbit _ in 0..256
+            parser_skip_newlines(@p)
+            if parser_check(@p, TOKEN_DEDENT) || parser_check(@p, TOKEN_EOF)
+                break
+
+            # Pattern
+            @pattern = parse_expression(@p, 0)
+            parser_add_child(@p, @pattern)
+
+            # Arrow and body
+            parser_expect(@p, TOKEN_FAT_ARROW)
+            @body = parse_expression(@p, 0)
+            parser_add_child(@p, @body)
+            @arm_count = @arm_count + 1
+
+        if parser_check(@p, TOKEN_DEDENT)
+            parser_advance(@p)
+
+        @p.nodes[@node].children_start = @arms_start
+        @p.nodes[@node].children_count = @arm_count * 2
+
+    return @node
+
+# Parse unsafe block
+fn parse_unsafe(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_UNSAFE)
+    parser_expect_keyword(@p, KW_UNSAFE)
+
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child1 = parse_block(@p)
+
+    return @node
+
+# Parse indented block
+fn parse_block(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_BLOCK)
+    @stmts_start = @p.children_count
+    @stmt_count = 0
+
+    orbit _ in 0..1024
+        parser_skip_newlines(@p)
+
+        if parser_check(@p, TOKEN_DEDENT) || parser_check(@p, TOKEN_EOF)
+            break
+
+        @stmt = parse_statement(@p)
+        if @stmt >= 0
+            parser_add_child(@p, @stmt)
+            @stmt_count = @stmt_count + 1
+
+    if parser_check(@p, TOKEN_DEDENT)
+        parser_advance(@p)
+
+    @p.nodes[@node].children_start = @stmts_start
+    @p.nodes[@node].children_count = @stmt_count
+    return @node
+
+# === TOP-LEVEL DECLARATIONS ===
+
+fn parse_function(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_FUNCTION)
+
+    # Attributes (e.g., #[inline])
+    orbit _ in 0..16
+        if parser_check(@p, TOKEN_HASH) == 0
+            break
+        parser_advance(@p)
+        parser_expect(@p, TOKEN_LBRACKET)
+        # Skip attribute content
+        orbit _ in 0..100
+            if parser_check(@p, TOKEN_RBRACKET)
+                break
+            parser_advance(@p)
+        parser_expect(@p, TOKEN_RBRACKET)
+        parser_skip_newlines(@p)
+
+    parser_expect_keyword(@p, KW_FN)
+
+    # Function name
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+
+    # Optional generic parameters: fn foo<T, U: Trait>(...)
+    parser_skip_generics(@p)
+
+    # Parameters
+    parser_expect(@p, TOKEN_LPAREN)
+    @params_start = @p.children_count
+    @param_count = 0
+
+    if parser_check(@p, TOKEN_RPAREN) == 0
+        orbit _ in 0..64
+            # Optional mut/ref/move modifiers on parameter
+            if parser_check_keyword(@p, KW_MUT) || parser_check_keyword(@p, KW_REF) || parser_check_keyword(@p, KW_MOVE)
+                parser_advance(@p)
+            # Special case: 'self' param (no type)
+            if parser_check_keyword(@p, KW_SELF)
+                @self_tok = parser_current(@p)
+                parser_add_child(@p, @self_tok.start)
+                parser_add_child(@p, @self_tok.length)
+                parser_advance(@p)
+                @param_count = @param_count + 1
+            else
+                @param_tok = parser_current(@p)
+                if @param_tok.kind == TOKEN_IDENT
+                    parser_add_child(@p, @param_tok.start)
+                    parser_add_child(@p, @param_tok.length)
+                    parser_advance(@p)
+
+                    # Type annotation (full type including generics)
+                    if parser_check(@p, TOKEN_COLON)
+                        parser_advance(@p)
+                        parser_skip_type(@p)
+
+                    @param_count = @param_count + 1
+
+            if parser_check(@p, TOKEN_COMMA) == 0
+                break
+            parser_advance(@p)
+
+    parser_expect(@p, TOKEN_RPAREN)
+    @p.nodes[@node].children_start = @params_start
+    @p.nodes[@node].children_count = @param_count * 2
+
+    # Return type (full type, not just ident)
+    if parser_check(@p, TOKEN_ARROW)
+        parser_advance(@p)
+        parser_skip_type(@p)
+
+    # Optional 'where' clause
+    parser_skip_where(@p)
+
+    # Body
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child1 = parse_block(@p)
+
+    return @node
+
+fn parse_struct(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_STRUCT)
+    parser_expect_keyword(@p, KW_STRUCT)
+
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+
+    # Optional generics <T, U>
+    parser_skip_generics(@p)
+
+    # Optional 'where' clause
+    parser_skip_where(@p)
+
+    # Fields
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @fields_start = @p.children_count
+        @field_count = 0
+
+        orbit _ in 0..256
+            parser_skip_newlines(@p)
+            if parser_check(@p, TOKEN_DEDENT) || parser_check(@p, TOKEN_EOF)
+                break
+
+            @field_tok = parser_current(@p)
+            if @field_tok.kind == TOKEN_IDENT
+                parser_add_child(@p, @field_tok.start)
+                parser_add_child(@p, @field_tok.length)
+                parser_advance(@p)
+
+                parser_expect(@p, TOKEN_COLON)
+                parser_skip_type(@p)
+
+                @field_count = @field_count + 1
+
+        if parser_check(@p, TOKEN_DEDENT)
+            parser_advance(@p)
+
+        @p.nodes[@node].children_start = @fields_start
+        @p.nodes[@node].children_count = @field_count * 2
+
+    return @node
+
+# Skip generic parameter list: <T, U: Trait + Copy, const N>
+fn parser_skip_generics(@p: Parser)
+    if parser_check(@p, TOKEN_LT) == 0
+        return
+    parser_advance(@p)
+    orbit _ in 0..64
+        if parser_check(@p, TOKEN_GT) || parser_check(@p, TOKEN_EOF)
+            break
+        # Skip param name + optional ': Bound + Bound'
+        if parser_check(@p, TOKEN_IDENT)
+            parser_advance(@p)
+        if parser_check(@p, TOKEN_COLON)
+            parser_advance(@p)
+            # Skip bounds (idents separated by '+')
+            orbit _ in 0..16
+                if parser_check(@p, TOKEN_IDENT)
+                    parser_advance(@p)
+                if parser_check(@p, TOKEN_PLUS) == 0
+                    break
+                parser_advance(@p)
+        if parser_check(@p, TOKEN_COMMA)
+            parser_advance(@p)
+        else
+            break
+    parser_expect(@p, TOKEN_GT)
+
+# Skip `where T: Bound, U: Bound2` clause
+fn parser_skip_where(@p: Parser)
+    if parser_check_keyword(@p, KW_WHERE) == 0
+        return
+    parser_advance(@p)
+    orbit _ in 0..64
+        if parser_check(@p, TOKEN_COLON)
+            parser_advance(@p)
+            # Skip bound chain
+            orbit _ in 0..16
+                if parser_check(@p, TOKEN_IDENT)
+                    parser_advance(@p)
+                else
+                    break
+                if parser_check(@p, TOKEN_PLUS) == 0
+                    break
+                parser_advance(@p)
+        if parser_check(@p, TOKEN_COMMA)
+            parser_advance(@p)
+        else
+            break
+        if parser_check(@p, TOKEN_IDENT) == 0
+            break
+
+# --- enum Name<T>:  Variant1(T)  Variant2(U,V)  Variant3 ---
+fn parse_enum(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_ENUM)
+    parser_expect_keyword(@p, KW_ENUM)
+
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+
+    parser_skip_generics(@p)
+    parser_skip_where(@p)
+
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @variants_start = @p.children_count
+        @variant_count = 0
+        orbit _ in 0..256
+            parser_skip_newlines(@p)
+            if parser_check(@p, TOKEN_DEDENT) || parser_check(@p, TOKEN_EOF)
+                break
+            @vt = parser_current(@p)
+            if @vt.kind == TOKEN_IDENT
+                parser_add_child(@p, @vt.start)
+                parser_add_child(@p, @vt.length)
+                parser_advance(@p)
+                # Optional tuple payload: Variant(T, U)
+                if parser_check(@p, TOKEN_LPAREN)
+                    parser_advance(@p)
+                    orbit _ in 0..16
+                        if parser_check(@p, TOKEN_RPAREN) || parser_check(@p, TOKEN_EOF)
+                            break
+                        parser_skip_type(@p)
+                        if parser_check(@p, TOKEN_COMMA)
+                            parser_advance(@p)
+                        else
+                            break
+                    parser_expect(@p, TOKEN_RPAREN)
+                @variant_count = @variant_count + 1
+        if parser_check(@p, TOKEN_DEDENT)
+            parser_advance(@p)
+        @p.nodes[@node].children_start = @variants_start
+        @p.nodes[@node].children_count = @variant_count * 2
+    return @node
+
+# --- trait Name<T>:  fn method(@self) -> T  ... ---
+fn parse_trait(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_TRAIT)
+    parser_expect_keyword(@p, KW_TRAIT)
+
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+
+    parser_skip_generics(@p)
+    parser_skip_where(@p)
+
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @methods_start = @p.children_count
+        @method_count = 0
+        orbit _ in 0..128
+            parser_skip_newlines(@p)
+            if parser_check(@p, TOKEN_DEDENT) || parser_check(@p, TOKEN_EOF)
+                break
+            if parser_check_keyword(@p, KW_FN) || parser_check(@p, TOKEN_HASH)
+                @m = parse_function(@p)
+                if @m >= 0
+                    parser_add_child(@p, @m)
+                    @method_count = @method_count + 1
+            else
+                parser_advance(@p)
+        if parser_check(@p, TOKEN_DEDENT)
+            parser_advance(@p)
+        @p.nodes[@node].children_start = @methods_start
+        @p.nodes[@node].children_count = @method_count
+    return @node
+
+# --- impl [Trait for] Type:  fn ... ---
+fn parse_impl(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_IMPL)
+    parser_expect_keyword(@p, KW_IMPL)
+
+    parser_skip_generics(@p)
+
+    # Save first type reference in data1/data2 (trait or Self type)
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+        # Skip possible generic args after the first name
+        if parser_check(@p, TOKEN_LT)
+            parser_skip_generics(@p)
+
+    # Optional 'for Type' — marks this as trait impl; record in data3
+    if parser_check_keyword(@p, KW_FOR)
+        @p.nodes[@node].data3 = 1
+        parser_advance(@p)
+        parser_skip_type(@p)
+
+    parser_skip_where(@p)
+
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @methods_start = @p.children_count
+        @method_count = 0
+        orbit _ in 0..128
+            parser_skip_newlines(@p)
+            if parser_check(@p, TOKEN_DEDENT) || parser_check(@p, TOKEN_EOF)
+                break
+            if parser_check_keyword(@p, KW_FN) || parser_check(@p, TOKEN_HASH)
+                @m = parse_function(@p)
+                if @m >= 0
+                    parser_add_child(@p, @m)
+                    @method_count = @method_count + 1
+            else
+                parser_advance(@p)
+        if parser_check(@p, TOKEN_DEDENT)
+            parser_advance(@p)
+        @p.nodes[@node].children_start = @methods_start
+        @p.nodes[@node].children_count = @method_count
+    return @node
+
+# --- type Alias<T> = Type | type ADT<T>:  Variant1  Variant2 ---
+fn parse_type_decl(@p: Parser) -> int
+    parser_expect_keyword(@p, KW_TYPE)
+    @tok = parser_current(@p)
+    @name_start = @tok.start
+    @name_len = @tok.length
+    if @tok.kind == TOKEN_IDENT
+        parser_advance(@p)
+    parser_skip_generics(@p)
+
+    # Indented ADT form:  type Name:  Variant1  Variant2
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        @enum_node = parser_alloc_node(@p, AST_ENUM)
+        @p.nodes[@enum_node].data1 = @name_start
+        @p.nodes[@enum_node].data2 = @name_len
+        parser_advance(@p)
+        @variants_start = @p.children_count
+        @variant_count = 0
+        orbit _ in 0..256
+            parser_skip_newlines(@p)
+            if parser_check(@p, TOKEN_DEDENT) || parser_check(@p, TOKEN_EOF)
+                break
+            @vt = parser_current(@p)
+            if @vt.kind == TOKEN_IDENT
+                parser_add_child(@p, @vt.start)
+                parser_add_child(@p, @vt.length)
+                parser_advance(@p)
+                if parser_check(@p, TOKEN_LPAREN)
+                    parser_advance(@p)
+                    orbit _ in 0..16
+                        if parser_check(@p, TOKEN_RPAREN) || parser_check(@p, TOKEN_EOF)
+                            break
+                        parser_skip_type(@p)
+                        if parser_check(@p, TOKEN_COMMA)
+                            parser_advance(@p)
+                        else
+                            break
+                    parser_expect(@p, TOKEN_RPAREN)
+                @variant_count = @variant_count + 1
+        if parser_check(@p, TOKEN_DEDENT)
+            parser_advance(@p)
+        @p.nodes[@enum_node].children_start = @variants_start
+        @p.nodes[@enum_node].children_count = @variant_count * 2
+        return @enum_node
+
+    # Alias form:  type Name = OtherType
+    if parser_check(@p, TOKEN_EQ)
+        parser_advance(@p)
+        @alias_node = parser_alloc_node(@p, AST_STRUCT)  # reuse AST_STRUCT for aliases (single field 'aliased')
+        @p.nodes[@alias_node].data1 = @name_start
+        @p.nodes[@alias_node].data2 = @name_len
+        @p.nodes[@alias_node].data3 = 1  # marker: type alias
+        parser_skip_type(@p)
+        return @alias_node
+
+    return -1
+
+# --- actor Name:  state...  on Msg -> body ---
+fn parse_actor(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_ACTOR)
+    parser_expect_keyword(@p, KW_ACTOR)
+    @tok = parser_current(@p)
+    if @tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @tok.start
+        @p.nodes[@node].data2 = @tok.length
+        parser_advance(@p)
+    parser_skip_generics(@p)
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child1 = parse_block(@p)
+    return @node
+
+# --- flow <pipeline> ---
+fn parse_flow(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_FLOW)
+    parser_expect_keyword(@p, KW_FLOW)
+    # Body is an expression (often a | a chain of pipes) or a block
+    parser_skip_newlines(@p)
+    if parser_check(@p, TOKEN_INDENT)
+        parser_advance(@p)
+        @p.nodes[@node].child1 = parse_block(@p)
+    else
+        @p.nodes[@node].child1 = parse_expression(@p, 0)
+    return @node
+
+# =============================================================================
+# EXTERN FUNCTION DECLARATION  (v4.3 — Lunar Independence)
+# =============================================================================
+# Syntax:
+#   extern "<abi>" fn <name>(<params>) [-> <ret>]
+#   extern "<abi>" lib "<libname>" fn <name>(<params>) [-> <ret>]
+#
+# <abi> is a double-quoted string. Recognised values:
+#   "C"               — System V / MS ABI via C runtime
+#   "stdcall"         — Windows PE imports (kernel32, ws2_32, ...)
+#   "linux_syscall"   — inline `syscall` instruction with number in rax
+#   "macho_syscall"   — Darwin BSD syscall via libSystem stub
+#   "cdecl"           — x86-32 cdecl (legacy)
+#
+# The ABI string is stored as AST_LITERAL at child1 (data1=LIT_STRING,
+# data2=start, data3=length). The function name is stored in the AST_EXTERN_FN
+# node's own data1/data2 for name-resolution compatibility with the rest of
+# the compiler.
+fn parse_extern_fn(@p: Parser) -> int
+    @node = parser_alloc_node(@p, AST_EXTERN_FN)
+    parser_expect_keyword(@p, KW_EXTERN)
+
+    # Mandatory ABI string literal
+    @abi_tok = parser_current(@p)
+    if @abi_tok.kind == TOKEN_STRING
+        # Store ABI string offset/length in data3 (high 16 bits offset, low 16 length).
+        @p.nodes[@node].data3 = (@abi_tok.start * 65536) + @abi_tok.length
+        parser_advance(@p)
+
+    # Optional "lib <name>" qualifier for PE/Mach-O imports
+    # (we just consume it — the compiler uses it for import-table emission)
+    if parser_check_keyword(@p, KW_PUB) == 0
+        # Check identifier "lib" — not a keyword, so we look at the raw text
+        @lib_tok = parser_current(@p)
+        if @lib_tok.kind == TOKEN_IDENT
+            @lib_name = parser_extract_name(@lib_tok.start, @lib_tok.length)
+            if @lib_name == "lib"
+                parser_advance(@p)
+                # Lib name is a string literal
+                if parser_check(@p, TOKEN_STRING)
+                    parser_advance(@p)
+
+    parser_expect_keyword(@p, KW_FN)
+
+    # Function name
+    @name_tok = parser_current(@p)
+    if @name_tok.kind == TOKEN_IDENT
+        @p.nodes[@node].data1 = @name_tok.start
+        @p.nodes[@node].data2 = @name_tok.length
+        parser_advance(@p)
+
+    # Parameters: reuse the same loop as parse_function, minus body
+    parser_expect(@p, TOKEN_LPAREN)
+    @params_start = @p.children_count
+    @param_count = 0
+
+    if parser_check(@p, TOKEN_RPAREN) == 0
+        orbit _ in 0..64
+            if parser_check_keyword(@p, KW_MUT) || parser_check_keyword(@p, KW_REF)
+                parser_advance(@p)
+            @pt = parser_current(@p)
+            if @pt.kind == TOKEN_IDENT
+                parser_add_child(@p, @pt.start)
+                parser_add_child(@p, @pt.length)
+                parser_advance(@p)
+                if parser_check(@p, TOKEN_COLON)
+                    parser_advance(@p)
+                    parser_skip_type(@p)
+                @param_count = @param_count + 1
+            if parser_check(@p, TOKEN_COMMA) == 0
+                break
+            parser_advance(@p)
+
+    parser_expect(@p, TOKEN_RPAREN)
+    @p.nodes[@node].children_start = @params_start
+    @p.nodes[@node].children_count = @param_count * 2
+
+    # Optional return type
+    if parser_check(@p, TOKEN_ARROW)
+        parser_advance(@p)
+        parser_skip_type(@p)
+
+    return @node
+
+# === PROGRAM PARSING ===
+
+fn parse_program(@p: Parser) -> int
+    @program = parser_alloc_node(@p, AST_PROGRAM)
+    @decls_start = @p.children_count
+    @decl_count = 0
+
+    orbit _ in 0..4096
+        parser_skip_newlines(@p)
+
+        if parser_check(@p, TOKEN_EOF)
+            break
+
+        @decl = -1
+
+        # `pub` modifier on any top-level decl — just skip for now (visibility tracked separately)
+        if parser_check_keyword(@p, KW_PUB)
+            parser_advance(@p)
+
+        # Check for top-level declarations
+        if parser_check_keyword(@p, KW_EXTERN)
+            @decl = parse_extern_fn(@p)
+        eclipse if parser_check_keyword(@p, KW_FN) || parser_check(@p, TOKEN_HASH)
+            @decl = parse_function(@p)
+        eclipse if parser_check_keyword(@p, KW_STRUCT)
+            @decl = parse_struct(@p)
+        eclipse if parser_check_keyword(@p, KW_ENUM)
+            @decl = parse_enum(@p)
+        eclipse if parser_check_keyword(@p, KW_TRAIT)
+            @decl = parse_trait(@p)
+        eclipse if parser_check_keyword(@p, KW_IMPL)
+            @decl = parse_impl(@p)
+        eclipse if parser_check_keyword(@p, KW_TYPE)
+            @decl = parse_type_decl(@p)
+        eclipse if parser_check_keyword(@p, KW_ACTOR)
+            @decl = parse_actor(@p)
+        eclipse if parser_check_keyword(@p, KW_FLOW)
+            @decl = parse_flow(@p)
+        eclipse if parser_check_keyword(@p, KW_CONST)
+            @decl = parse_const(@p)
+        eclipse if parser_check_keyword(@p, KW_MEOW)
+            @decl = parse_meow(@p)
+        eclipse if parser_check_keyword(@p, KW_SEAL)
+            @decl = parse_seal(@p)
+        eclipse if parser_check_keyword(@p, KW_IMPORT) || parser_check_keyword(@p, KW_USE)
+            parser_advance(@p)
+            # Accept dotted paths: import foo.bar.baz
+            orbit _ in 0..16
+                if parser_check(@p, TOKEN_IDENT)
+                    parser_advance(@p)
+                if parser_check(@p, TOKEN_DOT) || parser_check(@p, TOKEN_COLON_COLON)
+                    parser_advance(@p)
+                else
+                    break
+        eclipse if parser_check_keyword(@p, KW_EXPORT)
+            # Skip export declarations until matching brace/newline
+            parser_advance(@p)
+            if parser_check(@p, TOKEN_LBRACE)
+                @depth = 1
+                parser_advance(@p)
+                orbit _ in 0..4096
+                    if parser_check(@p, TOKEN_EOF) || @depth <= 0
+                        break
+                    if parser_check(@p, TOKEN_LBRACE)
+                        @depth = @depth + 1
+                    eclipse if parser_check(@p, TOKEN_RBRACE)
+                        @depth = @depth - 1
+                    parser_advance(@p)
+            else
+                orbit _ in 0..100
+                    if parser_check(@p, TOKEN_NEWLINE) || parser_check(@p, TOKEN_EOF)
+                        break
+                    parser_advance(@p)
+        else
+            @decl = parse_statement(@p)
+
+        if @decl >= 0
+            parser_add_child(@p, @decl)
+            @decl_count = @decl_count + 1
+
+    @p.nodes[@program].children_start = @decls_start
+    @p.nodes[@program].children_count = @decl_count
+    return @program
+
+# === MAIN PARSE FUNCTION ===
+
+fn parse(@source: str, @source_len: int) -> Parser
+    # Create lexer and tokenize
+    @lex = lexer_new(@source, @source_len)
+    @p = parser_new()
+
+    # Retain source for name resolution in later passes
+    @p.source = @source
+    @p.source_len = @source_len
+    # Publish on module-level handle for name helpers that lack a Parser
+    @g_last_source = @source
+    @g_last_source_len = @source_len
+
+    @p.token_count = lexer_tokenize_all(@lex, @p.tokens, 65536)
+
+    # Parse program
+    @root = parse_program(@p)
+
+    return @p
+
+# =============================================================================
+# NAME RESOLUTION HELPERS
+# =============================================================================
+# Static buffer for returning substrings without heap allocation on every call.
+# Safe for single-threaded compilation; caller copies if the value must persist
+# across another name lookup.
+
+const PARSER_NAME_BUF_SIZE: int = 512
+meow @g_name_buf: [int; 512] = [0; 512]
+
+# Extract a substring from the active source as a Luna str.
+# Uses bytes_to_str (runtime_core) to construct a proper string value.
+fn parser_extract_name(@start: int, @len: int) -> str
+    if @start < 0 || @len <= 0
+        return ""
+    if @g_last_source_len == 0
+        return ""
+    @n = @len
+    if @n >= PARSER_NAME_BUF_SIZE
+        @n = PARSER_NAME_BUF_SIZE - 1
+    orbit @i in 0..@n
+        unsafe
+            @g_name_buf[@i] = volatile_read(@g_last_source + @start + @i)
+    @g_name_buf[@n] = 0
+    return bytes_to_str(@g_name_buf, @n)
+
+# Name for an AST node (uses data1/data2 = source offset/length of the
+# identifier token recorded when the node was parsed).
+fn parser_node_name(@p: Parser, @node_idx: int) -> str
+    if @node_idx < 0 || @node_idx >= @p.node_count
+        return ""
+    @n = @p.nodes[@node_idx]
+    return parser_extract_name(@n.data1, @n.data2)
+
+# Legacy shim retained for borrow_checker.luna — old signature was
+# `parser_get_string(@id)`. We reinterpret `@id` as packed (start<<16)|len
+# when non-zero for backward compat, otherwise fall back to empty.
+fn parser_get_string(@packed_id: int) -> str
+    if @packed_id == 0
+        return ""
+    @start = @packed_id >> 16
+    @len = @packed_id & 0xFFFF
+    return parser_extract_name(@start, @len)
+
+# === EXPORTS ===
+export {
+    # Types
+    AstNode,
+    Parser,
+
+    # AST node types — core
+    AST_PROGRAM, AST_FUNCTION, AST_STRUCT, AST_ENUM, AST_TRAIT, AST_IMPL,
+    AST_LET, AST_CONST, AST_ASSIGN, AST_RETURN, AST_BREAK, AST_CONTINUE, AST_PASS,
+    AST_EXPR_STMT, AST_IF, AST_WHILE, AST_ORBIT, AST_MATCH, AST_BLOCK,
+    AST_BINARY, AST_UNARY, AST_CALL, AST_INDEX, AST_FIELD,
+    AST_LITERAL, AST_IDENT, AST_ARRAY, AST_STRUCT_LIT, AST_LAMBDA, AST_RANGE,
+
+    # AST node types — v0.6+ extended
+    AST_UNLESS, AST_GUARD, AST_ECLIPSE, AST_SEAL_STRUCT, AST_ACTOR, AST_FLOW,
+    AST_SPAWN, AST_SEND, AST_REQUIRE, AST_ENSURE, AST_EXTERN_FN,
+    AST_DEFER, AST_ATOMIC, AST_DROP, AST_VOLATILE_READ, AST_VOLATILE_WRITE,
+    AST_GLOBAL_ALLOC, AST_DICT, AST_PIPE, AST_NULL_COALESCE,
+    AST_MOVE, AST_FREEZE, AST_BOX_ALLOC, AST_RC_ALLOC, AST_WEAK_REF, AST_RAW_PTR,
+    AST_ASM, AST_UNSAFE, AST_ATTRIBUTE,
+
+    # Literal/op tags
+    LIT_INT, LIT_FLOAT, LIT_STRING, LIT_BOOL, LIT_NIL,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD,
+    OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR,
+    OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE,
+    OP_LOGICAL_AND, OP_LOGICAL_OR,
+    UNOP_NEG, UNOP_NOT, UNOP_BITNOT, UNOP_REF, UNOP_DEREF,
+
+    # Functions
+    parser_new,
+    parse_program,
+    parse,
+    ast_node_new,
+
+    # Helper predicates for type checker / borrow checker consumers
+    parser_current,
+    parser_check,
+    parser_check_keyword,
+
+    # Name resolution helpers (v4.3 — fixes empty-name bug in error messages)
+    parser_extract_name,
+    parser_node_name,
+    parser_get_string
+}

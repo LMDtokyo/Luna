@@ -1,0 +1,318 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Build — End-to-End Source → Native Binary Driver (v4.3)
+# =============================================================================
+# This is the glue that makes `luna build foo.luna` a real command.
+# It calls, in order:
+#
+#   1. lexer.lexer_new + tokenize_all               (src/core/lexer.luna)
+#   2. parser.parse                                  (src/core/parser.luna)
+#   3. types.tc_check_program                        (src/core/types.luna)
+#   4. borrow_checker.bc_check_stmt walk             (src/core/borrow_checker.luna)
+#   5. titan_opt.optimize                            (src/core/titan_opt.luna)
+#   6. lower.lower_program → Forge byte stream       (src/core/lower.luna)
+#   7. forge_reloc.forge_apply_relocs                (src/core/forge_reloc.luna)
+#   8. forge_elf.forge_emit_elf64   (Linux)          (src/core/forge_elf.luna)
+#      OR forge_pe.forge_emit_pe64  (Windows)        (src/core/forge_pe.luna)
+#   9. aether.scroll_unseal + inscribe               (src/core/aether.luna)
+#
+# Nothing here touches Rust, libc, LLVM, cargo, or linker tools.  A fresh
+# Luna install is one binary plus a stdlib; `luna_build` is what makes the
+# second binary.
+# =============================================================================
+
+import lexer
+import parser
+import types
+import borrow_checker
+import titan_opt
+import lower
+import forge
+import forge_reloc
+import forge_elf
+import forge_pe
+import aether
+
+# =============================================================================
+# SECTION 1 — BUILD RESULT
+# =============================================================================
+
+const BUILD_TARGET_LINUX:   int = 0
+const BUILD_TARGET_WINDOWS: int = 1
+const BUILD_TARGET_MACOS:   int = 2
+
+struct BuildResult
+    success: int                # 1 = ok, 0 = failure
+    phase_failed: int           # index of the pipeline phase that failed, -1 if none
+    errors: int                 # total error count across phases
+    bytes_written: int          # size of the final binary
+
+    # Per-phase timings (microseconds)
+    t_lex: int
+    t_parse: int
+    t_typecheck: int
+    t_borrowcheck: int
+    t_optimize: int
+    t_lower: int
+    t_reloc: int
+    t_emit: int
+    t_write: int
+
+fn build_result_new() -> BuildResult
+    return BuildResult {
+        success: 0, phase_failed: -1, errors: 0, bytes_written: 0,
+        t_lex: 0, t_parse: 0, t_typecheck: 0, t_borrowcheck: 0,
+        t_optimize: 0, t_lower: 0, t_reloc: 0, t_emit: 0, t_write: 0
+    }
+
+# =============================================================================
+# SECTION 2 — MAIN ENTRY POINT
+# =============================================================================
+# Compile @source_ptr/@source_len as a Luna program, emit native bytes for
+# @target, and write them to @out_path.  Returns a BuildResult describing
+# what happened.
+
+fn luna_build(@source_ptr: str, @source_len: int,
+              @out_path: str, @out_path_len: int,
+              @target: int, @opt_level: int) -> BuildResult
+    @r = build_result_new()
+
+    # -------------------------------------------------------------------
+    # Phase 1 — Lex + Parse
+    # -------------------------------------------------------------------
+    seal @t0 = moment_now()
+    @p = parse(@source_ptr, @source_len)
+    @r.t_parse = (moment_now() - @t0) / 1000
+    if @p.error_count > 0
+        @r.phase_failed = 1
+        @r.errors = @p.error_count
+        return @r
+
+    # -------------------------------------------------------------------
+    # Phase 2 — Type checking
+    # -------------------------------------------------------------------
+    seal @t1 = moment_now()
+    @tc = typechecker_new()
+    @tc_errors = tc_check_program(@tc, @p)
+    @r.t_typecheck = (moment_now() - @t1) / 1000
+    if @tc_errors > 0
+        @r.phase_failed = 2
+        @r.errors = @tc_errors
+        return @r
+
+    # -------------------------------------------------------------------
+    # Phase 3 — Borrow checking
+    # -------------------------------------------------------------------
+    seal @t2 = moment_now()
+    @bc = bc_new()
+    orbit @i in 0..@p.node_count
+        @n = @p.nodes[@i]
+        if @n.kind == AST_FUNCTION
+            bc_check_stmt(@bc, @p.nodes, @p.node_count, @p.children, @i)
+    @r.t_borrowcheck = (moment_now() - @t2) / 1000
+    if @bc.error_count > 0
+        @r.phase_failed = 3
+        @r.errors = @bc.error_count
+        return @r
+
+    # -------------------------------------------------------------------
+    # Phase 4 — Optimisation (Titan passes)
+    # -------------------------------------------------------------------
+    seal @t3 = moment_now()
+    if @opt_level > 0
+        optimize(@p, @tc.region, @opt_level)
+    @r.t_optimize = (moment_now() - @t3) / 1000
+
+    # -------------------------------------------------------------------
+    # Phase 5 — Lowering to Forge machine code
+    # -------------------------------------------------------------------
+    seal @t4 = moment_now()
+    @forge = forge_new()
+    @lower_ctx = lower_new(@forge, @p)
+    lower_program(@lower_ctx)
+    @r.t_lower = (moment_now() - @t4) / 1000
+    if @forge.errors > 0
+        @r.phase_failed = 5
+        @r.errors = @forge.errors
+        return @r
+
+    # -------------------------------------------------------------------
+    # Phase 6 — Relocation patching
+    # -------------------------------------------------------------------
+    # For ELF: text_rva = ELF_BASE + ELF_PAGE_SIZE = 0x401000
+    # For PE:  text_rva = PE_IMAGE_BASE + PE_SECTION_ALIGN = 0x140001000
+    # (PE's absolute addresses add the image base already in ABS64 path.)
+    seal @t5 = moment_now()
+    @text_rva = 0
+    if @target == BUILD_TARGET_LINUX
+        @text_rva = ELF_BASE + ELF_PAGE_SIZE
+    eclipse if @target == BUILD_TARGET_WINDOWS
+        @text_rva = PE_IMAGE_BASE + PE_SECTION_ALIGN
+    else
+        @text_rva = 0x100001000        # macOS default ASLR base
+
+    @addrs = forge_build_internal_addrs(@forge, @text_rva)
+    # Extern bindings are container-specific and applied below; for now
+    # the internal calls resolve.  Extern RELOC_PC32 entries will trap
+    # with int3 if unresolved, which is the correct behaviour for an
+    # incomplete link.
+    @applied = forge_apply_relocs(@forge, @addrs, @text_rva)
+    @r.t_reloc = (moment_now() - @t5) / 1000
+    if @forge.errors > 0 and @applied == 0
+        @r.phase_failed = 6
+        @r.errors = @forge.errors
+        return @r
+
+    # -------------------------------------------------------------------
+    # Phase 7 — Container emission (ELF / PE / Mach-O)
+    # -------------------------------------------------------------------
+    seal @t6 = moment_now()
+    seal @entry = find_entry_offset(@forge, @p)
+    @bytes_ptr = 0
+    @bytes_len = 0
+    if @target == BUILD_TARGET_LINUX
+        @w = forge_emit_elf64(@forge, @entry)
+        @bytes_ptr = @w.bytes
+        @bytes_len = @w.len
+    eclipse if @target == BUILD_TARGET_WINDOWS
+        @pe_im = build_pe_imports_from_forge(@forge)
+        @w = forge_emit_pe64(@forge, @pe_im, @entry)
+        @bytes_ptr = @w.bytes
+        @bytes_len = @w.len
+    else
+        @r.phase_failed = 7
+        @r.errors = 1
+        return @r       # macOS container not written yet
+    @r.t_emit = (moment_now() - @t6) / 1000
+
+    # -------------------------------------------------------------------
+    # Phase 8 — Write to disk via aether
+    # -------------------------------------------------------------------
+    seal @t7 = moment_now()
+    @fd = scroll_unseal(@out_path, @out_path_len,
+                        SCROLL_WRITE | SCROLL_CREATE | SCROLL_TRUNCATE)
+    if @fd < 0
+        @r.phase_failed = 8
+        @r.errors = 1
+        return @r
+    @written = scroll_inscribe(@fd, @bytes_ptr, @bytes_len)
+    scroll_reseal(@fd)
+    @r.t_write = (moment_now() - @t7) / 1000
+    if @written != @bytes_len
+        @r.phase_failed = 8
+        @r.errors = 1
+        return @r
+
+    @r.bytes_written = @bytes_len
+    @r.success = 1
+    return @r
+
+# =============================================================================
+# SECTION 3 — ENTRY POINT DISCOVERY
+# =============================================================================
+# Find the byte offset of the function named "main" within the forge code
+# buffer.  We scan @f.symbols for a symbol whose name (via
+# parser_extract_name) equals "main".  Returns 0 if not found — the
+# first instruction in the buffer is probably a reasonable fallback.
+
+fn find_entry_offset(@f: Forge, @p: Parser) -> int
+    orbit @i in 0..@f.symbol_count
+        @s = @f.symbols[@i]
+        if @s.is_extern == 1
+            continue
+        seal @name = parser_extract_name(@s.name_start, @s.name_len)
+        if @name == "main"
+            return @s.offset
+    return 0
+
+# =============================================================================
+# SECTION 4 — CLI-LEVEL CONVENIENCES
+# =============================================================================
+
+# Read a whole .luna file into a newly-claimed stardust buffer, then call
+# luna_build on it.  Intended to back `luna build <file>` in main.luna.
+fn luna_build_from_file(@in_path: str, @in_path_len: int,
+                        @out_path: str, @out_path_len: int,
+                        @target: int, @opt_level: int) -> BuildResult
+    @r = build_result_new()
+    @fd = scroll_unseal(@in_path, @in_path_len, SCROLL_READ)
+    if @fd < 0
+        @r.phase_failed = 0
+        @r.errors = 1
+        return @r
+    # Assume files <= 2 MiB for now (the lexer tokens cap at 65536).
+    @buf = stardust_claim(2097152)
+    if @buf < 0
+        @r.phase_failed = 0
+        @r.errors = 1
+        scroll_reseal(@fd)
+        return @r
+    @read = scroll_read(@fd, @buf, 2097152)
+    scroll_reseal(@fd)
+    if @read < 0
+        @r.phase_failed = 0
+        @r.errors = 1
+        stardust_return(@buf, 2097152)
+        return @r
+    @result = luna_build(@buf, @read, @out_path, @out_path_len, @target, @opt_level)
+    stardust_return(@buf, 2097152)
+    return @result
+
+# =============================================================================
+# SECTION 5 — SELF-TEST — COMPILE A TRIVIAL PROGRAM
+# =============================================================================
+# The pipeline selftest: feed a four-line program through the whole
+# chain and confirm a non-empty byte stream comes out the other end.
+
+fn build_selftest_trivial() -> int
+    seal @src = "fn main() -> int\n    return 42\n"
+    seal @len = 31
+    seal @out = "/tmp/luna_build_trivial.elf"
+    seal @out_len = 27
+    @r = luna_build(@src, @len, @out, @out_len, BUILD_TARGET_LINUX, 0)
+
+    # We can't actually write to disk inside the selftest harness (the
+    # aether calls would need a real OS), so we expect success==0 with
+    # phase_failed == 8 (the write phase) and all earlier phases clean.
+    # If the earlier phases themselves fail, that's a real regression.
+    if @r.phase_failed < 5 and @r.phase_failed >= 0
+        return 1
+    return 0
+
+fn run_luna_build_selftests() -> int
+    @pass = 0
+    if build_selftest_trivial() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+# SECTION 6 — REPORT PRINTER
+# =============================================================================
+
+fn build_report_print(@r: BuildResult)
+    if @r.success == 1
+        shine "Build succeeded — " + @r.bytes_written.show() + " bytes"
+    else
+        shine "Build failed at phase " + @r.phase_failed.show() +
+              " (" + @r.errors.show() + " errors)"
+    shine "  lex+parse:      " + @r.t_parse.show()     + " us"
+    shine "  typecheck:      " + @r.t_typecheck.show() + " us"
+    shine "  borrow-check:   " + @r.t_borrowcheck.show() + " us"
+    shine "  optimise:       " + @r.t_optimize.show()  + " us"
+    shine "  lower:          " + @r.t_lower.show()     + " us"
+    shine "  reloc:          " + @r.t_reloc.show()     + " us"
+    shine "  emit:           " + @r.t_emit.show()      + " us"
+    shine "  write:          " + @r.t_write.show()     + " us"
+
+# =============================================================================
+
+export {
+    BUILD_TARGET_LINUX, BUILD_TARGET_WINDOWS, BUILD_TARGET_MACOS,
+    BuildResult, build_result_new,
+    luna_build, luna_build_from_file,
+    find_entry_offset,
+    run_luna_build_selftests,
+    build_report_print
+}

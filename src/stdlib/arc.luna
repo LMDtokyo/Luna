@@ -1,0 +1,101 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo.
+# Licensed under GPLv3.
+
+# =============================================================================
+# Luna arc — Duration constructors (cosmic alias for time intervals)
+# =============================================================================
+# An `arc` is a span of time — the curve the cosmos draws between one
+# moment and the next.  In the rename map, `arc` replaces `Duration`
+# across the stdlib.
+#
+# Callers use short expressions like `arc.seconds(3)` or `arc.millis(25000)`
+# which return a plain integer millisecond count suitable for
+# `chrono.slumber` / `cascade.Link` heartbeats.  A future revision will
+# back `arc` with a proper struct carrying nanosecond precision.
+# =============================================================================
+
+# --- Constants --------------------------------------------------------------
+
+const ARC_MS_PER_SEC:  int = 1000
+const ARC_MS_PER_MIN:  int = 60000
+const ARC_MS_PER_HOUR: int = 3600000
+const ARC_MS_PER_DAY:  int = 86400000
+
+const ARC_US_PER_MS:   int = 1000
+const ARC_NS_PER_MS:   int = 1000000
+
+# --- Constructors (millisecond flavour) ------------------------------------
+
+fn arc_millis(@n: int) -> int
+    return @n
+
+fn arc_seconds(@n: int) -> int
+    return @n * ARC_MS_PER_SEC
+
+fn arc_minutes(@n: int) -> int
+    return @n * ARC_MS_PER_MIN
+
+fn arc_hours(@n: int) -> int
+    return @n * ARC_MS_PER_HOUR
+
+fn arc_days(@n: int) -> int
+    return @n * ARC_MS_PER_DAY
+
+# --- Shorthand the bots use (bare `arc.seconds(n)` etc.) -------------------
+# These exist so call sites written in the cosmic style read naturally.
+# They're indistinguishable from arc_seconds etc. — the compiler's
+# module-lookup rule matches `arc.seconds` to `arc_seconds` through the
+# module-function convention.
+
+fn seconds(@n: int) -> int
+    return arc_seconds(@n)
+
+fn millis(@n: int) -> int
+    return arc_millis(@n)
+
+fn minutes(@n: int) -> int
+    return arc_minutes(@n)
+
+fn hours(@n: int) -> int
+    return arc_hours(@n)
+
+fn days(@n: int) -> int
+    return arc_days(@n)
+
+# --- Interconversion helpers ------------------------------------------------
+
+fn arc_to_us(@ms: int) -> int
+    return @ms * ARC_US_PER_MS
+
+fn arc_to_ns(@ms: int) -> int
+    return @ms * ARC_NS_PER_MS
+
+fn arc_from_us(@us: int) -> int
+    return @us / ARC_US_PER_MS
+
+fn arc_from_ns(@ns: int) -> int
+    return @ns / ARC_NS_PER_MS
+
+# --- Arithmetic over arcs --------------------------------------------------
+
+fn arc_add(@a: int, @b: int) -> int
+    return @a + @b
+
+fn arc_sub(@a: int, @b: int) -> int
+    return @a - @b
+
+# Returns 1 iff @a < @b.
+fn arc_before(@a: int, @b: int) -> int
+    return if @a < @b then 1 else 0
+
+# =============================================================================
+
+export {
+    ARC_MS_PER_SEC, ARC_MS_PER_MIN, ARC_MS_PER_HOUR, ARC_MS_PER_DAY,
+    ARC_US_PER_MS, ARC_NS_PER_MS,
+
+    arc_millis, arc_seconds, arc_minutes, arc_hours, arc_days,
+    seconds, millis, minutes, hours, days,
+    arc_to_us, arc_to_ns, arc_from_us, arc_from_ns,
+    arc_add, arc_sub, arc_before
+}

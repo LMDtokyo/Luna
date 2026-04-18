@@ -1,0 +1,24 @@
+# =============================================================================
+# Luna Forge smoke test — hello, cosmos (v4.3)
+# =============================================================================
+# Runs the full Rust-free pipeline:
+#
+#   luna forge-build examples/forge_demo/hello.luna -o hello.elf
+#
+# ...and produces a statically-linked Linux x86-64 executable that prints
+# "hello, cosmos" to stdout and exits with status 0.  No libc, no linker,
+# no Rust-compiled runtime — the final bytes are written by Luna code
+# running through lexer → parser → types → borrow → titan_opt → lower →
+# forge → forge_reloc → forge_elf → aether.scroll_inscribe.
+#
+# The only OS interaction is the two direct Linux syscalls this program
+# makes.  Those are routed through aether.firmament_shine (sys_write)
+# and aether.supernova (sys_exit_group).
+# =============================================================================
+
+import aether
+
+fn main() -> int
+    seal @greeting = "hello, cosmos\n"
+    firmament_shine(@greeting, 14)
+    return 0

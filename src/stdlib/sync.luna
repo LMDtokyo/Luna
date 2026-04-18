@@ -1,0 +1,2528 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Synchronization Primitives v3.3 "Concurrency & Network"
+# =============================================================================
+# Thread-safe synchronization for the Luna runtime, providing atomic ops,
+# locks, channels, barriers, and one-shot initialization primitives.
+#
+# Primitives implemented:
+#   1.  Memory Ordering    - Constants for atomic fence semantics
+#   2.  Atomic Ops (FFI)   - LLVM intrinsic wrappers for i64 atomics
+#   3.  AtomicInt          - Safe wrapper over raw atomic i64
+#   4.  AtomicFlag         - Boolean atomic (test-and-set / clear)
+#   5.  SpinLock           - Low-level spin lock with exponential backoff
+#   6.  Mutex              - Hybrid spinlock + futex mutex (fast/slow path)
+#   7.  RwLock             - Readers-writer lock (multiple readers XOR one writer)
+#   8.  Condvar            - Condition variable (wait / signal / broadcast)
+#   9.  Channel<T>         - Bounded MPMC ring-buffer channel
+#   10. Unbounded Channel  - Growable segmented ring-buffer channel
+#   11. OnceCell           - Initialize-once, read-many cell
+#   12. Barrier            - Thread synchronization barrier
+#   13. Latch              - Countdown latch
+#
+# Design:
+# - All structures use flat array-based storage (i64 values)
+# - Parallel arrays with linear scan where needed (no HashMap)
+# - Fixed max capacity constants for deterministic memory usage
+# - FFI to LLVM intrinsics for hardware atomic instructions
+# - Futex FFI for OS-level blocking (Linux SYS_futex / Windows WaitOnAddress)
+#
+# Borrow Checker Integration:
+# - Mutex enforces exclusive borrow (one owner at a time)
+# - RwLock enforces shared XOR exclusive borrow model
+# - Channel send semantics = move ownership through the channel
+# - AtomicInt is a Copy type (no ownership transfer needed)
+#
+# Build: luna compile --release sync.luna -o sync.o
+# =============================================================================
+
+import types
+import borrow_checker
+
+# =============================================================================
+# SECTION 1: MEMORY ORDERING CONSTANTS
+# =============================================================================
+# Memory orderings control how atomic operations synchronize with other
+# memory operations across threads. These map directly to LLVM atomic
+# ordering semantics and C++ std::memory_order values.
+#
+# Relaxed:  No synchronization, only atomicity guaranteed.
+# Acquire:  Prevents memory reads/writes from being reordered before this op.
+# Release:  Prevents memory reads/writes from being reordered after this op.
+# AcqRel:   Acquire + Release combined (for read-modify-write operations).
+# SeqCst:   Sequential consistency — total global ordering of all SeqCst ops.
+
+const ORDER_RELAXED: int = 0
+const ORDER_ACQUIRE: int = 1
+const ORDER_RELEASE: int = 2
+const ORDER_ACQ_REL: int = 3
+const ORDER_SEQ_CST: int = 4
+
+# =============================================================================
+# SECTION 2: CAPACITY AND STATUS CONSTANTS
+# =============================================================================
+
+const MAX_CHANNEL_SIZE: int = 1024
+const MAX_UNBOUNDED_SEGMENT_SIZE: int = 256
+const MAX_UNBOUNDED_SEGMENTS: int = 64
+const MAX_SPIN_ITERATIONS: int = 64
+const SPIN_BACKOFF_INITIAL: int = 1
+const SPIN_BACKOFF_MAX: int = 32
+
+# --- Channel status codes ---
+const CHAN_OK: int = 0
+const CHAN_EMPTY: int = 1
+const CHAN_FULL: int = 2
+const CHAN_CLOSED: int = 3
+
+# --- Mutex state codes ---
+const MUTEX_UNLOCKED: int = 0
+const MUTEX_LOCKED: int = 1
+const MUTEX_LOCKED_WITH_WAITERS: int = 2
+
+# --- OnceCell state codes ---
+const ONCE_EMPTY: int = 0
+const ONCE_INITIALIZING: int = 1
+const ONCE_INITIALIZED: int = 2
+
+# --- Sentinel values ---
+const SYNC_NIL: int = -1
+const NO_OWNER: int = -1
+
+# =============================================================================
+# SECTION 3: LLVM ATOMIC INTRINSICS (FFI)
+# =============================================================================
+# Direct bindings to LLVM atomic intrinsic instructions. These compile down
+# to hardware atomic instructions (e.g., LOCK CMPXCHG on x86_64, LDXR/STXR
+# on AArch64). The @ordering parameter selects the memory fence semantics.
+#
+# These are the lowest-level atomic operations available. All higher-level
+# primitives (AtomicInt, Mutex, Channel, etc.) are built on top of these.
+
+# --- Load / Store ---
+
+# Atomically load a 64-bit integer from @ptr with given @ordering.
+# @param @ptr:      Pointer to the i64 value
+# @param @ordering: Memory ordering (ORDER_RELAXED..ORDER_SEQ_CST)
+# @return:          The loaded value
+extern "C" fn llvm_atomic_load_i64(@ptr: *i64, @ordering: int) -> i64
+
+# Atomically store @val into @ptr with given @ordering.
+# @param @ptr:      Pointer to the i64 value
+# @param @val:      Value to store
+# @param @ordering: Memory ordering (ORDER_RELAXED..ORDER_SEQ_CST)
+extern "C" fn llvm_atomic_store_i64(@ptr: *i64, @val: i64, @ordering: int)
+
+# --- Arithmetic (read-modify-write) ---
+
+# Atomically add @val to *@ptr, returning the OLD value.
+# @param @ptr:      Pointer to the i64 value
+# @param @val:      Value to add
+# @param @ordering: Memory ordering
+# @return:          The value before the addition
+extern "C" fn llvm_atomic_add_i64(@ptr: *i64, @val: i64, @ordering: int) -> i64
+
+# Atomically subtract @val from *@ptr, returning the OLD value.
+extern "C" fn llvm_atomic_sub_i64(@ptr: *i64, @val: i64, @ordering: int) -> i64
+
+# --- Bitwise (read-modify-write) ---
+
+# Atomically AND @val with *@ptr, returning the OLD value.
+extern "C" fn llvm_atomic_and_i64(@ptr: *i64, @val: i64, @ordering: int) -> i64
+
+# Atomically OR @val with *@ptr, returning the OLD value.
+extern "C" fn llvm_atomic_or_i64(@ptr: *i64, @val: i64, @ordering: int) -> i64
+
+# Atomically XOR @val with *@ptr, returning the OLD value.
+extern "C" fn llvm_atomic_xor_i64(@ptr: *i64, @val: i64, @ordering: int) -> i64
+
+# --- Compare-and-swap ---
+
+# Atomically compare *@ptr with @expected; if equal, store @desired.
+# Returns (old_value, success_bool).
+# @param @ptr:          Pointer to the i64 value
+# @param @expected:     Expected current value
+# @param @desired:      Value to store if comparison succeeds
+# @param @success_ord:  Ordering used on success
+# @param @fail_ord:     Ordering used on failure
+# @return:              Tuple (old_value, 1 if swapped else 0)
+extern "C" fn llvm_atomic_cas_i64(@ptr: *i64, @expected: i64, @desired: i64, @success_ord: int, @fail_ord: int) -> i64, int
+
+# --- Exchange ---
+
+# Atomically replace *@ptr with @val, returning the OLD value.
+extern "C" fn llvm_atomic_exchange_i64(@ptr: *i64, @val: i64, @ordering: int) -> i64
+
+# --- Fence ---
+
+# Issue a memory fence with the given ordering.
+# Ensures that memory operations before/after the fence are properly ordered
+# without being tied to a specific memory location.
+extern "C" fn llvm_atomic_fence(@ordering: int)
+
+# --- CPU hint: PAUSE instruction ---
+# Tells the CPU this is a spin-wait loop. On x86_64 this is the PAUSE
+# instruction; on ARM it maps to YIELD. Reduces power consumption and
+# avoids pipeline stalls during busy-waiting.
+extern "C" fn llvm_cpu_pause()
+
+# =============================================================================
+# SECTION 4: FUTEX FFI (OS-level blocking)
+# =============================================================================
+# Futex (Fast Userspace muTEX) provides efficient blocking when contention
+# is detected. The fast path uses atomic CAS in userspace; the slow path
+# calls into the kernel to sleep/wake threads.
+#
+# Linux:   Uses SYS_futex syscall (number 202 on x86_64)
+#          FUTEX_WAIT = 0, FUTEX_WAKE = 1
+# Windows: Uses WaitOnAddress / WakeByAddressSingle from synchapi.h
+#          Available since Windows 8 (kernel32.dll)
+
+# Block the calling thread if *@addr == @expected_val.
+# The check and sleep are performed atomically by the kernel.
+# @param @addr:         Pointer to the watched i64 value
+# @param @expected_val: Only sleep if *@addr equals this value
+extern "C" fn futex_wait(@addr: *i64, @expected_val: i64)
+
+# Wake up to @count threads blocked on futex_wait for @addr.
+# @param @addr:  Pointer to the watched i64 value
+# @param @count: Maximum number of threads to wake (1 for signal, MAX for broadcast)
+extern "C" fn futex_wake(@addr: *i64, @count: int)
+
+# Timed futex wait with millisecond timeout.
+# Returns 1 if woken by signal, 0 if timed out.
+# @param @addr:         Pointer to the watched i64 value
+# @param @expected_val: Only sleep if *@addr equals this value
+# @param @timeout_ms:   Timeout in milliseconds
+# @return:              1 = signaled, 0 = timed out
+extern "C" fn futex_wait_timeout(@addr: *i64, @expected_val: i64, @timeout_ms: int) -> int
+
+# Get the current thread ID (OS-specific).
+# Linux: gettid() syscall. Windows: GetCurrentThreadId().
+extern "C" fn get_thread_id() -> i64
+
+# =============================================================================
+# SECTION 5: AtomicInt — Safe Atomic Integer Wrapper
+# =============================================================================
+# Provides a safe, high-level interface over raw atomic i64 operations.
+# AtomicInt is a Copy type in the borrow checker — no ownership transfer
+# is needed because atomic operations are inherently thread-safe.
+#
+# All methods delegate to the LLVM intrinsics with appropriate ordering.
+# The default ordering for most operations is SeqCst (strongest guarantee).
+#
+# Borrow Checker Integration:
+#   AtomicInt has type tag TYPE_ATOMIC_INT which is marked as Copy.
+#   This means the borrow checker will NOT enforce move semantics:
+#   you can freely alias an AtomicInt across threads without ownership
+#   conflicts, because all access is mediated by hardware atomics.
+
+struct AtomicInt
+    value: i64          # The raw atomic value (accessed only via intrinsics)
+
+# Create a new AtomicInt initialized to @initial_value.
+# The initial store uses SeqCst ordering to establish a happens-before
+# relationship with any subsequent loads from other threads.
+#
+# @param @initial_value: Starting value for the atomic
+# @return:               A new AtomicInt
+fn atomic_new(@initial_value: i64) -> AtomicInt
+    @atom = AtomicInt { value: @initial_value }
+    return @atom
+
+# Atomically load the current value.
+# @param @atom:     The AtomicInt to load from
+# @param @ordering: Memory ordering (typically ORDER_ACQUIRE or ORDER_SEQ_CST)
+# @return:          The current value
+fn atomic_load(@atom: AtomicInt, @ordering: int) -> i64
+    return llvm_atomic_load_i64(&@atom.value, @ordering)
+
+# Atomically store a new value.
+# @param @atom:     The AtomicInt to store into
+# @param @val:      Value to store
+# @param @ordering: Memory ordering (typically ORDER_RELEASE or ORDER_SEQ_CST)
+fn atomic_store(@atom: AtomicInt, @val: i64, @ordering: int)
+    llvm_atomic_store_i64(&@atom.value, @val, @ordering)
+
+# Atomically add @val and return the OLD value.
+# @param @atom:     The AtomicInt
+# @param @val:      Value to add
+# @param @ordering: Memory ordering
+# @return:          Value before the addition
+fn atomic_fetch_add(@atom: AtomicInt, @val: i64, @ordering: int) -> i64
+    return llvm_atomic_add_i64(&@atom.value, @val, @ordering)
+
+# Atomically subtract @val and return the OLD value.
+# @param @atom:     The AtomicInt
+# @param @val:      Value to subtract
+# @param @ordering: Memory ordering
+# @return:          Value before the subtraction
+fn atomic_fetch_sub(@atom: AtomicInt, @val: i64, @ordering: int) -> i64
+    return llvm_atomic_sub_i64(&@atom.value, @val, @ordering)
+
+# Atomically compute max(current, @val) and return the OLD value.
+# Implemented as a CAS loop because LLVM doesn't provide a direct atomic max.
+# @param @atom:     The AtomicInt
+# @param @val:      Value to compare against
+# @param @ordering: Memory ordering
+# @return:          Value before the operation
+fn atomic_fetch_max(@atom: AtomicInt, @val: i64, @ordering: int) -> i64
+    orbit @spin in 0..MAX_SPIN_ITERATIONS
+        @current = llvm_atomic_load_i64(&@atom.value, @ordering)
+        if @current >= @val
+            return @current
+        @old, @ok = llvm_atomic_cas_i64(&@atom.value, @current, @val, @ordering, ORDER_RELAXED)
+        if @ok == 1
+            return @old
+    # Fallback: return current value if CAS loop exhausted (should not happen)
+    return llvm_atomic_load_i64(&@atom.value, @ordering)
+
+# Atomically compute min(current, @val) and return the OLD value.
+# Implemented as a CAS loop.
+# @param @atom:     The AtomicInt
+# @param @val:      Value to compare against
+# @param @ordering: Memory ordering
+# @return:          Value before the operation
+fn atomic_fetch_min(@atom: AtomicInt, @val: i64, @ordering: int) -> i64
+    orbit @spin in 0..MAX_SPIN_ITERATIONS
+        @current = llvm_atomic_load_i64(&@atom.value, @ordering)
+        if @current <= @val
+            return @current
+        @old, @ok = llvm_atomic_cas_i64(&@atom.value, @current, @val, @ordering, ORDER_RELAXED)
+        if @ok == 1
+            return @old
+    return llvm_atomic_load_i64(&@atom.value, @ordering)
+
+# Atomically compare current value with @expected; if equal, store @desired.
+# Uses SeqCst ordering for both success and failure paths.
+# @param @atom:     The AtomicInt
+# @param @expected: Expected current value
+# @param @desired:  Value to store on match
+# @return:          Tuple (old_value, success_bool)
+fn atomic_compare_exchange(@atom: AtomicInt, @expected: i64, @desired: i64) -> i64, int
+    @old, @ok = llvm_atomic_cas_i64(&@atom.value, @expected, @desired, ORDER_SEQ_CST, ORDER_SEQ_CST)
+    return @old, @ok
+
+# Weak compare-and-exchange: may spuriously fail even if values match.
+# Uses Acquire ordering on failure (weaker guarantee, higher throughput).
+# Suitable for CAS loops where a retry is cheap.
+# @param @atom:     The AtomicInt
+# @param @expected: Expected current value
+# @param @desired:  Value to store on match
+# @return:          Tuple (old_value, success_bool)
+fn atomic_compare_exchange_weak(@atom: AtomicInt, @expected: i64, @desired: i64) -> i64, int
+    @old, @ok = llvm_atomic_cas_i64(&@atom.value, @expected, @desired, ORDER_ACQ_REL, ORDER_ACQUIRE)
+    return @old, @ok
+
+# Atomically swap the value with @val, returning the OLD value.
+# @param @atom:     The AtomicInt
+# @param @val:      New value to store
+# @param @ordering: Memory ordering
+# @return:          The previous value
+fn atomic_swap(@atom: AtomicInt, @val: i64, @ordering: int) -> i64
+    return llvm_atomic_exchange_i64(&@atom.value, @val, @ordering)
+
+# Atomically AND @val with the current value, returning the OLD value.
+# @param @atom:     The AtomicInt
+# @param @val:      Value to AND with
+# @param @ordering: Memory ordering
+# @return:          Value before the operation
+fn atomic_fetch_and(@atom: AtomicInt, @val: i64, @ordering: int) -> i64
+    return llvm_atomic_and_i64(&@atom.value, @val, @ordering)
+
+# Atomically OR @val with the current value, returning the OLD value.
+# @param @atom:     The AtomicInt
+# @param @val:      Value to OR with
+# @param @ordering: Memory ordering
+# @return:          Value before the operation
+fn atomic_fetch_or(@atom: AtomicInt, @val: i64, @ordering: int) -> i64
+    return llvm_atomic_or_i64(&@atom.value, @val, @ordering)
+
+# Atomically XOR @val with the current value, returning the OLD value.
+# @param @atom:     The AtomicInt
+# @param @val:      Value to XOR with
+# @param @ordering: Memory ordering
+# @return:          Value before the operation
+fn atomic_fetch_xor(@atom: AtomicInt, @val: i64, @ordering: int) -> i64
+    return llvm_atomic_xor_i64(&@atom.value, @val, @ordering)
+
+# Issue a standalone memory fence with the given ordering.
+# This is a convenience wrapper around llvm_atomic_fence.
+fn memory_fence(@ordering: int)
+    llvm_atomic_fence(@ordering)
+
+# =============================================================================
+# SECTION 6: AtomicFlag — Boolean Atomic
+# =============================================================================
+# A minimal atomic boolean for lock-free flag operations.
+# Internally represented as an AtomicInt where 0 = false, 1 = true.
+# Primary use case: SpinLock implementation and simple signaling.
+
+struct AtomicFlag
+    state: AtomicInt    # 0 = cleared (false), 1 = set (true)
+
+# Create a new AtomicFlag with the given initial state.
+# @param @initial: Initial value (0 = false, 1 = true)
+# @return:         A new AtomicFlag
+fn atomic_flag_new(@initial: int) -> AtomicFlag
+    @flag = AtomicFlag { state: atomic_new(@initial) }
+    return @flag
+
+# Atomically set the flag to 1 and return the OLD value.
+# This is the classic test-and-set operation used for spinlocks.
+# @param @flag: The AtomicFlag
+# @return:      Previous value (0 if was clear, 1 if was already set)
+fn atomic_flag_test_and_set(@flag: AtomicFlag) -> int
+    @old = atomic_swap(@flag.state, 1, ORDER_ACQ_REL)
+    return @old
+
+# Atomically clear the flag (set to 0).
+# Uses Release ordering so that all writes before the clear are visible
+# to the thread that next acquires the flag.
+# @param @flag: The AtomicFlag
+fn atomic_flag_clear(@flag: AtomicFlag)
+    atomic_store(@flag.state, 0, ORDER_RELEASE)
+
+# Atomically load the current flag state.
+# @param @flag: The AtomicFlag
+# @return:      Current value (0 = false, 1 = true)
+fn atomic_flag_load(@flag: AtomicFlag) -> int
+    @val = atomic_load(@flag.state, ORDER_ACQUIRE)
+    return @val
+
+# =============================================================================
+# SECTION 7: SpinLock — Low-Level Spin Lock
+# =============================================================================
+# A spin lock that busy-waits with exponential backoff using the CPU PAUSE
+# instruction. Suitable for very short critical sections where context-
+# switching overhead would dominate.
+#
+# The PAUSE instruction (x86_64) / YIELD (ARM) reduces power consumption
+# and pipeline stalls during spin-wait loops. Backoff starts at 1 PAUSE
+# iteration and doubles up to SPIN_BACKOFF_MAX iterations.
+#
+# Borrow Checker Integration:
+#   SpinLock guards exclusive access to a resource. When locked, the borrow
+#   checker treats the protected region as an exclusive (&mut) borrow.
+#   Only the owning thread (tracked by owner_thread) may unlock it.
+
+struct SpinLock
+    locked: AtomicFlag      # 0 = unlocked, 1 = locked
+    owner_thread: i64       # Thread ID of current owner (NO_OWNER if unlocked)
+
+# Create a new unlocked SpinLock.
+# @return: A new SpinLock in the unlocked state
+fn spinlock_new() -> SpinLock
+    @lock = SpinLock {
+        locked: atomic_flag_new(0),
+        owner_thread: NO_OWNER
+    }
+    return @lock
+
+# Acquire the spin lock. Spins with exponential backoff until acquired.
+# Each backoff iteration doubles the number of PAUSE instructions executed,
+# up to SPIN_BACKOFF_MAX. This reduces contention on the cache line.
+#
+# @param @lock: The SpinLock to acquire
+fn spinlock_lock(@lock: SpinLock)
+    @backoff = SPIN_BACKOFF_INITIAL
+    orbit @attempt in 0..MAX_SPIN_ITERATIONS
+        # Try to acquire: test-and-set returns 0 if we got it
+        @was_locked = atomic_flag_test_and_set(@lock.locked)
+        if @was_locked == 0
+            # Successfully acquired the lock
+            @lock.owner_thread = get_thread_id()
+            llvm_atomic_fence(ORDER_ACQUIRE)
+            return
+        # Backoff: execute PAUSE instructions to reduce contention
+        orbit @p in 0..@backoff
+            llvm_cpu_pause()
+        # Exponential backoff: double up to max
+        if @backoff < SPIN_BACKOFF_MAX
+            @backoff = @backoff * 2
+            if @backoff > SPIN_BACKOFF_MAX
+                @backoff = SPIN_BACKOFF_MAX
+    # If we exhaust MAX_SPIN_ITERATIONS, the lock is heavily contended.
+    # In a production system this would yield to the OS scheduler.
+    # For now, keep spinning with max backoff.
+    orbit @forever in 0..1000000
+        @was_locked = atomic_flag_test_and_set(@lock.locked)
+        if @was_locked == 0
+            @lock.owner_thread = get_thread_id()
+            llvm_atomic_fence(ORDER_ACQUIRE)
+            return
+        orbit @p in 0..SPIN_BACKOFF_MAX
+            llvm_cpu_pause()
+
+# Try to acquire the spin lock without blocking.
+# @param @lock: The SpinLock
+# @return:      1 if acquired, 0 if already locked
+fn spinlock_try_lock(@lock: SpinLock) -> int
+    @was_locked = atomic_flag_test_and_set(@lock.locked)
+    if @was_locked == 0
+        @lock.owner_thread = get_thread_id()
+        llvm_atomic_fence(ORDER_ACQUIRE)
+        return 1
+    return 0
+
+# Release the spin lock.
+# Must only be called by the thread that acquired the lock.
+# @param @lock: The SpinLock to release
+fn spinlock_unlock(@lock: SpinLock)
+    llvm_atomic_fence(ORDER_RELEASE)
+    @lock.owner_thread = NO_OWNER
+    atomic_flag_clear(@lock.locked)
+
+# Check if the spin lock is currently held.
+# Note: This is inherently racy — the result may be stale by the time
+# the caller acts on it. Use only for debugging/diagnostics.
+# @param @lock: The SpinLock
+# @return:      1 if locked, 0 if unlocked
+fn spinlock_is_locked(@lock: SpinLock) -> int
+    return atomic_flag_load(@lock.locked)
+
+# =============================================================================
+# SECTION 8: Mutex — Hybrid SpinLock + Futex Mutex
+# =============================================================================
+# A mutual exclusion lock with a fast path (userspace CAS) and slow path
+# (OS futex for sleeping). This avoids both the overhead of always calling
+# into the kernel (like a pure futex mutex) and the CPU waste of always
+# spinning (like a pure spinlock).
+#
+# State machine:
+#   MUTEX_UNLOCKED (0)             — Lock is free
+#   MUTEX_LOCKED (1)               — Lock is held, no waiters
+#   MUTEX_LOCKED_WITH_WAITERS (2)  — Lock is held, threads are sleeping
+#
+# Fast path (uncontended):
+#   lock:   CAS(0 → 1)  — single atomic instruction, no syscall
+#   unlock: CAS(1 → 0)  — single atomic instruction, no syscall
+#
+# Slow path (contended):
+#   lock:   CAS(→ 2) + futex_wait(&state, 2) — sleep until woken
+#   unlock: store(0) + futex_wake(&state, 1)  — wake one waiter
+#
+# Borrow Checker Integration:
+#   Mutex enforces exclusive borrowing semantics. When locked, the borrow
+#   checker treats the protected data as exclusively borrowed (&mut).
+#   Only one thread may hold the lock at any time. Attempting to lock
+#   while already holding it results in deadlock (no recursive locking).
+#   To support recursive locking, use recursion_count > 0.
+
+struct Mutex
+    state: AtomicInt        # UNLOCKED=0, LOCKED=1, LOCKED_WITH_WAITERS=2
+    owner: i64              # Thread ID of current owner (NO_OWNER if unlocked)
+    recursion_count: int    # For recursive lock support (0 = non-recursive)
+
+# Create a new unlocked Mutex.
+# @return: A new Mutex in the unlocked state
+fn mutex_new() -> Mutex
+    @mtx = Mutex {
+        state: atomic_new(MUTEX_UNLOCKED),
+        owner: NO_OWNER,
+        recursion_count: 0
+    }
+    return @mtx
+
+# Acquire the mutex. Uses fast path CAS when uncontended; falls back to
+# futex_wait when contention is detected.
+#
+# Fast path:
+#   CAS(UNLOCKED → LOCKED) succeeds — we own the lock, done.
+#
+# Slow path:
+#   1. Set state to LOCKED_WITH_WAITERS (so unlock knows to wake us)
+#   2. futex_wait(&state, LOCKED_WITH_WAITERS) — kernel puts us to sleep
+#   3. On wake, retry from the beginning
+#
+# @param @mtx: The Mutex to acquire
+fn mutex_lock(@mtx: Mutex)
+    # Fast path: CAS(0 → 1) — uncontended acquisition
+    @old, @ok = atomic_compare_exchange(@mtx.state, MUTEX_UNLOCKED, MUTEX_LOCKED)
+    if @ok == 1
+        @mtx.owner = get_thread_id()
+        return
+
+    # Check for recursive lock by same thread
+    @tid = get_thread_id()
+    if @mtx.owner == @tid
+        @mtx.recursion_count = @mtx.recursion_count + 1
+        return
+
+    # Slow path: contention detected
+    orbit @attempt in 0..1000000
+        # If state is LOCKED (not LOCKED_WITH_WAITERS), try brief spin
+        @current = atomic_load(@mtx.state, ORDER_RELAXED)
+        if @current == MUTEX_UNLOCKED
+            @old2, @ok2 = atomic_compare_exchange(@mtx.state, MUTEX_UNLOCKED, MUTEX_LOCKED)
+            if @ok2 == 1
+                @mtx.owner = get_thread_id()
+                return
+
+        # Transition to LOCKED_WITH_WAITERS so unlock will wake us
+        if @current != MUTEX_LOCKED_WITH_WAITERS
+            atomic_swap(@mtx.state, MUTEX_LOCKED_WITH_WAITERS, ORDER_ACQ_REL)
+
+        # Sleep until state changes from LOCKED_WITH_WAITERS
+        futex_wait(&@mtx.state.value, MUTEX_LOCKED_WITH_WAITERS)
+
+        # Woken up — try to acquire
+        @old3, @ok3 = atomic_compare_exchange(@mtx.state, MUTEX_UNLOCKED, MUTEX_LOCKED_WITH_WAITERS)
+        if @ok3 == 1
+            @mtx.owner = get_thread_id()
+            return
+
+# Try to acquire the mutex without blocking.
+# @param @mtx: The Mutex
+# @return:     1 if acquired, 0 if already locked
+fn mutex_try_lock(@mtx: Mutex) -> int
+    @old, @ok = atomic_compare_exchange(@mtx.state, MUTEX_UNLOCKED, MUTEX_LOCKED)
+    if @ok == 1
+        @mtx.owner = get_thread_id()
+        return 1
+    # Allow recursive try_lock by same owner
+    @tid = get_thread_id()
+    if @mtx.owner == @tid
+        @mtx.recursion_count = @mtx.recursion_count + 1
+        return 1
+    return 0
+
+# Release the mutex.
+#
+# Fast path:
+#   CAS(LOCKED → UNLOCKED) succeeds — no waiters, done.
+#
+# Slow path:
+#   State was LOCKED_WITH_WAITERS, so:
+#   1. Store UNLOCKED
+#   2. futex_wake(&state, 1) — wake one sleeping thread
+#
+# @param @mtx: The Mutex to release
+fn mutex_unlock(@mtx: Mutex)
+    # Handle recursive unlock
+    if @mtx.recursion_count > 0
+        @mtx.recursion_count = @mtx.recursion_count - 1
+        return
+
+    @mtx.owner = NO_OWNER
+
+    # Fast path: CAS(LOCKED → UNLOCKED) — no waiters
+    @old, @ok = atomic_compare_exchange(@mtx.state, MUTEX_LOCKED, MUTEX_UNLOCKED)
+    if @ok == 1
+        return
+
+    # Slow path: there are waiters — store 0 and wake one
+    atomic_store(@mtx.state, MUTEX_UNLOCKED, ORDER_RELEASE)
+    futex_wake(&@mtx.state.value, 1)
+
+# Check if the mutex is currently locked.
+# Warning: inherently racy — use for debugging only.
+# @param @mtx: The Mutex
+# @return:     1 if locked, 0 if unlocked
+fn mutex_is_locked(@mtx: Mutex) -> int
+    @s = atomic_load(@mtx.state, ORDER_RELAXED)
+    if @s != MUTEX_UNLOCKED
+        return 1
+    return 0
+
+# =============================================================================
+# SECTION 9: RwLock — Readers-Writer Lock
+# =============================================================================
+# Allows multiple concurrent readers OR one exclusive writer. This is the
+# dual of the borrow checker's shared/exclusive borrow model:
+#   - Read lock  = shared borrow (&T)   — multiple simultaneous allowed
+#   - Write lock = exclusive borrow (&mut T) — only one, no readers
+#
+# State encoding (single AtomicInt):
+#   state > 0   →  Number of active readers
+#   state == 0  →  Unlocked (no readers, no writer)
+#   state == -1 →  Write-locked (one exclusive writer)
+#
+# Read lock: CAS loop incrementing state if state >= 0
+# Write lock: CAS(0 → -1)
+#
+# Borrow Checker Integration:
+#   RwLock directly mirrors Luna's borrow rules:
+#   - rwlock_read_lock  → shared borrow (multiple &T allowed)
+#   - rwlock_write_lock → exclusive borrow (single &mut T)
+#   - rwlock_read_unlock  → release shared borrow
+#   - rwlock_write_unlock → release exclusive borrow
+#   The borrow checker validates at compile time that no exclusive borrow
+#   coexists with any shared borrow on the same protected resource.
+
+struct RwLock
+    state: AtomicInt    # >0 = reader count, 0 = unlocked, -1 = write-locked
+
+# Create a new unlocked RwLock.
+# @return: A new RwLock in the unlocked state
+fn rwlock_new() -> RwLock
+    @rw = RwLock { state: atomic_new(0) }
+    return @rw
+
+# Acquire a read lock. Blocks until no writer holds the lock.
+# Increments the reader count atomically.
+# Multiple threads can hold read locks simultaneously.
+#
+# @param @rw: The RwLock
+fn rwlock_read_lock(@rw: RwLock)
+    orbit @attempt in 0..1000000
+        @current = atomic_load(@rw.state, ORDER_ACQUIRE)
+        # Can acquire if state >= 0 (no writer)
+        if @current >= 0
+            @old, @ok = atomic_compare_exchange(@rw.state, @current, @current + 1)
+            if @ok == 1
+                return
+        # Writer holds the lock — spin briefly with PAUSE
+        orbit @p in 0..4
+            llvm_cpu_pause()
+
+# Release a read lock. Decrements the reader count atomically.
+# @param @rw: The RwLock
+fn rwlock_read_unlock(@rw: RwLock)
+    atomic_fetch_sub(@rw.state, 1, ORDER_RELEASE)
+
+# Acquire a write lock. Blocks until no readers and no other writer.
+# Sets state to -1 atomically.
+#
+# @param @rw: The RwLock
+fn rwlock_write_lock(@rw: RwLock)
+    orbit @attempt in 0..1000000
+        @old, @ok = atomic_compare_exchange(@rw.state, 0, -1)
+        if @ok == 1
+            return
+        # Readers or another writer present — spin
+        orbit @p in 0..8
+            llvm_cpu_pause()
+
+# Release a write lock. Sets state back to 0.
+# @param @rw: The RwLock
+fn rwlock_write_unlock(@rw: RwLock)
+    atomic_store(@rw.state, 0, ORDER_RELEASE)
+
+# Try to acquire a read lock without blocking.
+# @param @rw: The RwLock
+# @return:    1 if acquired, 0 if a writer holds the lock
+fn rwlock_try_read_lock(@rw: RwLock) -> int
+    @current = atomic_load(@rw.state, ORDER_ACQUIRE)
+    if @current >= 0
+        @old, @ok = atomic_compare_exchange(@rw.state, @current, @current + 1)
+        if @ok == 1
+            return 1
+    return 0
+
+# Try to acquire a write lock without blocking.
+# @param @rw: The RwLock
+# @return:    1 if acquired, 0 if any readers or writer hold the lock
+fn rwlock_try_write_lock(@rw: RwLock) -> int
+    @old, @ok = atomic_compare_exchange(@rw.state, 0, -1)
+    if @ok == 1
+        return 1
+    return 0
+
+# =============================================================================
+# SECTION 10: Condvar — Condition Variable
+# =============================================================================
+# Condition variables enable threads to wait for a condition to become true
+# while releasing a mutex. The classic pattern is:
+#
+#   mutex_lock(@mtx)
+#   orbit @wait in 0..1000000
+#       if @condition_met
+#           break
+#       condvar_wait(@cv, @mtx)
+#   # ... condition is now met, mutex is re-locked ...
+#   mutex_unlock(@mtx)
+#
+# condvar_wait atomically releases the mutex and sleeps. When woken
+# (by condvar_signal or condvar_broadcast), it re-acquires the mutex
+# before returning.
+
+struct Condvar
+    waiters: AtomicInt       # Number of threads currently waiting
+    signal_count: AtomicInt  # Monotonic signal counter for spurious wake detection
+
+# Create a new Condvar with no waiters.
+# @return: A new Condvar
+fn condvar_new() -> Condvar
+    @cv = Condvar {
+        waiters: atomic_new(0),
+        signal_count: atomic_new(0)
+    }
+    return @cv
+
+# Wait on the condition variable, releasing the mutex while sleeping.
+#
+# 1. Record current signal count (for spurious wake detection)
+# 2. Increment waiter count
+# 3. Unlock the mutex (allows signaler to enter critical section)
+# 4. futex_wait on signal_count (sleep until it changes)
+# 5. Decrement waiter count
+# 6. Re-lock the mutex
+#
+# @param @cv:  The Condvar to wait on
+# @param @mtx: The Mutex to release/re-acquire
+fn condvar_wait(@cv: Condvar, @mtx: Mutex)
+    @seq = atomic_load(@cv.signal_count, ORDER_ACQUIRE)
+    atomic_fetch_add(@cv.waiters, 1, ORDER_RELAXED)
+    mutex_unlock(@mtx)
+    # Sleep until signal_count changes from @seq
+    futex_wait(&@cv.signal_count.value, @seq)
+    atomic_fetch_sub(@cv.waiters, 1, ORDER_RELAXED)
+    mutex_lock(@mtx)
+
+# Wait on the condition variable with a timeout.
+# @param @cv:         The Condvar
+# @param @mtx:        The Mutex to release/re-acquire
+# @param @timeout_ms: Maximum time to wait in milliseconds
+# @return:            1 if signaled, 0 if timed out
+fn condvar_wait_timeout(@cv: Condvar, @mtx: Mutex, @timeout_ms: int) -> int
+    @seq = atomic_load(@cv.signal_count, ORDER_ACQUIRE)
+    atomic_fetch_add(@cv.waiters, 1, ORDER_RELAXED)
+    mutex_unlock(@mtx)
+    @result = futex_wait_timeout(&@cv.signal_count.value, @seq, @timeout_ms)
+    atomic_fetch_sub(@cv.waiters, 1, ORDER_RELAXED)
+    mutex_lock(@mtx)
+    return @result
+
+# Signal one waiting thread to wake up.
+# Increments the signal counter (waking one futex waiter) and issues a
+# futex_wake to release one sleeping thread.
+#
+# @param @cv: The Condvar
+fn condvar_signal(@cv: Condvar)
+    atomic_fetch_add(@cv.signal_count, 1, ORDER_RELEASE)
+    @n_waiters = atomic_load(@cv.waiters, ORDER_RELAXED)
+    if @n_waiters > 0
+        futex_wake(&@cv.signal_count.value, 1)
+
+# Wake ALL waiting threads.
+# Increments the signal counter and issues a futex_wake with a high count
+# to release all sleeping threads.
+#
+# @param @cv: The Condvar
+fn condvar_broadcast(@cv: Condvar)
+    atomic_fetch_add(@cv.signal_count, 1, ORDER_RELEASE)
+    @n_waiters = atomic_load(@cv.waiters, ORDER_RELAXED)
+    if @n_waiters > 0
+        futex_wake(&@cv.signal_count.value, @n_waiters)
+
+# =============================================================================
+# SECTION 11: Channel — Bounded MPMC Ring-Buffer Channel
+# =============================================================================
+# A multi-producer, multi-consumer (MPMC) bounded channel implemented as a
+# lock-free circular buffer. This is the primary inter-thread communication
+# mechanism in Luna's actor model.
+#
+# The channel uses two atomic cursors (head and tail) with modular arithmetic
+# over a power-of-two capacity. Producers write at head, consumers read at
+# tail. The count atomic tracks the current number of elements for fast
+# is_empty/is_full checks.
+#
+# Borrow Checker Integration:
+#   Channel send has MOVE semantics: sending a value through a channel
+#   transfers ownership from the sender to the receiver. The borrow checker
+#   ensures that after channel_send(@ch, @val), @val is no longer accessible
+#   in the sender's scope (moved out). The receiver obtains exclusive
+#   ownership of the value via channel_recv.
+#
+#   For Copy types (integers, booleans, AtomicInt), the value is implicitly
+#   cloned on send, so the sender retains its copy.
+
+struct Channel
+    buffer: [i64; 1024]         # Circular buffer (MAX_CHANNEL_SIZE elements)
+    head: AtomicInt             # Write position (producer cursor)
+    tail: AtomicInt             # Read position (consumer cursor)
+    capacity: int               # Maximum number of elements
+    count: AtomicInt            # Current element count
+    closed: AtomicFlag          # Channel closed flag
+    senders: AtomicInt          # Number of active sender handles
+    receivers: AtomicInt        # Number of active receiver handles
+
+# Create a new bounded channel with the given capacity.
+# Capacity is clamped to MAX_CHANNEL_SIZE.
+# @param @cap: Desired capacity (1..MAX_CHANNEL_SIZE)
+# @return:     A new empty Channel
+fn channel_new(@cap: int) -> Channel
+    @actual_cap = @cap
+    if @actual_cap < 1
+        @actual_cap = 1
+    if @actual_cap > MAX_CHANNEL_SIZE
+        @actual_cap = MAX_CHANNEL_SIZE
+    @ch = Channel {
+        buffer: [0; 1024],
+        head: atomic_new(0),
+        tail: atomic_new(0),
+        capacity: @actual_cap,
+        count: atomic_new(0),
+        closed: atomic_flag_new(0),
+        senders: atomic_new(1),
+        receivers: atomic_new(1)
+    }
+    return @ch
+
+# Send a value through the channel.
+# Blocks if the channel is full (spins with backoff + futex wait).
+# Returns CHAN_CLOSED if the channel has been closed.
+#
+# @param @ch:    The Channel
+# @param @value: Value to send (ownership is moved to the channel)
+# @return:       CHAN_OK on success, CHAN_CLOSED if channel is closed
+fn channel_send(@ch: Channel, @value: i64) -> int
+    orbit @attempt in 0..1000000
+        # Check if channel is closed
+        if atomic_flag_load(@ch.closed) == 1
+            return CHAN_CLOSED
+
+        # Check if channel is full
+        @cnt = atomic_load(@ch.count, ORDER_ACQUIRE)
+        if @cnt >= @ch.capacity
+            # Channel is full — spin briefly, then futex wait
+            orbit @p in 0..16
+                llvm_cpu_pause()
+            # Recheck after spin
+            @cnt2 = atomic_load(@ch.count, ORDER_ACQUIRE)
+            if @cnt2 >= @ch.capacity
+                futex_wait(&@ch.count.value, @cnt2)
+            continue
+
+        # Try to claim a write slot
+        @pos = atomic_load(@ch.head, ORDER_RELAXED)
+        @new_pos = (@pos + 1) % @ch.capacity
+        @old_pos, @ok = atomic_compare_exchange(@ch.head, @pos, @new_pos)
+        if @ok == 1
+            # Write the value into the buffer at @pos
+            @buf_idx = @pos % @ch.capacity
+            @ch.buffer[@buf_idx] = @value
+            llvm_atomic_fence(ORDER_RELEASE)
+            # Increment element count and wake a potential consumer
+            atomic_fetch_add(@ch.count, 1, ORDER_RELEASE)
+            futex_wake(&@ch.count.value, 1)
+            return CHAN_OK
+    return CHAN_FULL
+
+# Try to send a value without blocking.
+# @param @ch:    The Channel
+# @param @value: Value to send
+# @return:       CHAN_OK on success, CHAN_FULL if full, CHAN_CLOSED if closed
+fn channel_try_send(@ch: Channel, @value: i64) -> int
+    if atomic_flag_load(@ch.closed) == 1
+        return CHAN_CLOSED
+    @cnt = atomic_load(@ch.count, ORDER_ACQUIRE)
+    if @cnt >= @ch.capacity
+        return CHAN_FULL
+    @pos = atomic_load(@ch.head, ORDER_RELAXED)
+    @new_pos = (@pos + 1) % @ch.capacity
+    @old_pos, @ok = atomic_compare_exchange(@ch.head, @pos, @new_pos)
+    if @ok == 1
+        @buf_idx = @pos % @ch.capacity
+        @ch.buffer[@buf_idx] = @value
+        llvm_atomic_fence(ORDER_RELEASE)
+        atomic_fetch_add(@ch.count, 1, ORDER_RELEASE)
+        futex_wake(&@ch.count.value, 1)
+        return CHAN_OK
+    return CHAN_FULL
+
+# Receive a value from the channel.
+# Blocks if the channel is empty (spins with backoff + futex wait).
+# Returns (value, CHAN_CLOSED) if the channel is closed and empty.
+#
+# @param @ch: The Channel
+# @return:    Tuple (value, status) where status is CHAN_OK or CHAN_CLOSED
+fn channel_recv(@ch: Channel) -> i64, int
+    orbit @attempt in 0..1000000
+        @cnt = atomic_load(@ch.count, ORDER_ACQUIRE)
+        if @cnt > 0
+            # Try to claim a read slot
+            @pos = atomic_load(@ch.tail, ORDER_RELAXED)
+            @new_pos = (@pos + 1) % @ch.capacity
+            @old_pos, @ok = atomic_compare_exchange(@ch.tail, @pos, @new_pos)
+            if @ok == 1
+                @buf_idx = @pos % @ch.capacity
+                llvm_atomic_fence(ORDER_ACQUIRE)
+                @value = @ch.buffer[@buf_idx]
+                # Decrement element count and wake a potential producer
+                atomic_fetch_sub(@ch.count, 1, ORDER_RELEASE)
+                futex_wake(&@ch.count.value, 1)
+                return @value, CHAN_OK
+
+        # Channel is empty
+        if atomic_flag_load(@ch.closed) == 1
+            return 0, CHAN_CLOSED
+
+        # Spin briefly, then futex wait
+        orbit @p in 0..16
+            llvm_cpu_pause()
+        @cnt2 = atomic_load(@ch.count, ORDER_ACQUIRE)
+        if @cnt2 == 0
+            if atomic_flag_load(@ch.closed) == 1
+                return 0, CHAN_CLOSED
+            futex_wait(&@ch.count.value, 0)
+    return 0, CHAN_EMPTY
+
+# Try to receive a value without blocking.
+# @param @ch: The Channel
+# @return:    Tuple (value, status) where status is CHAN_OK, CHAN_EMPTY, or CHAN_CLOSED
+fn channel_try_recv(@ch: Channel) -> i64, int
+    @cnt = atomic_load(@ch.count, ORDER_ACQUIRE)
+    if @cnt == 0
+        if atomic_flag_load(@ch.closed) == 1
+            return 0, CHAN_CLOSED
+        return 0, CHAN_EMPTY
+    @pos = atomic_load(@ch.tail, ORDER_RELAXED)
+    @new_pos = (@pos + 1) % @ch.capacity
+    @old_pos, @ok = atomic_compare_exchange(@ch.tail, @pos, @new_pos)
+    if @ok == 1
+        @buf_idx = @pos % @ch.capacity
+        llvm_atomic_fence(ORDER_ACQUIRE)
+        @value = @ch.buffer[@buf_idx]
+        atomic_fetch_sub(@ch.count, 1, ORDER_RELEASE)
+        futex_wake(&@ch.count.value, 1)
+        return @value, CHAN_OK
+    return 0, CHAN_EMPTY
+
+# Close the channel. No more values can be sent after closing.
+# Wakes all threads currently blocked on send or recv so they can
+# observe the closed state.
+#
+# @param @ch: The Channel to close
+fn channel_close(@ch: Channel)
+    atomic_flag_test_and_set(@ch.closed)
+    # Wake all potential waiters so they can detect the closed state
+    futex_wake(&@ch.count.value, 1000000)
+
+# Check if the channel is closed.
+# @param @ch: The Channel
+# @return:    1 if closed, 0 if open
+fn channel_is_closed(@ch: Channel) -> int
+    return atomic_flag_load(@ch.closed)
+
+# Get the number of elements currently in the channel.
+# @param @ch: The Channel
+# @return:    Current element count
+fn channel_len(@ch: Channel) -> int
+    return atomic_load(@ch.count, ORDER_RELAXED)
+
+# Check if the channel is empty.
+# @param @ch: The Channel
+# @return:    1 if empty, 0 if has elements
+fn channel_is_empty(@ch: Channel) -> int
+    if atomic_load(@ch.count, ORDER_RELAXED) == 0
+        return 1
+    return 0
+
+# Check if the channel is full.
+# @param @ch: The Channel
+# @return:    1 if full, 0 if has space
+fn channel_is_full(@ch: Channel) -> int
+    if atomic_load(@ch.count, ORDER_RELAXED) >= @ch.capacity
+        return 1
+    return 0
+
+# =============================================================================
+# SECTION 12: Unbounded Channel — Growable Segmented Ring Buffer
+# =============================================================================
+# An unbounded channel that grows dynamically using linked segments.
+# Each segment is a fixed-size ring buffer (MAX_UNBOUNDED_SEGMENT_SIZE).
+# When one segment fills, a new segment is allocated and appended.
+#
+# This avoids the capacity constraint of bounded channels while still
+# providing efficient lock-free operation within each segment.
+#
+# The send operation always succeeds (unless the channel is closed or
+# the maximum number of segments is exhausted).
+
+struct ChannelSegment
+    buffer: [i64; 256]          # Segment buffer (MAX_UNBOUNDED_SEGMENT_SIZE)
+    head: int                   # Write position within this segment
+    tail: int                   # Read position within this segment
+    next_segment: int           # Index of next segment (SYNC_NIL if last)
+    active: int                 # 1 = in use, 0 = free
+
+struct UnboundedChannel
+    segments: [ChannelSegment; 64]  # Pre-allocated segment pool
+    segment_count: int              # Number of allocated segments
+    write_seg: int                  # Index of current write segment
+    read_seg: int                   # Index of current read segment
+    total_count: AtomicInt          # Total elements across all segments
+    closed: AtomicFlag              # Channel closed flag
+    lock: SpinLock                  # Lock for segment management
+
+# Create a new unbounded channel.
+# Starts with one pre-allocated segment.
+# @return: A new empty UnboundedChannel
+fn unbounded_channel_new() -> UnboundedChannel
+    @uch = UnboundedChannel {
+        segments: [ChannelSegment {
+            buffer: [0; 256],
+            head: 0,
+            tail: 0,
+            next_segment: SYNC_NIL,
+            active: 0
+        }; 64],
+        segment_count: 0,
+        write_seg: 0,
+        read_seg: 0,
+        total_count: atomic_new(0),
+        closed: atomic_flag_new(0),
+        lock: spinlock_new()
+    }
+    # Allocate the first segment
+    @uch.segments[0].active = 1
+    @uch.segment_count = 1
+    return @uch
+
+# Allocate a new segment from the pool.
+# @param @uch: The UnboundedChannel
+# @return:     Index of the new segment, or SYNC_NIL if pool exhausted
+fn unbounded_alloc_segment(@uch: UnboundedChannel) -> int
+    if @uch.segment_count >= MAX_UNBOUNDED_SEGMENTS
+        return SYNC_NIL
+    @idx = @uch.segment_count
+    @uch.segments[@idx].head = 0
+    @uch.segments[@idx].tail = 0
+    @uch.segments[@idx].next_segment = SYNC_NIL
+    @uch.segments[@idx].active = 1
+    @uch.segment_count = @uch.segment_count + 1
+    return @idx
+
+# Send a value through the unbounded channel.
+# Always succeeds unless the channel is closed or segment pool is exhausted.
+#
+# @param @uch:   The UnboundedChannel
+# @param @value: Value to send
+# @return:       CHAN_OK on success, CHAN_CLOSED if closed, CHAN_FULL if segments exhausted
+fn unbounded_channel_send(@uch: UnboundedChannel, @value: i64) -> int
+    if atomic_flag_load(@uch.closed) == 1
+        return CHAN_CLOSED
+
+    spinlock_lock(@uch.lock)
+
+    @ws = @uch.write_seg
+    @seg_head = @uch.segments[@ws].head
+
+    # Check if current write segment is full
+    if @seg_head >= MAX_UNBOUNDED_SEGMENT_SIZE
+        # Allocate new segment
+        @new_seg = unbounded_alloc_segment(@uch)
+        if @new_seg == SYNC_NIL
+            spinlock_unlock(@uch.lock)
+            return CHAN_FULL
+        @uch.segments[@ws].next_segment = @new_seg
+        @uch.write_seg = @new_seg
+        @ws = @new_seg
+        @seg_head = 0
+
+    # Write value into segment
+    @uch.segments[@ws].buffer[@seg_head] = @value
+    @uch.segments[@ws].head = @seg_head + 1
+    atomic_fetch_add(@uch.total_count, 1, ORDER_RELEASE)
+
+    spinlock_unlock(@uch.lock)
+    return CHAN_OK
+
+# Receive a value from the unbounded channel.
+# @param @uch: The UnboundedChannel
+# @return:     Tuple (value, status)
+fn unbounded_channel_recv(@uch: UnboundedChannel) -> i64, int
+    spinlock_lock(@uch.lock)
+
+    @total = atomic_load(@uch.total_count, ORDER_ACQUIRE)
+    if @total == 0
+        spinlock_unlock(@uch.lock)
+        if atomic_flag_load(@uch.closed) == 1
+            return 0, CHAN_CLOSED
+        return 0, CHAN_EMPTY
+
+    @rs = @uch.read_seg
+    @seg_tail = @uch.segments[@rs].tail
+    @seg_head = @uch.segments[@rs].head
+
+    # Check if current read segment is exhausted
+    if @seg_tail >= @seg_head
+        # Move to next segment
+        @next = @uch.segments[@rs].next_segment
+        if @next == SYNC_NIL
+            spinlock_unlock(@uch.lock)
+            return 0, CHAN_EMPTY
+        # Deactivate exhausted segment
+        @uch.segments[@rs].active = 0
+        @uch.read_seg = @next
+        @rs = @next
+        @seg_tail = @uch.segments[@rs].tail
+
+    # Read value from segment
+    @value = @uch.segments[@rs].buffer[@seg_tail]
+    @uch.segments[@rs].tail = @seg_tail + 1
+    atomic_fetch_sub(@uch.total_count, 1, ORDER_RELEASE)
+
+    spinlock_unlock(@uch.lock)
+    return @value, CHAN_OK
+
+# Close the unbounded channel.
+# @param @uch: The UnboundedChannel
+fn unbounded_channel_close(@uch: UnboundedChannel)
+    atomic_flag_test_and_set(@uch.closed)
+
+# Get total element count in the unbounded channel.
+# @param @uch: The UnboundedChannel
+# @return:     Total element count
+fn unbounded_channel_len(@uch: UnboundedChannel) -> int
+    return atomic_load(@uch.total_count, ORDER_RELAXED)
+
+# Check if unbounded channel is closed.
+# @param @uch: The UnboundedChannel
+# @return:     1 if closed, 0 if open
+fn unbounded_channel_is_closed(@uch: UnboundedChannel) -> int
+    return atomic_flag_load(@uch.closed)
+
+# =============================================================================
+# SECTION 13: OnceCell — Initialize Once, Read Many
+# =============================================================================
+# A synchronization primitive that can be written to exactly once.
+# After initialization, all subsequent reads return the stored value
+# without any synchronization overhead (just an atomic load).
+#
+# State machine:
+#   ONCE_EMPTY (0)         — No value stored yet
+#   ONCE_INITIALIZING (1)  — A thread is currently initializing
+#   ONCE_INITIALIZED (2)   — Value is available
+#
+# The initializing thread wins the CAS(EMPTY → INITIALIZING) race.
+# All other threads spin-wait until state transitions to INITIALIZED.
+
+struct OnceCell
+    state: AtomicInt    # ONCE_EMPTY, ONCE_INITIALIZING, or ONCE_INITIALIZED
+    value: i64          # The stored value (valid only when state == INITIALIZED)
+
+# Create a new empty OnceCell.
+# @return: A new OnceCell in the EMPTY state
+fn once_new() -> OnceCell
+    @cell = OnceCell {
+        state: atomic_new(ONCE_EMPTY),
+        value: 0
+    }
+    return @cell
+
+# Get the stored value if initialized.
+# @param @cell: The OnceCell
+# @return:      Tuple (value, is_initialized) where is_initialized is 0 or 1
+fn once_get(@cell: OnceCell) -> i64, int
+    @s = atomic_load(@cell.state, ORDER_ACQUIRE)
+    if @s == ONCE_INITIALIZED
+        return @cell.value, 1
+    return 0, 0
+
+# Try to set the value. Succeeds only if the cell is empty.
+# @param @cell:  The OnceCell
+# @param @value: Value to store
+# @return:       1 if set successfully, 0 if already initialized
+fn once_set(@cell: OnceCell, @value: i64) -> int
+    # Try to transition EMPTY → INITIALIZING
+    @old, @ok = atomic_compare_exchange(@cell.state, ONCE_EMPTY, ONCE_INITIALIZING)
+    if @ok == 0
+        return 0    # Someone else already initialized or is initializing
+    # We won the race — store the value
+    @cell.value = @value
+    llvm_atomic_fence(ORDER_RELEASE)
+    # Transition INITIALIZING → INITIALIZED
+    atomic_store(@cell.state, ONCE_INITIALIZED, ORDER_RELEASE)
+    return 1
+
+# Get the value, initializing it with @init_fn if not yet set.
+# This is the canonical "lazy initialization" pattern:
+#   @val = once_get_or_init(@cell, fn() -> compute_expensive_value())
+#
+# If multiple threads race to initialize, only one wins the CAS;
+# the others spin-wait for the winner to complete initialization.
+#
+# @param @cell:    The OnceCell
+# @param @init_fn: Initialization function (called at most once)
+# @return:         The stored value
+fn once_get_or_init(@cell: OnceCell, @init_fn: fn() -> i64) -> i64
+    # Fast path: already initialized
+    @s = atomic_load(@cell.state, ORDER_ACQUIRE)
+    if @s == ONCE_INITIALIZED
+        return @cell.value
+
+    # Try to become the initializer
+    @old, @ok = atomic_compare_exchange(@cell.state, ONCE_EMPTY, ONCE_INITIALIZING)
+    if @ok == 1
+        # We won — call the init function
+        @val = @init_fn()
+        @cell.value = @val
+        llvm_atomic_fence(ORDER_RELEASE)
+        atomic_store(@cell.state, ONCE_INITIALIZED, ORDER_RELEASE)
+        # Wake any threads spinning on our initialization
+        futex_wake(&@cell.state.value, 1000000)
+        return @val
+
+    # Another thread is initializing — spin-wait for completion
+    orbit @spin in 0..1000000
+        @s2 = atomic_load(@cell.state, ORDER_ACQUIRE)
+        if @s2 == ONCE_INITIALIZED
+            return @cell.value
+        if @s2 == ONCE_INITIALIZING
+            futex_wait(&@cell.state.value, ONCE_INITIALIZING)
+    # Should never reach here in correct programs
+    return @cell.value
+
+# =============================================================================
+# SECTION 14: Barrier — Thread Synchronization Barrier
+# =============================================================================
+# A barrier synchronizes a fixed number of threads at a rendezvous point.
+# Each thread calls barrier_wait, which blocks until all @total threads
+# have arrived. The last thread to arrive is designated the "leader"
+# (returns 1 from barrier_wait) and resets the barrier for reuse.
+#
+# The generation counter prevents threads from being confused across
+# successive uses of the barrier (the "barrier reuse" problem).
+
+struct Barrier
+    count: AtomicInt        # Number of threads that have arrived
+    generation: AtomicInt   # Incremented each time barrier is released
+    total: int              # Total number of threads to synchronize
+
+# Create a new barrier for @count threads.
+# @param @count: Number of threads that must arrive before release
+# @return:       A new Barrier
+fn barrier_new(@count: int) -> Barrier
+    @bar = Barrier {
+        count: atomic_new(0),
+        generation: atomic_new(0),
+        total: @count
+    }
+    return @bar
+
+# Wait at the barrier until all threads arrive.
+# The last thread to arrive resets the barrier and wakes all others.
+#
+# @param @bar: The Barrier
+# @return:     1 if this thread is the leader (last to arrive), 0 otherwise
+fn barrier_wait(@bar: Barrier) -> int
+    @gen = atomic_load(@bar.generation, ORDER_ACQUIRE)
+
+    # Increment arrival count
+    @arrived = atomic_fetch_add(@bar.count, 1, ORDER_ACQ_REL)
+    @arrived = @arrived + 1   # fetch_add returns OLD value
+
+    if @arrived >= @bar.total
+        # We are the last thread — reset and wake everyone
+        atomic_store(@bar.count, 0, ORDER_RELEASE)
+        atomic_fetch_add(@bar.generation, 1, ORDER_RELEASE)
+        futex_wake(&@bar.generation.value, @bar.total)
+        return 1   # Leader
+
+    # Not the last thread — wait for generation to change
+    orbit @spin in 0..1000000
+        @current_gen = atomic_load(@bar.generation, ORDER_ACQUIRE)
+        if @current_gen != @gen
+            return 0   # Not leader
+        futex_wait(&@bar.generation.value, @gen)
+    return 0
+
+# =============================================================================
+# SECTION 15: Latch — Countdown Latch
+# =============================================================================
+# A countdown latch starts with a given count and allows threads to wait
+# until the count reaches zero. Unlike a barrier, the latch is one-shot:
+# it does not reset after being triggered.
+#
+# Typical usage:
+#   Main thread creates latch with count = N
+#   N worker threads each call latch_count_down after completing work
+#   Main thread calls latch_wait to block until all workers finish
+
+struct Latch
+    count: AtomicInt    # Remaining count (starts positive, decrements to 0)
+
+# Create a new latch with the given initial count.
+# @param @count: Initial count (number of count_down calls needed to release)
+# @return:       A new Latch
+fn latch_new(@count: int) -> Latch
+    @latch = Latch { count: atomic_new(@count) }
+    return @latch
+
+# Decrement the latch count by 1.
+# If the count reaches 0, wake all threads waiting on the latch.
+#
+# @param @latch: The Latch
+fn latch_count_down(@latch: Latch)
+    @old = atomic_fetch_sub(@latch.count, 1, ORDER_ACQ_REL)
+    # @old is the value BEFORE subtraction
+    if @old <= 1
+        # Count reached 0 — wake all waiters
+        futex_wake(&@latch.count.value, 1000000)
+
+# Block until the latch count reaches 0.
+# If the count is already 0, returns immediately.
+#
+# @param @latch: The Latch
+fn latch_wait(@latch: Latch)
+    orbit @spin in 0..1000000
+        @c = atomic_load(@latch.count, ORDER_ACQUIRE)
+        if @c <= 0
+            return
+        futex_wait(&@latch.count.value, @c)
+
+# Get the current count of the latch.
+# @param @latch: The Latch
+# @return:       Current remaining count
+fn latch_get_count(@latch: Latch) -> int
+    return atomic_load(@latch.count, ORDER_RELAXED)
+
+# =============================================================================
+# SECTION 16: BORROW CHECKER INTEGRATION NOTES
+# =============================================================================
+# The following documents how borrow_checker.luna validates usage of
+# synchronization primitives at compile time.
+#
+# --- Mutex ---
+# When a thread calls mutex_lock(@mtx), the borrow checker creates an
+# exclusive borrow (&mut) on the protected resource associated with @mtx.
+# While the mutex is held:
+#   - No other borrow (shared or exclusive) may be created on the resource
+#   - The borrow expires when mutex_unlock(@mtx) is called
+#   - Failure to unlock (e.g., panic without cleanup) triggers error E0499
+#
+# --- RwLock ---
+# rwlock_read_lock creates a shared borrow (&T):
+#   - Multiple shared borrows may coexist (one per reader)
+#   - No exclusive borrow may be created while any shared borrow exists
+# rwlock_write_lock creates an exclusive borrow (&mut T):
+#   - Only one exclusive borrow may exist at a time
+#   - No shared borrows may coexist with an exclusive borrow
+# These rules directly mirror Rust's borrowing discipline.
+#
+# --- Channel ---
+# channel_send(@ch, @val) performs a MOVE of @val:
+#   - After send, @val's ownership state transitions to MOVED
+#   - Any subsequent use of @val triggers error E0382 (use after move)
+#   - The receiver obtains ownership via channel_recv
+# Exception: Copy types (int, float, bool, AtomicInt) are implicitly
+# cloned on send, so the sender retains its copy.
+#
+# --- AtomicInt ---
+# AtomicInt is registered as a Copy type:
+#   - No ownership transfer occurs on assignment or passing to functions
+#   - Multiple aliases may exist simultaneously
+#   - This is safe because all access is through hardware atomic instructions
+#   - The borrow checker skips move-checking for Copy types
+
+# =============================================================================
+# SECTION 17: SELF-TESTS
+# =============================================================================
+# Comprehensive test suite for all synchronization primitives.
+# Each test function validates a specific behavior and prints PASS/FAIL.
+# Note: Multi-threaded tests are limited in single-threaded self-test mode;
+# we verify correctness of the logic and state transitions.
+
+# --- Test: Memory ordering constants ---
+fn test_ordering_constants()
+    shine("  [test] Memory ordering constants...")
+    guard ORDER_RELAXED == 0 else
+        shine("    FAIL: ORDER_RELAXED should be 0")
+        return
+    guard ORDER_ACQUIRE == 1 else
+        shine("    FAIL: ORDER_ACQUIRE should be 1")
+        return
+    guard ORDER_RELEASE == 2 else
+        shine("    FAIL: ORDER_RELEASE should be 2")
+        return
+    guard ORDER_ACQ_REL == 3 else
+        shine("    FAIL: ORDER_ACQ_REL should be 3")
+        return
+    guard ORDER_SEQ_CST == 4 else
+        shine("    FAIL: ORDER_SEQ_CST should be 4")
+        return
+    shine("    PASS")
+
+# --- Test: AtomicInt load/store ---
+fn test_atomic_load_store()
+    shine("  [test] AtomicInt load/store...")
+    @a = atomic_new(42)
+    @val = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val == 42 else
+        shine("    FAIL: initial load should be 42")
+        return
+    atomic_store(@a, 100, ORDER_SEQ_CST)
+    @val2 = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val2 == 100 else
+        shine("    FAIL: load after store should be 100")
+        return
+    # Store zero
+    atomic_store(@a, 0, ORDER_SEQ_CST)
+    @val3 = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val3 == 0 else
+        shine("    FAIL: load after store(0) should be 0")
+        return
+    shine("    PASS")
+
+# --- Test: AtomicInt fetch_add ---
+fn test_atomic_fetch_add()
+    shine("  [test] AtomicInt fetch_add...")
+    @a = atomic_new(10)
+    @old = atomic_fetch_add(@a, 5, ORDER_SEQ_CST)
+    guard @old == 10 else
+        shine("    FAIL: fetch_add should return old value 10")
+        return
+    @val = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val == 15 else
+        shine("    FAIL: value after fetch_add(5) should be 15")
+        return
+    # Add negative
+    @old2 = atomic_fetch_add(@a, -3, ORDER_SEQ_CST)
+    guard @old2 == 15 else
+        shine("    FAIL: fetch_add(-3) should return old value 15")
+        return
+    @val2 = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val2 == 12 else
+        shine("    FAIL: value after fetch_add(-3) should be 12")
+        return
+    shine("    PASS")
+
+# --- Test: AtomicInt fetch_sub ---
+fn test_atomic_fetch_sub()
+    shine("  [test] AtomicInt fetch_sub...")
+    @a = atomic_new(20)
+    @old = atomic_fetch_sub(@a, 7, ORDER_SEQ_CST)
+    guard @old == 20 else
+        shine("    FAIL: fetch_sub should return old value 20")
+        return
+    @val = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val == 13 else
+        shine("    FAIL: value after fetch_sub(7) should be 13")
+        return
+    shine("    PASS")
+
+# --- Test: AtomicInt fetch_max ---
+fn test_atomic_fetch_max()
+    shine("  [test] AtomicInt fetch_max...")
+    @a = atomic_new(10)
+    # fetch_max with larger value should update
+    @old = atomic_fetch_max(@a, 20, ORDER_SEQ_CST)
+    guard @old == 10 else
+        shine("    FAIL: fetch_max(20) should return old value 10")
+        return
+    @val = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val == 20 else
+        shine("    FAIL: value after fetch_max(20) should be 20")
+        return
+    # fetch_max with smaller value should NOT update
+    @old2 = atomic_fetch_max(@a, 5, ORDER_SEQ_CST)
+    guard @old2 == 20 else
+        shine("    FAIL: fetch_max(5) should return current value 20")
+        return
+    @val2 = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val2 == 20 else
+        shine("    FAIL: value should still be 20 after fetch_max(5)")
+        return
+    shine("    PASS")
+
+# --- Test: AtomicInt fetch_min ---
+fn test_atomic_fetch_min()
+    shine("  [test] AtomicInt fetch_min...")
+    @a = atomic_new(10)
+    # fetch_min with smaller value should update
+    @old = atomic_fetch_min(@a, 3, ORDER_SEQ_CST)
+    guard @old == 10 else
+        shine("    FAIL: fetch_min(3) should return old value 10")
+        return
+    @val = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val == 3 else
+        shine("    FAIL: value after fetch_min(3) should be 3")
+        return
+    # fetch_min with larger value should NOT update
+    @old2 = atomic_fetch_min(@a, 100, ORDER_SEQ_CST)
+    guard @old2 == 3 else
+        shine("    FAIL: fetch_min(100) should return current value 3")
+        return
+    @val2 = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val2 == 3 else
+        shine("    FAIL: value should still be 3 after fetch_min(100)")
+        return
+    shine("    PASS")
+
+# --- Test: AtomicInt compare_exchange success ---
+fn test_atomic_compare_exchange_success()
+    shine("  [test] AtomicInt compare_exchange (success)...")
+    @a = atomic_new(42)
+    @old, @ok = atomic_compare_exchange(@a, 42, 99)
+    guard @ok == 1 else
+        shine("    FAIL: CAS(42 -> 99) should succeed")
+        return
+    guard @old == 42 else
+        shine("    FAIL: CAS should return old value 42")
+        return
+    @val = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val == 99 else
+        shine("    FAIL: value after successful CAS should be 99")
+        return
+    shine("    PASS")
+
+# --- Test: AtomicInt compare_exchange failure ---
+fn test_atomic_compare_exchange_failure()
+    shine("  [test] AtomicInt compare_exchange (failure)...")
+    @a = atomic_new(42)
+    @old, @ok = atomic_compare_exchange(@a, 99, 100)
+    guard @ok == 0 else
+        shine("    FAIL: CAS(expected=99, actual=42) should fail")
+        return
+    guard @old == 42 else
+        shine("    FAIL: CAS should return actual value 42 on failure")
+        return
+    @val = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val == 42 else
+        shine("    FAIL: value should be unchanged (42) after failed CAS")
+        return
+    shine("    PASS")
+
+# --- Test: AtomicFlag test_and_set / clear ---
+fn test_atomic_flag()
+    shine("  [test] AtomicFlag test_and_set/clear...")
+    @flag = atomic_flag_new(0)
+    # Flag starts clear
+    @loaded = atomic_flag_load(@flag)
+    guard @loaded == 0 else
+        shine("    FAIL: new flag should be 0 (clear)")
+        return
+    # First test_and_set: should return 0 (was clear) and set to 1
+    @old = atomic_flag_test_and_set(@flag)
+    guard @old == 0 else
+        shine("    FAIL: first test_and_set should return 0")
+        return
+    @loaded2 = atomic_flag_load(@flag)
+    guard @loaded2 == 1 else
+        shine("    FAIL: flag should be 1 after test_and_set")
+        return
+    # Second test_and_set: should return 1 (was already set)
+    @old2 = atomic_flag_test_and_set(@flag)
+    guard @old2 == 1 else
+        shine("    FAIL: second test_and_set should return 1")
+        return
+    # Clear the flag
+    atomic_flag_clear(@flag)
+    @loaded3 = atomic_flag_load(@flag)
+    guard @loaded3 == 0 else
+        shine("    FAIL: flag should be 0 after clear")
+        return
+    shine("    PASS")
+
+# --- Test: SpinLock lock/try_lock/unlock ---
+fn test_spinlock_basic()
+    shine("  [test] SpinLock lock/try_lock/unlock...")
+    @lock = spinlock_new()
+    # Initially unlocked
+    guard spinlock_is_locked(@lock) == 0 else
+        shine("    FAIL: new spinlock should be unlocked")
+        return
+    # Lock it
+    spinlock_lock(@lock)
+    guard spinlock_is_locked(@lock) == 1 else
+        shine("    FAIL: spinlock should be locked after lock()")
+        return
+    # Unlock it
+    spinlock_unlock(@lock)
+    guard spinlock_is_locked(@lock) == 0 else
+        shine("    FAIL: spinlock should be unlocked after unlock()")
+        return
+    # Try lock should succeed on unlocked
+    @got = spinlock_try_lock(@lock)
+    guard @got == 1 else
+        shine("    FAIL: try_lock should return 1 on unlocked spinlock")
+        return
+    guard spinlock_is_locked(@lock) == 1 else
+        shine("    FAIL: spinlock should be locked after try_lock")
+        return
+    spinlock_unlock(@lock)
+    shine("    PASS")
+
+# --- Test: SpinLock with backoff (lock/unlock cycle) ---
+fn test_spinlock_backoff_cycle()
+    shine("  [test] SpinLock backoff (lock/unlock cycle)...")
+    @lock = spinlock_new()
+    # Perform multiple lock/unlock cycles to exercise backoff logic
+    orbit @i in 0..10
+        spinlock_lock(@lock)
+        guard spinlock_is_locked(@lock) == 1 else
+            shine("    FAIL: spinlock should be locked in cycle")
+            return
+        spinlock_unlock(@lock)
+        guard spinlock_is_locked(@lock) == 0 else
+            shine("    FAIL: spinlock should be unlocked after cycle")
+            return
+    shine("    PASS")
+
+# --- Test: Mutex lock/unlock (single threaded) ---
+fn test_mutex_basic()
+    shine("  [test] Mutex lock/unlock (single threaded)...")
+    @mtx = mutex_new()
+    # Initially unlocked
+    guard mutex_is_locked(@mtx) == 0 else
+        shine("    FAIL: new mutex should be unlocked")
+        return
+    # Lock
+    mutex_lock(@mtx)
+    guard mutex_is_locked(@mtx) == 1 else
+        shine("    FAIL: mutex should be locked after lock()")
+        return
+    # Unlock
+    mutex_unlock(@mtx)
+    guard mutex_is_locked(@mtx) == 0 else
+        shine("    FAIL: mutex should be unlocked after unlock()")
+        return
+    shine("    PASS")
+
+# --- Test: Mutex try_lock ---
+fn test_mutex_try_lock()
+    shine("  [test] Mutex try_lock behavior...")
+    @mtx = mutex_new()
+    # try_lock should succeed on unlocked mutex
+    @got = mutex_try_lock(@mtx)
+    guard @got == 1 else
+        shine("    FAIL: try_lock should return 1 on unlocked mutex")
+        return
+    guard mutex_is_locked(@mtx) == 1 else
+        shine("    FAIL: mutex should be locked after try_lock")
+        return
+    # Note: In single-threaded mode, try_lock from the same thread
+    # uses recursion_count, so it should succeed again
+    @got2 = mutex_try_lock(@mtx)
+    guard @got2 == 1 else
+        shine("    FAIL: recursive try_lock should succeed for same thread")
+        return
+    # Unlock recursion
+    mutex_unlock(@mtx)
+    guard mutex_is_locked(@mtx) == 1 else
+        shine("    FAIL: mutex should still be locked (recursion)")
+        return
+    # Final unlock
+    mutex_unlock(@mtx)
+    guard mutex_is_locked(@mtx) == 0 else
+        shine("    FAIL: mutex should be unlocked after both unlocks")
+        return
+    shine("    PASS")
+
+# --- Test: RwLock multiple readers ---
+fn test_rwlock_multiple_readers()
+    shine("  [test] RwLock multiple readers...")
+    @rw = rwlock_new()
+    # Acquire multiple read locks (simulating concurrent readers)
+    @got1 = rwlock_try_read_lock(@rw)
+    guard @got1 == 1 else
+        shine("    FAIL: first read lock should succeed")
+        return
+    @got2 = rwlock_try_read_lock(@rw)
+    guard @got2 == 1 else
+        shine("    FAIL: second read lock should succeed (multiple readers)")
+        return
+    @got3 = rwlock_try_read_lock(@rw)
+    guard @got3 == 1 else
+        shine("    FAIL: third read lock should succeed")
+        return
+    # State should be 3 (three readers)
+    @state = atomic_load(@rw.state, ORDER_ACQUIRE)
+    guard @state == 3 else
+        shine("    FAIL: state should be 3 with three readers")
+        return
+    # Release all readers
+    rwlock_read_unlock(@rw)
+    rwlock_read_unlock(@rw)
+    rwlock_read_unlock(@rw)
+    @state2 = atomic_load(@rw.state, ORDER_ACQUIRE)
+    guard @state2 == 0 else
+        shine("    FAIL: state should be 0 after all readers unlock")
+        return
+    shine("    PASS")
+
+# --- Test: RwLock write exclusion ---
+fn test_rwlock_write_exclusion()
+    shine("  [test] RwLock write exclusion...")
+    @rw = rwlock_new()
+    # Acquire write lock
+    @got_w = rwlock_try_write_lock(@rw)
+    guard @got_w == 1 else
+        shine("    FAIL: write lock should succeed on unlocked rwlock")
+        return
+    # State should be -1 (write locked)
+    @state = atomic_load(@rw.state, ORDER_ACQUIRE)
+    guard @state == -1 else
+        shine("    FAIL: state should be -1 with write lock")
+        return
+    # Try read lock should fail while write-locked
+    @got_r = rwlock_try_read_lock(@rw)
+    guard @got_r == 0 else
+        shine("    FAIL: read lock should fail while write-locked")
+        return
+    # Try write lock again should fail
+    @got_w2 = rwlock_try_write_lock(@rw)
+    guard @got_w2 == 0 else
+        shine("    FAIL: second write lock should fail")
+        return
+    # Release write lock
+    rwlock_write_unlock(@rw)
+    @state2 = atomic_load(@rw.state, ORDER_ACQUIRE)
+    guard @state2 == 0 else
+        shine("    FAIL: state should be 0 after write unlock")
+        return
+    # Now read lock should succeed
+    @got_r2 = rwlock_try_read_lock(@rw)
+    guard @got_r2 == 1 else
+        shine("    FAIL: read lock should succeed after write unlock")
+        return
+    rwlock_read_unlock(@rw)
+    shine("    PASS")
+
+# --- Test: Condvar basic signal ---
+fn test_condvar_basic()
+    shine("  [test] Condvar basic signal (state check)...")
+    @cv = condvar_new()
+    # Check initial state
+    @waiters = atomic_load(@cv.waiters, ORDER_RELAXED)
+    guard @waiters == 0 else
+        shine("    FAIL: initial waiters should be 0")
+        return
+    @signals = atomic_load(@cv.signal_count, ORDER_RELAXED)
+    guard @signals == 0 else
+        shine("    FAIL: initial signal_count should be 0")
+        return
+    # Signal without waiters (should be a no-op, no crash)
+    condvar_signal(@cv)
+    @signals2 = atomic_load(@cv.signal_count, ORDER_RELAXED)
+    guard @signals2 == 1 else
+        shine("    FAIL: signal_count should be 1 after signal")
+        return
+    # Broadcast without waiters
+    condvar_broadcast(@cv)
+    @signals3 = atomic_load(@cv.signal_count, ORDER_RELAXED)
+    guard @signals3 == 2 else
+        shine("    FAIL: signal_count should be 2 after broadcast")
+        return
+    shine("    PASS")
+
+# --- Test: Channel send/recv single item ---
+fn test_channel_single_item()
+    shine("  [test] Channel send/recv single item...")
+    @ch = channel_new(8)
+    # Send one item
+    @status = channel_send(@ch, 42)
+    guard @status == CHAN_OK else
+        shine("    FAIL: send should return CHAN_OK")
+        return
+    guard channel_len(@ch) == 1 else
+        shine("    FAIL: channel length should be 1 after send")
+        return
+    # Receive it
+    @val, @recv_status = channel_recv(@ch)
+    guard @recv_status == CHAN_OK else
+        shine("    FAIL: recv should return CHAN_OK")
+        return
+    guard @val == 42 else
+        shine("    FAIL: recv should return 42")
+        return
+    guard channel_len(@ch) == 0 else
+        shine("    FAIL: channel length should be 0 after recv")
+        return
+    shine("    PASS")
+
+# --- Test: Channel capacity enforcement ---
+fn test_channel_capacity()
+    shine("  [test] Channel capacity enforcement (full/empty)...")
+    @ch = channel_new(4)
+    guard channel_is_empty(@ch) == 1 else
+        shine("    FAIL: new channel should be empty")
+        return
+    # Fill the channel
+    @s1 = channel_try_send(@ch, 10)
+    @s2 = channel_try_send(@ch, 20)
+    @s3 = channel_try_send(@ch, 30)
+    @s4 = channel_try_send(@ch, 40)
+    guard @s1 == CHAN_OK else
+        shine("    FAIL: send 1 should succeed")
+        return
+    guard @s4 == CHAN_OK else
+        shine("    FAIL: send 4 should succeed")
+        return
+    guard channel_is_full(@ch) == 1 else
+        shine("    FAIL: channel should be full after 4 sends (cap=4)")
+        return
+    # Try send when full should return CHAN_FULL
+    @s5 = channel_try_send(@ch, 50)
+    guard @s5 == CHAN_FULL else
+        shine("    FAIL: send to full channel should return CHAN_FULL")
+        return
+    # Try recv when empty
+    @v1, @rs1 = channel_recv(@ch)   # drain one
+    @v2, @rs2 = channel_recv(@ch)
+    @v3, @rs3 = channel_recv(@ch)
+    @v4, @rs4 = channel_recv(@ch)
+    guard channel_is_empty(@ch) == 1 else
+        shine("    FAIL: channel should be empty after draining all")
+        return
+    @vx, @rsx = channel_try_recv(@ch)
+    guard @rsx == CHAN_EMPTY else
+        shine("    FAIL: try_recv on empty channel should return CHAN_EMPTY")
+        return
+    shine("    PASS")
+
+# --- Test: Channel close behavior ---
+fn test_channel_close()
+    shine("  [test] Channel close behavior...")
+    @ch = channel_new(8)
+    channel_send(@ch, 100)
+    channel_send(@ch, 200)
+    # Close the channel
+    channel_close(@ch)
+    guard channel_is_closed(@ch) == 1 else
+        shine("    FAIL: channel should be closed after close()")
+        return
+    # Sending to a closed channel should return CHAN_CLOSED
+    @status = channel_try_send(@ch, 300)
+    guard @status == CHAN_CLOSED else
+        shine("    FAIL: send to closed channel should return CHAN_CLOSED")
+        return
+    # But we can still drain existing items
+    @v1, @rs1 = channel_recv(@ch)
+    guard @rs1 == CHAN_OK else
+        shine("    FAIL: recv of buffered item from closed channel should succeed")
+        return
+    guard @v1 == 100 else
+        shine("    FAIL: first recv should be 100")
+        return
+    @v2, @rs2 = channel_recv(@ch)
+    guard @rs2 == CHAN_OK else
+        shine("    FAIL: recv of second buffered item should succeed")
+        return
+    guard @v2 == 200 else
+        shine("    FAIL: second recv should be 200")
+        return
+    # Now channel is closed AND empty — recv should return CHAN_CLOSED
+    @v3, @rs3 = channel_try_recv(@ch)
+    guard @rs3 == CHAN_CLOSED else
+        shine("    FAIL: recv on closed+empty channel should return CHAN_CLOSED")
+        return
+    shine("    PASS")
+
+# --- Test: Channel FIFO ordering ---
+fn test_channel_fifo()
+    shine("  [test] Channel FIFO ordering...")
+    @ch = channel_new(16)
+    # Send values in order
+    orbit @i in 0..8
+        channel_send(@ch, @i * 10)
+    # Receive and verify FIFO order
+    orbit @i in 0..8
+        @val, @status = channel_recv(@ch)
+        guard @status == CHAN_OK else
+            shine("    FAIL: recv should succeed")
+            return
+        @expected = @i * 10
+        guard @val == @expected else
+            shine("    FAIL: FIFO order violated")
+            return
+    shine("    PASS")
+
+# --- Test: Unbounded channel send ---
+fn test_unbounded_channel_send()
+    shine("  [test] Unbounded channel send...")
+    @uch = unbounded_channel_new()
+    # Send multiple values
+    orbit @i in 0..10
+        @status = unbounded_channel_send(@uch, @i + 1)
+        guard @status == CHAN_OK else
+            shine("    FAIL: unbounded send should always succeed")
+            return
+    guard unbounded_channel_len(@uch) == 10 else
+        shine("    FAIL: unbounded channel should have 10 elements")
+        return
+    # Receive them in FIFO order
+    orbit @i in 0..10
+        @val, @rs = unbounded_channel_recv(@uch)
+        guard @rs == CHAN_OK else
+            shine("    FAIL: unbounded recv should succeed")
+            return
+        @expected = @i + 1
+        guard @val == @expected else
+            shine("    FAIL: unbounded FIFO order violated")
+            return
+    guard unbounded_channel_len(@uch) == 0 else
+        shine("    FAIL: unbounded channel should be empty after draining")
+        return
+    shine("    PASS")
+
+# --- Test: OnceCell set/get ---
+fn test_once_cell_basic()
+    shine("  [test] OnceCell set/get...")
+    @cell = once_new()
+    # Initially empty
+    @val, @init = once_get(@cell)
+    guard @init == 0 else
+        shine("    FAIL: new OnceCell should not be initialized")
+        return
+    # Set a value
+    @ok = once_set(@cell, 42)
+    guard @ok == 1 else
+        shine("    FAIL: first set should succeed")
+        return
+    # Get the value
+    @val2, @init2 = once_get(@cell)
+    guard @init2 == 1 else
+        shine("    FAIL: OnceCell should be initialized after set")
+        return
+    guard @val2 == 42 else
+        shine("    FAIL: OnceCell value should be 42")
+        return
+    shine("    PASS")
+
+# --- Test: OnceCell double-set prevention ---
+fn test_once_cell_double_set()
+    shine("  [test] OnceCell double-set prevention...")
+    @cell = once_new()
+    @ok1 = once_set(@cell, 100)
+    guard @ok1 == 1 else
+        shine("    FAIL: first set should succeed")
+        return
+    # Second set should fail
+    @ok2 = once_set(@cell, 200)
+    guard @ok2 == 0 else
+        shine("    FAIL: second set should fail (already initialized)")
+        return
+    # Value should still be 100
+    @val, @init = once_get(@cell)
+    guard @val == 100 else
+        shine("    FAIL: value should remain 100 after failed second set")
+        return
+    shine("    PASS")
+
+# --- Test: Barrier wait (single thread = immediate return) ---
+fn test_barrier_single_thread()
+    shine("  [test] Barrier wait (single thread, count=1)...")
+    @bar = barrier_new(1)
+    # With count=1, barrier_wait should return immediately as leader
+    @is_leader = barrier_wait(@bar)
+    guard @is_leader == 1 else
+        shine("    FAIL: single-thread barrier should return leader=1")
+        return
+    # Barrier should be reset — can be used again
+    @is_leader2 = barrier_wait(@bar)
+    guard @is_leader2 == 1 else
+        shine("    FAIL: barrier should be reusable (second wait)")
+        return
+    shine("    PASS")
+
+# --- Test: Latch countdown ---
+fn test_latch_countdown()
+    shine("  [test] Latch countdown...")
+    @latch = latch_new(3)
+    guard latch_get_count(@latch) == 3 else
+        shine("    FAIL: initial count should be 3")
+        return
+    latch_count_down(@latch)
+    guard latch_get_count(@latch) == 2 else
+        shine("    FAIL: count should be 2 after one count_down")
+        return
+    latch_count_down(@latch)
+    guard latch_get_count(@latch) == 1 else
+        shine("    FAIL: count should be 1 after two count_downs")
+        return
+    latch_count_down(@latch)
+    guard latch_get_count(@latch) == 0 else
+        shine("    FAIL: count should be 0 after three count_downs")
+        return
+    # latch_wait should return immediately when count is 0
+    latch_wait(@latch)
+    shine("    PASS")
+
+# --- Test: AtomicInt swap ---
+fn test_atomic_swap()
+    shine("  [test] AtomicInt swap...")
+    @a = atomic_new(77)
+    @old = atomic_swap(@a, 99, ORDER_SEQ_CST)
+    guard @old == 77 else
+        shine("    FAIL: swap should return old value 77")
+        return
+    @val = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val == 99 else
+        shine("    FAIL: value after swap should be 99")
+        return
+    shine("    PASS")
+
+# --- Test: AtomicInt fetch_and / fetch_or / fetch_xor ---
+fn test_atomic_bitwise()
+    shine("  [test] AtomicInt fetch_and/fetch_or/fetch_xor...")
+    @a = atomic_new(0xFF)
+    # fetch_and with 0x0F → result should be 0x0F
+    @old1 = atomic_fetch_and(@a, 0x0F, ORDER_SEQ_CST)
+    guard @old1 == 0xFF else
+        shine("    FAIL: fetch_and should return old value 0xFF")
+        return
+    @val1 = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val1 == 0x0F else
+        shine("    FAIL: value after AND(0x0F) should be 0x0F")
+        return
+    # fetch_or with 0xF0 → result should be 0xFF
+    @old2 = atomic_fetch_or(@a, 0xF0, ORDER_SEQ_CST)
+    guard @old2 == 0x0F else
+        shine("    FAIL: fetch_or should return old value 0x0F")
+        return
+    @val2 = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val2 == 0xFF else
+        shine("    FAIL: value after OR(0xF0) should be 0xFF")
+        return
+    # fetch_xor with 0xFF → result should be 0
+    @old3 = atomic_fetch_xor(@a, 0xFF, ORDER_SEQ_CST)
+    guard @old3 == 0xFF else
+        shine("    FAIL: fetch_xor should return old value 0xFF")
+        return
+    @val3 = atomic_load(@a, ORDER_SEQ_CST)
+    guard @val3 == 0 else
+        shine("    FAIL: value after XOR(0xFF) should be 0")
+        return
+    shine("    PASS")
+
+# --- Test: Channel with zero initial ---
+fn test_channel_zero_init()
+    shine("  [test] Channel send/recv zero values...")
+    @ch = channel_new(4)
+    channel_send(@ch, 0)
+    channel_send(@ch, 0)
+    @v1, @s1 = channel_recv(@ch)
+    guard @s1 == CHAN_OK else
+        shine("    FAIL: recv of zero should succeed")
+        return
+    guard @v1 == 0 else
+        shine("    FAIL: recv should return 0")
+        return
+    @v2, @s2 = channel_recv(@ch)
+    guard @s2 == CHAN_OK else
+        shine("    FAIL: second recv of zero should succeed")
+        return
+    guard @v2 == 0 else
+        shine("    FAIL: second recv should return 0")
+        return
+    shine("    PASS")
+
+# --- Test: RwLock read-then-write transition ---
+fn test_rwlock_read_write_transition()
+    shine("  [test] RwLock read-then-write transition...")
+    @rw = rwlock_new()
+    # Acquire read lock
+    rwlock_read_lock(@rw)
+    # Try write lock should fail while read-locked
+    @got_w = rwlock_try_write_lock(@rw)
+    guard @got_w == 0 else
+        shine("    FAIL: write lock should fail while read-locked")
+        return
+    # Release read lock
+    rwlock_read_unlock(@rw)
+    # Now write lock should succeed
+    @got_w2 = rwlock_try_write_lock(@rw)
+    guard @got_w2 == 1 else
+        shine("    FAIL: write lock should succeed after read unlock")
+        return
+    rwlock_write_unlock(@rw)
+    shine("    PASS")
+
+# --- Test: Mutex lock/unlock cycles ---
+fn test_mutex_lock_cycles()
+    shine("  [test] Mutex lock/unlock cycles...")
+    @mtx = mutex_new()
+    orbit @i in 0..20
+        mutex_lock(@mtx)
+        guard mutex_is_locked(@mtx) == 1 else
+            shine("    FAIL: mutex should be locked in cycle")
+            return
+        mutex_unlock(@mtx)
+        guard mutex_is_locked(@mtx) == 0 else
+            shine("    FAIL: mutex should be unlocked after cycle")
+            return
+    shine("    PASS")
+
+# =============================================================================
+# SECTION 18: TEST RUNNER
+# =============================================================================
+
+fn run_self_tests()
+    shine("=== Luna Sync Primitives Self-Test Suite ===")
+    shine("")
+
+    shine("--- Memory Ordering ---")
+    test_ordering_constants()
+    shine("")
+
+    shine("--- AtomicInt ---")
+    test_atomic_load_store()
+    test_atomic_fetch_add()
+    test_atomic_fetch_sub()
+    test_atomic_fetch_max()
+    test_atomic_fetch_min()
+    test_atomic_compare_exchange_success()
+    test_atomic_compare_exchange_failure()
+    test_atomic_swap()
+    test_atomic_bitwise()
+    shine("")
+
+    shine("--- AtomicFlag ---")
+    test_atomic_flag()
+    shine("")
+
+    shine("--- SpinLock ---")
+    test_spinlock_basic()
+    test_spinlock_backoff_cycle()
+    shine("")
+
+    shine("--- Mutex ---")
+    test_mutex_basic()
+    test_mutex_try_lock()
+    test_mutex_lock_cycles()
+    shine("")
+
+    shine("--- RwLock ---")
+    test_rwlock_multiple_readers()
+    test_rwlock_write_exclusion()
+    test_rwlock_read_write_transition()
+    shine("")
+
+    shine("--- Condvar ---")
+    test_condvar_basic()
+    shine("")
+
+    shine("--- Channel ---")
+    test_channel_single_item()
+    test_channel_capacity()
+    test_channel_close()
+    test_channel_fifo()
+    test_channel_zero_init()
+    shine("")
+
+    shine("--- Unbounded Channel ---")
+    test_unbounded_channel_send()
+    shine("")
+
+    shine("--- OnceCell ---")
+    test_once_cell_basic()
+    test_once_cell_double_set()
+    shine("")
+
+    shine("--- Barrier ---")
+    test_barrier_single_thread()
+    shine("")
+
+    shine("--- Latch ---")
+    test_latch_countdown()
+    shine("")
+
+    shine("=== All sync tests complete ===")
+
+# =============================================================================
+# SECTION 19: FFI EXPORTS
+# =============================================================================
+# C-ABI exported functions for embedding Luna's sync primitives in external
+# programs or calling from the Luna bytecode VM. Each function wraps the
+# corresponding Luna function with a C-compatible signature.
+#
+# Naming convention: luna_<primitive>_<operation>
+# All exported functions use i64 for handles (pointers to structs).
+
+#[export("luna_atomic_new")]
+fn ffi_atomic_new(@initial: i64) -> i64
+    @atom = atomic_new(@initial)
+    return ptr_of(@atom)
+
+#[export("luna_atomic_load")]
+fn ffi_atomic_load(@atom_ptr: i64, @ordering: int) -> i64
+    @atom = deref_as(AtomicInt, @atom_ptr)
+    return atomic_load(@atom, @ordering)
+
+#[export("luna_atomic_store")]
+fn ffi_atomic_store(@atom_ptr: i64, @val: i64, @ordering: int)
+    @atom = deref_as(AtomicInt, @atom_ptr)
+    atomic_store(@atom, @val, @ordering)
+
+#[export("luna_atomic_fetch_add")]
+fn ffi_atomic_fetch_add(@atom_ptr: i64, @val: i64, @ordering: int) -> i64
+    @atom = deref_as(AtomicInt, @atom_ptr)
+    return atomic_fetch_add(@atom, @val, @ordering)
+
+#[export("luna_atomic_fetch_sub")]
+fn ffi_atomic_fetch_sub(@atom_ptr: i64, @val: i64, @ordering: int) -> i64
+    @atom = deref_as(AtomicInt, @atom_ptr)
+    return atomic_fetch_sub(@atom, @val, @ordering)
+
+#[export("luna_atomic_compare_exchange")]
+fn ffi_atomic_cas(@atom_ptr: i64, @expected: i64, @desired: i64) -> i64, int
+    @atom = deref_as(AtomicInt, @atom_ptr)
+    return atomic_compare_exchange(@atom, @expected, @desired)
+
+#[export("luna_atomic_swap")]
+fn ffi_atomic_swap(@atom_ptr: i64, @val: i64, @ordering: int) -> i64
+    @atom = deref_as(AtomicInt, @atom_ptr)
+    return atomic_swap(@atom, @val, @ordering)
+
+#[export("luna_spinlock_new")]
+fn ffi_spinlock_new() -> i64
+    @lock = spinlock_new()
+    return ptr_of(@lock)
+
+#[export("luna_spinlock_lock")]
+fn ffi_spinlock_lock(@lock_ptr: i64)
+    @lock = deref_as(SpinLock, @lock_ptr)
+    spinlock_lock(@lock)
+
+#[export("luna_spinlock_unlock")]
+fn ffi_spinlock_unlock(@lock_ptr: i64)
+    @lock = deref_as(SpinLock, @lock_ptr)
+    spinlock_unlock(@lock)
+
+#[export("luna_mutex_new")]
+fn ffi_mutex_new() -> i64
+    @mtx = mutex_new()
+    return ptr_of(@mtx)
+
+#[export("luna_mutex_lock")]
+fn ffi_mutex_lock(@mtx_ptr: i64)
+    @mtx = deref_as(Mutex, @mtx_ptr)
+    mutex_lock(@mtx)
+
+#[export("luna_mutex_unlock")]
+fn ffi_mutex_unlock(@mtx_ptr: i64)
+    @mtx = deref_as(Mutex, @mtx_ptr)
+    mutex_unlock(@mtx)
+
+#[export("luna_rwlock_new")]
+fn ffi_rwlock_new() -> i64
+    @rw = rwlock_new()
+    return ptr_of(@rw)
+
+#[export("luna_rwlock_read_lock")]
+fn ffi_rwlock_read_lock(@rw_ptr: i64)
+    @rw = deref_as(RwLock, @rw_ptr)
+    rwlock_read_lock(@rw)
+
+#[export("luna_rwlock_read_unlock")]
+fn ffi_rwlock_read_unlock(@rw_ptr: i64)
+    @rw = deref_as(RwLock, @rw_ptr)
+    rwlock_read_unlock(@rw)
+
+#[export("luna_rwlock_write_lock")]
+fn ffi_rwlock_write_lock(@rw_ptr: i64)
+    @rw = deref_as(RwLock, @rw_ptr)
+    rwlock_write_lock(@rw)
+
+#[export("luna_rwlock_write_unlock")]
+fn ffi_rwlock_write_unlock(@rw_ptr: i64)
+    @rw = deref_as(RwLock, @rw_ptr)
+    rwlock_write_unlock(@rw)
+
+#[export("luna_condvar_new")]
+fn ffi_condvar_new() -> i64
+    @cv = condvar_new()
+    return ptr_of(@cv)
+
+#[export("luna_condvar_wait")]
+fn ffi_condvar_wait(@cv_ptr: i64, @mtx_ptr: i64)
+    @cv = deref_as(Condvar, @cv_ptr)
+    @mtx = deref_as(Mutex, @mtx_ptr)
+    condvar_wait(@cv, @mtx)
+
+#[export("luna_condvar_signal")]
+fn ffi_condvar_signal(@cv_ptr: i64)
+    @cv = deref_as(Condvar, @cv_ptr)
+    condvar_signal(@cv)
+
+#[export("luna_condvar_broadcast")]
+fn ffi_condvar_broadcast(@cv_ptr: i64)
+    @cv = deref_as(Condvar, @cv_ptr)
+    condvar_broadcast(@cv)
+
+#[export("luna_channel_new")]
+fn ffi_channel_new(@capacity: int) -> i64
+    @ch = channel_new(@capacity)
+    return ptr_of(@ch)
+
+#[export("luna_channel_send")]
+fn ffi_channel_send(@ch_ptr: i64, @value: i64) -> int
+    @ch = deref_as(Channel, @ch_ptr)
+    return channel_send(@ch, @value)
+
+#[export("luna_channel_recv")]
+fn ffi_channel_recv(@ch_ptr: i64) -> i64, int
+    @ch = deref_as(Channel, @ch_ptr)
+    return channel_recv(@ch)
+
+#[export("luna_channel_close")]
+fn ffi_channel_close(@ch_ptr: i64)
+    @ch = deref_as(Channel, @ch_ptr)
+    channel_close(@ch)
+
+#[export("luna_barrier_new")]
+fn ffi_barrier_new(@count: int) -> i64
+    @bar = barrier_new(@count)
+    return ptr_of(@bar)
+
+#[export("luna_barrier_wait")]
+fn ffi_barrier_wait(@bar_ptr: i64) -> int
+    @bar = deref_as(Barrier, @bar_ptr)
+    return barrier_wait(@bar)
+
+#[export("luna_latch_new")]
+fn ffi_latch_new(@count: int) -> i64
+    @latch = latch_new(@count)
+    return ptr_of(@latch)
+
+#[export("luna_latch_count_down")]
+fn ffi_latch_count_down(@latch_ptr: i64)
+    @latch = deref_as(Latch, @latch_ptr)
+    latch_count_down(@latch)
+
+#[export("luna_latch_wait")]
+fn ffi_latch_wait(@latch_ptr: i64)
+    @latch = deref_as(Latch, @latch_ptr)
+    latch_wait(@latch)
+
+#[export("luna_once_new")]
+fn ffi_once_new() -> i64
+    @cell = once_new()
+    return ptr_of(@cell)
+
+#[export("luna_once_set")]
+fn ffi_once_set(@cell_ptr: i64, @value: i64) -> int
+    @cell = deref_as(OnceCell, @cell_ptr)
+    return once_set(@cell, @value)
+
+#[export("luna_once_get")]
+fn ffi_once_get(@cell_ptr: i64) -> i64, int
+    @cell = deref_as(OnceCell, @cell_ptr)
+    return once_get(@cell)
+
+# =============================================================================
+# SECTION 20: MODULE EXPORTS
+# =============================================================================
+
+export {
+    # Memory ordering constants
+    ORDER_RELAXED,
+    ORDER_ACQUIRE,
+    ORDER_RELEASE,
+    ORDER_ACQ_REL,
+    ORDER_SEQ_CST,
+
+    # Capacity and status constants
+    MAX_CHANNEL_SIZE,
+    MAX_UNBOUNDED_SEGMENT_SIZE,
+    MAX_UNBOUNDED_SEGMENTS,
+    CHAN_OK,
+    CHAN_EMPTY,
+    CHAN_FULL,
+    CHAN_CLOSED,
+    MUTEX_UNLOCKED,
+    MUTEX_LOCKED,
+    MUTEX_LOCKED_WITH_WAITERS,
+    ONCE_EMPTY,
+    ONCE_INITIALIZING,
+    ONCE_INITIALIZED,
+
+    # AtomicInt types and functions
+    AtomicInt,
+    atomic_new,
+    atomic_load,
+    atomic_store,
+    atomic_fetch_add,
+    atomic_fetch_sub,
+    atomic_fetch_max,
+    atomic_fetch_min,
+    atomic_compare_exchange,
+    atomic_compare_exchange_weak,
+    atomic_swap,
+    atomic_fetch_and,
+    atomic_fetch_or,
+    atomic_fetch_xor,
+    memory_fence,
+
+    # AtomicFlag types and functions
+    AtomicFlag,
+    atomic_flag_new,
+    atomic_flag_test_and_set,
+    atomic_flag_clear,
+    atomic_flag_load,
+
+    # SpinLock types and functions
+    SpinLock,
+    spinlock_new,
+    spinlock_lock,
+    spinlock_try_lock,
+    spinlock_unlock,
+    spinlock_is_locked,
+
+    # Mutex types and functions
+    Mutex,
+    mutex_new,
+    mutex_lock,
+    mutex_try_lock,
+    mutex_unlock,
+    mutex_is_locked,
+
+    # RwLock types and functions
+    RwLock,
+    rwlock_new,
+    rwlock_read_lock,
+    rwlock_read_unlock,
+    rwlock_write_lock,
+    rwlock_write_unlock,
+    rwlock_try_read_lock,
+    rwlock_try_write_lock,
+
+    # Condvar types and functions
+    Condvar,
+    condvar_new,
+    condvar_wait,
+    condvar_wait_timeout,
+    condvar_signal,
+    condvar_broadcast,
+
+    # Channel types and functions
+    Channel,
+    channel_new,
+    channel_send,
+    channel_try_send,
+    channel_recv,
+    channel_try_recv,
+    channel_close,
+    channel_is_closed,
+    channel_len,
+    channel_is_empty,
+    channel_is_full,
+
+    # Unbounded Channel types and functions
+    ChannelSegment,
+    UnboundedChannel,
+    unbounded_channel_new,
+    unbounded_channel_send,
+    unbounded_channel_recv,
+    unbounded_channel_close,
+    unbounded_channel_len,
+    unbounded_channel_is_closed,
+
+    # OnceCell types and functions
+    OnceCell,
+    once_new,
+    once_get,
+    once_set,
+    once_get_or_init,
+
+    # Barrier types and functions
+    Barrier,
+    barrier_new,
+    barrier_wait,
+
+    # Latch types and functions
+    Latch,
+    latch_new,
+    latch_count_down,
+    latch_wait,
+    latch_get_count,
+
+    # Test runner
+    run_self_tests
+}

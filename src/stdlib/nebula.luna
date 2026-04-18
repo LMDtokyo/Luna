@@ -1,0 +1,149 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna nebula — cosmic alias for the scheduler (v4.3)
+# =============================================================================
+# `nebula` is the cloud of work: fibres, tasks, workers.  Per L4_RENAME_MAP
+# §4.5 the shim re-exports the scheduler's spawn/ignite/run verbs under
+# their cosmic spellings, and forwards pulse (channel) construction to the
+# existing API in `sync` (channels do not live in `scheduler.luna`; this
+# file is the one place where both re-exports land together).
+#
+# `spawn` the *keyword* stays a language primitive — see the Discord bot,
+# which uses the block form `nebula.spawn ...`.  `nebula.spawn_fn(fn, arg)`
+# is the function-call form for code that prefers handles.
+# =============================================================================
+
+import scheduler
+import sync
+
+# --- Scheduler lifecycle ----------------------------------------------------
+
+fn ignite(@num_workers: int) -> int
+    return sched_init(@num_workers)
+
+fn ignite_per_core() -> int
+    return sched_init_per_core()
+
+fn collapse()
+    sched_shutdown()
+
+fn orbit_forever()
+    run_until_complete()
+
+# --- Spawn verbs ------------------------------------------------------------
+# `spawn` the keyword is untouched; `spawn_fn` is the function form.  A task
+# handle (int) is returned in every case.
+
+fn spawn_fn(@func_ptr: int) -> int
+    return spawn(@func_ptr)
+
+fn spawn_at(@func_ptr: int, @priority: int) -> int
+    return spawn_priority(@func_ptr, @priority)
+
+fn spawn_cancelable(@func_ptr: int, @cancel_token: int) -> int
+    return spawn_cancellable(@func_ptr, @cancel_token)
+
+fn spawn_grounded(@func_ptr: int) -> int
+    return spawn_blocking(@func_ptr)
+
+# --- Task / comet helpers ---------------------------------------------------
+
+fn await_comet(@task_id: int) -> int
+    return await_task(@task_id)
+
+fn active() -> int
+    return active_tasks()
+
+fn spawned_total() -> int
+    return total_spawned()
+
+fn workers() -> int
+    return num_workers()
+
+fn cores() -> int
+    return cpu_count()
+
+fn heists() -> int
+    return steal_count()
+
+fn heist_rate() -> int
+    return steal_rate()
+
+# --- Cooperative yield / sleep ---------------------------------------------
+# `drift` yields a time slice; `slumber` blocks for a whole-ms arc.  Both are
+# free functions, not methods on any task.
+
+fn drift()
+    sched_yield()
+
+fn slumber(@ms: int)
+    sleep_ms(@ms)
+
+# --- Pulse (channel) re-exports --------------------------------------------
+# Channels live in sync.luna.  The pulse namespace provides the cosmic verbs:
+# bounded / open constructors, emit / catch send-receive, seal to close.
+
+fn pulse_bounded(@cap: int) -> Channel
+    return channel_new(@cap)
+
+fn pulse_open() -> UnboundedChannel
+    return unbounded_channel_new()
+
+fn pulse_emit(@ch: Channel, @value: i64) -> int
+    return channel_send(@ch, @value)
+
+fn pulse_try_emit(@ch: Channel, @value: i64) -> int
+    return channel_try_send(@ch, @value)
+
+fn pulse_catch(@ch: Channel) -> i64, int
+    return channel_recv(@ch)
+
+fn pulse_try_catch(@ch: Channel) -> i64, int
+    return channel_try_recv(@ch)
+
+fn pulse_seal(@ch: Channel)
+    channel_close(@ch)
+
+fn pulse_sealed(@ch: Channel) -> int
+    return channel_is_closed(@ch)
+
+fn pulse_depth(@ch: Channel) -> int
+    return channel_len(@ch)
+
+# Unbounded variants keep the same verbs but target UnboundedChannel.
+fn pulse_emit_open(@uch: UnboundedChannel, @value: i64) -> int
+    return unbounded_channel_send(@uch, @value)
+
+fn pulse_catch_open(@uch: UnboundedChannel) -> i64, int
+    return unbounded_channel_recv(@uch)
+
+fn pulse_seal_open(@uch: UnboundedChannel)
+    unbounded_channel_close(@uch)
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+export {
+    # Lifecycle
+    ignite, ignite_per_core, collapse, orbit_forever,
+
+    # Spawn
+    spawn_fn, spawn_at, spawn_cancelable, spawn_grounded,
+
+    # Task stats
+    await_comet, active, spawned_total, workers, cores,
+    heists, heist_rate,
+
+    # Free functions
+    drift, slumber,
+
+    # Pulse (bounded + unbounded)
+    Channel, UnboundedChannel,
+    pulse_bounded, pulse_open,
+    pulse_emit, pulse_try_emit, pulse_catch, pulse_try_catch,
+    pulse_seal, pulse_sealed, pulse_depth,
+    pulse_emit_open, pulse_catch_open, pulse_seal_open
+}

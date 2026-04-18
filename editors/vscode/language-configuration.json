@@ -1,0 +1,38 @@
+{
+    "comments": {
+        "lineComment": "#"
+    },
+    "brackets": [
+        ["(", ")"],
+        ["[", "]"]
+    ],
+    "autoClosingPairs": [
+        { "open": "(", "close": ")" },
+        { "open": "[", "close": "]" },
+        { "open": "\"", "close": "\"" },
+        { "open": "'", "close": "'" }
+    ],
+    "surroundingPairs": [
+        { "open": "(", "close": ")" },
+        { "open": "[", "close": "]" },
+        { "open": "\"", "close": "\"" },
+        { "open": "'", "close": "'" }
+    ],
+    "indentationRules": {
+        "increaseIndentPattern": "^\\s*(fn|if|else|eclipse|while|orbit|struct|trait|impl|actor|flow|match|phase|guard|unless|spawn|defer|unsafe|extern)\\b[^#]*$",
+        "decreaseIndentPattern": "^\\s*(else|eclipse)\\b"
+    },
+    "onEnterRules": [
+        {
+            "beforeText": "^\\s*(fn|if|else|eclipse|while|orbit|struct|trait|impl|actor|flow|match|phase|guard|unless|spawn|defer|unsafe|extern)\\b.*$",
+            "action": { "indent": "indent" }
+        }
+    ],
+    "folding": {
+        "offSide": true,
+        "markers": {
+            "start": "^\\s*#\\s*region\\b",
+            "end": "^\\s*#\\s*endregion\\b"
+        }
+    }
+}

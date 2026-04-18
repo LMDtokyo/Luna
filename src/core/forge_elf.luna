@@ -1,0 +1,523 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Forge ELF — Linux ELF64 Container Writer (v4.3, phase L1)
+# =============================================================================
+# "The forge beats the steel; the mould holds it in shape."
+#
+# Sister file to src/core/forge.luna.  Takes a Forge state (code buffer +
+# symbol table + relocations) and wraps it in a valid ELF64 executable for
+# Linux x86-64.  Produces the raw bytes — writing to disk is the caller's
+# job (see aether.scroll_inscribe).
+#
+# # Scope
+#
+# This writer emits **statically-linked** ELF executables that speak to the
+# kernel directly via `syscall`.  No libc interposition, no dynamic linker,
+# no PT_INTERP.  That matches aether.luna's `AETHER_USE_SYSCALLS = 1` build
+# path and is what Luna binaries default to on Linux — one file, nothing
+# else on the disk.
+#
+# A dynamic-linking variant (PT_INTERP + DT_NEEDED libc) is planned for the
+# compat build where `AETHER_USE_SYSCALLS = 0`.  That will live in
+# forge_elf_dyn.luna alongside this one.
+#
+# # Layout
+#
+# We emit the simplest legal ELF64:
+#
+#   +0x0000  ElfHeader                   (64 bytes)
+#   +0x0040  one PT_LOAD program header  (56 bytes)
+#   +0x0078  (padding to 0x1000)
+#   +0x1000  .text — Forge code bytes
+#   +??????  .data — rodata / writable globals (if any)
+#   ... and then the section header table at the tail, for introspection
+#       tools (readelf, objdump).  The kernel doesn't need it; we keep it
+#       for human sanity.
+#
+# Virtual address plan:
+#   - Base: 0x400000 (traditional Linux x86-64 ELF base)
+#   - .text:  0x401000    (page after ELF header)
+#   - .data:  0x402000    (page after .text, if present)
+# =============================================================================
+
+import forge
+
+# =============================================================================
+# SECTION 1 — ELF CONSTANTS
+# =============================================================================
+# Everything from elf.h distilled to what we actually emit.
+
+# e_ident magic and class
+const EI_MAG0:      int = 0x7F
+const EI_MAG1:      int = 0x45     # 'E'
+const EI_MAG2:      int = 0x4C     # 'L'
+const EI_MAG3:      int = 0x46     # 'F'
+const ELFCLASS64:   int = 2
+const ELFDATA2LSB:  int = 1        # little-endian
+const EV_CURRENT:   int = 1
+const ELFOSABI_LINUX: int = 3      # actually ELFOSABI_LINUX = GNU = 3
+const ELFOSABI_SYSV:  int = 0      # we use SYSV (default)
+
+# e_type
+const ET_NONE: int = 0
+const ET_REL:  int = 1
+const ET_EXEC: int = 2
+const ET_DYN:  int = 3
+
+# e_machine
+const EM_X86_64: int = 62
+const EM_AARCH64: int = 183
+
+# p_type (program header type)
+const PT_NULL:    int = 0
+const PT_LOAD:    int = 1
+const PT_DYNAMIC: int = 2
+const PT_INTERP:  int = 3
+const PT_NOTE:    int = 4
+const PT_PHDR:    int = 6
+
+# p_flags (program header permissions)
+const PF_X: int = 1     # execute
+const PF_W: int = 2     # write
+const PF_R: int = 4     # read
+
+# sh_type (section header type)
+const SHT_NULL:     int = 0
+const SHT_PROGBITS: int = 1
+const SHT_SYMTAB:   int = 2
+const SHT_STRTAB:   int = 3
+const SHT_RELA:     int = 4
+const SHT_NOBITS:   int = 8
+const SHT_DYNSYM:   int = 11
+
+# sh_flags
+const SHF_WRITE:     int = 0x1
+const SHF_ALLOC:     int = 0x2
+const SHF_EXECINSTR: int = 0x4
+
+# Virtual address constants
+const ELF_BASE:      int = 0x400000
+const ELF_PAGE_SIZE: int = 0x1000
+
+# =============================================================================
+# SECTION 2 — ELF WRITER
+# =============================================================================
+# A byte-stream-with-cursor sitting on a fixed buffer.  Mirrors the Forge
+# code emitter's style so callers recognise the pattern immediately.
+
+const ELFW_MAX: int = 2097152    # 2 MiB output cap — plenty for a bootstrap binary
+
+struct ElfWriter
+    bytes: [int; 2097152]
+    len:   int
+    errors: int
+
+fn elfw_new() -> ElfWriter
+    return ElfWriter {
+        bytes: [0; 2097152],
+        len: 0,
+        errors: 0
+    }
+
+#[inline]
+fn elfw_u8(@w: ElfWriter, @v: int)
+    if @w.len >= ELFW_MAX
+        @w.errors = @w.errors + 1
+        return
+    @w.bytes[@w.len] = @v & 0xFF
+    @w.len = @w.len + 1
+
+#[inline]
+fn elfw_u16(@w: ElfWriter, @v: int)
+    elfw_u8(@w, @v & 0xFF)
+    elfw_u8(@w, (@v >> 8) & 0xFF)
+
+#[inline]
+fn elfw_u32(@w: ElfWriter, @v: int)
+    elfw_u8(@w, @v & 0xFF)
+    elfw_u8(@w, (@v >> 8) & 0xFF)
+    elfw_u8(@w, (@v >> 16) & 0xFF)
+    elfw_u8(@w, (@v >> 24) & 0xFF)
+
+#[inline]
+fn elfw_u64(@w: ElfWriter, @v: int)
+    elfw_u32(@w, @v & 0xFFFFFFFF)
+    elfw_u32(@w, (@v >> 32) & 0xFFFFFFFF)
+
+fn elfw_bytes(@w: ElfWriter, @src: [int; 1048576], @n: int)
+    orbit @i in 0..@n
+        elfw_u8(@w, @src[@i])
+
+# Write @n zero bytes (for padding).
+fn elfw_zero(@w: ElfWriter, @n: int)
+    orbit _ in 0..@n
+        elfw_u8(@w, 0)
+
+# Pad the writer so its length becomes a multiple of @align.
+fn elfw_pad_to(@w: ElfWriter, @align: int)
+    @rem = @w.len % @align
+    if @rem == 0
+        return
+    elfw_zero(@w, @align - @rem)
+
+# Patch a u32 already written, at absolute byte offset @at.
+fn elfw_patch_u32(@w: ElfWriter, @at: int, @v: int)
+    if @at < 0 or @at + 4 > @w.len
+        @w.errors = @w.errors + 1
+        return
+    @w.bytes[@at + 0] = @v & 0xFF
+    @w.bytes[@at + 1] = (@v >> 8) & 0xFF
+    @w.bytes[@at + 2] = (@v >> 16) & 0xFF
+    @w.bytes[@at + 3] = (@v >> 24) & 0xFF
+
+fn elfw_patch_u64(@w: ElfWriter, @at: int, @v: int)
+    elfw_patch_u32(@w, @at, @v & 0xFFFFFFFF)
+    elfw_patch_u32(@w, @at + 4, (@v >> 32) & 0xFFFFFFFF)
+
+# =============================================================================
+# SECTION 3 — ELF HEADER
+# =============================================================================
+# 64 bytes of preamble.  Most fields are compile-time known; the ones that
+# depend on the binary we're producing (e_entry, e_phoff, e_shoff) are
+# patched once we know the final offsets.
+#
+# Returns offsets (as a tiny struct) so the caller can patch them later.
+
+struct ElfHeaderPatches
+    e_entry_at:  int     # where in the writer the entry address lives
+    e_phoff_at:  int
+    e_shoff_at:  int
+    e_phnum_at:  int
+    e_shnum_at:  int
+    e_shstrndx_at: int
+
+fn emit_elf_header(@w: ElfWriter) -> ElfHeaderPatches
+    # e_ident[0..16]
+    elfw_u8(@w, EI_MAG0)
+    elfw_u8(@w, EI_MAG1)
+    elfw_u8(@w, EI_MAG2)
+    elfw_u8(@w, EI_MAG3)
+    elfw_u8(@w, ELFCLASS64)
+    elfw_u8(@w, ELFDATA2LSB)
+    elfw_u8(@w, EV_CURRENT)
+    elfw_u8(@w, ELFOSABI_SYSV)
+    elfw_u8(@w, 0)          # EI_ABIVERSION
+    elfw_zero(@w, 7)        # EI_PAD
+
+    elfw_u16(@w, ET_EXEC)        # e_type
+    elfw_u16(@w, EM_X86_64)      # e_machine
+    elfw_u32(@w, EV_CURRENT)     # e_version
+
+    seal @entry_at = @w.len
+    elfw_u64(@w, 0)              # e_entry  (patched later)
+
+    seal @phoff_at = @w.len
+    elfw_u64(@w, 0)              # e_phoff  (patched later — offset of PHT)
+
+    seal @shoff_at = @w.len
+    elfw_u64(@w, 0)              # e_shoff  (patched later)
+
+    elfw_u32(@w, 0)              # e_flags  (no processor flags)
+    elfw_u16(@w, 64)             # e_ehsize     — size of this header
+    elfw_u16(@w, 56)             # e_phentsize  — size of a program header entry
+
+    seal @phnum_at = @w.len
+    elfw_u16(@w, 0)              # e_phnum     (patched)
+
+    elfw_u16(@w, 64)             # e_shentsize — size of a section header entry
+
+    seal @shnum_at = @w.len
+    elfw_u16(@w, 0)              # e_shnum     (patched)
+
+    seal @shstrndx_at = @w.len
+    elfw_u16(@w, 0)              # e_shstrndx  (patched)
+
+    return ElfHeaderPatches {
+        e_entry_at: @entry_at,
+        e_phoff_at: @phoff_at,
+        e_shoff_at: @shoff_at,
+        e_phnum_at: @phnum_at,
+        e_shnum_at: @shnum_at,
+        e_shstrndx_at: @shstrndx_at
+    }
+
+# =============================================================================
+# SECTION 4 — PROGRAM HEADER (PT_LOAD)
+# =============================================================================
+# For a static ELF with just code + optional data, we emit one or two
+# PT_LOAD entries.  All of them are contiguous in the file and the
+# virtual-address space.
+
+fn emit_program_header_load(@w: ElfWriter, @p_offset: int, @p_vaddr: int,
+                            @p_filesz: int, @p_memsz: int, @p_flags: int)
+    elfw_u32(@w, PT_LOAD)
+    elfw_u32(@w, @p_flags)
+    elfw_u64(@w, @p_offset)
+    elfw_u64(@w, @p_vaddr)
+    elfw_u64(@w, @p_vaddr)      # p_paddr — ignored on modern systems, mirror vaddr
+    elfw_u64(@w, @p_filesz)
+    elfw_u64(@w, @p_memsz)
+    elfw_u64(@w, ELF_PAGE_SIZE) # p_align — page-sized
+
+# =============================================================================
+# SECTION 5 — SECTION HEADERS
+# =============================================================================
+# These aren't needed by the kernel for loading, but `readelf` / `objdump`
+# and `strip` expect them.  Each entry is 64 bytes.
+
+fn emit_section_header(@w: ElfWriter, @sh_name: int, @sh_type: int,
+                       @sh_flags: int, @sh_addr: int, @sh_offset: int,
+                       @sh_size: int, @sh_link: int, @sh_info: int,
+                       @sh_addralign: int, @sh_entsize: int)
+    elfw_u32(@w, @sh_name)
+    elfw_u32(@w, @sh_type)
+    elfw_u64(@w, @sh_flags)
+    elfw_u64(@w, @sh_addr)
+    elfw_u64(@w, @sh_offset)
+    elfw_u64(@w, @sh_size)
+    elfw_u32(@w, @sh_link)
+    elfw_u32(@w, @sh_info)
+    elfw_u64(@w, @sh_addralign)
+    elfw_u64(@w, @sh_entsize)
+
+# =============================================================================
+# SECTION 6 — STRING TABLE BUILDER
+# =============================================================================
+# .shstrtab contains the names of the sections themselves.  We compose the
+# whole string blob in a small buffer and record each entry's offset.
+
+struct StrTab
+    bytes: [int; 4096]
+    len:   int
+
+fn strtab_new() -> StrTab
+    @t = StrTab { bytes: [0; 4096], len: 0 }
+    @t.bytes[0] = 0    # first byte is always NUL — name-index 0 means "no name"
+    @t.len = 1
+    return @t
+
+fn strtab_add(@t: StrTab, @s: str, @s_len: int) -> int
+    seal @off = @t.len
+    orbit @i in 0..@s_len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@s + @i)
+        @t.bytes[@t.len] = @ch
+        @t.len = @t.len + 1
+    @t.bytes[@t.len] = 0    # NUL terminator
+    @t.len = @t.len + 1
+    return @off
+
+# =============================================================================
+# SECTION 7 — TOP-LEVEL EMIT
+# =============================================================================
+# Produce a complete ELF64 executable.  @entry_offset is the byte offset
+# of the entry symbol (typically "_start") within the Forge code buffer.
+#
+# Returns an ElfWriter whose @bytes[0..@len] is the finished image.
+
+fn forge_emit_elf64(@f: Forge, @entry_offset: int) -> ElfWriter
+    @w = elfw_new()
+
+    # --- Header placeholder -----------------------------------------------
+    @hp = emit_elf_header(@w)
+
+    # --- Program header table ---------------------------------------------
+    # We emit ONE PT_LOAD covering text only.  Data merges into the same
+    # segment (readable + executable is the simplest approximation; later
+    # versions will split R-X and R/W PT_LOADs).
+    seal @phoff = @w.len
+    # Reserve one program header — we'll fill in the actual values after
+    # we know where text lands and how big it is.
+    seal @ph_entry_start = @w.len
+    elfw_zero(@w, 56)      # one PT_LOAD slot; will be filled in
+
+    # --- Pad to page boundary so .text starts at vaddr 0x401000 -----------
+    elfw_pad_to(@w, ELF_PAGE_SIZE)
+    seal @text_off = @w.len
+    seal @text_vaddr = ELF_BASE + @text_off       # = 0x400000 + 0x1000
+
+    # --- Emit the .text bytes from Forge ----------------------------------
+    orbit @i in 0..@f.code_len
+        elfw_u8(@w, @f.code[@i])
+    seal @text_size = @f.code_len
+    seal @text_end_off = @w.len
+
+    # Entry point in virtual memory
+    seal @entry_vaddr = @text_vaddr + @entry_offset
+
+    # --- Fill in PT_LOAD now that we know offsets -------------------------
+    # The header format is:
+    #   u32 p_type | u32 p_flags | u64 p_offset | u64 p_vaddr | u64 p_paddr
+    #   u64 p_filesz | u64 p_memsz | u64 p_align
+    # We just overwrite the 56 zero bytes we wrote earlier.
+    @save_len = @w.len
+    @w.len = @ph_entry_start
+    emit_program_header_load(@w,
+        0,                         # file offset — the PT_LOAD covers the whole file up through text
+        ELF_BASE,                  # virtual address = base
+        @text_end_off,             # filesz — bytes on disk
+        @text_end_off,             # memsz  — same, no .bss yet
+        PF_R | PF_X                # readable + executable
+    )
+    @w.len = @save_len
+
+    # --- Section header string table (.shstrtab) --------------------------
+    # Build the shstrtab before emitting section headers — we need the
+    # offsets so SHTs can reference them.
+    @strtab = strtab_new()
+    seal @sn_null   = 0
+    seal @sn_text   = strtab_add(@strtab, ".text", 5)
+    seal @sn_shstrtab = strtab_add(@strtab, ".shstrtab", 9)
+
+    seal @shstrtab_off = @w.len
+    orbit @i in 0..@strtab.len
+        elfw_u8(@w, @strtab.bytes[@i])
+    seal @shstrtab_size = @strtab.len
+
+    # --- Pad before section header table (8-byte alignment) ---------------
+    elfw_pad_to(@w, 8)
+    seal @shoff = @w.len
+
+    # --- Section headers: [null, .text, .shstrtab] ------------------------
+    # SHT[0] — null entry (mandatory)
+    emit_section_header(@w, 0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    # SHT[1] — .text
+    emit_section_header(@w, @sn_text, SHT_PROGBITS,
+                        SHF_ALLOC | SHF_EXECINSTR,
+                        @text_vaddr, @text_off, @text_size,
+                        0, 0, 16, 0)
+
+    # SHT[2] — .shstrtab
+    emit_section_header(@w, @sn_shstrtab, SHT_STRTAB,
+                        0, 0, @shstrtab_off, @shstrtab_size,
+                        0, 0, 1, 0)
+
+    seal @shnum = 3
+    seal @shstrndx = 2     # index of .shstrtab section itself
+
+    # --- Patch the ELF header with the values we know now ----------------
+    elfw_patch_u64(@w, @hp.e_entry_at, @entry_vaddr)
+    elfw_patch_u64(@w, @hp.e_phoff_at, @phoff)
+    elfw_patch_u64(@w, @hp.e_shoff_at, @shoff)
+    elfw_patch_u32(@w, @hp.e_phnum_at, 1 | (@shnum << 16))
+    # Wait — e_phnum is u16 and e_shnum is u16 in separate slots. We wrote
+    # u16 when emitting the header, so patch u16s individually using u32
+    # helpers against the low bytes. Let's be precise:
+    @w.bytes[@hp.e_phnum_at + 0] = 1 & 0xFF
+    @w.bytes[@hp.e_phnum_at + 1] = 0
+    @w.bytes[@hp.e_shnum_at + 0] = @shnum & 0xFF
+    @w.bytes[@hp.e_shnum_at + 1] = (@shnum >> 8) & 0xFF
+    @w.bytes[@hp.e_shstrndx_at + 0] = @shstrndx & 0xFF
+    @w.bytes[@hp.e_shstrndx_at + 1] = (@shstrndx >> 8) & 0xFF
+
+    return @w
+
+# =============================================================================
+# SECTION 8 — SELF-TESTS
+# =============================================================================
+# We verify the emitted ELF against a known-minimal hand-computed layout:
+# a 3-instruction program (mov rax,60 ; xor rdi,rdi ; syscall) that exits
+# with status 0.  We don't shell out to readelf — we just check offsets.
+
+fn elf_selftest_exit0() -> int
+    @f = forge_new()
+    # _start: exit(0)
+    #   mov rax, 60       ; syscall number for exit_group (wrong for static exit_group)
+    #   xor rdi, rdi
+    #   syscall
+    emit_mov_reg_imm64(@f, REG_RAX, 60)
+    emit_xor_reg_reg(@f, REG_RDI, REG_RDI)
+    emit_syscall(@f)
+
+    seal @w = forge_emit_elf64(@f, 0)
+
+    # --- Byte-level assertions -------------------------------------------
+    # Magic "\x7FELF"
+    if @w.bytes[0] != 0x7F or @w.bytes[1] != 0x45
+        return 1
+    if @w.bytes[2] != 0x4C or @w.bytes[3] != 0x46
+        return 2
+    # e_type == ET_EXEC (offset 16)
+    if @w.bytes[16] != 2
+        return 3
+    # e_machine == EM_X86_64 (offset 18) — little-endian 62 → 0x3E 0x00
+    if @w.bytes[18] != 62 or @w.bytes[19] != 0
+        return 4
+    # The first byte after the page boundary (offset 0x1000) must be our
+    # first instruction: mov rax,60 → REX.W (0x48) B8 3C 00 00 00 00 00 00 00
+    if @w.bytes[0x1000] != 0x48 or @w.bytes[0x1001] != 0xB8
+        return 5
+    if @w.bytes[0x1002] != 60 or @w.bytes[0x1009] != 0
+        return 6
+    # Size sanity — ~ 0x1000 + a handful of instructions + shstrtab + SHTs
+    if @w.len < 0x1050
+        return 7
+    return 0
+
+fn run_forge_elf_selftests() -> int
+    @pass = 0
+    if elf_selftest_exit0() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+# SECTION 9 — ROADMAP
+# =============================================================================
+#
+# What's here:
+#   * Minimal static ELF64 executable
+#   * One PT_LOAD covering text
+#   * .text + .shstrtab section headers
+#   * Byte-level self-test verifying the header and first instruction
+#
+# What's still TODO for real-world use:
+#
+#   1. **.data / .rodata**
+#      Add a second PT_LOAD (R/W vs R-X) and a second page boundary.
+#      String literals and global constants go here.
+#
+#   2. **.bss / zero-init**
+#      Extend PT_LOAD.memsz beyond filesz for uninitialised data.
+#
+#   3. **Relocation fixup**
+#      Walk @f.relocs and patch the code bytes *before* emission:
+#        - RELOC_PC32    -> (target_vaddr - (at_vaddr + 4))
+#        - RELOC_ABS64   -> target_vaddr
+#      Currently forge emits zeroes at call sites; elf emission leaves
+#      them alone.
+#
+#   4. **.symtab / .strtab**
+#      For debuggability: emit symbol names (from @f.symbols) and a
+#      SHT_SYMTAB section pointing at them.  Not required for exec, but
+#      necessary for `objdump -d` to show function names.
+#
+#   5. **Dynamic linking variant (forge_elf_dyn.luna)**
+#      For the AETHER_USE_SYSCALLS = 0 build: PT_INTERP referencing
+#      /lib64/ld-linux-x86-64.so.2, PT_DYNAMIC with DT_NEEDED entries,
+#      PLT + GOT, SHT_DYNSYM, SHT_RELA.
+# =============================================================================
+
+export {
+    # constants (subset most callers need)
+    ELF_BASE, ELF_PAGE_SIZE,
+    ET_EXEC, EM_X86_64, PT_LOAD, PF_R, PF_W, PF_X,
+    SHT_NULL, SHT_PROGBITS, SHT_STRTAB,
+    SHF_ALLOC, SHF_EXECINSTR,
+
+    # writer
+    ElfWriter, elfw_new, elfw_u8, elfw_u16, elfw_u32, elfw_u64,
+    elfw_bytes, elfw_zero, elfw_pad_to, elfw_patch_u32, elfw_patch_u64,
+
+    # string table
+    StrTab, strtab_new, strtab_add,
+
+    # high-level emit
+    forge_emit_elf64,
+
+    # selftest
+    run_forge_elf_selftests
+}

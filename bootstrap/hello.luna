@@ -1,0 +1,8 @@
+extern "linux_syscall" fn sys_write(@fd: int, @buf: int, @n: int) -> int
+extern "linux_syscall" fn sys_exit_group(@code: int) -> int
+
+fn main() -> int {
+    let @msg = "Hello from Luna!\n"
+    sys_write(1, @msg, 17)
+    return 0
+}

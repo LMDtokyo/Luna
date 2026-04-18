@@ -1,0 +1,147 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna cascade — cosmic alias for the WebSocket surface of net.luna (v4.3)
+# =============================================================================
+# A `cascade` is a bi-directional pulse chain — the cosmic name for a
+# WebSocket.  Per L4_RENAME_MAP §4.1.4 the shim forwards the ws_* / wss_*
+# free functions to their `cascade.*` spellings and wraps the integer handle
+# in a `CascadeLink` struct that remembers whether the connection is secure.
+#
+# Helpers worth flagging:
+#   * `emit_lumen(link, doc, node_idx)` — JSON-serialises a lumen node and
+#     ships it as a text frame.  Used by the Discord bot's heartbeat.
+#   * `catch_frame(link) -> Frame` — combines ws_recv + the opcode/payload
+#     triple so a single call returns the full frame.
+# =============================================================================
+
+import net
+import lumen
+
+# --- Link --------------------------------------------------------------------
+# Wraps the raw ws handle + a secure flag.  The handle is an int because both
+# ws_connect and wss_connect return one; the flag exists purely so helpers
+# like `emit_*` know which underlying send path to dispatch to.
+#
+# Exported as both `Link` (the cosmic name used from bot code as
+# `cascade.Link`) and `CascadeLink` (fully-qualified alias kept for any
+# caller that has already adopted the longer spelling).
+
+struct Link
+    handle:    int
+    is_secure: int
+
+# Type alias for migration — same shape, older name.
+struct CascadeLink
+    handle:    int
+    is_secure: int
+
+# --- Frame -----------------------------------------------------------------
+# Cosmic replacement for ws_frame_opcode + ws_frame_payload_ptr +
+# ws_frame_payload_len.  A frame carries its own payload slice.
+
+struct Frame
+    kind:        int    # opcode: 1=text, 2=binary, 8=close, 9=ping, 10=pong
+    payload_ptr: int
+    payload_len: int
+
+# --- Open / close ----------------------------------------------------------
+
+fn link(@url_ptr: int, @url_len: int) -> Link
+    @h = ws_connect(@url_ptr, @url_len)
+    return Link { handle: @h, is_secure: 0 }
+
+fn link_secure(@url_ptr: int, @url_len: int,
+               @alpn_ptr: int, @alpn_len: int) -> Link
+    @h = wss_connect(@url_ptr, @url_len, @alpn_ptr, @alpn_len)
+    return Link { handle: @h, is_secure: 1 }
+
+fn seal(@c: Link) -> int
+    return ws_close(@c.handle)
+
+# --- Emit (send) -----------------------------------------------------------
+
+fn emit_text(@c: Link, @data_ptr: int, @data_len: int) -> int
+    return ws_send_text(@c.handle, @data_ptr, @data_len)
+
+fn emit_binary(@c: Link, @data_ptr: int, @data_len: int) -> int
+    return ws_send_binary(@c.handle, @data_ptr, @data_len)
+
+fn ping(@c: Link) -> int
+    return ws_send_ping(@c.handle)
+
+# Serialise a lumen node to JSON and ship it as a text frame.  Returns the
+# wire length (matching ws_send_text's return contract) or -1 on stringify
+# failure.  Used by the Discord bot to send identify/heartbeat payloads.
+fn emit_lumen(@c: Link, @doc: JsonDoc, @node_idx: int) -> int
+    @serialized = lumen::show(@doc, @node_idx)
+    @len = len(@serialized)
+    if @len <= 0
+        return -1
+    return ws_send_text(@c.handle, @serialized, @len)
+
+# --- Catch (receive) -------------------------------------------------------
+
+# Low-level: pull one frame's worth of bytes and leave the opcode + payload
+# pointer + length accessible via the companion getters.  Returns the opcode
+# directly so guard-style dispatch is one call.
+fn catch(@c: Link) -> int
+    @ok = ws_recv(@c.handle)
+    if @ok < 0
+        return @ok
+    return ws_frame_opcode(@c.handle)
+
+# Aggregate form: returns the full Frame struct.  Payload slice references
+# the internal receive buffer owned by net.luna — safe to read until the next
+# `catch*` on this link.
+fn catch_frame(@c: Link) -> Frame
+    @rc = ws_recv(@c.handle)
+    if @rc < 0
+        return Frame { kind: -1, payload_ptr: 0, payload_len: 0 }
+    @op  = ws_frame_opcode(@c.handle)
+    @ptr = ws_frame_payload_ptr(@c.handle)
+    @n   = ws_frame_payload_len(@c.handle)
+    return Frame { kind: @op, payload_ptr: @ptr, payload_len: @n }
+
+fn frame_kind(@c: Link) -> int
+    return ws_frame_opcode(@c.handle)
+
+fn frame_payload_ptr(@c: Link) -> int
+    return ws_frame_payload_ptr(@c.handle)
+
+fn frame_payload_len(@c: Link) -> int
+    return ws_frame_payload_len(@c.handle)
+
+# --- Server side ------------------------------------------------------------
+
+fn anchor(@addr_ptr: int, @addr_len: int, @port: int) -> int
+    return ws_listen(@addr_ptr, @addr_len, @port)
+
+fn catch_client(@server: int) -> Link
+    @h = ws_accept(@server)
+    return Link { handle: @h, is_secure: 0 }
+
+fn pulse_all(@server: int, @data_ptr: int, @data_len: int) -> int
+    return ws_broadcast(@server, @data_ptr, @data_len)
+
+fn fade(@server: int) -> int
+    return ws_server_close(@server)
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+export {
+    # Types
+    Link, CascadeLink, Frame,
+
+    # Client
+    link, link_secure, seal,
+    emit_text, emit_binary, emit_lumen, ping,
+    catch, catch_frame,
+    frame_kind, frame_payload_ptr, frame_payload_len,
+
+    # Server
+    anchor, catch_client, pulse_all, fade
+}

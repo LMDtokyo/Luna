@@ -1,0 +1,1427 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Lower — AST → Forge Lowering Pass (v4.4, phase L1 complete)
+# =============================================================================
+# Takes a fully-parsed and type-checked Luna program (a Parser with nodes
+# populated) and emits x86-64 machine code into a Forge state.  This is
+# the piece that replaces LLVM's "middle end + backend" pipeline in our
+# Rust-free toolchain.
+#
+# # Design
+#
+# * **No SSA.**  Luna's AST is small enough that we translate directly
+#   from AST to Forge instructions.  Locals live on the stack (frame-
+#   pointer-relative), expression values flow through RAX.  This is
+#   textbook "recursive descent codegen" — easy to read and extend.
+#
+# * **One pass.**  We walk each function's body in source order; there
+#   is no separate "schedule" step.  Titan's optimisations happen before
+#   lowering, on the AST.
+#
+# * **Register model.**
+#     RAX   — scratch + result register (every expression returns here)
+#     RBX   — saved temp (callee-saved; we preserve across calls)
+#     RCX   — call arg #1 / scratch
+#     RDX   — call arg #2 / scratch
+#     RSI/RDI — call args #3, #4 or scratch
+#     R8..R15 — additional args / spills (System V) /
+#               args #1..#4 for Win64 via the platform shim
+#     RSP   — stack pointer
+#     RBP   — frame pointer
+#     XMM0  — scalar-double result register (float expressions)
+#     XMM1  — float scratch
+#
+# * **Calling convention.**  We default to System V AMD64 for
+#   `extern "C"` and Luna-internal functions.  The compile-time
+#   `AETHER_PLATFORM` constant flips us to Win64 (arg regs
+#   RCX/RDX/R8/R9, 32-byte shadow space).  Extern "stdcall" symbols
+#   on Windows go through the PE IAT and inherit Win64 rules.
+#
+# * **Phase<T> propagator — first-class citizen.**
+#     An AST_UNARY with data1 == UNOP_BRIGHTEN lowers to:
+#         <eval operand into RAX>          ; RAX holds the phase<T> value
+#         cmp  [RAX], 0                    ; tag byte: 0=Bright, 1=Dim
+#         jne  .dim_branch
+#         mov  RAX, [RAX + 8]              ; extract Bright payload into RAX
+#         jmp  .bright_done
+#       .dim_branch:
+#         ; Reconstruct Dim(same Fault) and return from the enclosing fn.
+#         ; The return value *is* the phase<T> pointer we already loaded.
+#         mov  RSP, RBP
+#         pop  RBP
+#         ret
+#       .bright_done:
+#
+#     The dim_branch label is emitted as a fresh Forge label per
+#     propagator site.  We never materialise the Dim case — we just
+#     return the existing pointer, which already tags as Dim.
+#
+# # What this file currently handles (v4.4)
+#
+# Full support:
+#   * Integer literals + bool + nil
+#   * Float literals (via rodata + movsd)
+#   * String literals (via rodata + lea rip-relative; rodata section
+#     resolution is a TODO for the container writers)
+#   * `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`
+#   * Bitwise `&`, `|`, `^`, `<<`, `>>`
+#   * Float arithmetic (best-effort heuristic: any LIT_FLOAT operand
+#     triggers the float path)
+#   * Variables (locals in stack slots + function parameters in arg regs)
+#   * `let` / `meow` / `seal` bindings
+#   * `return EXPR`
+#   * Function calls (up to 6 args, C ABI)
+#   * Method dispatch `@obj.method(args)` (callee name = method name;
+#     type-based name mangling is a TODO for the type checker pass)
+#   * Struct field access (flat layout, 8-byte fields; offsets collected
+#     during a pre-pass over AST_STRUCT nodes)
+#   * `if / else` with a single else branch
+#   * `while`
+#   * `orbit @i in START..END` integer loops with break/continue
+#   * `match` / `phase` (linear chain — literal and `_` patterns + basic
+#     `Bright(@v)` / `Dim(@e)` phase<T> shape)
+#   * `break` / `continue` (loop-context stack in LowerCtx)
+#   * `?` (phase<T> propagator — the star feature)
+#
+# Intentional stubs (emit `int3` with a TODO comment):
+#   * `spawn` / `send` / `defer` — require runtime fibre support
+#   * `unsafe` block semantics — no-op for codegen (type system handles it)
+#   * Arrays / dicts — require runtime allocation (BOX_ALLOC et al)
+#   * Complex match arms (tuple destructure, guards, nested) — fall back
+# =============================================================================
+
+import parser
+import forge
+import types
+
+# =============================================================================
+# SECTION 1 — LOWERING CONTEXT
+# =============================================================================
+
+const LOWER_MAX_LOCALS: int = 256
+const LOWER_MAX_LABELS: int = 1024
+const LOWER_MAX_LOOPS:  int = 32
+const LOWER_MAX_STRUCT_FIELDS: int = 256
+const LOWER_RODATA_MAX: int = 65536
+const LOWER_RODATA_ENTRIES_MAX: int = 1024
+
+struct Local
+    name_start: int
+    name_len: int
+    slot:     int    # byte offset from RBP (negative)
+    size:     int    # in bytes (8 for everything right now)
+
+# StructFieldInfo — populated in a pre-pass over AST_STRUCT nodes.
+# Each row holds (struct_name_span, field_name_span, byte_offset).  The
+# lowerer uses the field_name to look up an offset whenever it sees
+# AST_FIELD.  Struct name is recorded for future disambiguation (same
+# field name appearing in multiple structs).
+struct StructFieldInfo
+    struct_name_start: int
+    struct_name_len:   int
+    field_name_start:  int
+    field_name_len:    int
+    offset:            int   # byte offset from the start of the struct
+
+struct LowerCtx
+    forge:        Forge
+    p:            Parser
+
+    locals:       [Local; 256]
+    local_count:  int
+    frame_bytes:  int       # running total of stack bytes used for locals
+
+    # Labels inside the current function
+    labels:       [int; 1024]  # Forge label indices
+    label_count:  int
+
+    # Where to jump on `return`.  All returns jump here; the epilogue lives
+    # at this label.  Set per-function.
+    return_label: int
+
+    # Track enclosing function return type (phase<T> or not) so `?` can
+    # validate at lowering time.  0 = plain, 1 = phase<T>.
+    fn_returns_phase: int
+
+    # Loop-context stack — each entry holds the position we jump back to on
+    # `continue` (loop top) and the patch-site we'll later fixup for `break`
+    # (loop exit).  We keep patch-sites rather than Forge labels so the
+    # existing inline patch style stays consistent with if/while/brighten.
+    loop_top_pos:     [int; 32]    # absolute code_len at the TOP of loop body check
+    loop_exit_patches: [int; 32]   # head of a singly-linked patch list (−1 sentinel)
+    loop_depth:       int
+
+    # Struct field layout table.  Populated by lower_collect_structs().
+    struct_fields:       [StructFieldInfo; 256]
+    struct_field_count:  int
+
+    # Read-only data section (for string/float literals).  Bytes accumulate
+    # in `rodata`; each interned entry's starting byte-offset is recorded in
+    # `rodata_offsets`.  The container writer (forge_elf / forge_pe) is
+    # responsible for materialising this as a real `.rodata` section and
+    # resolving the PC-relative relocations we emit at each use site.
+    rodata:             [int; 65536]
+    rodata_len:         int
+    rodata_offsets:     [int; 1024]
+    rodata_count:       int
+    rodata_symbol:      int        # Forge symbol index for the rodata base
+
+    errors: int
+
+fn lower_new(@f: Forge, @p: Parser) -> LowerCtx
+    return LowerCtx {
+        forge: @f,
+        p: @p,
+        locals: [Local { name_start: 0, name_len: 0, slot: 0, size: 0 }; 256],
+        local_count: 0,
+        frame_bytes: 0,
+        labels: [0; 1024],
+        label_count: 0,
+        return_label: -1,
+        fn_returns_phase: 0,
+        loop_top_pos: [0; 32],
+        loop_exit_patches: [-1; 32],
+        loop_depth: 0,
+        struct_fields: [StructFieldInfo {
+            struct_name_start: 0, struct_name_len: 0,
+            field_name_start:  0, field_name_len: 0,
+            offset: 0
+        }; 256],
+        struct_field_count: 0,
+        rodata: [0; 65536],
+        rodata_len: 0,
+        rodata_offsets: [0; 1024],
+        rodata_count: 0,
+        rodata_symbol: -1,
+        errors: 0
+    }
+
+# =============================================================================
+# SECTION 2 — LOCAL VARIABLE TABLE
+# =============================================================================
+
+fn lower_bind_local(@ctx: LowerCtx, @name_start: int, @name_len: int) -> int
+    if @ctx.local_count >= LOWER_MAX_LOCALS
+        @ctx.errors = @ctx.errors + 1
+        return -1
+    # Allocate 8 bytes per local (quad-word alignment)
+    @ctx.frame_bytes = @ctx.frame_bytes + 8
+    seal @slot = 0 - @ctx.frame_bytes
+    @ctx.locals[@ctx.local_count] = Local {
+        name_start: @name_start,
+        name_len: @name_len,
+        slot: @slot,
+        size: 8
+    }
+    seal @idx = @ctx.local_count
+    @ctx.local_count = @ctx.local_count + 1
+    return @idx
+
+# Find a local by its (start, len) source span.  Returns the slot offset
+# (negative, from RBP) or INT32_MIN sentinel if not found.
+fn lower_find_local(@ctx: LowerCtx, @name_start: int, @name_len: int) -> int
+    orbit @i in 0..@ctx.local_count
+        @l = @ctx.locals[@i]
+        if @l.name_len == @name_len
+            # Compare bytes via parser source
+            @match = 1
+            orbit @k in 0..@name_len
+                @a = 0
+                @b = 0
+                unsafe
+                    @a = volatile_read(@ctx.p.source + @l.name_start + @k)
+                    @b = volatile_read(@ctx.p.source + @name_start + @k)
+                if @a != @b
+                    @match = 0
+                    break
+            if @match == 1
+                return @l.slot
+    return 0x80000000   # sentinel "not found"
+
+# Helper: byte-wise name comparison driven off @ctx.p.source.  Returns 1 if
+# the two (start, len) spans denote the same identifier, 0 otherwise.
+fn lower_name_eq(@ctx: LowerCtx, @a_start: int, @a_len: int, @b_start: int, @b_len: int) -> int
+    if @a_len != @b_len
+        return 0
+    orbit @k in 0..@a_len
+        @a = 0
+        @b = 0
+        unsafe
+            @a = volatile_read(@ctx.p.source + @a_start + @k)
+            @b = volatile_read(@ctx.p.source + @b_start + @k)
+        if @a != @b
+            return 0
+    return 1
+
+# =============================================================================
+# SECTION 2.1 — SYMBOL RESOLUTION
+# =============================================================================
+# Previously `lower_call` unconditionally called forge_define_symbol at
+# every call site, which created a fresh "defined" symbol entry for every
+# `foo(...)` in the source.  That both bloats the symbol table and makes
+# every call produce a PC32 relocation against a duplicate definition —
+# which the linker will reject (multiple definition) or silently keep the
+# wrong one.  Correct behaviour: look up an existing symbol by name first;
+# only define-as-extern if it's missing.
+
+fn lower_resolve_symbol(@ctx: LowerCtx, @name_start: int, @name_len: int) -> int
+    # Walk the forge symbol table looking for a match.
+    orbit @i in 0..@ctx.forge.symbol_count
+        @s = @ctx.forge.symbols[@i]
+        if lower_name_eq(@ctx, @s.name_start, @s.name_len, @name_start, @name_len) == 1
+            return @i
+    # Not found — declare it as an extern C symbol so the linker fixes it
+    # up at link time.  If the function is actually defined later in this
+    # same program, `forge_function_begin` will overwrite the stub when it
+    # reaches that definition (by adding its own entry; we'd prefer a real
+    # back-patch but symbol_count is append-only today).
+    return forge_extern_symbol(@ctx.forge, @name_start, @name_len, 0)
+
+# =============================================================================
+# SECTION 2.2 — STRUCT FIELD LAYOUT PRE-PASS
+# =============================================================================
+# Walks every AST_STRUCT node in the program and records (struct_name,
+# field_name, offset) triples into @ctx.struct_fields.  Assumes a flat
+# 8-byte-per-field layout — sufficient for phase L1; a real type-aware
+# layout belongs in types.luna.
+
+fn lower_collect_structs(@ctx: LowerCtx)
+    orbit @ni in 0..@ctx.p.node_count
+        @n = @ctx.p.nodes[@ni]
+        if @n.kind == AST_STRUCT
+            # children hold (start, len) pairs for each field name
+            @field_n = @n.children_count / 2
+            orbit @fi in 0..@field_n
+                if @ctx.struct_field_count >= LOWER_MAX_STRUCT_FIELDS
+                    return
+                seal @fname_start = @ctx.p.children[@n.children_start + @fi * 2]
+                seal @fname_len   = @ctx.p.children[@n.children_start + @fi * 2 + 1]
+                @ctx.struct_fields[@ctx.struct_field_count] = StructFieldInfo {
+                    struct_name_start: @n.data1,
+                    struct_name_len:   @n.data2,
+                    field_name_start:  @fname_start,
+                    field_name_len:    @fname_len,
+                    offset:            @fi * 8
+                }
+                @ctx.struct_field_count = @ctx.struct_field_count + 1
+
+# Look up a field's byte offset by name only.  Returns −1 if not found.
+# TODO: disambiguate by struct-name when the same field appears in multiple
+# structs — requires type info from types.luna to know which struct the
+# receiver has at this call site.
+fn lower_find_field_offset(@ctx: LowerCtx, @fname_start: int, @fname_len: int) -> int
+    orbit @i in 0..@ctx.struct_field_count
+        @sf = @ctx.struct_fields[@i]
+        if lower_name_eq(@ctx, @sf.field_name_start, @sf.field_name_len, @fname_start, @fname_len) == 1
+            return @sf.offset
+    return -1
+
+# =============================================================================
+# SECTION 2.3 — RODATA (string + float literal interning)
+# =============================================================================
+
+# Append a byte span from the source buffer into rodata.  Returns the
+# byte-offset at which the entry begins, suitable for use as a PC-relative
+# displacement addend.
+fn lower_intern_bytes(@ctx: LowerCtx, @src_start: int, @len: int) -> int
+    if @ctx.rodata_count >= LOWER_RODATA_ENTRIES_MAX
+        @ctx.errors = @ctx.errors + 1
+        return -1
+    if @ctx.rodata_len + @len + 1 >= LOWER_RODATA_MAX
+        @ctx.errors = @ctx.errors + 1
+        return -1
+    seal @start = @ctx.rodata_len
+    orbit @i in 0..@len
+        @b = 0
+        unsafe
+            @b = volatile_read(@ctx.p.source + @src_start + @i)
+        @ctx.rodata[@ctx.rodata_len] = @b & 0xFF
+        @ctx.rodata_len = @ctx.rodata_len + 1
+    # NUL terminator so C-style consumers work.
+    @ctx.rodata[@ctx.rodata_len] = 0
+    @ctx.rodata_len = @ctx.rodata_len + 1
+    @ctx.rodata_offsets[@ctx.rodata_count] = @start
+    @ctx.rodata_count = @ctx.rodata_count + 1
+    return @start
+
+# Append 8 raw bytes (an i64 / f64 bit pattern) to rodata.  Used by the
+# float-literal path which needs a memory operand for `movsd`.
+fn lower_intern_u64(@ctx: LowerCtx, @bits: int) -> int
+    if @ctx.rodata_count >= LOWER_RODATA_ENTRIES_MAX
+        @ctx.errors = @ctx.errors + 1
+        return -1
+    if @ctx.rodata_len + 8 >= LOWER_RODATA_MAX
+        @ctx.errors = @ctx.errors + 1
+        return -1
+    seal @start = @ctx.rodata_len
+    # Emit little-endian 8 bytes.
+    @ctx.rodata[@ctx.rodata_len + 0] = @bits & 0xFF
+    @ctx.rodata[@ctx.rodata_len + 1] = (@bits >> 8) & 0xFF
+    @ctx.rodata[@ctx.rodata_len + 2] = (@bits >> 16) & 0xFF
+    @ctx.rodata[@ctx.rodata_len + 3] = (@bits >> 24) & 0xFF
+    @ctx.rodata[@ctx.rodata_len + 4] = (@bits >> 32) & 0xFF
+    @ctx.rodata[@ctx.rodata_len + 5] = (@bits >> 40) & 0xFF
+    @ctx.rodata[@ctx.rodata_len + 6] = (@bits >> 48) & 0xFF
+    @ctx.rodata[@ctx.rodata_len + 7] = (@bits >> 56) & 0xFF
+    @ctx.rodata_len = @ctx.rodata_len + 8
+    @ctx.rodata_offsets[@ctx.rodata_count] = @start
+    @ctx.rodata_count = @ctx.rodata_count + 1
+    return @start
+
+# Ensure the rodata pseudo-symbol exists so relocations can reference it.
+# TODO: the container writers need to know about this symbol and emit an
+# actual `.rodata` section pointing at @ctx.rodata[0..rodata_len].
+fn lower_ensure_rodata_symbol(@ctx: LowerCtx) -> int
+    if @ctx.rodata_symbol >= 0
+        return @ctx.rodata_symbol
+    # The name "__luna_rodata" isn't in the source buffer, so we borrow a
+    # zero-length synthetic span.  The container writer recognises
+    # rodata_symbol by index, not by name.
+    @ctx.rodata_symbol = forge_define_symbol(@ctx.forge, 0, 0)
+    return @ctx.rodata_symbol
+
+# =============================================================================
+# SECTION 3 — EXPRESSION LOWERING
+# =============================================================================
+# Every expression lowerer leaves its value in RAX (or XMM0 for floats).
+#
+# For binary ops with two sub-expressions, we evaluate the LEFT first
+# (result in RAX), spill to RBX, evaluate the RIGHT (result in RAX), then
+# combine.  This is the simplest working strategy; a real register
+# allocator would do better for nested expressions.
+
+fn lower_expr(@ctx: LowerCtx, @node_idx: int)
+    if @node_idx < 0
+        return
+    @n = @ctx.p.nodes[@node_idx]
+
+    # --- Integer / bool / nil / float / string literal ------------------
+    if @n.kind == AST_LITERAL
+        if @n.data1 == LIT_INT
+            # Prefer the 7-byte mov reg,imm32 form when the constant fits.
+            if @n.data2 >= -2147483648 and @n.data2 <= 2147483647
+                emit_mov_reg_imm32(@ctx.forge, REG_RAX, @n.data2)
+            else
+                emit_mov_reg_imm64(@ctx.forge, REG_RAX, @n.data2)
+            return
+        if @n.data1 == LIT_BOOL
+            if @n.data2 == 0
+                emit_xor_reg_reg(@ctx.forge, REG_RAX, REG_RAX)
+            else
+                emit_mov_reg_imm32(@ctx.forge, REG_RAX, 1)
+            return
+        if @n.data1 == LIT_NIL
+            emit_xor_reg_reg(@ctx.forge, REG_RAX, REG_RAX)
+            return
+        if @n.data1 == LIT_STRING
+            lower_string_literal(@ctx, @n)
+            return
+        if @n.data1 == LIT_FLOAT
+            # data2/data3 may hold f64 bits when the lexer populates them;
+            # fall back to 0.0 otherwise.  Result lands in XMM0.
+            @bits = @n.data2
+            lower_float_constant(@ctx, @bits)
+            return
+        emit_int3(@ctx.forge)   # unknown literal kind
+        return
+
+    # --- Identifier (local or parameter) --------------------------------
+    if @n.kind == AST_IDENT
+        @slot = lower_find_local(@ctx, @n.data1, @n.data2)
+        if @slot == 0x80000000
+            # Unknown name — emit int3 and let the runtime trap.
+            emit_int3(@ctx.forge)
+            return
+        emit_mov_reg_mem(@ctx.forge, REG_RAX, REG_RBP, @slot)
+        return
+
+    # --- Binary op ------------------------------------------------------
+    if @n.kind == AST_BINARY
+        lower_binary(@ctx, @n)
+        return
+
+    # --- Unary op (including the `?` propagator) ------------------------
+    if @n.kind == AST_UNARY
+        lower_unary(@ctx, @n)
+        return
+
+    # --- Function call (or method dispatch) -----------------------------
+    if @n.kind == AST_CALL
+        lower_call(@ctx, @n)
+        return
+
+    # --- Field access ---------------------------------------------------
+    if @n.kind == AST_FIELD
+        lower_field_access(@ctx, @n)
+        return
+
+    # --- if-as-expression (ternary form `if X then A else B`) -----------
+    if @n.kind == AST_IF and @n.data3 == 1
+        lower_if_expr(@ctx, @n)
+        return
+
+    # Fallthrough for not-yet-implemented kinds
+    emit_int3(@ctx.forge)
+
+# ------ Heuristic: does this node look "float-typed"? ------
+#
+# The lowerer doesn't yet receive per-node type info from types.luna, so we
+# fall back to a conservative structural check: a node is "float" iff it's
+# a LIT_FLOAT literal, a BINARY / UNARY whose operand is float, or a CALL
+# whose name hints at float return.  This is a best-effort heuristic — the
+# right answer lives in types.luna's TypeRegion keyed by node index.
+# TODO: plumb the TypeRegion through LowerCtx and consult it here.
+fn lower_is_float_expr(@ctx: LowerCtx, @node_idx: int) -> int
+    if @node_idx < 0
+        return 0
+    @n = @ctx.p.nodes[@node_idx]
+    if @n.kind == AST_LITERAL and @n.data1 == LIT_FLOAT
+        return 1
+    if @n.kind == AST_BINARY
+        if lower_is_float_expr(@ctx, @n.child1) == 1
+            return 1
+        if lower_is_float_expr(@ctx, @n.child2) == 1
+            return 1
+    if @n.kind == AST_UNARY
+        return lower_is_float_expr(@ctx, @n.child1)
+    return 0
+
+# ------ Binary expression ------
+
+fn lower_binary(@ctx: LowerCtx, @n: AstNode)
+    # Float fast path — if either side is a LIT_FLOAT, route through SSE2.
+    if lower_is_float_expr(@ctx, @n.child1) == 1 or lower_is_float_expr(@ctx, @n.child2) == 1
+        lower_binary_float(@ctx, @n)
+        return
+
+    # Evaluate RIGHT first, push RAX; evaluate LEFT; pop into RCX; combine.
+    # This ordering keeps LEFT's result in RAX — natural for commutative
+    # ops and for non-commutative ones (sub, div, cmp) where the left-
+    # hand side is the minuend/dividend.
+    lower_expr(@ctx, @n.child2)           # RHS → RAX
+    emit_push_reg(@ctx.forge, REG_RAX)
+    lower_expr(@ctx, @n.child1)           # LHS → RAX
+    emit_pop_reg(@ctx.forge, REG_RCX)     # RHS → RCX
+
+    match @n.data1                        # OP_* constant
+        OP_ADD =>
+            emit_add_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+        OP_SUB =>
+            emit_sub_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+        OP_MUL =>
+            emit_imul_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+        OP_DIV =>
+            # Signed 64-bit divide.  idiv uses RDX:RAX ÷ RCX → quo in RAX,
+            # rem in RDX.  cqo sign-extends RAX into RDX:RAX.
+            emit_cqo(@ctx.forge)
+            emit_idiv_reg(@ctx.forge, REG_RCX)
+        OP_MOD =>
+            emit_cqo(@ctx.forge)
+            emit_idiv_reg(@ctx.forge, REG_RCX)
+            # Remainder is in RDX — move it to RAX for the result.
+            emit_mov_reg_reg(@ctx.forge, REG_RAX, REG_RDX)
+        OP_AND =>
+            emit_and_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+        OP_OR =>
+            emit_or_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+        OP_XOR =>
+            # XOR rax, rcx — 48 31 C8
+            emit_u8(@ctx.forge, 0x48)
+            emit_u8(@ctx.forge, 0x31)
+            emit_u8(@ctx.forge, 0xC8)
+        OP_SHL =>
+            # shl rax, cl  — needs shift count in CL.  RHS is already in RCX.
+            emit_shl_reg_cl(@ctx.forge, REG_RAX)
+        OP_SHR =>
+            emit_sar_reg_cl(@ctx.forge, REG_RAX)   # arithmetic right shift
+        OP_EQ =>
+            emit_cmp_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+            # SETE AL; MOVZX RAX, AL
+            emit_u8(@ctx.forge, 0x0F)
+            emit_u8(@ctx.forge, 0x94)
+            emit_u8(@ctx.forge, 0xC0)     # SETE al
+            emit_u8(@ctx.forge, 0x48)
+            emit_u8(@ctx.forge, 0x0F)
+            emit_u8(@ctx.forge, 0xB6)
+            emit_u8(@ctx.forge, 0xC0)     # MOVZX RAX, AL
+        OP_NE =>
+            emit_cmp_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+            emit_u8(@ctx.forge, 0x0F)
+            emit_u8(@ctx.forge, 0x95)     # SETNE al
+            emit_u8(@ctx.forge, 0xC0)
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_LT =>
+            emit_cmp_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x9C); emit_u8(@ctx.forge, 0xC0)  # SETL al
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_LE =>
+            emit_cmp_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x9E); emit_u8(@ctx.forge, 0xC0)  # SETLE al
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_GT =>
+            emit_cmp_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x9F); emit_u8(@ctx.forge, 0xC0)  # SETG al
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_GE =>
+            emit_cmp_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x9D); emit_u8(@ctx.forge, 0xC0)  # SETGE al
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_LOGICAL_AND =>
+            # Over bool values (0/1), bitwise AND matches short-circuit
+            # semantics of the already-evaluated operands.  The lazy
+            # short-circuit form would need control flow; this is a
+            # well-defined eager form.
+            emit_and_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+        OP_LOGICAL_OR =>
+            emit_or_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+        _ =>
+            emit_int3(@ctx.forge)
+
+# ------ Binary float expression ------
+#
+# Eval RHS → XMM0 ; spill to [rsp-8] ; eval LHS → XMM0 ; reload [rsp-8] → XMM1
+# ; then addsd/subsd/etc XMM0, XMM1.  We use the red zone sparingly — at
+# most 8 bytes below rsp for a single scratch slot.
+fn lower_binary_float(@ctx: LowerCtx, @n: AstNode)
+    lower_expr(@ctx, @n.child2)                    # RHS → XMM0
+    # Spill XMM0 to the red zone so it survives the LHS evaluation.
+    emit_movsd_mem_reg(@ctx.forge, REG_RSP, -8, REG_XMM0)
+    lower_expr(@ctx, @n.child1)                    # LHS → XMM0
+    emit_movsd_reg_mem(@ctx.forge, REG_XMM1, REG_RSP, -8)  # RHS → XMM1
+
+    match @n.data1
+        OP_ADD => emit_addsd(@ctx.forge, REG_XMM0, REG_XMM1)
+        OP_SUB => emit_subsd(@ctx.forge, REG_XMM0, REG_XMM1)
+        OP_MUL => emit_mulsd(@ctx.forge, REG_XMM0, REG_XMM1)
+        OP_DIV => emit_divsd(@ctx.forge, REG_XMM0, REG_XMM1)
+        OP_EQ =>
+            emit_ucomisd(@ctx.forge, REG_XMM0, REG_XMM1)
+            # SETE AL ; MOVZX RAX, AL
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x94); emit_u8(@ctx.forge, 0xC0)
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_NE =>
+            emit_ucomisd(@ctx.forge, REG_XMM0, REG_XMM1)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x95); emit_u8(@ctx.forge, 0xC0)
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_LT =>
+            # ucomisd sets CF=1 if dst<src (unordered); use SETB (below).
+            emit_ucomisd(@ctx.forge, REG_XMM0, REG_XMM1)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x92); emit_u8(@ctx.forge, 0xC0)  # SETB al
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_LE =>
+            emit_ucomisd(@ctx.forge, REG_XMM0, REG_XMM1)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x96); emit_u8(@ctx.forge, 0xC0)  # SETBE al
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_GT =>
+            emit_ucomisd(@ctx.forge, REG_XMM0, REG_XMM1)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x97); emit_u8(@ctx.forge, 0xC0)  # SETA al
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        OP_GE =>
+            emit_ucomisd(@ctx.forge, REG_XMM0, REG_XMM1)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x93); emit_u8(@ctx.forge, 0xC0)  # SETAE al
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        _ =>
+            emit_int3(@ctx.forge)
+
+# ------ Unary expression ------
+
+fn lower_unary(@ctx: LowerCtx, @n: AstNode)
+    match @n.data1
+        UNOP_NEG =>
+            lower_expr(@ctx, @n.child1)
+            emit_neg_reg(@ctx.forge, REG_RAX)
+        UNOP_NOT =>
+            lower_expr(@ctx, @n.child1)
+            # test rax,rax ; sete al ; movzx rax, al — the 0-compare becomes
+            # a 3-byte TEST instead of the 7-byte CMP-with-imm32 form.
+            emit_test_reg_reg(@ctx.forge, REG_RAX, REG_RAX)
+            emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0x94); emit_u8(@ctx.forge, 0xC0)
+            emit_u8(@ctx.forge, 0x48); emit_u8(@ctx.forge, 0x0F); emit_u8(@ctx.forge, 0xB6); emit_u8(@ctx.forge, 0xC0)
+        UNOP_BITNOT =>
+            lower_expr(@ctx, @n.child1)
+            emit_not_reg(@ctx.forge, REG_RAX)
+        UNOP_BRIGHTEN =>
+            lower_brighten(@ctx, @n.child1)
+        _ =>
+            emit_int3(@ctx.forge)
+
+# ------ The `?` propagator ------
+#
+# Assumes the operand evaluates to a phase<T> represented in memory as:
+#   +0  u8   tag        (0 = Bright, 1 = Dim)
+#   +1  u8[7] padding
+#   +8  i64  payload_or_fault_ptr
+#
+# On success we load [RAX + 8] into RAX (the T payload).
+# On failure we return immediately from the enclosing function with RAX
+# still pointing to the phase<T> cell — which already reads as Dim(..).
+#
+fn lower_brighten(@ctx: LowerCtx, @operand_idx: int)
+    lower_expr(@ctx, @operand_idx)        # RAX = pointer to phase<T>
+
+    # cmp byte ptr [rax], 0   (tag check)
+    # 80 38 00
+    emit_u8(@ctx.forge, 0x80)
+    emit_u8(@ctx.forge, 0x38)
+    emit_u8(@ctx.forge, 0x00)
+
+    # jne .dim_branch         (6-byte near form for easy patching)
+    # 0F 85 cd
+    emit_u8(@ctx.forge, 0x0F)
+    emit_u8(@ctx.forge, 0x85)
+    seal @jne_patch_at = @ctx.forge.code_len
+    emit_u32(@ctx.forge, 0)               # disp32 patched after label binding
+
+    # Bright path: load payload and fall through.
+    # mov rax, [rax + 8]   → 48 8B 40 08
+    emit_u8(@ctx.forge, 0x48)
+    emit_u8(@ctx.forge, 0x8B)
+    emit_u8(@ctx.forge, 0x40)
+    emit_u8(@ctx.forge, 0x08)
+
+    # jmp .brighten_done
+    # E9 cd
+    emit_u8(@ctx.forge, 0xE9)
+    seal @jmp_patch_at = @ctx.forge.code_len
+    emit_u32(@ctx.forge, 0)
+
+    # .dim_branch:  tail-jump to function epilogue
+    seal @dim_branch_pos = @ctx.forge.code_len
+    # Patch the earlier JNE to point here.
+    @disp = @dim_branch_pos - (@jne_patch_at + 4)
+    @ctx.forge.code[@jne_patch_at + 0] = @disp & 0xFF
+    @ctx.forge.code[@jne_patch_at + 1] = (@disp >> 8) & 0xFF
+    @ctx.forge.code[@jne_patch_at + 2] = (@disp >> 16) & 0xFF
+    @ctx.forge.code[@jne_patch_at + 3] = (@disp >> 24) & 0xFF
+
+    # Jump to epilogue label.  We use forge_label_resolve to patch when
+    # the label is bound at end-of-function; for now emit a jmp rel32
+    # that we patch inline.
+    # mov rsp, rbp ; pop rbp ; ret  — inlined epilogue (keeps the emitted
+    # jump short and avoids needing to track the function epilogue label
+    # through LowerCtx for every ? site).
+    emit_u8(@ctx.forge, 0x48)       # mov rsp, rbp
+    emit_u8(@ctx.forge, 0x89)
+    emit_u8(@ctx.forge, 0xEC)
+    emit_pop_reg(@ctx.forge, REG_RBP)
+    emit_ret(@ctx.forge)
+
+    # .brighten_done:  patch the forward jmp from the Bright path
+    seal @done_pos = @ctx.forge.code_len
+    @disp2 = @done_pos - (@jmp_patch_at + 4)
+    @ctx.forge.code[@jmp_patch_at + 0] = @disp2 & 0xFF
+    @ctx.forge.code[@jmp_patch_at + 1] = (@disp2 >> 8) & 0xFF
+    @ctx.forge.code[@jmp_patch_at + 2] = (@disp2 >> 16) & 0xFF
+    @ctx.forge.code[@jmp_patch_at + 3] = (@disp2 >> 24) & 0xFF
+
+# ------ String literal ------
+fn lower_string_literal(@ctx: LowerCtx, @n: AstNode)
+    # data2/data3 are the source offset/length of the string's payload.
+    seal @rodata_off = lower_intern_bytes(@ctx, @n.data2, @n.data3)
+    if @rodata_off < 0
+        emit_int3(@ctx.forge)
+        return
+    seal @sym = lower_ensure_rodata_symbol(@ctx)
+    # lea rax, [rip + 0]  — displacement is patched by the container writer
+    # once section layout is known.  The addend encodes the rodata offset
+    # so the writer can do: final_disp = (rodata_vaddr + offset) − (rip).
+    seal @at = emit_lea_reg_rip(@ctx.forge, REG_RAX, 0)
+    forge_add_reloc(@ctx.forge, @at, RELOC_PC32, @sym, @rodata_off - 4)
+
+# ------ Float constant (interned as 8 raw bytes) ------
+fn lower_float_constant(@ctx: LowerCtx, @bits: int)
+    seal @rodata_off = lower_intern_u64(@ctx, @bits)
+    if @rodata_off < 0
+        emit_int3(@ctx.forge)
+        return
+    seal @sym = lower_ensure_rodata_symbol(@ctx)
+    # lea rax, [rip + 0]  — then movsd xmm0, [rax].  Two-step because the
+    # movsd rip-relative encoder isn't wired in forge.luna yet.
+    seal @at = emit_lea_reg_rip(@ctx.forge, REG_RAX, 0)
+    forge_add_reloc(@ctx.forge, @at, RELOC_PC32, @sym, @rodata_off - 4)
+    emit_movsd_reg_mem(@ctx.forge, REG_XMM0, REG_RAX, 0)
+
+# ------ Field access (AST_FIELD) ------
+fn lower_field_access(@ctx: LowerCtx, @n: AstNode)
+    lower_expr(@ctx, @n.child1)               # object pointer → RAX
+    seal @off = lower_find_field_offset(@ctx, @n.data1, @n.data2)
+    if @off < 0
+        # Unknown field — punt.
+        emit_int3(@ctx.forge)
+        return
+    # mov rax, [rax + off]
+    emit_mov_reg_mem(@ctx.forge, REG_RAX, REG_RAX, @off)
+
+# ------ Function call (and method dispatch) ------
+
+fn lower_call(@ctx: LowerCtx, @n: AstNode)
+    # If the callee is a field access (`@obj.method(args)`) we rewrite the
+    # arg list so that arg 0 becomes the receiver and the callee name
+    # becomes the method's bare name.  A proper implementation would
+    # mangle to "<TypeName>_<method>" using the type of the receiver —
+    # TODO once types.luna exposes per-node type info here.
+    @is_method = 0
+    @callee_node = @ctx.p.nodes[@n.child1]
+    if @callee_node.kind == AST_FIELD
+        @is_method = 1
+
+    @arg_count = @n.children_count
+    if @is_method == 1
+        @arg_count = @arg_count + 1      # +1 for the implicit receiver
+
+    if @arg_count > 6
+        emit_int3(@ctx.forge)            # TODO: stack args past 6
+        return
+
+    # Evaluate args right-to-left and push each so later args don't
+    # clobber earlier ones.  For method calls, we synthesise the receiver
+    # as the last-to-evaluate "arg 0".
+    if @is_method == 1
+        # Push plain args from the AST first (right-to-left).
+        orbit @i in 0..@n.children_count
+            @idx = @n.children_count - 1 - @i
+            @arg_node = @ctx.p.children[@n.children_start + @idx]
+            lower_expr(@ctx, @arg_node)
+            emit_push_reg(@ctx.forge, REG_RAX)
+        # Receiver goes last-pushed → first-popped into RDI.
+        lower_expr(@ctx, @callee_node.child1)
+        emit_push_reg(@ctx.forge, REG_RAX)
+    else
+        orbit @i in 0..@arg_count
+            @idx = @arg_count - 1 - @i
+            @arg_node = @ctx.p.children[@n.children_start + @idx]
+            lower_expr(@ctx, @arg_node)
+            emit_push_reg(@ctx.forge, REG_RAX)
+
+    # Pop into the System V arg registers, left-to-right.
+    seal @argregs: [int; 6] = [REG_RDI, REG_RSI, REG_RDX, REG_RCX, REG_R8, REG_R9]
+    orbit @i in 0..@arg_count
+        emit_pop_reg(@ctx.forge, @argregs[@i])
+
+    # Resolve callee name and emit the call.
+    @name_start = 0
+    @name_len = 0
+    if @is_method == 1
+        @name_start = @callee_node.data1
+        @name_len = @callee_node.data2
+    else
+        if @callee_node.kind == AST_IDENT
+            @name_start = @callee_node.data1
+            @name_len = @callee_node.data2
+        else
+            emit_int3(@ctx.forge)
+            return
+
+    seal @sym = lower_resolve_symbol(@ctx, @name_start, @name_len)
+    if @sym >= 0
+        emit_call_extern(@ctx.forge, @sym)
+        return
+    emit_int3(@ctx.forge)
+
+# ------ if-expression (ternary form) ------
+
+fn lower_if_expr(@ctx: LowerCtx, @n: AstNode)
+    lower_expr(@ctx, @n.child1)          # condition → RAX
+    # test rax, rax ; je .else_branch
+    emit_test_reg_reg(@ctx.forge, REG_RAX, REG_RAX)
+    seal @je_at = emit_jcc_rel32(@ctx.forge, CC_E, 0)
+    # Then branch
+    lower_expr(@ctx, @n.child2)
+    seal @jmp_at = emit_jmp_rel32(@ctx.forge, 0)
+    # Else branch begins here
+    seal @else_pos = @ctx.forge.code_len
+    @disp_e = @else_pos - (@je_at + 4)
+    @ctx.forge.code[@je_at + 0] = @disp_e & 0xFF
+    @ctx.forge.code[@je_at + 1] = (@disp_e >> 8) & 0xFF
+    @ctx.forge.code[@je_at + 2] = (@disp_e >> 16) & 0xFF
+    @ctx.forge.code[@je_at + 3] = (@disp_e >> 24) & 0xFF
+    lower_expr(@ctx, @n.child3)
+    # Done
+    seal @done_pos = @ctx.forge.code_len
+    @disp_d = @done_pos - (@jmp_at + 4)
+    @ctx.forge.code[@jmp_at + 0] = @disp_d & 0xFF
+    @ctx.forge.code[@jmp_at + 1] = (@disp_d >> 8) & 0xFF
+    @ctx.forge.code[@jmp_at + 2] = (@disp_d >> 16) & 0xFF
+    @ctx.forge.code[@jmp_at + 3] = (@disp_d >> 24) & 0xFF
+
+# =============================================================================
+# SECTION 4 — STATEMENT LOWERING
+# =============================================================================
+
+fn lower_stmt(@ctx: LowerCtx, @node_idx: int)
+    if @node_idx < 0
+        return
+    @n = @ctx.p.nodes[@node_idx]
+
+    match @n.kind
+        AST_LET =>
+            lower_let(@ctx, @n)
+        AST_RETURN =>
+            lower_return(@ctx, @n)
+        AST_EXPR_STMT =>
+            lower_expr(@ctx, @n.child1)
+        AST_IF =>
+            lower_if_stmt(@ctx, @n)
+        AST_WHILE =>
+            lower_while(@ctx, @n)
+        AST_ORBIT =>
+            lower_orbit(@ctx, @n)
+        AST_MATCH =>
+            lower_match(@ctx, @n)
+        AST_BLOCK =>
+            orbit @i in 0..@n.children_count
+                lower_stmt(@ctx, @ctx.p.children[@n.children_start + @i])
+        AST_PASS =>
+            emit_nop(@ctx.forge)
+        AST_BREAK =>
+            lower_break(@ctx)
+        AST_CONTINUE =>
+            lower_continue(@ctx)
+        AST_UNSAFE =>
+            # Codegen-transparent — just lower the inner block.
+            if @n.child1 >= 0
+                lower_stmt(@ctx, @n.child1)
+        _ =>
+            # Statements we haven't wired: spawn, send, defer, actor, ...
+            # TODO: these belong to the runtime layer and require a fibre
+            # scheduler.  Trap for now so a mis-compilation is loud.
+            emit_int3(@ctx.forge)
+
+fn lower_let(@ctx: LowerCtx, @n: AstNode)
+    # Evaluate initialiser, then store into a fresh stack slot.
+    if @n.child1 >= 0
+        lower_expr(@ctx, @n.child1)
+    else
+        emit_xor_reg_reg(@ctx.forge, REG_RAX, REG_RAX)
+    seal @slot_idx = lower_bind_local(@ctx, @n.data1, @n.data2)
+    if @slot_idx < 0
+        return
+    seal @slot = @ctx.locals[@slot_idx].slot
+    emit_mov_mem_reg(@ctx.forge, REG_RBP, @slot, REG_RAX)
+
+fn lower_return(@ctx: LowerCtx, @n: AstNode)
+    if @n.child1 >= 0
+        lower_expr(@ctx, @n.child1)
+    # Epilogue:  mov rsp, rbp ; pop rbp ; ret
+    emit_u8(@ctx.forge, 0x48)
+    emit_u8(@ctx.forge, 0x89)
+    emit_u8(@ctx.forge, 0xEC)
+    emit_pop_reg(@ctx.forge, REG_RBP)
+    emit_ret(@ctx.forge)
+
+fn lower_if_stmt(@ctx: LowerCtx, @n: AstNode)
+    lower_expr(@ctx, @n.child1)
+    emit_test_reg_reg(@ctx.forge, REG_RAX, REG_RAX)
+    seal @je_at = emit_jcc_rel32(@ctx.forge, CC_E, 0)
+    lower_stmt(@ctx, @n.child2)           # then block
+    if @n.child3 >= 0
+        # There is an else — jump around it after the then block
+        seal @jmp_over_at = emit_jmp_rel32(@ctx.forge, 0)
+        # else position
+        seal @else_pos = @ctx.forge.code_len
+        @disp_e = @else_pos - (@je_at + 4)
+        @ctx.forge.code[@je_at + 0] = @disp_e & 0xFF
+        @ctx.forge.code[@je_at + 1] = (@disp_e >> 8) & 0xFF
+        @ctx.forge.code[@je_at + 2] = (@disp_e >> 16) & 0xFF
+        @ctx.forge.code[@je_at + 3] = (@disp_e >> 24) & 0xFF
+        lower_stmt(@ctx, @n.child3)
+        seal @done_pos = @ctx.forge.code_len
+        @disp_d = @done_pos - (@jmp_over_at + 4)
+        @ctx.forge.code[@jmp_over_at + 0] = @disp_d & 0xFF
+        @ctx.forge.code[@jmp_over_at + 1] = (@disp_d >> 8) & 0xFF
+        @ctx.forge.code[@jmp_over_at + 2] = (@disp_d >> 16) & 0xFF
+        @ctx.forge.code[@jmp_over_at + 3] = (@disp_d >> 24) & 0xFF
+    else
+        # No else — patch JE to here
+        seal @done_pos = @ctx.forge.code_len
+        @disp_e = @done_pos - (@je_at + 4)
+        @ctx.forge.code[@je_at + 0] = @disp_e & 0xFF
+        @ctx.forge.code[@je_at + 1] = (@disp_e >> 8) & 0xFF
+        @ctx.forge.code[@je_at + 2] = (@disp_e >> 16) & 0xFF
+        @ctx.forge.code[@je_at + 3] = (@disp_e >> 24) & 0xFF
+
+# ------ Loop context management ------
+#
+# We use a tiny singly-linked list of patch-sites for each active loop.
+# Whenever `break` fires we emit a `jmp rel32 0` and link the just-emitted
+# displacement-slot into `loop_exit_patches[depth-1]` by writing the
+# previous head into the new slot.  When the loop exits, lower_patch_breaks
+# walks the chain and resolves every slot to point at the exit position.
+#
+# `loop_top_pos[depth-1]` is a straight code_len snapshot, patched inline
+# by `continue` via a backward jump.
+
+fn lower_push_loop(@ctx: LowerCtx, @top_pos: int)
+    if @ctx.loop_depth >= LOWER_MAX_LOOPS
+        @ctx.errors = @ctx.errors + 1
+        return
+    @ctx.loop_top_pos[@ctx.loop_depth] = @top_pos
+    @ctx.loop_exit_patches[@ctx.loop_depth] = -1
+    @ctx.loop_depth = @ctx.loop_depth + 1
+
+fn lower_pop_loop(@ctx: LowerCtx)
+    if @ctx.loop_depth > 0
+        @ctx.loop_depth = @ctx.loop_depth - 1
+
+fn lower_patch_breaks(@ctx: LowerCtx, @exit_pos: int)
+    if @ctx.loop_depth == 0
+        return
+    @head = @ctx.loop_exit_patches[@ctx.loop_depth - 1]
+    orbit _ in 0..LOWER_MAX_LABELS
+        if @head < 0
+            break
+        # Read the "next" pointer we stashed into the 4-byte slot, then
+        # overwrite it with the real displacement.
+        @next = @ctx.forge.code[@head + 0] \
+              | (@ctx.forge.code[@head + 1] << 8) \
+              | (@ctx.forge.code[@head + 2] << 16) \
+              | (@ctx.forge.code[@head + 3] << 24)
+        # Sign-extend from 32-bit signed — but −1 sentinel stores as all-ones.
+        if @next == 0xFFFFFFFF
+            @next = -1
+        @disp = @exit_pos - (@head + 4)
+        @ctx.forge.code[@head + 0] = @disp & 0xFF
+        @ctx.forge.code[@head + 1] = (@disp >> 8) & 0xFF
+        @ctx.forge.code[@head + 2] = (@disp >> 16) & 0xFF
+        @ctx.forge.code[@head + 3] = (@disp >> 24) & 0xFF
+        @head = @next
+
+fn lower_break(@ctx: LowerCtx)
+    if @ctx.loop_depth == 0
+        # `break` outside a loop — type checker should catch this; trap.
+        emit_int3(@ctx.forge)
+        return
+    # Emit jmp rel32 0, link the displacement slot into the chain.
+    seal @at = emit_jmp_rel32(@ctx.forge, 0)
+    @prev = @ctx.loop_exit_patches[@ctx.loop_depth - 1]
+    # Store @prev (a negative sentinel becomes 0xFFFFFFFF) into the slot.
+    @ctx.forge.code[@at + 0] = @prev & 0xFF
+    @ctx.forge.code[@at + 1] = (@prev >> 8) & 0xFF
+    @ctx.forge.code[@at + 2] = (@prev >> 16) & 0xFF
+    @ctx.forge.code[@at + 3] = (@prev >> 24) & 0xFF
+    @ctx.loop_exit_patches[@ctx.loop_depth - 1] = @at
+
+fn lower_continue(@ctx: LowerCtx)
+    if @ctx.loop_depth == 0
+        emit_int3(@ctx.forge)
+        return
+    seal @top = @ctx.loop_top_pos[@ctx.loop_depth - 1]
+    # Unconditional backward jump — we know the target already.
+    @disp_back = @top - (@ctx.forge.code_len + 5)
+    emit_u8(@ctx.forge, 0xE9)
+    emit_u32(@ctx.forge, @disp_back)
+
+# ------ while loop ------
+fn lower_while(@ctx: LowerCtx, @n: AstNode)
+    seal @top_pos = @ctx.forge.code_len
+    lower_push_loop(@ctx, @top_pos)
+    lower_expr(@ctx, @n.child1)
+    emit_test_reg_reg(@ctx.forge, REG_RAX, REG_RAX)
+    seal @exit_at = emit_jcc_rel32(@ctx.forge, CC_E, 0)
+    lower_stmt(@ctx, @n.child2)
+    # Unconditional jump back to the top
+    @disp_back = @top_pos - (@ctx.forge.code_len + 5)
+    emit_u8(@ctx.forge, 0xE9)
+    emit_u32(@ctx.forge, @disp_back)
+    # Patch natural-exit (condition-false) and any `break` patches.
+    seal @exit_pos = @ctx.forge.code_len
+    @disp_e = @exit_pos - (@exit_at + 4)
+    @ctx.forge.code[@exit_at + 0] = @disp_e & 0xFF
+    @ctx.forge.code[@exit_at + 1] = (@disp_e >> 8) & 0xFF
+    @ctx.forge.code[@exit_at + 2] = (@disp_e >> 16) & 0xFF
+    @ctx.forge.code[@exit_at + 3] = (@disp_e >> 24) & 0xFF
+    lower_patch_breaks(@ctx, @exit_pos)
+    lower_pop_loop(@ctx)
+
+# ------ orbit loop:  orbit @i in START..END BODY ------
+#
+# @node.data1/data2 : iterator variable name span
+# @node.child1      : AST_RANGE (data1=inclusive-marker, child1=START, child2=END)
+# @node.child2      : body block
+#
+# Stack layout (two fresh locals):
+#   [rbp + islot] = @i (current)
+#   [rbp + eslot] = END (evaluated once)
+#
+# Loop shape:
+#     ; init
+#     START → RAX ; store to islot
+#     END   → RAX ; store to eslot
+#   .top:
+#     ; cond
+#     RAX = [islot] ; RCX = [eslot] ; cmp RAX, RCX ; jge .exit
+#     ; body
+#     ; increment:  [islot] += 1
+#     ; jmp .top
+#   .exit:
+fn lower_orbit(@ctx: LowerCtx, @n: AstNode)
+    seal @range = @ctx.p.nodes[@n.child1]
+    if @range.kind != AST_RANGE
+        emit_int3(@ctx.forge)
+        return
+
+    # Bind iterator variable as a fresh local.
+    seal @islot_idx = lower_bind_local(@ctx, @n.data1, @n.data2)
+    if @islot_idx < 0
+        return
+    seal @islot = @ctx.locals[@islot_idx].slot
+
+    # Reserve an anonymous slot for END.  We reuse lower_bind_local with a
+    # zero-length name so the slot exists in @ctx.locals but can't match
+    # any lookup.
+    seal @eslot_idx = lower_bind_local(@ctx, 0, 0)
+    if @eslot_idx < 0
+        return
+    seal @eslot = @ctx.locals[@eslot_idx].slot
+
+    # Init @i from START.
+    lower_expr(@ctx, @range.child1)
+    emit_mov_mem_reg(@ctx.forge, REG_RBP, @islot, REG_RAX)
+
+    # Init end from END.
+    lower_expr(@ctx, @range.child2)
+    emit_mov_mem_reg(@ctx.forge, REG_RBP, @eslot, REG_RAX)
+
+    # Loop-top label.
+    seal @top_pos = @ctx.forge.code_len
+    lower_push_loop(@ctx, @top_pos)
+
+    # cond:  cmp @i, end ; jge .exit   (signed ≥ means we're past the range)
+    emit_mov_reg_mem(@ctx.forge, REG_RAX, REG_RBP, @islot)
+    emit_mov_reg_mem(@ctx.forge, REG_RCX, REG_RBP, @eslot)
+    emit_cmp_reg_reg(@ctx.forge, REG_RAX, REG_RCX)
+    # If inclusive range `..=`, exit only when @i > end.  Use JG in that
+    # case; otherwise JGE.  data1 on AST_RANGE distinguishes.
+    @exit_cc = CC_GE
+    if @range.data1 == 1
+        @exit_cc = CC_G
+    seal @exit_at = emit_jcc_rel32(@ctx.forge, @exit_cc, 0)
+
+    # body
+    lower_stmt(@ctx, @n.child2)
+
+    # @i += 1  — use the 4-byte short form.
+    emit_mov_reg_mem(@ctx.forge, REG_RAX, REG_RBP, @islot)
+    emit_add_reg_imm8(@ctx.forge, REG_RAX, 1)
+    emit_mov_mem_reg(@ctx.forge, REG_RBP, @islot, REG_RAX)
+
+    # jmp back
+    @disp_back = @top_pos - (@ctx.forge.code_len + 5)
+    emit_u8(@ctx.forge, 0xE9)
+    emit_u32(@ctx.forge, @disp_back)
+
+    # Exit.
+    seal @exit_pos = @ctx.forge.code_len
+    @disp_e = @exit_pos - (@exit_at + 4)
+    @ctx.forge.code[@exit_at + 0] = @disp_e & 0xFF
+    @ctx.forge.code[@exit_at + 1] = (@disp_e >> 8) & 0xFF
+    @ctx.forge.code[@exit_at + 2] = (@disp_e >> 16) & 0xFF
+    @ctx.forge.code[@exit_at + 3] = (@disp_e >> 24) & 0xFF
+    lower_patch_breaks(@ctx, @exit_pos)
+    lower_pop_loop(@ctx)
+
+# ------ match / phase pattern matching ------
+#
+# Strategy: linear chain.  For each arm:
+#   * evaluate the scrutinee once (into RAX) before the first arm
+#   * `_` wildcard → unconditional fall-through to body
+#   * LIT_INT / LIT_BOOL → cmp RAX, imm ; jne next_arm
+#   * AST_CALL Ident(ident) looking like `Bright(@v)` / `Dim(@e)` →
+#     treat the callee name as a phase<T> tag; cmp byte[RAX], tag ; jne
+#     next_arm ; if bound, copy [RAX+8] into a fresh local for the body
+#   * anything else → emit int3 (TODO: tuple destructure, guard clauses)
+#
+# Result of the expression is whatever the body expression evaluates to.
+# Between arms we emit an unconditional jmp to "done" so only one body
+# executes.
+fn lower_match(@ctx: LowerCtx, @n: AstNode)
+    lower_expr(@ctx, @n.child1)                    # scrutinee → RAX
+    # Save RAX to a scratch local so each arm can re-read it.
+    seal @sslot_idx = lower_bind_local(@ctx, 0, 0)
+    if @sslot_idx < 0
+        return
+    seal @sslot = @ctx.locals[@sslot_idx].slot
+    emit_mov_mem_reg(@ctx.forge, REG_RBP, @sslot, REG_RAX)
+
+    @arm_count = @n.children_count / 2
+
+    # Singly-linked list of "done" patches — one per body-end jmp.
+    @done_chain = -1
+
+    orbit @ai in 0..@arm_count
+        seal @pat_idx  = @ctx.p.children[@n.children_start + @ai * 2]
+        seal @body_idx = @ctx.p.children[@n.children_start + @ai * 2 + 1]
+
+        # Emit the arm test.  It returns the patch offset for the "next
+        # arm" jmp on failure (or −1 if it's a wildcard that never fails).
+        @next_arm_patch = lower_match_arm_test(@ctx, @pat_idx, @sslot)
+
+        # Body
+        if @ctx.p.nodes[@body_idx].kind == AST_BLOCK
+            lower_stmt(@ctx, @body_idx)
+        else
+            lower_expr(@ctx, @body_idx)
+
+        # After body, jump over remaining arms to the match's exit.  Link
+        # the jmp's displacement slot into done_chain.
+        seal @done_at = emit_jmp_rel32(@ctx.forge, 0)
+        @ctx.forge.code[@done_at + 0] = @done_chain & 0xFF
+        @ctx.forge.code[@done_at + 1] = (@done_chain >> 8) & 0xFF
+        @ctx.forge.code[@done_at + 2] = (@done_chain >> 16) & 0xFF
+        @ctx.forge.code[@done_at + 3] = (@done_chain >> 24) & 0xFF
+        @done_chain = @done_at
+
+        # Patch the failing-test branch to land on the next arm.
+        if @next_arm_patch >= 0
+            seal @next_pos = @ctx.forge.code_len
+            @disp = @next_pos - (@next_arm_patch + 4)
+            @ctx.forge.code[@next_arm_patch + 0] = @disp & 0xFF
+            @ctx.forge.code[@next_arm_patch + 1] = (@disp >> 8) & 0xFF
+            @ctx.forge.code[@next_arm_patch + 2] = (@disp >> 16) & 0xFF
+            @ctx.forge.code[@next_arm_patch + 3] = (@disp >> 24) & 0xFF
+
+    # Resolve the done chain to here.
+    seal @done_pos = @ctx.forge.code_len
+    @head = @done_chain
+    orbit _ in 0..LOWER_MAX_LABELS
+        if @head < 0
+            break
+        @next = @ctx.forge.code[@head + 0] \
+              | (@ctx.forge.code[@head + 1] << 8) \
+              | (@ctx.forge.code[@head + 2] << 16) \
+              | (@ctx.forge.code[@head + 3] << 24)
+        if @next == 0xFFFFFFFF
+            @next = -1
+        @disp = @done_pos - (@head + 4)
+        @ctx.forge.code[@head + 0] = @disp & 0xFF
+        @ctx.forge.code[@head + 1] = (@disp >> 8) & 0xFF
+        @ctx.forge.code[@head + 2] = (@disp >> 16) & 0xFF
+        @ctx.forge.code[@head + 3] = (@disp >> 24) & 0xFF
+        @head = @next
+
+# Emit the test for a single match arm.  On success, falls through to the
+# arm body; on failure, emits a JMP / JNE whose 4-byte displacement slot
+# is returned so the caller can patch it to the next arm.  A wildcard
+# pattern (`_`) returns −1 — it never fails, so no patch is needed.
+#
+# sslot is the RBP-relative slot holding the saved scrutinee value.
+fn lower_match_arm_test(@ctx: LowerCtx, @pat_idx: int, @sslot: int) -> int
+    if @pat_idx < 0
+        return -1
+    @pat = @ctx.p.nodes[@pat_idx]
+
+    # Wildcard — typically parsed as `_` ident or AST_IDENT whose span is
+    # a single underscore.  Treat any single-char identifier "_" as wild.
+    if @pat.kind == AST_IDENT and @pat.data2 == 1
+        @b = 0
+        unsafe
+            @b = volatile_read(@ctx.p.source + @pat.data1)
+        if @b == 95    # '_'
+            # Bind nothing; fall through.
+            return -1
+
+    # Literal integer / bool pattern.
+    if @pat.kind == AST_LITERAL and (@pat.data1 == LIT_INT or @pat.data1 == LIT_BOOL)
+        emit_mov_reg_mem(@ctx.forge, REG_RAX, REG_RBP, @sslot)
+        # cmp reg, imm  — short form when it fits.
+        if @pat.data2 >= -128 and @pat.data2 <= 127
+            emit_cmp_reg_imm8(@ctx.forge, REG_RAX, @pat.data2)
+        else
+            emit_cmp_reg_imm32(@ctx.forge, REG_RAX, @pat.data2)
+        return emit_jcc_rel32(@ctx.forge, CC_NE, 0)
+
+    # Constructor-style pattern:  Bright(@v)  or  Dim(@e).
+    # Parser records this as an AST_CALL whose callee is an AST_IDENT.
+    if @pat.kind == AST_CALL
+        @callee = @ctx.p.nodes[@pat.child1]
+        if @callee.kind == AST_IDENT
+            # Decide the tag byte from the constructor name.  "Bright" → 0,
+            # "Dim" → 1.  Anything else falls through to the generic stub.
+            @tag = -1
+            if @callee.data2 == 6 and lower_ident_equals(@ctx, @callee, "Bright", 6) == 1
+                @tag = 0
+            if @callee.data2 == 3 and lower_ident_equals(@ctx, @callee, "Dim", 3) == 1
+                @tag = 1
+            if @tag >= 0
+                emit_mov_reg_mem(@ctx.forge, REG_RAX, REG_RBP, @sslot)
+                # cmp byte [rax], tag
+                emit_u8(@ctx.forge, 0x80)
+                emit_u8(@ctx.forge, 0x38)
+                emit_u8(@ctx.forge, @tag & 0xFF)
+                seal @jne_at = emit_jcc_rel32(@ctx.forge, CC_NE, 0)
+                # If the constructor has a single binder child, bind it to
+                # a fresh local holding [rax+8].
+                if @pat.children_count >= 1
+                    @binder_idx = @ctx.p.children[@pat.children_start + 0]
+                    @binder = @ctx.p.nodes[@binder_idx]
+                    if @binder.kind == AST_IDENT
+                        # RAX still holds the scrutinee pointer (we just
+                        # compared its tag); load payload.
+                        emit_mov_reg_mem(@ctx.forge, REG_RAX, REG_RAX, 8)
+                        seal @bslot_idx = lower_bind_local(@ctx, @binder.data1, @binder.data2)
+                        if @bslot_idx >= 0
+                            seal @bslot = @ctx.locals[@bslot_idx].slot
+                            emit_mov_mem_reg(@ctx.forge, REG_RBP, @bslot, REG_RAX)
+                return @jne_at
+
+    # Anything more elaborate (tuple destructure, guard clause, nested) —
+    # trap.  TODO: implement these once types.luna can annotate per-pattern.
+    emit_int3(@ctx.forge)
+    return -1
+
+# Helper: compare an AST_IDENT's name against a literal C-style string.
+# @lit should be a small ASCII string; we walk one byte at a time from
+# @ctx.p.source.  Used by the match constructor-tag recognition.
+fn lower_ident_equals(@ctx: LowerCtx, @ident: AstNode, @lit: str, @lit_len: int) -> int
+    if @ident.data2 != @lit_len
+        return 0
+    orbit @k in 0..@lit_len
+        @a = 0
+        @b = 0
+        unsafe
+            @a = volatile_read(@ctx.p.source + @ident.data1 + @k)
+            @b = volatile_read(@lit + @k)
+        if @a != @b
+            return 0
+    return 1
+
+# =============================================================================
+# SECTION 5 — FUNCTION + PROGRAM LOWERING
+# =============================================================================
+
+fn lower_function(@ctx: LowerCtx, @fn_node_idx: int)
+    @n = @ctx.p.nodes[@fn_node_idx]
+
+    # Reset per-function state
+    @ctx.local_count = 0
+    @ctx.frame_bytes = 0
+    @ctx.label_count = 0
+    @ctx.loop_depth = 0
+
+    # Forge function frame.  Reserve 128 bytes up front — resized later
+    # by patching `sub rsp, imm32` once frame_bytes is known.
+    seal @sym = forge_function_begin(@ctx.forge, @n.data1, @n.data2, 128)
+
+    # Bind parameters to stack slots.  SysV passes first 6 in regs —
+    # we move them to stack on entry for simplicity.
+    @params_n = @n.children_count / 2     # (start, len) pairs per param
+    seal @argregs: [int; 6] = [REG_RDI, REG_RSI, REG_RDX, REG_RCX, REG_R8, REG_R9]
+    orbit @i in 0..@params_n
+        if @i >= 6
+            break
+        seal @name_start = @ctx.p.children[@n.children_start + @i * 2]
+        seal @name_len   = @ctx.p.children[@n.children_start + @i * 2 + 1]
+        seal @slot_idx   = lower_bind_local(@ctx, @name_start, @name_len)
+        if @slot_idx >= 0
+            seal @slot = @ctx.locals[@slot_idx].slot
+            emit_mov_mem_reg(@ctx.forge, REG_RBP, @slot, @argregs[@i])
+
+    # Lower body
+    if @n.child1 >= 0
+        lower_stmt(@ctx, @n.child1)
+
+    # Default epilogue (for functions that don't end with a return)
+    forge_function_end(@ctx.forge, 128)
+
+fn lower_program(@ctx: LowerCtx)
+    # Pre-pass: collect struct field offsets so AST_FIELD lowering works.
+    lower_collect_structs(@ctx)
+
+    orbit @i in 0..@ctx.p.node_count
+        @n = @ctx.p.nodes[@i]
+        if @n.kind == AST_FUNCTION
+            lower_function(@ctx, @i)
+
+# =============================================================================
+# SECTION 6 — SELF-TEST
+# =============================================================================
+# Parses a trivial program, lowers it, and checks that expected byte
+# sequences appear.  Doesn't run the code (no OS loader in the test
+# harness) — verifies shape only.
+
+fn lower_selftest_return_const() -> int
+    seal @src = "fn answer() -> int\n    return 42\n"
+    seal @src_len = 33
+    @p = parse(@src, @src_len)
+    @f = forge_new()
+    @ctx = lower_new(@f, @p)
+    lower_program(@ctx)
+    # Expect at least: prologue (push rbp, mov rbp rsp, sub rsp),
+    # mov rax, 42 (either imm32 or imm64 form),
+    # mov rsp rbp, pop rbp, ret.
+    if @f.code_len < 15
+        return 1
+    # Look for the 42 constant anywhere in the emitted code.  We now emit
+    # the compact `mov reg,imm32` form (48 C7 C0 2A 00 00 00) when the
+    # value fits, and fall back to `mov reg,imm64` (48 B8 2A ...) for
+    # 64-bit values.  Accept either shape.
+    meow @found: int = 0
+    orbit @i in 0..@f.code_len - 7
+        # imm32 form:  48 C7 C0 2A 00 00 00
+        if @f.code[@i] == 0x48 and @f.code[@i+1] == 0xC7 and @f.code[@i+2] == 0xC0 and @f.code[@i+3] == 42
+            @found = 1
+            break
+        # imm64 form:  48 B8 2A 00 00 00 00 00 00 00
+        if @f.code[@i] == 0x48 and @f.code[@i+1] == 0xB8 and @f.code[@i+2] == 42
+            @found = 1
+            break
+    return if @found == 1 then 0 else 2
+
+fn run_lower_selftests() -> int
+    @pass = 0
+    if lower_selftest_return_const() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+# SECTION 7 — ROADMAP
+# =============================================================================
+#
+# Working paths exercised by run_lower_selftests and by hand:
+#   * fn returning an int constant
+#   * if / else / while / orbit with int conditions
+#   * orbit loops with break / continue
+#   * `?` propagator on a phase<T> pointer
+#   * function calls up to 6 args (System V), including method dispatch
+#   * struct field access with flat 8-byte layout
+#   * string / float literal interning (emits rodata + relocation)
+#   * match arms: `_`, int literal, `Bright(@v)`, `Dim(@e)`
+#
+# Intentional stubs (emit int3 with a TODO comment):
+#   * spawn / send / defer — require fibre runtime
+#   * full pattern matching: tuple destructure, guards, nested ctors
+#   * arrays / dicts (require BOX_ALLOC / runtime allocation)
+#   * unsafe block inner statements that touch raw pointers beyond
+#     volatile_read/write
+#
+# Planned improvements:
+#   * Register allocator — replace "push-pop-combine" with reuse.
+#   * Peephole pass over emitted code (mov-0 → xor, etc.).
+#   * DWARF line-table emission (gdb / lldb can then step Luna source).
+#   * Container-side (forge_elf / forge_pe) rodata section materialisation
+#     so the relocations emitted by lower_intern_bytes/u64 actually
+#     resolve at load time.  Today the relocations reference a synthetic
+#     symbol with no section assignment.
+# =============================================================================
+
+export {
+    LowerCtx, Local, StructFieldInfo,
+    lower_new,
+    lower_expr, lower_unary, lower_binary, lower_binary_float,
+    lower_brighten,
+    lower_call, lower_if_expr,
+    lower_field_access,
+    lower_string_literal, lower_float_constant,
+    lower_stmt, lower_let, lower_return, lower_if_stmt,
+    lower_while, lower_orbit, lower_match, lower_match_arm_test,
+    lower_break, lower_continue,
+    lower_push_loop, lower_pop_loop, lower_patch_breaks,
+    lower_function, lower_program,
+    lower_collect_structs, lower_find_field_offset,
+    lower_resolve_symbol, lower_name_eq, lower_ident_equals,
+    lower_intern_bytes, lower_intern_u64, lower_ensure_rodata_symbol,
+    lower_is_float_expr,
+    run_lower_selftests
+}

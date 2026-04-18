@@ -1,0 +1,168 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna chrono — cosmic alias for the time module (v4.3)
+# =============================================================================
+# `chrono` keeps its Greek-adjacent name (L4_RENAME_MAP §4.7); it still counts
+# as cosmic because time is a dimension of the cosmos.  This shim forwards
+# the legacy time.luna verbs to their new spellings:
+#
+#   * `chrono.now` / `chrono.now_ms` / `chrono.now_ns` — instants.
+#   * `chrono.slumber(ms)` — blocking sleep.  The bots call this with
+#     `arc.millis(n)` and `arc.seconds(n)`, which return `int` ms already.
+#   * `arc.seconds(n)` / `arc.millis(n)` — duration constructors returning
+#     plain `int` ms, *not* a struct.  The bots only need an ms count so we
+#     intentionally stay flat for now; a future pass can promote `arc` to
+#     a struct once more code depends on the richer Duration API.
+# =============================================================================
+
+import time
+import aether
+
+# --- Moment (instant) --------------------------------------------------------
+# type moment = Instant (monotonic point in time).
+
+fn now() -> Instant
+    return instant_now()
+
+fn now_ms() -> int
+    return now_ms()
+
+fn now_ns() -> int
+    return now_nano()
+
+# Wall-clock variant.  Kept separate from `now()` because wall clock is
+# subject to jumps and must not be mixed with monotonic arithmetic.
+fn now_wall() -> SystemTime
+    return system_time_now()
+
+fn from_epoch_ms(@ms: int) -> SystemTime
+    return system_time_from_epoch_ms(@ms)
+
+fn moment_since(@start: Instant) -> Duration
+    return instant_elapsed(@start)
+
+fn moment_gap(@later: Instant, @earlier: Instant) -> Duration
+    return instant_duration_since(@later, @earlier)
+
+# --- Formatting --------------------------------------------------------------
+
+fn iso(@epoch_ms: int) -> str
+    return to_iso(@epoch_ms)
+
+fn rfc2822(@epoch_ms: int) -> str
+    return to_rfc2822(@epoch_ms)
+
+fn format(@epoch_ms: int, @fmt: str) -> str
+    return format_moment(@epoch_ms, @fmt)
+
+# --- Slumber / gauge --------------------------------------------------------
+# `slumber(ms)` blocks the current fibre/thread for `ms` milliseconds.  It
+# prefers the scheduler-aware `sleep_ms` from time.luna; aether.moment_drift
+# is the lower-level syscall path and is retained as an escape hatch for
+# pre-scheduler boot.
+
+fn slumber(@ms: int)
+    sleep_ms(@ms)
+
+# Bottom-of-the-stack variant used during boot (before the scheduler is up).
+fn slumber_raw(@ms: int)
+    moment_drift(@ms)
+
+fn gauge(@fn_ptr: int, @iterations: int) -> int
+    return benchmark(@fn_ptr, @iterations)
+
+# --- Arc (duration) ---------------------------------------------------------
+# arc.seconds / arc.millis / arc.micros / arc.nanos all return an int count
+# of milliseconds — the unit that downstream APIs (`slumber`, timer wheel)
+# want anyway.  That keeps call-sites like `chrono.slumber(arc.seconds(3))`
+# parseable today.  A richer `Duration` struct is available via dur_* if a
+# caller really needs sub-ms granularity.
+
+fn arc_seconds(@n: int) -> int
+    return @n * 1000
+
+fn arc_millis(@n: int) -> int
+    return @n
+
+fn arc_micros(@n: int) -> int
+    return @n / 1000
+
+fn arc_nanos(@n: int) -> int
+    return @n / 1000000
+
+# Richer Duration forwarders for callers that want the full struct.
+fn arc_new(@secs: int, @nanos: int) -> Duration
+    return dur_new(@secs, @nanos)
+
+fn arc_from_secs(@s: int) -> Duration
+    return dur_from_secs(@s)
+
+fn arc_from_millis(@ms: int) -> Duration
+    return dur_from_millis(@ms)
+
+fn arc_in_millis(@d: Duration) -> int
+    return dur_as_millis(@d)
+
+fn arc_in_secs(@d: Duration) -> int
+    return dur_as_secs(@d)
+
+# --- Countdown / throttle ---------------------------------------------------
+# Simple forwarders so bot code can call `chrono.countdown_new(ms)` without
+# reaching back into the legacy namespace.
+
+fn countdown_new(@ms: int) -> Timeout
+    return timeout_new_ms(@ms)
+
+fn countdown_done(@t: Timeout) -> int
+    return timeout_is_expired(@t)
+
+fn countdown_left(@t: Timeout) -> int
+    return timeout_remaining_ms(@t)
+
+fn throttle_new(@max_per_sec: int) -> RateLimiter
+    return rate_limiter_new(@max_per_sec)
+
+fn throttle_try_pass(@rl: RateLimiter) -> int
+    return rate_limiter_try_acquire(@rl)
+
+fn throttle_pass(@rl: RateLimiter)
+    rate_limiter_wait(@rl)
+
+# --- Timer wheel ------------------------------------------------------------
+
+fn schedule(@delay_ms: int, @callback_ptr: int, @user_data: int) -> int
+    return wheel_schedule(@delay_ms, @callback_ptr, @user_data)
+
+fn cancel(@timer_id: int)
+    wheel_cancel(@timer_id)
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+export {
+    # Type re-exports
+    Instant, SystemTime, Duration, Timeout, RateLimiter,
+
+    # Moment / wall clock
+    now, now_ms, now_ns, now_wall, from_epoch_ms,
+    moment_since, moment_gap,
+
+    # Formatting
+    iso, rfc2822, format,
+
+    # Slumber / gauge
+    slumber, slumber_raw, gauge,
+
+    # Arc
+    arc_seconds, arc_millis, arc_micros, arc_nanos,
+    arc_new, arc_from_secs, arc_from_millis,
+    arc_in_millis, arc_in_secs,
+
+    # Countdown / throttle / wheel
+    countdown_new, countdown_done, countdown_left,
+    throttle_new, throttle_try_pass, throttle_pass,
+    schedule, cancel
+}

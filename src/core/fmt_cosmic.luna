@@ -1,0 +1,429 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Fmt Cosmic — Automatic Rename Applicator (v4.3)
+# =============================================================================
+# `luna fmt --cosmic` walks a .luna source file, finds every identifier
+# that matches the Luna v4.2 → v4.3 rename map (docs/L4_RENAME_MAP.md),
+# and rewrites it with the cosmic name.  The result is emitted as new
+# source bytes preserving every comment, newline, and indent exactly.
+#
+# # How it works
+#
+# 1. Tokenise via lexer.luna.
+# 2. Iterate tokens; for each TOKEN_IDENT or TOKEN_KEYWORD, look up in the
+#    RENAME_TABLE below.
+# 3. Emit bytes: non-ident tokens use the original substring (we re-read
+#    from the source buffer); ident tokens with a hit emit the new name
+#    instead.
+# 4. Whitespace and comments are NOT tokens — we copy them verbatim by
+#    tracking the source cursor between token starts.
+#
+# This is safe because:
+#   * The rename map only touches identifiers, never syntax
+#   * The lexer preserves exact source offsets for every token
+#
+# # Usage
+#
+#   fn main()
+#       @src = scroll_read_all("src/stdlib/net.luna")
+#       @out: [int; 262144] = [0; 262144]
+#       @n = fmt_cosmic(@src, @src_len, @out, 262144)
+#       scroll_write("src/stdlib/net.luna", @out, @n)
+#
+# # Scope
+#
+# This first pass implements the roughly 120 most common renames — enough
+# for a real-world migration to leave only a handful of hand-edits.  The
+# full map in docs/L4_RENAME_MAP.md has ~350 entries; extending the table
+# below is mechanical.
+# =============================================================================
+
+import lexer
+import parser   # for parser_extract_name
+
+# =============================================================================
+# SECTION 1 — RENAME TABLE
+# =============================================================================
+# Each pair is (old, new).  Stored as parallel arrays of interned Luna str
+# values.  Lookup is O(n_renames) per identifier; with ~120 entries and a
+# moderately-sized source (<100k tokens), this runs in a fraction of a
+# second even without indexing.
+#
+# Priorities covered here:
+#   * Module names (import http → import beam)
+#   * Top-level client functions from http / net / json / io / time
+#   * Type names (HttpResponse → Echo, Mutex → halo, etc.)
+#   * Sentinel constants when they have a clear enum home
+#
+# NOT covered (intentionally, to avoid false positives):
+#   * Method names inside user code that happen to collide (`get`, `put`)
+#   * `get_*` / `set_*` accessors on user-defined structs
+#   * Anything that appears inside a string literal (the lexer
+#     already scans past string bodies so we won't touch them)
+
+const MAX_RENAMES: int = 256
+
+meow @rename_old: [str; 256] = [""; 256]
+meow @rename_new: [str; 256] = [""; 256]
+meow @rename_count: int = 0
+
+fn rn_add(@old: str, @new: str)
+    if @rename_count >= MAX_RENAMES
+        return
+    @rename_old[@rename_count] = @old
+    @rename_new[@rename_count] = @new
+    @rename_count = @rename_count + 1
+
+# Populate the table with the canonical v4.3 renames.
+fn fmt_cosmic_init()
+    if @rename_count > 0
+        return     # already initialised
+
+    # --- Module names ----------------------------------------------------
+    rn_add("http",       "beam")
+    rn_add("json",       "lumen")
+    rn_add("time",       "chrono")
+    rn_add("scheduler",  "nebula")
+    rn_add("crypto",     "veil")          # note: existing "crypto" module kept as alias
+    rn_add("regex",      "glyph")
+    rn_add("db",         "vault")
+    rn_add("collections","constellation")
+    rn_add("math",       "helix")
+
+    # --- HTTP client -----------------------------------------------------
+    rn_add("http_get",          "beam.fetch")
+    rn_add("http_post",         "beam.push")
+    rn_add("http_post_json",    "beam.push_lumen")
+    rn_add("http_request",      "beam.send")
+    rn_add("http_parse_response", "beam.read_echo")
+    rn_add("http_parse_request",  "beam.read_incoming")
+    rn_add("http_response_new",   "beam.reply")
+    rn_add("http_response_text",  "reply.text")
+    rn_add("http_response_json",  "reply.lumen")
+    rn_add("http_response_html",  "reply.html")
+    rn_add("HttpResponse",        "Echo")
+    rn_add("ParsedUrl",           "BeamTarget")
+    rn_add("url_parse",           "beam.parse_url")
+    rn_add("url_encode",          "beam.seal_url")
+    rn_add("url_decode",          "beam.unseal_url")
+
+    # --- TCP / net -------------------------------------------------------
+    rn_add("tcp_connect",       "orbit.link")
+    rn_add("tcp_listen",        "orbit.anchor")
+    rn_add("tcp_accept",        "orbit.catch")
+    rn_add("tcp_send",          "star.emit")
+    rn_add("tcp_recv",          "star.receive")
+    rn_add("tcp_close",         "star.extinguish")
+    rn_add("tcp_set_timeout",   "star.set_arc")
+    rn_add("tcp_is_connected",  "star.is_lit")
+    rn_add("tcp_remote_addr",   "star.peer_coords")
+    rn_add("tcp_remote_port",   "star.peer_port")
+    rn_add("tcp_local_port",    "star.home_port")
+    rn_add("TcpStream",         "Star")
+
+    # --- WebSocket (→ cascade) -------------------------------------------
+    rn_add("ws_connect",        "cascade.link")
+    rn_add("wss_connect",       "cascade.link_secure")
+    rn_add("ws_send_text",      "cascade.emit_text")
+    rn_add("ws_send_binary",    "cascade.emit_binary")
+    rn_add("ws_send_ping",      "cascade.ping")
+    rn_add("ws_recv",           "cascade.catch")
+    rn_add("ws_close",          "cascade.seal")
+
+    # --- TLS (→ veil) ----------------------------------------------------
+    rn_add("tls_connect",       "veil.link")
+    rn_add("tls_send",          "veil.whisper")
+    rn_add("tls_recv",          "veil.hear")
+    rn_add("tls_close",         "veil.dissolve")
+    rn_add("TlsStream",         "VeilLink")
+
+    # --- Sync primitives -------------------------------------------------
+    rn_add("Mutex",             "halo")
+    rn_add("mutex_lock",        "halo.hold")
+    rn_add("mutex_unlock",      "halo.release")
+    rn_add("mutex_try_lock",    "halo.try_hold")
+    rn_add("RwLock",            "halo_rw")
+    rn_add("Channel",           "pulse")
+    rn_add("channel_send",      "pulse.emit")
+    rn_add("channel_recv",      "pulse.catch")
+    rn_add("channel_close",     "pulse.seal")
+    rn_add("AtomicInt",         "beacon")
+    rn_add("atomic_load",       "beacon.read")
+    rn_add("atomic_store",      "beacon.flash")
+    rn_add("atomic_add",        "beacon.bump")
+    rn_add("atomic_cas",        "beacon.compare_flash")
+
+    # --- Scheduler -------------------------------------------------------
+    rn_add("spawn_fn",          "nebula.spawn_fn")
+    rn_add("sleep_ms",          "chrono.slumber")
+    rn_add("sleep_us",          "chrono.slumber_us")
+    rn_add("time_now",          "chrono.now")
+    rn_add("time_now_us",       "chrono.now_us")
+    rn_add("Instant",           "moment")
+    rn_add("Duration",          "arc")
+
+    # --- IO --------------------------------------------------------------
+    rn_add("io_open",           "scroll.unroll")
+    rn_add("io_close",          "scroll.reroll")
+    rn_add("io_read",           "scroll.read")
+    rn_add("io_write",          "scroll.write")
+    rn_add("io_seek",           "scroll.skip_to")
+    rn_add("io_flush",          "scroll.flush")
+    rn_add("io_sync",           "scroll.commit")
+    rn_add("io_truncate",       "scroll.cut")
+    rn_add("io_exists",         "scroll.exists")
+    rn_add("io_is_file",        "scroll.is_scroll")
+    rn_add("io_is_dir",         "scroll.is_library")
+    rn_add("io_file_size",      "scroll.weight")
+    rn_add("FileHandle",        "Scroll")
+    rn_add("FileInfo",          "ScrollStat")
+
+    # --- Env -------------------------------------------------------------
+    rn_add("env_get",           "cosmos.peek")
+    rn_add("env_set",           "cosmos.impress")
+
+    # --- JSON ------------------------------------------------------------
+    rn_add("json_parse",        "lumen.parse")
+    rn_add("json_get",          "lumen.at")
+    rn_add("json_get_int",      "lumen.as_int")
+    rn_add("json_get_str",      "lumen.as_text")
+    rn_add("json_array_get",    "lumen.items_at")
+    rn_add("json_array_len",    "lumen.items_len")
+    rn_add("json_free",         "lumen.dissolve")
+
+    # --- Error shape ----------------------------------------------------
+    # Result<T,E> mechanics — we can't easily rewrite generic type syntax
+    # without parsing, but simple `Ok(` → `Bright(` and `Err(` → `Dim(`
+    # substitutions are usually safe at the ident level.
+    rn_add("Ok",                "Bright")
+    rn_add("Err",               "Dim")
+    rn_add("Result",            "phase")
+    rn_add("Option",            "seen")
+    rn_add("Some",              "Here")
+    rn_add("None",              "Gone")
+
+# =============================================================================
+# SECTION 2 — NAME LOOKUP
+# =============================================================================
+# Does this identifier appear in the rename table?  Returns the index into
+# the parallel arrays (or -1 if not renamed).
+
+fn rn_lookup(@name: str, @name_len: int) -> int
+    orbit @i in 0..@rename_count
+        @old = @rename_old[@i]
+        if str_eq_len(@old, @name, @name_len)
+            return @i
+    return -1
+
+# Compare a Luna str against a raw (@ptr, @len) byte span.  Returns 1 if
+# their contents match exactly, 0 otherwise.  Uses volatile_read because
+# the raw span lives in the source buffer, not in a Luna-allocated string.
+fn str_eq_len(@canon: str, @raw_ptr: str, @raw_len: int) -> int
+    # Fast-path length mismatch: canon is NUL-terminated; we walk until
+    # NUL and check the count matches @raw_len.
+    @i = 0
+    orbit _ in 0..256
+        @c = 0
+        unsafe
+            @c = volatile_read(@canon + @i)
+        if @c == 0
+            break
+        if @i >= @raw_len
+            return 0
+        @r = 0
+        unsafe
+            @r = volatile_read(@raw_ptr + @i)
+        if @c != @r
+            return 0
+        @i = @i + 1
+    return if @i == @raw_len then 1 else 0
+
+# =============================================================================
+# SECTION 3 — WRITER
+# =============================================================================
+# We emit rewritten bytes into an output buffer.  Simpler than a full
+# string allocator — the caller passes a byte array big enough for the
+# rewrite (for safety, 2× the input length is plenty since renames are
+# length-neutral on average and rarely expand more than 2×).
+
+struct FmtWriter
+    out: [int; 262144]
+    len: int
+    cap: int
+    overflow: int
+
+fn fmtw_new(@cap: int) -> FmtWriter
+    return FmtWriter {
+        out: [0; 262144],
+        len: 0,
+        cap: @cap,
+        overflow: 0
+    }
+
+#[inline]
+fn fmtw_u8(@w: FmtWriter, @b: int)
+    if @w.len >= @w.cap
+        @w.overflow = @w.overflow + 1
+        return
+    @w.out[@w.len] = @b & 0xFF
+    @w.len = @w.len + 1
+
+# Copy [@start .. @end) from the source buffer into the writer.
+fn fmtw_copy_range(@w: FmtWriter, @src: str, @start: int, @end: int)
+    orbit @i in @start..@end
+        @b = 0
+        unsafe
+            @b = volatile_read(@src + @i)
+        fmtw_u8(@w, @b)
+
+# Write an ASCII/Luna str (NUL-terminated canonical).
+fn fmtw_write_str(@w: FmtWriter, @s: str)
+    @i = 0
+    orbit _ in 0..256
+        @c = 0
+        unsafe
+            @c = volatile_read(@s + @i)
+        if @c == 0
+            break
+        fmtw_u8(@w, @c)
+        @i = @i + 1
+
+# =============================================================================
+# SECTION 4 — TOP-LEVEL REWRITE
+# =============================================================================
+
+# Rewrite @src (length @src_len) into @w applying cosmic renames.
+# Returns the new byte length written.  On overflow, returns -1.
+fn fmt_cosmic(@src: str, @src_len: int, @out_buf: FmtWriter) -> int
+    fmt_cosmic_init()
+    @out_buf.len = 0
+    @out_buf.overflow = 0
+
+    # Tokenise.  We reuse the existing Lexer directly.
+    @lex = lexer_new(@src, @src_len)
+    meow @cursor: int = 0     # how much of @src we've already copied to output
+
+    # Lexer state — we consume tokens one at a time via lexer_next_token,
+    # not via lexer_tokenize_all, so we can interleave "copy whitespace"
+    # steps between tokens.
+    orbit _ in 0..1000000
+        @tok = lexer_next_token(@lex)
+        if @tok.kind == TOKEN_EOF
+            break
+        if @tok.kind == TOKEN_INDENT or @tok.kind == TOKEN_DEDENT or @tok.kind == TOKEN_NEWLINE
+            # These tokens don't carry a source span we should rewrite —
+            # their whitespace is handled by the cursor copy below.
+            # Skip directly to the next token, letting cursor catch up.
+            continue
+        if @tok.kind == TOKEN_ERROR
+            # Malformed input; bail with a partial result.
+            break
+
+        # Copy everything in @src between the current cursor and this token's
+        # start — that's the preserved whitespace + comments.
+        if @tok.start > @cursor
+            fmtw_copy_range(@out_buf, @src, @cursor, @tok.start)
+
+        # Decide whether to rewrite THIS token.
+        @rewrite_idx = -1
+        if @tok.kind == TOKEN_IDENT
+            @rewrite_idx = rn_lookup(@src + @tok.start, @tok.length)
+            # Note: keyword tokens are NOT rewritten — they're already part
+            # of the language.  Only IDENTs get cosmic-migrated.
+
+        if @rewrite_idx >= 0
+            fmtw_write_str(@out_buf, @rename_new[@rewrite_idx])
+        else
+            fmtw_copy_range(@out_buf, @src, @tok.start, @tok.start + @tok.length)
+
+        @cursor = @tok.start + @tok.length
+
+    # Copy trailing bytes after the last token (usually a final newline).
+    if @cursor < @src_len
+        fmtw_copy_range(@out_buf, @src, @cursor, @src_len)
+
+    if @out_buf.overflow > 0
+        return -1
+    return @out_buf.len
+
+# =============================================================================
+# SECTION 5 — SELF-TESTS
+# =============================================================================
+
+fn fmt_selftest_simple() -> int
+    # "http_get" should become "beam.fetch" when it's used as a bare ident.
+    @src = "fn main() -> int\n    @r = http_get(url, len)\n    return 0\n"
+    @src_len = 52
+    @w = fmtw_new(262144)
+    @n = fmt_cosmic(@src, @src_len, @w)
+    if @n < 0
+        return 1
+    # The output must contain the substring "beam.fetch"
+    # Search for 'b','e','a','m','.','f','e','t','c','h'
+    meow @found: int = 0
+    orbit @i in 0..@w.len - 10
+        if @w.out[@i] == 98 and @w.out[@i+1] == 101 and @w.out[@i+2] == 97
+            if @w.out[@i+3] == 109 and @w.out[@i+4] == 46 and @w.out[@i+5] == 102
+                if @w.out[@i+6] == 101 and @w.out[@i+7] == 116 and @w.out[@i+8] == 99
+                    if @w.out[@i+9] == 104
+                        @found = 1
+                        break
+    return if @found == 1 then 0 else 2
+
+fn fmt_selftest_preserves_comments() -> int
+    # A comment containing "http_get" must NOT be rewritten.
+    @src = "# http_get is legacy\nlet x = 1\n"
+    @src_len = 30
+    @w = fmtw_new(262144)
+    @n = fmt_cosmic(@src, @src_len, @w)
+    if @n < 0
+        return 1
+    # The output must still contain "http_get" (the comment was preserved).
+    meow @found: int = 0
+    orbit @i in 0..@w.len - 8
+        if @w.out[@i] == 104 and @w.out[@i+1] == 116 and @w.out[@i+2] == 116
+            if @w.out[@i+3] == 112 and @w.out[@i+4] == 95 and @w.out[@i+5] == 103
+                if @w.out[@i+6] == 101 and @w.out[@i+7] == 116
+                    @found = 1
+                    break
+    return if @found == 1 then 0 else 2
+
+fn fmt_selftest_module_rename() -> int
+    # "import http" should become "import beam"
+    @src = "import http\nfn f() { }\n"
+    @src_len = 22
+    @w = fmtw_new(262144)
+    @n = fmt_cosmic(@src, @src_len, @w)
+    if @n < 0
+        return 1
+    # Look for "import beam"
+    if @w.out[7] != 98     # 'b' after "import "
+        return 2
+    if @w.out[8] != 101    # 'e'
+        return 3
+    return 0
+
+fn run_fmt_cosmic_selftests() -> int
+    @pass = 0
+    if fmt_selftest_simple() == 0
+        @pass = @pass + 1
+    if fmt_selftest_preserves_comments() == 0
+        @pass = @pass + 1
+    if fmt_selftest_module_rename() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+export {
+    MAX_RENAMES,
+    FmtWriter,
+    fmtw_new, fmtw_u8, fmtw_copy_range, fmtw_write_str,
+    fmt_cosmic,
+    fmt_cosmic_init,
+    rn_add, rn_lookup,
+    run_fmt_cosmic_selftests
+}

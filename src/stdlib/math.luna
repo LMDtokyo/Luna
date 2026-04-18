@@ -1,0 +1,864 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Math Standard Library — math.luna
+# =============================================================================
+# Pure Luna implementation of mathematical functions.
+# Ported from Rust interpreter builtins and native_compiler math stubs.
+#
+# Features:
+#   - Fundamental constants (PI, E, TAU, EPSILON)
+#   - Basic operations (abs, sign, min, max, clamp, floor, ceil, round)
+#   - Exponential/logarithmic (pow, sqrt, cbrt, exp, log, log2, log10)
+#   - Trigonometric (sin, cos, tan, asin, acos, atan, atan2)
+#   - Hyperbolic (sinh, cosh, tanh)
+#   - PRNG (xorshift64* seedable generator)
+#   - Vector math (2D/3D dot, cross, length, normalize)
+#   - Interpolation (lerp, smoothstep, bezier)
+#   - Self-tests verifying precision against known values
+#
+# All functions use pure computation — no FFI, no OS calls.
+# Precision target: 1e-10 for transcendental functions.
+# =============================================================================
+
+# =============================================================================
+# SECTION 1: FUNDAMENTAL CONSTANTS
+# =============================================================================
+
+const PI: float = 3.14159265358979323846
+const TAU: float = 6.28318530717958647692
+const E: float = 2.71828182845904523536
+const LN2: float = 0.69314718055994530942
+const LN10: float = 2.30258509299404568402
+const LOG2E: float = 1.44269504088896340736
+const LOG10E: float = 0.43429448190325182765
+const SQRT2: float = 1.41421356237309504880
+const SQRT1_2: float = 0.70710678118654752440
+const EPSILON: float = 0.00000000001
+const INF: float = 1.0e308
+const HALF_PI: float = 1.57079632679489661923
+const QUARTER_PI: float = 0.78539816339744830962
+
+# Maximum iterations for iterative algorithms
+const MAX_NEWTON_ITER: int = 64
+const MAX_TAYLOR_TERMS: int = 25
+
+# =============================================================================
+# SECTION 2: BASIC OPERATIONS
+# =============================================================================
+
+# Absolute value
+fn math_abs(@x: float) -> float
+    if @x < 0.0
+        return -@x
+    return @x
+
+# Integer absolute value
+fn math_abs_int(@x: int) -> int
+    if @x < 0
+        return -@x
+    return @x
+
+# Sign function: returns -1.0, 0.0, or 1.0
+fn math_sign(@x: float) -> float
+    if @x > 0.0
+        return 1.0
+    if @x < 0.0
+        return -1.0
+    return 0.0
+
+# Minimum of two floats
+fn math_min(@a: float, @b: float) -> float
+    if @a <= @b
+        return @a
+    return @b
+
+# Maximum of two floats
+fn math_max(@a: float, @b: float) -> float
+    if @a >= @b
+        return @a
+    return @b
+
+# Integer minimum
+fn math_min_int(@a: int, @b: int) -> int
+    if @a <= @b
+        return @a
+    return @b
+
+# Integer maximum
+fn math_max_int(@a: int, @b: int) -> int
+    if @a >= @b
+        return @a
+    return @b
+
+# Clamp value to [lo, hi]
+fn math_clamp(@x: float, @lo: float, @hi: float) -> float
+    if @x < @lo
+        return @lo
+    if @x > @hi
+        return @hi
+    return @x
+
+# Integer clamp
+fn math_clamp_int(@x: int, @lo: int, @hi: int) -> int
+    if @x < @lo
+        return @lo
+    if @x > @hi
+        return @hi
+    return @x
+
+# =============================================================================
+# SECTION 3: ROUNDING OPERATIONS
+# =============================================================================
+
+# Floor: largest integer <= x
+fn math_floor(@x: float) -> float
+    @i = int(@x)
+    if @x < 0.0 and float(@i) != @x
+        return float(@i - 1)
+    return float(@i)
+
+# Ceil: smallest integer >= x
+fn math_ceil(@x: float) -> float
+    @i = int(@x)
+    if @x > 0.0 and float(@i) != @x
+        return float(@i + 1)
+    return float(@i)
+
+# Round to nearest integer (half-up)
+fn math_round(@x: float) -> float
+    if @x >= 0.0
+        return math_floor(@x + 0.5)
+    return math_ceil(@x - 0.5)
+
+# Truncate toward zero
+fn math_trunc(@x: float) -> float
+    return float(int(@x))
+
+# Fractional part
+fn math_fract(@x: float) -> float
+    return @x - math_floor(@x)
+
+# Modulo that always returns positive (Euclidean mod)
+fn math_mod(@a: float, @b: float) -> float
+    @r = @a - math_floor(@a / @b) * @b
+    return @r
+
+# =============================================================================
+# SECTION 4: POWER & ROOT FUNCTIONS
+# =============================================================================
+
+# Integer power (repeated squaring) — O(log n)
+fn math_pow_int(@base: float, @exp: int) -> float
+    if @exp == 0
+        return 1.0
+    if @exp < 0
+        return 1.0 / math_pow_int(@base, -@exp)
+    @result = 1.0
+    @b = @base
+    @e = @exp
+    orbit @_ in 0..64
+        if @e <= 0
+            break
+        if @e % 2 == 1
+            @result = @result * @b
+        @b = @b * @b
+        @e = @e / 2
+    return @result
+
+# Square root via Newton's method
+fn math_sqrt(@x: float) -> float
+    if @x < 0.0
+        return -1.0
+    if @x == 0.0
+        return 0.0
+    if @x == 1.0
+        return 1.0
+    @guess = @x
+    if @x > 1.0
+        @guess = @x / 2.0
+    else
+        @guess = 1.0
+    # Newton iterations: x_{n+1} = (x_n + S/x_n) / 2
+    orbit @_ in 0..MAX_NEWTON_ITER
+        @next = (@guess + @x / @guess) * 0.5
+        if math_abs(@next - @guess) < EPSILON
+            return @next
+        @guess = @next
+    return @guess
+
+# Cube root via Newton's method
+fn math_cbrt(@x: float) -> float
+    if @x == 0.0
+        return 0.0
+    @neg = 0
+    @val = @x
+    if @x < 0.0
+        @neg = 1
+        @val = -@x
+    @guess = @val / 3.0
+    if @guess < 1.0
+        @guess = 1.0
+    orbit @_ in 0..MAX_NEWTON_ITER
+        @next = (2.0 * @guess + @val / (@guess * @guess)) / 3.0
+        if math_abs(@next - @guess) < EPSILON
+            if @neg == 1
+                return -@next
+            return @next
+        @guess = @next
+    if @neg == 1
+        return -@guess
+    return @guess
+
+# Hypotenuse: sqrt(a^2 + b^2) — avoids overflow
+fn math_hypot(@a: float, @b: float) -> float
+    @aa = math_abs(@a)
+    @bb = math_abs(@b)
+    if @aa > @bb
+        @r = @bb / @aa
+        return @aa * math_sqrt(1.0 + @r * @r)
+    if @bb == 0.0
+        return 0.0
+    @r = @aa / @bb
+    return @bb * math_sqrt(1.0 + @r * @r)
+
+# =============================================================================
+# SECTION 5: EXPONENTIAL & LOGARITHMIC
+# =============================================================================
+
+# Natural exponential e^x — Taylor series
+fn math_exp(@x: float) -> float
+    if @x == 0.0
+        return 1.0
+    if @x > 709.0
+        return INF
+    if @x < -709.0
+        return 0.0
+    # For large values, use repeated squaring: e^x = (e^(x/2))^2
+    if @x > 20.0 or @x < -20.0
+        @half = math_exp(@x * 0.5)
+        return @half * @half
+    @sum = 1.0
+    @term = 1.0
+    orbit @i in 1..MAX_TAYLOR_TERMS
+        @term = @term * @x / float(@i)
+        @sum = @sum + @term
+        if math_abs(@term) < EPSILON * math_abs(@sum)
+            break
+    return @sum
+
+# Natural logarithm ln(x) — series expansion
+# Uses: ln(x) = 2 * atanh((x-1)/(x+1)) for fast convergence
+fn math_log(@x: float) -> float
+    if @x <= 0.0
+        return -INF
+    if @x == 1.0
+        return 0.0
+    # Range reduction: normalize x to [0.5, 2.0]
+    @e_count = 0
+    @m = @x
+    orbit @_ in 0..1024
+        if @m >= 0.5 and @m <= 2.0
+            break
+        if @m > 2.0
+            @m = @m * 0.5
+            @e_count = @e_count + 1
+        else
+            @m = @m * 2.0
+            @e_count = @e_count - 1
+    # Series: ln(m) = 2 * sum (1/(2k+1)) * ((m-1)/(m+1))^(2k+1)
+    @z = (@m - 1.0) / (@m + 1.0)
+    @z2 = @z * @z
+    @sum = 0.0
+    @power = @z
+    orbit @k in 0..MAX_TAYLOR_TERMS
+        @term = @power / float(2 * @k + 1)
+        @sum = @sum + @term
+        if math_abs(@term) < EPSILON
+            break
+        @power = @power * @z2
+    return 2.0 * @sum + float(@e_count) * LN2
+
+# Log base 2
+fn math_log2(@x: float) -> float
+    return math_log(@x) * LOG2E
+
+# Log base 10
+fn math_log10(@x: float) -> float
+    return math_log(@x) * LOG10E
+
+# General power: a^b = e^(b * ln(a))
+fn math_pow(@base: float, @exp: float) -> float
+    if @exp == 0.0
+        return 1.0
+    if @base == 0.0
+        if @exp > 0.0
+            return 0.0
+        return INF
+    if @base == 1.0
+        return 1.0
+    @int_exp = int(@exp)
+    if float(@int_exp) == @exp and @int_exp >= -30 and @int_exp <= 30
+        return math_pow_int(@base, @int_exp)
+    if @base > 0.0
+        return math_exp(@exp * math_log(@base))
+    return -1.0
+
+# =============================================================================
+# SECTION 6: TRIGONOMETRIC FUNCTIONS
+# =============================================================================
+
+# Reduce angle to [-PI, PI] range
+fn trig_reduce(@x: float) -> float
+    @r = @x
+    orbit @_ in 0..100
+        if @r > PI
+            @r = @r - TAU
+        else if @r < -PI
+            @r = @r + TAU
+        else
+            break
+    return @r
+
+# Sine via Taylor series: sin(x) = x - x^3/3! + x^5/5! - ...
+fn math_sin(@x: float) -> float
+    @r = trig_reduce(@x)
+    @sum = 0.0
+    @term = @r
+    @r2 = @r * @r
+    orbit @k in 0..15
+        @sum = @sum + @term
+        @term = -@term * @r2 / float((2 * @k + 2) * (2 * @k + 3))
+        if math_abs(@term) < EPSILON
+            break
+    return @sum
+
+# Cosine via Taylor series: cos(x) = 1 - x^2/2! + x^4/4! - ...
+fn math_cos(@x: float) -> float
+    @r = trig_reduce(@x)
+    @sum = 0.0
+    @term = 1.0
+    @r2 = @r * @r
+    orbit @k in 0..15
+        @sum = @sum + @term
+        @term = -@term * @r2 / float((2 * @k + 1) * (2 * @k + 2))
+        if math_abs(@term) < EPSILON
+            break
+    return @sum
+
+# Tangent
+fn math_tan(@x: float) -> float
+    @c = math_cos(@x)
+    if math_abs(@c) < EPSILON
+        if math_sin(@x) > 0.0
+            return INF
+        return -INF
+    return math_sin(@x) / @c
+
+# Arc sine via Taylor series + identity for |x| near 1
+fn math_asin(@x: float) -> float
+    if @x < -1.0 or @x > 1.0
+        return -1.0
+    if @x == 1.0
+        return HALF_PI
+    if @x == -1.0
+        return -HALF_PI
+    if math_abs(@x) < 0.7
+        @sum = @x
+        @term = @x
+        @x2 = @x * @x
+        orbit @k in 1..20
+            @term = @term * @x2 * float(2 * @k - 1) * float(2 * @k - 1) / (float(2 * @k) * float(2 * @k + 1))
+            @sum = @sum + @term
+            if math_abs(@term) < EPSILON
+                break
+        return @sum
+    if @x > 0.0
+        return HALF_PI - 2.0 * math_asin(math_sqrt((1.0 - @x) * 0.5))
+    return -HALF_PI + 2.0 * math_asin(math_sqrt((1.0 + @x) * 0.5))
+
+# Arc cosine: acos(x) = PI/2 - asin(x)
+fn math_acos(@x: float) -> float
+    return HALF_PI - math_asin(@x)
+
+# Arc tangent via Taylor series
+fn math_atan(@x: float) -> float
+    if @x > 1.0
+        return HALF_PI - math_atan(1.0 / @x)
+    if @x < -1.0
+        return -HALF_PI - math_atan(1.0 / @x)
+    @sum = 0.0
+    @term = @x
+    @x2 = @x * @x
+    orbit @k in 0..50
+        @sum = @sum + @term / float(2 * @k + 1)
+        @term = -@term * @x2
+        if math_abs(@term / float(2 * @k + 3)) < EPSILON
+            break
+    return @sum
+
+# Two-argument arc tangent
+fn math_atan2(@y: float, @x: float) -> float
+    if @x > 0.0
+        return math_atan(@y / @x)
+    if @x < 0.0
+        if @y >= 0.0
+            return math_atan(@y / @x) + PI
+        return math_atan(@y / @x) - PI
+    if @y > 0.0
+        return HALF_PI
+    if @y < 0.0
+        return -HALF_PI
+    return 0.0
+
+# =============================================================================
+# SECTION 7: HYPERBOLIC FUNCTIONS
+# =============================================================================
+
+fn math_sinh(@x: float) -> float
+    @ep = math_exp(@x)
+    @em = math_exp(-@x)
+    return (@ep - @em) * 0.5
+
+fn math_cosh(@x: float) -> float
+    @ep = math_exp(@x)
+    @em = math_exp(-@x)
+    return (@ep + @em) * 0.5
+
+fn math_tanh(@x: float) -> float
+    if @x > 20.0
+        return 1.0
+    if @x < -20.0
+        return -1.0
+    @ep = math_exp(2.0 * @x)
+    return (@ep - 1.0) / (@ep + 1.0)
+
+# =============================================================================
+# SECTION 8: PSEUDO-RANDOM NUMBER GENERATOR (xorshift64*)
+# =============================================================================
+
+const PRNG_MULTIPLIER: int = 2685821657736338717
+
+struct MathRng
+    state: int
+
+fn math_rng_new(@seed: int) -> MathRng
+    @s = @seed
+    if @s == 0
+        @s = 88172645463325252
+    return MathRng { state: @s }
+
+fn math_rng_next(@rng: MathRng) -> int
+    @s = @rng.state
+    @s = @s ^ (@s >> 12)
+    @s = @s ^ (@s << 25)
+    @s = @s ^ (@s >> 27)
+    @rng.state = @s
+    @result = @s * PRNG_MULTIPLIER
+    if @result < 0
+        @result = -@result
+    return @result
+
+fn math_random(@rng: MathRng) -> float
+    @val = math_rng_next(@rng)
+    @positive = @val % 1000000007
+    if @positive < 0
+        @positive = -@positive
+    return float(@positive) / 1000000007.0
+
+fn math_random_range(@rng: MathRng, @lo: int, @hi: int) -> int
+    if @lo >= @hi
+        return @lo
+    @range = @hi - @lo
+    @val = math_rng_next(@rng) % @range
+    if @val < 0
+        @val = -@val
+    return @lo + @val
+
+fn math_random_bool(@rng: MathRng, @p: float) -> int
+    if math_random(@rng) < @p
+        return 1
+    return 0
+
+fn math_shuffle(@rng: MathRng, @arr: [int; 256], @len: int)
+    orbit @i in 0..(@len - 1)
+        @j = @i + math_random_range(@rng, 0, @len - @i)
+        if @j != @i and @j < @len
+            @tmp = @arr[@i]
+            @arr[@i] = @arr[@j]
+            @arr[@j] = @tmp
+
+# =============================================================================
+# SECTION 9: INTERPOLATION & EASING
+# =============================================================================
+
+fn math_lerp(@a: float, @b: float, @t: float) -> float
+    return @a + @t * (@b - @a)
+
+fn math_inverse_lerp(@a: float, @b: float, @v: float) -> float
+    if math_abs(@b - @a) < EPSILON
+        return 0.0
+    return (@v - @a) / (@b - @a)
+
+fn math_smoothstep(@edge0: float, @edge1: float, @x: float) -> float
+    @t = math_clamp((@x - @edge0) / (@edge1 - @edge0), 0.0, 1.0)
+    return @t * @t * (3.0 - 2.0 * @t)
+
+fn math_smootherstep(@edge0: float, @edge1: float, @x: float) -> float
+    @t = math_clamp((@x - @edge0) / (@edge1 - @edge0), 0.0, 1.0)
+    return @t * @t * @t * (@t * (@t * 6.0 - 15.0) + 10.0)
+
+fn math_bezier_quad(@p0: float, @p1: float, @p2: float, @t: float) -> float
+    @u = 1.0 - @t
+    return @u * @u * @p0 + 2.0 * @u * @t * @p1 + @t * @t * @p2
+
+fn math_bezier_cubic(@p0: float, @p1: float, @p2: float, @p3: float, @t: float) -> float
+    @u = 1.0 - @t
+    @u2 = @u * @u
+    @t2 = @t * @t
+    return @u2 * @u * @p0 + 3.0 * @u2 * @t * @p1 + 3.0 * @u * @t2 * @p2 + @t2 * @t * @p3
+
+# =============================================================================
+# SECTION 10: VECTOR MATHEMATICS
+# =============================================================================
+
+fn vec2_dot(@ax: float, @ay: float, @bx: float, @by: float) -> float
+    return @ax * @bx + @ay * @by
+
+fn vec2_len(@x: float, @y: float) -> float
+    return math_sqrt(@x * @x + @y * @y)
+
+fn vec2_normalize_x(@x: float, @y: float) -> float
+    @len = vec2_len(@x, @y)
+    if @len < EPSILON
+        return 0.0
+    return @x / @len
+
+fn vec2_normalize_y(@x: float, @y: float) -> float
+    @len = vec2_len(@x, @y)
+    if @len < EPSILON
+        return 0.0
+    return @y / @len
+
+fn vec2_dist(@ax: float, @ay: float, @bx: float, @by: float) -> float
+    return vec2_len(@bx - @ax, @by - @ay)
+
+fn vec3_dot(@ax: float, @ay: float, @az: float, @bx: float, @by: float, @bz: float) -> float
+    return @ax * @bx + @ay * @by + @az * @bz
+
+fn vec3_cross_x(@ax: float, @ay: float, @az: float, @bx: float, @by: float, @bz: float) -> float
+    return @ay * @bz - @az * @by
+
+fn vec3_cross_y(@ax: float, @ay: float, @az: float, @bx: float, @by: float, @bz: float) -> float
+    return @az * @bx - @ax * @bz
+
+fn vec3_cross_z(@ax: float, @ay: float, @az: float, @bx: float, @by: float, @bz: float) -> float
+    return @ax * @by - @ay * @bx
+
+fn vec3_len(@x: float, @y: float, @z: float) -> float
+    return math_sqrt(@x * @x + @y * @y + @z * @z)
+
+fn vec3_dist(@ax: float, @ay: float, @az: float, @bx: float, @by: float, @bz: float) -> float
+    return vec3_len(@bx - @ax, @by - @ay, @bz - @az)
+
+# =============================================================================
+# SECTION 11: ADDITIONAL UTILITIES
+# =============================================================================
+
+fn math_to_radians(@deg: float) -> float
+    return @deg * PI / 180.0
+
+fn math_to_degrees(@rad: float) -> float
+    return @rad * 180.0 / PI
+
+fn math_gcd(@a: int, @b: int) -> int
+    @x = math_abs_int(@a)
+    @y = math_abs_int(@b)
+    orbit @_ in 0..100
+        if @y == 0
+            return @x
+        @tmp = @y
+        @y = @x % @y
+        @x = @tmp
+    return @x
+
+fn math_lcm(@a: int, @b: int) -> int
+    if @a == 0 or @b == 0
+        return 0
+    @g = math_gcd(@a, @b)
+    return math_abs_int(@a / @g * @b)
+
+fn math_fib(@n: int) -> int
+    if @n <= 0
+        return 0
+    if @n == 1
+        return 1
+    @a = 0
+    @b = 1
+    orbit @_ in 2..(@n + 1)
+        @tmp = @a + @b
+        @a = @b
+        @b = @tmp
+    return @b
+
+fn math_is_prime(@n: int) -> int
+    if @n < 2
+        return 0
+    if @n < 4
+        return 1
+    if @n % 2 == 0 or @n % 3 == 0
+        return 0
+    @i = 5
+    orbit @_ in 0..1000
+        if @i * @i > @n
+            break
+        if @n % @i == 0 or @n % (@i + 2) == 0
+            return 0
+        @i = @i + 6
+    return 1
+
+fn math_factorial(@n: int) -> int
+    if @n < 0
+        return -1
+    if @n <= 1
+        return 1
+    @result = 1
+    orbit @i in 2..(@n + 1)
+        @result = @result * @i
+    return @result
+
+fn math_choose(@n: int, @k: int) -> int
+    if @k < 0 or @k > @n
+        return 0
+    if @k == 0 or @k == @n
+        return 1
+    @kk = @k
+    if @kk > @n - @kk
+        @kk = @n - @kk
+    @result = 1
+    orbit @i in 0..@kk
+        @result = @result * (@n - @i) / (@i + 1)
+    return @result
+
+# =============================================================================
+# SECTION 12: SELF-TESTS
+# =============================================================================
+
+fn approx_eq(@a: float, @b: float, @tol: float) -> int
+    if math_abs(@a - @b) < @tol
+        return 1
+    return 0
+
+fn test_basic_ops()
+    shine("  [test] Basic operations...")
+    guard math_abs(-5.0) == 5.0 else
+        shine("    FAIL: abs(-5)")
+        return
+    guard math_abs(3.0) == 3.0 else
+        shine("    FAIL: abs(3)")
+        return
+    guard math_sign(-7.0) == -1.0 else
+        shine("    FAIL: sign(-7)")
+        return
+    guard math_sign(0.0) == 0.0 else
+        shine("    FAIL: sign(0)")
+        return
+    guard math_min(3.0, 7.0) == 3.0 else
+        shine("    FAIL: min(3,7)")
+        return
+    guard math_max(3.0, 7.0) == 7.0 else
+        shine("    FAIL: max(3,7)")
+        return
+    guard math_clamp(5.0, 0.0, 3.0) == 3.0 else
+        shine("    FAIL: clamp(5,0,3)")
+        return
+    shine("    PASS")
+
+fn test_rounding()
+    shine("  [test] Rounding operations...")
+    guard math_floor(3.7) == 3.0 else
+        shine("    FAIL: floor(3.7)")
+        return
+    guard math_floor(-3.2) == -4.0 else
+        shine("    FAIL: floor(-3.2)")
+        return
+    guard math_ceil(3.2) == 4.0 else
+        shine("    FAIL: ceil(3.2)")
+        return
+    guard math_round(3.5) == 4.0 else
+        shine("    FAIL: round(3.5)")
+        return
+    guard math_trunc(-3.7) == -3.0 else
+        shine("    FAIL: trunc(-3.7)")
+        return
+    shine("    PASS")
+
+fn test_sqrt_pow()
+    shine("  [test] sqrt/pow...")
+    guard approx_eq(math_sqrt(4.0), 2.0, EPSILON) == 1 else
+        shine("    FAIL: sqrt(4) != 2")
+        return
+    guard approx_eq(math_sqrt(9.0), 3.0, EPSILON) == 1 else
+        shine("    FAIL: sqrt(9) != 3")
+        return
+    guard approx_eq(math_sqrt(2.0), SQRT2, 0.0000001) == 1 else
+        shine("    FAIL: sqrt(2) != SQRT2")
+        return
+    guard approx_eq(math_pow(2.0, 10.0), 1024.0, EPSILON) == 1 else
+        shine("    FAIL: pow(2,10) != 1024")
+        return
+    guard approx_eq(math_pow(3.0, 0.0), 1.0, EPSILON) == 1 else
+        shine("    FAIL: pow(3,0) != 1")
+        return
+    shine("    PASS")
+
+fn test_exp_log()
+    shine("  [test] exp/log...")
+    guard approx_eq(math_exp(0.0), 1.0, EPSILON) == 1 else
+        shine("    FAIL: exp(0) != 1")
+        return
+    guard approx_eq(math_exp(1.0), E, 0.0000001) == 1 else
+        shine("    FAIL: exp(1) != E")
+        return
+    guard approx_eq(math_log(1.0), 0.0, EPSILON) == 1 else
+        shine("    FAIL: log(1) != 0")
+        return
+    guard approx_eq(math_log(E), 1.0, 0.0000001) == 1 else
+        shine("    FAIL: log(E) != 1")
+        return
+    guard approx_eq(math_log2(8.0), 3.0, 0.0001) == 1 else
+        shine("    FAIL: log2(8) != 3")
+        return
+    shine("    PASS")
+
+fn test_trig()
+    shine("  [test] Trigonometric...")
+    guard approx_eq(math_sin(0.0), 0.0, EPSILON) == 1 else
+        shine("    FAIL: sin(0) != 0")
+        return
+    guard approx_eq(math_cos(0.0), 1.0, EPSILON) == 1 else
+        shine("    FAIL: cos(0) != 1")
+        return
+    guard approx_eq(math_sin(HALF_PI), 1.0, 0.0000001) == 1 else
+        shine("    FAIL: sin(PI/2) != 1")
+        return
+    guard approx_eq(math_cos(PI), -1.0, 0.0000001) == 1 else
+        shine("    FAIL: cos(PI) != -1")
+        return
+    guard approx_eq(math_tan(0.0), 0.0, EPSILON) == 1 else
+        shine("    FAIL: tan(0) != 0")
+        return
+    shine("    PASS")
+
+fn test_inverse_trig()
+    shine("  [test] Inverse trig...")
+    guard approx_eq(math_asin(0.0), 0.0, EPSILON) == 1 else
+        shine("    FAIL: asin(0) != 0")
+        return
+    guard approx_eq(math_asin(1.0), HALF_PI, 0.0000001) == 1 else
+        shine("    FAIL: asin(1) != PI/2")
+        return
+    guard approx_eq(math_acos(1.0), 0.0, EPSILON) == 1 else
+        shine("    FAIL: acos(1) != 0")
+        return
+    guard approx_eq(math_atan(0.0), 0.0, EPSILON) == 1 else
+        shine("    FAIL: atan(0) != 0")
+        return
+    shine("    PASS")
+
+fn test_hyperbolic()
+    shine("  [test] Hyperbolic...")
+    guard approx_eq(math_sinh(0.0), 0.0, EPSILON) == 1 else
+        shine("    FAIL: sinh(0) != 0")
+        return
+    guard approx_eq(math_cosh(0.0), 1.0, EPSILON) == 1 else
+        shine("    FAIL: cosh(0) != 1")
+        return
+    guard approx_eq(math_tanh(0.0), 0.0, EPSILON) == 1 else
+        shine("    FAIL: tanh(0) != 0")
+        return
+    shine("    PASS")
+
+fn test_prng()
+    shine("  [test] PRNG...")
+    @rng = math_rng_new(42)
+    @val1 = math_random(@rng)
+    @val2 = math_random(@rng)
+    guard @val1 >= 0.0 and @val1 < 1.0 else
+        shine("    FAIL: random not in [0,1)")
+        return
+    guard @val2 >= 0.0 and @val2 < 1.0 else
+        shine("    FAIL: random2 not in [0,1)")
+        return
+    @range_val = math_random_range(@rng, 10, 20)
+    guard @range_val >= 10 and @range_val < 20 else
+        shine("    FAIL: random_range not in [10,20)")
+        return
+    shine("    PASS")
+
+fn test_integer_math()
+    shine("  [test] Integer math...")
+    guard math_gcd(12, 8) == 4 else
+        shine("    FAIL: gcd(12,8) != 4")
+        return
+    guard math_lcm(4, 6) == 12 else
+        shine("    FAIL: lcm(4,6) != 12")
+        return
+    guard math_fib(10) == 55 else
+        shine("    FAIL: fib(10) != 55")
+        return
+    guard math_is_prime(7) == 1 else
+        shine("    FAIL: 7 is prime")
+        return
+    guard math_is_prime(9) == 0 else
+        shine("    FAIL: 9 is not prime")
+        return
+    guard math_factorial(5) == 120 else
+        shine("    FAIL: 5! != 120")
+        return
+    guard math_choose(5, 2) == 10 else
+        shine("    FAIL: C(5,2) != 10")
+        return
+    shine("    PASS")
+
+fn test_vector_math()
+    shine("  [test] Vector math...")
+    guard approx_eq(vec2_dot(1.0, 0.0, 0.0, 1.0), 0.0, EPSILON) == 1 else
+        shine("    FAIL: orthogonal dot != 0")
+        return
+    guard approx_eq(vec2_len(3.0, 4.0), 5.0, EPSILON) == 1 else
+        shine("    FAIL: len(3,4) != 5")
+        return
+    guard approx_eq(vec3_cross_z(1.0, 0.0, 0.0, 0.0, 1.0, 0.0), 1.0, EPSILON) == 1 else
+        shine("    FAIL: cross(x,y).z != 1")
+        return
+    shine("    PASS")
+
+fn test_interpolation()
+    shine("  [test] Interpolation...")
+    guard approx_eq(math_lerp(0.0, 10.0, 0.5), 5.0, EPSILON) == 1 else
+        shine("    FAIL: lerp(0,10,0.5) != 5")
+        return
+    guard approx_eq(math_smoothstep(0.0, 1.0, 0.5), 0.5, 0.001) == 1 else
+        shine("    FAIL: smoothstep(0,1,0.5) != 0.5")
+        return
+    shine("    PASS")
+
+fn run_self_tests()
+    shine("=== Math Standard Library Self-Tests ===")
+    test_basic_ops()
+    test_rounding()
+    test_sqrt_pow()
+    test_exp_log()
+    test_trig()
+    test_inverse_trig()
+    test_hyperbolic()
+    test_prng()
+    test_integer_math()
+    test_vector_math()
+    test_interpolation()
+    shine("=== All Math Tests Done ===")
+
+# Run self-tests when executed directly
+run_self_tests()

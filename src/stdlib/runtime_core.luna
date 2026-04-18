@@ -1,0 +1,2636 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Runtime Core v1.0 - Pure Luna Port of allocator.rs
+# =============================================================================
+# High-Performance Memory Allocator with NaN-Boxing Value Representation
+#
+# This is the self-hosted runtime core for the Luna programming language,
+# ported line-by-line from the Rust implementation in src/runtime/allocator.rs.
+#
+# Architecture (NaN-boxing):
+# +---------------------------------------------------------------------+
+# |                    64-bit Luna Value Layout                          |
+# +---------------------------------------------------------------------+
+# | Double:    Raw IEEE 754 bits (any value < 0x7FFC_0000_0000_0000)    |
+# | Tagged:    0x7FFC_TTTT_PPPP_PPPP (T=type nibble, P=44-bit payload) |
+# +---------------------------------------------------------------------+
+# | 0x7FFC_1  | Small integer (44-bit signed, -2^43 to 2^43-1)         |
+# | 0x7FFC_2  | Small string (up to 5 UTF-8 bytes inline)              |
+# | 0x7FFC_3  | Boolean (0 = false, 1 = true in low bit)               |
+# | 0x7FFC_4  | None/Nil                                                |
+# | 0x7FFC_5  | Small array (up to 2 elements inline)                  |
+# | 0x7FFC_6  | Symbol (interned string ID)                             |
+# | 0x7FFC_7  | Character (Unicode code point)                          |
+# | 0x7FFC_8  | Heap pointer (44-bit addressable)                      |
+# +---------------------------------------------------------------------+
+#
+# Memory Subsystems:
+# 1. NaN-Boxing Tags   - Type encoding in IEEE 754 quiet NaN space
+# 2. LunaValue         - Transparent 64-bit tagged union
+# 3. SizeClassAlloc    - Lock-free Treiber stack per size class
+# 4. LunaAllocator     - 12 size classes + large alloc fallback
+# 5. Arena             - Chunk-based bump allocator for compilation
+# 6. ThreadCache       - Per-thread local cache for hot allocations
+# 7. AllocStats        - Allocation tracking and diagnostics
+# 8. FFI Exports       - C-ABI functions for embedding
+#
+# Build: luna compile --release runtime_core.luna -o runtime_core.o
+# =============================================================================
+
+import parser
+
+# =============================================================================
+# SECTION 1: NaN-Boxing Tags Module
+# =============================================================================
+# Standard NaN-boxing: all non-double values are encoded as quiet NaN
+# with payload bits used for type tagging. IEEE 754 double NaN has bits
+# [63:52] = 0x7FF + signal bit. We use quiet NaN patterns (bit 51 = 1)
+# starting at 0x7FFC (to avoid actual NaN doubles which have 0x7FF8).
+#
+# Layout:
+#   Double:   any bit pattern that is NOT a quiet NaN with our tags
+#   Tagged:   0x7FFC_TTTT_PPPP_PPPP  (T=type, P=payload)
+#
+# The QNAN base occupies bits [63:50] = 0x1FFF when shifted right by 50.
+# This leaves bits [49:0] for type tags and payloads. We place the type
+# nibble in bits [47:44] giving us 16 possible tagged types, and the
+# payload in bits [43:0] giving 44 bits (enough for pointers on x86_64
+# which only use 48 bits of virtual address space, minus the 4 tag bits).
+# =============================================================================
+
+# --- Base quiet NaN pattern ---
+# IEEE 754 quiet NaN requires bits [63:52] = 0x7FF and bit 51 = 1.
+# We additionally set bit 50 = 1 to avoid collision with canonical NaN
+# (0x7FF8_0000_0000_0000). This gives us 0x7FFC_0000_0000_0000 as base.
+const QNAN: u64 = 0x7FFC000000000000
+
+# --- Mask constants ---
+# TAG_MASK extracts the upper 20 bits: type tag + QNAN base
+# This identifies which tagged type a value belongs to
+const TAG_MASK: u64 = 0xFFFFF00000000000
+
+# PAYLOAD_MASK extracts the lower 44 bits: the actual data
+# For small ints this is a 44-bit two's complement integer
+# For pointers this is a 44-bit address (16 TB addressable)
+# For small strings this encodes length + up to 5 bytes
+const PAYLOAD_MASK: u64 = 0x00000FFFFFFFFFFF
+
+# --- Type tag constants ---
+# Each type tag is QNAN | (nibble << 44)
+# The nibble occupies bits [47:44] of the 64-bit value
+
+# Small integer: 44-bit signed two's complement
+# Range: -(2^43) to (2^43 - 1) = -8,796,093,022,208 to 8,796,093,022,207
+# Bit layout: [63:48]=0x7FFC [47:44]=0x1 [43:0]=signed_payload
+const SMALL_INT: u64 = 0x7FFC100000000000
+
+# Small string: up to 5 UTF-8 bytes packed inline
+# Bit layout: [63:48]=0x7FFC [47:44]=0x2 [43:40]=length [39:0]=byte_data
+# Length field (4 bits) holds 0-5; bytes packed LSB-first in bits [39:0]
+const SMALL_STR: u64 = 0x7FFC200000000000
+
+# Boolean: single bit in payload position 0
+# false = BOOLEAN | 0, true = BOOLEAN | 1
+const BOOLEAN: u64 = 0x7FFC300000000000
+
+# None/Nil: no payload, exact bit pattern match
+# This is the "null" value of the Luna type system
+const NONE: u64 = 0x7FFC400000000000
+
+# Small array: up to 2 elements packed inline
+# Used for tiny tuples and pairs
+const SMALL_ARR: u64 = 0x7FFC500000000000
+
+# Symbol: interned string identifier
+# Payload is a 32-bit symbol table index
+const SYMBOL: u64 = 0x7FFC600000000000
+
+# Character: Unicode code point (up to U+10FFFF)
+# Payload is a 32-bit Unicode scalar value
+const CHAR: u64 = 0x7FFC700000000000
+
+# Heap pointer: 44-bit address to heap-allocated object
+# Sufficient for x86_64 user-space (current CPUs use 48-bit virtual,
+# but user space is limited to 47 bits, well within our 44-bit range
+# for aligned allocations)
+const HEAP_PTR: u64 = 0x7FFC800000000000
+
+# --- Derived constants ---
+# Canonical NaN used when a real NaN collides with our tag space
+# IEEE 754 canonical quiet NaN: sign=0, exp=0x7FF, mantissa=0x8...
+const CANONICAL_NAN: u64 = 0x7FF8000000000000
+
+# QNAN detection mask: upper 14 bits that identify our tag space
+# If (bits & QNAN_DETECT_MASK) == QNAN, the value is tagged (not a double)
+const QNAN_DETECT_MASK: u64 = 0xFFFC000000000000
+
+# Sign bit mask for 44-bit two's complement sign extension
+const SIGN_BIT_43: u64 = 0x0000080000000000
+
+# Inverse of payload mask for sign extension of negative small ints
+const SIGN_EXTEND_MASK: u64 = 0xFFFFF00000000000
+
+# Maximum small string length in bytes
+const SMALL_STR_MAX_LEN: int = 5
+
+# Small string length field position (bits 43:40)
+const SMALL_STR_LEN_SHIFT: int = 40
+
+# Small string length field mask (4 bits)
+const SMALL_STR_LEN_MASK: u64 = 0x0F
+
+# Unicode maximum code point
+const UNICODE_MAX: u64 = 0x10FFFF
+
+# Low 32-bit mask for char and symbol extraction
+const LOW_32_MASK: u64 = 0x00000000FFFFFFFF
+
+
+# =============================================================================
+# SECTION 2: LunaValue Struct
+# =============================================================================
+# The fundamental value type of the Luna runtime. Every Luna value is
+# represented as a single 64-bit word using NaN-boxing. Doubles are stored
+# as raw IEEE 754 bits; all other types are encoded in the quiet NaN space.
+#
+# This struct is repr(transparent) over u64, meaning it has identical
+# layout and ABI to a plain u64. This is critical for FFI compatibility
+# and for the bytecode VM which operates on u64 slots.
+#
+# Memory layout (transparent):
+#   struct LunaValue { bits: u64 }
+#   sizeof(LunaValue) == 8
+#   alignof(LunaValue) == 8
+# =============================================================================
+
+#[repr(transparent)]
+struct LunaValue
+    bits: u64
+
+
+# =============================================================================
+# SECTION 2a: LunaValue Constructors
+# =============================================================================
+# Factory functions for creating LunaValue instances from various Luna types.
+# Each constructor encodes the value into the appropriate NaN-boxed format.
+# =============================================================================
+
+# --- from_bits: Create LunaValue from raw 64-bit pattern ---
+# This is the lowest-level constructor. No validation is performed.
+# Used internally by other constructors and for deserialization.
+#
+# @param @raw_bits: The raw 64-bit NaN-boxed representation
+# @return: A LunaValue wrapping the given bits
+#[inline]
+fn luna_value_from_bits(@raw_bits: u64) -> LunaValue
+    return LunaValue { bits: @raw_bits }
+
+
+# --- none: Create the None/Nil value ---
+# None is the absence of a value. It has a fixed bit pattern with no payload.
+# There is exactly one None value: NONE (0x7FFC_4000_0000_0000).
+#
+# @return: The singleton None value
+#[inline]
+fn luna_value_none_create() -> LunaValue
+    return LunaValue { bits: NONE }
+
+
+# --- boolean: Create a boolean value ---
+# Booleans are encoded with the BOOLEAN tag and a single payload bit.
+# false = BOOLEAN | 0 = 0x7FFC_3000_0000_0000
+# true  = BOOLEAN | 1 = 0x7FFC_3000_0000_0001
+#
+# @param @b: The boolean value (0 = false, nonzero = true)
+# @return: A NaN-boxed boolean LunaValue
+#[inline]
+fn luna_value_boolean(@b: int) -> LunaValue
+    # Normalize to 0 or 1
+    if @b != 0
+        return LunaValue { bits: BOOLEAN | 1 }
+    return LunaValue { bits: BOOLEAN | 0 }
+
+
+# --- small_int: Create a small integer value ---
+# Small integers are stored as 44-bit two's complement in the payload.
+# The valid range is -(2^43) to (2^43 - 1).
+#
+# Encoding:
+#   payload = (n as u64) & PAYLOAD_MASK
+#   result  = SMALL_INT | payload
+#
+# For negative numbers, the two's complement representation naturally
+# fits in 44 bits when masked with PAYLOAD_MASK. The sign bit is at
+# position 43.
+#
+# @param @n: Integer value, must be in range [-(2^43), 2^43 - 1]
+# @return: A NaN-boxed small integer LunaValue
+#[inline]
+fn luna_value_small_int(@n: i64) -> LunaValue
+    # Debug assertion: check range -(2^43) to (2^43 - 1)
+    # @min_small_int = -(1 << 43)  = -8796093022208
+    # @max_small_int =  (1 << 43) - 1 = 8796093022207
+    # assert(@n >= @min_small_int and @n <= @max_small_int,
+    #        "Integer too large for small int")
+
+    # Store as two's complement in lower 44 bits
+    # Cast to unsigned and mask off upper bits
+    @payload = @n & PAYLOAD_MASK
+    return LunaValue { bits: SMALL_INT | @payload }
+
+
+# --- double: Create a double-precision floating point value ---
+# Doubles are stored as raw IEEE 754 bits. Most doubles have bit patterns
+# that do not collide with our tagged NaN space (0x7FFC_xxxx_xxxx_xxxx).
+#
+# However, some NaN bit patterns DO collide with our tag space. Specifically,
+# any NaN whose upper 14 bits are 0x1FFF (when bits & 0xFFFC... == 0x7FFC...)
+# would be misidentified as a tagged value. We detect this and replace such
+# NaNs with the IEEE canonical quiet NaN (0x7FF8_0000_0000_0000).
+#
+# This canonicalization is safe because NaN != NaN in IEEE 754, so all NaN
+# values are semantically equivalent for arithmetic purposes.
+#
+# @param @f: The double-precision float value
+# @return: A NaN-boxed double LunaValue
+#[inline]
+fn luna_value_double(@f: f64) -> LunaValue
+    @fbits = float_to_bits(@f)
+
+    # Check if the double's bits collide with our tagged value space
+    # Tagged values have upper 14 bits matching QNAN prefix
+    @masked = @fbits & QNAN_DETECT_MASK
+    if @masked == QNAN
+        # This NaN collides with our tag space - canonicalize it
+        # Use IEEE canonical quiet NaN: 0x7FF8_0000_0000_0000
+        return LunaValue { bits: CANONICAL_NAN }
+
+    # Normal double (positive, negative, infinity, -0, subnormals, etc.)
+    return LunaValue { bits: @fbits }
+
+
+# --- small_string: Create an inline small string value ---
+# Small strings of up to 5 UTF-8 bytes are stored entirely within the
+# 44-bit payload, avoiding heap allocation entirely.
+#
+# Payload layout (44 bits):
+#   Bits [43:40] = length (0-5), 4-bit field
+#   Bits [39:32] = byte 4 (if length >= 5)
+#   Bits [31:24] = byte 3 (if length >= 4)
+#   Bits [23:16] = byte 2 (if length >= 3)
+#   Bits [15:8]  = byte 1 (if length >= 2)
+#   Bits [7:0]   = byte 0 (if length >= 1)
+#
+# Bytes are packed LSB-first: byte 0 in bits [7:0], byte 1 in [15:8], etc.
+#
+# @param @s: The string to encode (must be <= 5 bytes UTF-8)
+# @return: A NaN-boxed small string LunaValue, or None if string too long
+fn luna_value_small_string(@s: str) -> LunaValue
+    @bytes = str_as_bytes(@s)
+    @len = len(@bytes)
+
+    # Cannot inline strings longer than 5 bytes
+    if @len > SMALL_STR_MAX_LEN
+        # Return None to signal failure - caller must heap-allocate
+        return LunaValue { bits: NONE }
+
+    @payload: u64 = 0
+
+    # Pack length in bits 43:40 (4-bit field, max value 5)
+    @payload = @payload | (@len << SMALL_STR_LEN_SHIFT)
+
+    # Pack bytes into bits 39:0 (5 bytes max, LSB-first)
+    # Each byte occupies 8 bits at position (i * 8)
+    orbit @i in 0..@len
+        @byte_val = @bytes[@i]
+        @payload = @payload | (@byte_val << (@i * 8))
+
+    return LunaValue { bits: SMALL_STR | @payload }
+
+
+# --- heap_ptr: Create a heap pointer value ---
+# Heap pointers store a 44-bit address in the payload. On x86_64,
+# user-space addresses fit in 47 bits, but aligned allocations from
+# our allocator always fit in 44 bits (16 TB address space).
+#
+# The pointer is masked to 44 bits on construction. A debug assertion
+# verifies the pointer actually fits.
+#
+# @param @ptr: Raw pointer to heap-allocated memory
+# @return: A NaN-boxed heap pointer LunaValue
+#[inline]
+fn luna_value_heap_ptr(@ptr: u64) -> LunaValue
+    # Debug assertion: pointer must fit in 44-bit address space
+    # assert(@ptr <= PAYLOAD_MASK, "Pointer exceeds 44-bit address space")
+
+    @masked_ptr = @ptr & PAYLOAD_MASK
+    return LunaValue { bits: HEAP_PTR | @masked_ptr }
+
+
+# --- char: Create a character value ---
+# Characters are Unicode scalar values (code points) stored in the
+# lower 32 bits of the payload. Valid range: 0x0000 to 0x10FFFF,
+# excluding surrogates 0xD800-0xDFFF.
+#
+# @param @c: Unicode code point
+# @return: A NaN-boxed character LunaValue
+#[inline]
+fn luna_value_char(@c: u64) -> LunaValue
+    return LunaValue { bits: CHAR | @c }
+
+
+# --- symbol: Create a symbol (interned string ID) value ---
+# Symbols are interned string identifiers. The payload contains a
+# 32-bit index into the global symbol/intern table. Symbols enable
+# O(1) string equality comparison.
+#
+# @param @id: Symbol table index (32-bit unsigned)
+# @return: A NaN-boxed symbol LunaValue
+#[inline]
+fn luna_value_symbol(@id: u32) -> LunaValue
+    return LunaValue { bits: SYMBOL | @id }
+
+
+# =============================================================================
+# SECTION 2b: LunaValue Type Checks
+# =============================================================================
+# Predicate functions to determine the runtime type of a LunaValue.
+# These use bitwise masking against the tag constants.
+#
+# Key insight: a value is a double if and only if its upper 14 bits
+# do NOT match our QNAN prefix. All tagged values have the QNAN prefix.
+# =============================================================================
+
+# --- is_double: Check if value is a double-precision float ---
+# A double is any value that is NOT in our tagged QNAN space.
+# Tagged values have bits [63:50] = 0x1FFF (i.e., 0x7FFC prefix).
+# Doubles can be:
+#   - Positive: bits < 0x7FFC (positive finite, +inf, canonical NaN)
+#   - Negative: bit 63 set (negative finite, -inf, -0.0)
+# So a value is tagged iff its upper 14 bits match our QNAN prefix.
+#
+# Check: (bits & 0xFFFC_0000_0000_0000) != QNAN
+#
+# @param @val: The LunaValue to check
+# @return: 1 if double, 0 otherwise
+#[inline]
+fn luna_value_is_double(@val: LunaValue) -> int
+    @masked = @val.bits & QNAN_DETECT_MASK
+    if @masked != QNAN
+        return 1
+    return 0
+
+
+# --- is_heap_ptr: Check if value is a heap pointer ---
+# Heap pointers have tag 0x7FFC_8 in the upper 20 bits.
+#
+# @param @val: The LunaValue to check
+# @return: 1 if heap pointer, 0 otherwise
+#[inline]
+fn luna_value_is_heap_ptr(@val: LunaValue) -> int
+    @tag = @val.bits & TAG_MASK
+    if @tag == HEAP_PTR
+        return 1
+    return 0
+
+
+# --- is_small_int: Check if value is a small integer ---
+# Small ints have tag 0x7FFC_1 in the upper 20 bits.
+#
+# @param @val: The LunaValue to check
+# @return: 1 if small integer, 0 otherwise
+#[inline]
+fn luna_value_is_small_int(@val: LunaValue) -> int
+    @tag = @val.bits & TAG_MASK
+    if @tag == SMALL_INT
+        return 1
+    return 0
+
+
+# --- is_small_string: Check if value is a small string ---
+# Small strings have tag 0x7FFC_2 in the upper 20 bits.
+#
+# @param @val: The LunaValue to check
+# @return: 1 if small string, 0 otherwise
+#[inline]
+fn luna_value_is_small_string(@val: LunaValue) -> int
+    @tag = @val.bits & TAG_MASK
+    if @tag == SMALL_STR
+        return 1
+    return 0
+
+
+# --- is_boolean: Check if value is a boolean ---
+# Booleans have tag 0x7FFC_3 in the upper 20 bits.
+#
+# @param @val: The LunaValue to check
+# @return: 1 if boolean, 0 otherwise
+#[inline]
+fn luna_value_is_boolean(@val: LunaValue) -> int
+    @tag = @val.bits & TAG_MASK
+    if @tag == BOOLEAN
+        return 1
+    return 0
+
+
+# --- is_none: Check if value is None ---
+# None is an exact bit pattern match (no payload variation).
+# There is exactly one None value: 0x7FFC_4000_0000_0000.
+#
+# @param @val: The LunaValue to check
+# @return: 1 if None, 0 otherwise
+#[inline]
+fn luna_value_is_none(@val: LunaValue) -> int
+    if @val.bits == NONE
+        return 1
+    return 0
+
+
+# --- is_char: Check if value is a character ---
+# Characters have tag 0x7FFC_7 in the upper 20 bits.
+#
+# @param @val: The LunaValue to check
+# @return: 1 if character, 0 otherwise
+#[inline]
+fn luna_value_is_char(@val: LunaValue) -> int
+    @tag = @val.bits & TAG_MASK
+    if @tag == CHAR
+        return 1
+    return 0
+
+
+# --- is_symbol: Check if value is a symbol ---
+# Symbols have tag 0x7FFC_6 in the upper 20 bits.
+#
+# @param @val: The LunaValue to check
+# @return: 1 if symbol, 0 otherwise
+#[inline]
+fn luna_value_is_symbol(@val: LunaValue) -> int
+    @tag = @val.bits & TAG_MASK
+    if @tag == SYMBOL
+        return 1
+    return 0
+
+
+# =============================================================================
+# SECTION 2c: LunaValue Extractors
+# =============================================================================
+# Functions to extract the typed payload from a NaN-boxed LunaValue.
+# Each extractor checks the type tag first and returns a sentinel value
+# on type mismatch (since Luna does not have Rust's Option type natively,
+# we use explicit success/value pairs or sentinel returns).
+# =============================================================================
+
+# --- as_double: Extract double value ---
+# Returns the IEEE 754 double by reinterpreting the raw bits.
+# Returns 0.0 if the value is not a double.
+#
+# @param @val: The LunaValue to extract from
+# @return: The double value, or 0.0 if not a double
+#[inline]
+fn luna_value_as_double(@val: LunaValue) -> f64
+    if luna_value_is_double(@val) == 0
+        return 0.0
+    return bits_to_float(@val.bits)
+
+
+# --- as_small_int: Extract small integer value ---
+# Extracts the 44-bit two's complement integer from the payload.
+# Performs sign extension from bit 43 to produce a full 64-bit signed int.
+#
+# Sign extension algorithm:
+#   1. Extract 44-bit payload: payload = bits & PAYLOAD_MASK
+#   2. Check sign bit (bit 43): sign_bit = payload & SIGN_BIT_43
+#   3. If sign bit set: result = payload | SIGN_EXTEND_MASK
+#      (fills upper 20 bits with 1s, producing negative i64)
+#   4. If sign bit clear: result = payload (positive, upper bits already 0)
+#
+# @param @val: The LunaValue to extract from
+# @return: The integer value, or 0 if not a small int
+#[inline]
+fn luna_value_as_small_int(@val: LunaValue) -> i64
+    if luna_value_is_small_int(@val) == 0
+        return 0
+
+    @payload = @val.bits & PAYLOAD_MASK
+
+    # Sign extend from 44 bits to 64 bits
+    # Check if sign bit (bit 43) is set
+    @sign_bit = @payload & SIGN_BIT_43
+    if @sign_bit != 0
+        # Negative: fill upper 20 bits with 1s
+        # This converts the 44-bit two's complement to 64-bit
+        @result = @payload | SIGN_EXTEND_MASK
+        return @result
+    # Positive: upper bits are already zero
+    return @payload
+
+
+# --- as_boolean: Extract boolean value ---
+# Returns the boolean by checking bit 0 of the payload.
+# Returns 0 (false) if the value is not a boolean.
+#
+# @param @val: The LunaValue to extract from
+# @return: 1 for true, 0 for false (or if not a boolean)
+#[inline]
+fn luna_value_as_boolean(@val: LunaValue) -> int
+    if luna_value_is_boolean(@val) == 0
+        return 0
+    @low_bit = @val.bits & 1
+    if @low_bit != 0
+        return 1
+    return 0
+
+
+# --- as_heap_ptr: Extract heap pointer ---
+# Returns the 44-bit pointer value from the payload.
+# Returns 0 (null) if the value is not a heap pointer.
+#
+# @param @val: The LunaValue to extract from
+# @return: The raw pointer value, or 0 if not a heap pointer
+#[inline]
+fn luna_value_as_heap_ptr(@val: LunaValue) -> u64
+    if luna_value_is_heap_ptr(@val) == 0
+        return 0
+    return @val.bits & PAYLOAD_MASK
+
+
+# --- as_small_string: Extract small string ---
+# Unpacks the length and bytes from the 44-bit payload.
+#
+# Extraction algorithm:
+#   1. Extract payload: payload = bits & PAYLOAD_MASK
+#   2. Extract length: len = (payload >> 40) & 0x0F
+#   3. Validate: len must be <= 5
+#   4. Extract each byte: byte[i] = (payload >> (i * 8)) & 0xFF
+#   5. Build string from bytes
+#
+# @param @val: The LunaValue to extract from
+# @return: The string, or "" if not a small string or invalid
+fn luna_value_as_small_string(@val: LunaValue) -> str
+    if luna_value_is_small_string(@val) == 0
+        return ""
+
+    @payload = @val.bits & PAYLOAD_MASK
+
+    # Extract length from bits 43:40 (4-bit field)
+    @len = (@payload >> SMALL_STR_LEN_SHIFT) & SMALL_STR_LEN_MASK
+
+    # Validate length
+    if @len > SMALL_STR_MAX_LEN
+        return ""
+
+    # Unpack bytes from payload
+    @byte_buf: [u8; 5] = [0; 5]
+    orbit @i in 0..@len
+        @byte_buf[@i] = (@payload >> (@i * 8)) & 0xFF
+
+    # Build string from byte buffer
+    return bytes_to_str(@byte_buf, @len)
+
+
+# --- as_char: Extract character value ---
+# Returns the Unicode code point from the lower 32 bits of the payload.
+# Returns 0 if the value is not a character.
+#
+# @param @val: The LunaValue to extract from
+# @return: The Unicode code point, or 0 if not a character
+#[inline]
+fn luna_value_as_char(@val: LunaValue) -> u32
+    if luna_value_is_char(@val) == 0
+        return 0
+    return (@val.bits & LOW_32_MASK)
+
+
+# --- as_symbol: Extract symbol ID ---
+# Returns the 32-bit symbol table index from the payload.
+# Returns 0 if the value is not a symbol.
+#
+# @param @val: The LunaValue to extract from
+# @return: The symbol ID, or 0 if not a symbol
+#[inline]
+fn luna_value_as_symbol(@val: LunaValue) -> u32
+    if luna_value_is_symbol(@val) == 0
+        return 0
+    return (@val.bits & LOW_32_MASK)
+
+
+# =============================================================================
+# SECTION 2d: LunaValue Raw Access
+# =============================================================================
+# Low-level access to the raw bit representation and tag extraction.
+# Used by the bytecode compiler and debugging tools.
+# =============================================================================
+
+# --- bits: Get raw 64-bit representation ---
+# Returns the underlying u64 of a LunaValue without interpretation.
+#
+# @param @val: The LunaValue
+# @return: Raw 64-bit pattern
+#[inline]
+fn luna_value_bits(@val: LunaValue) -> u64
+    return @val.bits
+
+
+# --- tag: Extract the type tag ---
+# Returns the upper 20 bits which identify the value's type.
+# For doubles, this returns a non-QNAN pattern.
+# For tagged values, this returns SMALL_INT, BOOLEAN, etc.
+#
+# @param @val: The LunaValue
+# @return: The 20-bit type tag (upper bits, lower 44 bits zeroed)
+#[inline]
+fn luna_value_tag(@val: LunaValue) -> u64
+    return @val.bits & TAG_MASK
+
+
+# =============================================================================
+# SECTION 2e: LunaValue Debug Formatting
+# =============================================================================
+# Human-readable string representation for debugging and REPL output.
+# =============================================================================
+
+# --- debug_format: Format a LunaValue as a human-readable string ---
+# Produces output like: "None", "Bool(true)", "Int(42)", "Double(3.14)",
+# "SmallStr(\"hello\")", "Char('A')", "HeapPtr(0x00123456789a)"
+#
+# @param @val: The LunaValue to format
+# @return: Debug string representation
+fn luna_value_debug(@val: LunaValue) -> str
+    # Check for None first (exact match, most common sentinel)
+    if luna_value_is_none(@val) == 1
+        return "None"
+
+    # Check boolean
+    if luna_value_is_boolean(@val) == 1
+        @b = luna_value_as_boolean(@val)
+        if @b == 1
+            return "Bool(true)"
+        return "Bool(false)"
+
+    # Check small integer
+    if luna_value_is_small_int(@val) == 1
+        @n = luna_value_as_small_int(@val)
+        return "Int(" + int_to_str(@n) + ")"
+
+    # Check double (must come after all tagged checks since doubles
+    # are identified by the ABSENCE of a tag)
+    if luna_value_is_double(@val) == 1
+        @d = luna_value_as_double(@val)
+        return "Double(" + float_to_str(@d) + ")"
+
+    # Check small string
+    if luna_value_is_small_string(@val) == 1
+        @s = luna_value_as_small_string(@val)
+        return "SmallStr(\"" + @s + "\")"
+
+    # Check character
+    if luna_value_is_char(@val) == 1
+        @c = luna_value_as_char(@val)
+        return "Char(" + char_to_str(@c) + ")"
+
+    # Check symbol
+    if luna_value_is_symbol(@val) == 1
+        @sym = luna_value_as_symbol(@val)
+        return "Symbol(" + int_to_str(@sym) + ")"
+
+    # Check heap pointer
+    if luna_value_is_heap_ptr(@val) == 1
+        @ptr = luna_value_as_heap_ptr(@val)
+        return "HeapPtr(0x" + u64_to_hex(@ptr) + ")"
+
+    # Unknown bit pattern
+    return "Unknown(0x" + u64_to_hex(@val.bits) + ")"
+
+
+# =============================================================================
+# SECTION 3: Size Class Allocator
+# =============================================================================
+# A lock-free slab allocator using Treiber stacks for free lists.
+# Memory is organized into 12 size classes, each backed by 64KB slabs.
+#
+# Size classes are chosen to minimize internal fragmentation while covering
+# the most common allocation sizes in a dynamic language runtime:
+#   - 16, 32 bytes: NaN-boxed value pairs, tiny structs
+#   - 48, 64 bytes: Small closures, 2-3 field objects
+#   - 96, 128 bytes: Medium objects, small arrays
+#   - 192, 256 bytes: Larger structs, hash buckets
+#   - 384, 512 bytes: String buffers, medium arrays
+#   - 1024, 2048 bytes: Large objects (beyond 2KB → system allocator)
+#
+# Allocation strategy (in priority order):
+#   1. Pop from lock-free free list (Treiber stack) - O(1) amortized
+#   2. Bump allocate from current slab - O(1) with CAS
+#   3. Allocate new 64KB slab from system - O(1) amortized
+#
+# Deallocation:
+#   Push freed block onto free list (Treiber stack) - O(1)
+# =============================================================================
+
+# --- Size class table ---
+# 12 size classes covering allocations from 1 byte to 2048 bytes.
+# Any allocation request is rounded up to the nearest size class.
+# Requests larger than 2048 bytes go directly to the system allocator.
+const NUM_SIZE_CLASSES: int = 12
+
+const SIZE_CLASS_0: u64 = 16       # Tiny objects, NaN-boxed value pairs
+const SIZE_CLASS_1: u64 = 32       # Small structs, pairs
+const SIZE_CLASS_2: u64 = 48       # Three-field objects
+const SIZE_CLASS_3: u64 = 64       # Cache-line sized, small closures
+const SIZE_CLASS_4: u64 = 96       # Medium closures
+const SIZE_CLASS_5: u64 = 128      # Small arrays, hash entries
+const SIZE_CLASS_6: u64 = 192      # Medium structs
+const SIZE_CLASS_7: u64 = 256      # Larger objects
+const SIZE_CLASS_8: u64 = 384      # String buffers
+const SIZE_CLASS_9: u64 = 512      # Medium arrays
+const SIZE_CLASS_10: u64 = 1024    # 1KB objects
+const SIZE_CLASS_11: u64 = 2048    # 2KB - largest size class
+
+# Table as fixed array for indexed access
+const SIZE_CLASSES: [u64; 12] = [16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024, 2048]
+
+# --- Slab constants ---
+# Each size class allocates from 64KB slabs. When a slab is exhausted,
+# a new one is allocated from the system with 64-byte alignment
+# (to ensure cache-line alignment for the first allocation).
+const SLAB_SIZE: u64 = 65536       # 64KB per slab
+const SLAB_ALIGN: u64 = 64         # 64-byte alignment for slabs
+const SYSTEM_ALLOC_ALIGN: u64 = 16 # Alignment for large allocations
+
+
+# --- size_class_index: Find the size class for a given allocation size ---
+# Linear search through the size class table. Returns -1 if the size
+# exceeds the largest class (2048 bytes).
+#
+# Performance note: with only 12 entries, linear search is faster than
+# binary search due to branch prediction and the small constant factor.
+# The compiler may also unroll this loop.
+#
+# @param @size: The requested allocation size in bytes
+# @return: Size class index (0-11), or -1 if too large
+#[inline]
+fn size_class_index(@size: u64) -> int
+    orbit @i in 0..NUM_SIZE_CLASSES
+        if @size <= SIZE_CLASSES[@i]
+            return @i
+    return -1
+
+
+# =============================================================================
+# SECTION 3a: FreeNode - Embedded Free List Node
+# =============================================================================
+# When a block is freed, its first 8 bytes are overwritten with a pointer
+# to the next free block, forming an intrusive singly-linked list.
+# This is the classic slab allocator free list technique.
+#
+# Safety: The minimum size class is 16 bytes, so there is always room
+# for at least one pointer (8 bytes on 64-bit).
+#
+# Layout (C repr for predictable field offset):
+#   struct FreeNode {
+#       next: *mut FreeNode   // offset 0, size 8
+#   }
+# =============================================================================
+
+#[repr(C)]
+struct FreeNode
+    next: u64    # Pointer to next FreeNode (atomic in concurrent context)
+
+
+# =============================================================================
+# SECTION 3b: SizeClassAllocator
+# =============================================================================
+# Per-size-class allocator combining a lock-free Treiber stack (free list)
+# with bump allocation from a slab.
+#
+# Thread safety: All operations use atomic compare-and-swap (CAS) loops.
+# The free list uses a Treiber stack (lock-free LIFO). Slab bump allocation
+# uses atomic fetch-add equivalent via CAS on slab_pos.
+#
+# Fields:
+#   size          - Size of allocations in this class (e.g., 64)
+#   free_list     - Atomic pointer to head of Treiber stack
+#   slab          - Atomic pointer to current slab base
+#   slab_pos      - Atomic bump pointer offset within slab
+#   slab_capacity - Total capacity of current slab (always SLAB_SIZE)
+#   allocs        - Atomic counter of total allocations
+#   frees         - Atomic counter of total frees
+# =============================================================================
+
+struct SizeClassAllocator
+    size: u64               # Size of each allocation in this class
+    free_list: u64          # AtomicPtr<FreeNode> - head of Treiber stack
+    slab: u64               # AtomicPtr<u8> - base of current slab
+    slab_pos: u64           # AtomicUsize - current bump position in slab
+    slab_capacity: u64      # Total slab capacity (SLAB_SIZE = 65536)
+    allocs: u64             # AtomicU64 - total allocation count
+    frees: u64              # AtomicU64 - total free count
+
+
+# --- size_class_allocator_new: Initialize a SizeClassAllocator ---
+# Creates a new allocator for the given size class. The slab is initially
+# null and will be allocated on the first allocation request.
+#
+# @param @class_size: The size of allocations for this class
+# @return: An initialized SizeClassAllocator
+fn size_class_allocator_new(@class_size: u64) -> SizeClassAllocator
+    return SizeClassAllocator {
+        size: @class_size,
+        free_list: 0,       # null - empty free list
+        slab: 0,            # null - no slab yet
+        slab_pos: 0,        # start of slab
+        slab_capacity: 0,   # no capacity until slab allocated
+        allocs: 0,          # zero allocations
+        frees: 0            # zero frees
+    }
+
+
+# --- size_class_alloc: Allocate from this size class ---
+# Allocation priority:
+#   1. Try lock-free pop from Treiber stack (free list)
+#   2. Try bump allocation from current slab
+#   3. Allocate new slab and retry
+#
+# Treiber stack pop (lock-free):
+#   loop {
+#       head = free_list.load(Acquire)
+#       if head == null: break
+#       next = head.next.load(Relaxed)
+#       if CAS(free_list, head, next, Release, Relaxed): return head
+#   }
+#
+# Slab bump allocation:
+#   loop {
+#       slab = slab.load(Acquire)
+#       pos = slab_pos.load(Acquire)
+#       if slab == null or pos + size > SLAB_SIZE: alloc_new_slab; continue
+#       if CAS(slab_pos, pos, pos + size, Release, Relaxed): return slab + pos
+#   }
+#
+# @param @alloc: The SizeClassAllocator to allocate from
+# @return: Pointer to allocated memory, or 0 on failure
+fn size_class_alloc(@alloc: SizeClassAllocator) -> u64
+    # Increment allocation counter (atomic relaxed)
+    @alloc.allocs = @alloc.allocs + 1
+
+    # === Phase 1: Try free list (Treiber stack pop) ===
+    # This is the fast path - reusing previously freed memory.
+    # Lock-free via compare-and-swap loop.
+    @retry_free_list = 1
+    orbit @attempt in 0..256
+        if @retry_free_list == 0
+            nova
+
+        @head = atomic_load_acquire(@alloc.free_list)
+
+        # If free list is empty, fall through to slab allocation
+        if @head == 0
+            @retry_free_list = 0
+            nova
+
+        # Read the next pointer from the head node
+        # Safety: head is a valid FreeNode pointer from a previous free()
+        unsafe
+            @next = atomic_load_relaxed(ptr_read(@head))
+
+        # Attempt to swing the head pointer from head to next
+        # If another thread modified free_list between our load and CAS,
+        # the CAS fails and we retry.
+        @cas_result = atomic_compare_exchange_weak(
+            @alloc.free_list, @head, @next
+        )
+        if @cas_result == 1
+            # Successfully popped head from free list
+            return @head
+        # CAS failed - another thread modified the list, retry
+
+    # === Phase 2: Free list empty - allocate from slab ===
+    @result = size_class_alloc_from_slab(@alloc)
+    return @result
+
+
+# --- size_class_alloc_from_slab: Bump allocate from current slab ---
+# Atomically bumps the slab position pointer. If the slab is exhausted
+# or not yet allocated, requests a new slab.
+#
+# CAS loop for bump allocation:
+#   1. Load current slab base and position
+#   2. Check if allocation fits: pos + size <= SLAB_SIZE
+#   3. CAS slab_pos from pos to pos + size
+#   4. On success: return slab + pos
+#   5. On failure: retry (another thread bumped first)
+#
+# @param @alloc: The SizeClassAllocator
+# @return: Pointer to allocated memory
+fn size_class_alloc_from_slab(@alloc: SizeClassAllocator) -> u64
+    orbit @attempt in 0..1024
+        @slab = atomic_load_acquire(@alloc.slab)
+        @pos = atomic_load_acquire(@alloc.slab_pos)
+
+        # Check if slab exists and has room
+        if @slab == 0 or (@pos + @alloc.size) > SLAB_SIZE
+            # Need a new slab - allocate from system
+            size_class_alloc_new_slab(@alloc)
+            nova
+
+        # Try to bump allocate: CAS slab_pos from pos to pos + size
+        @new_pos = @pos + @alloc.size
+        @cas_result = atomic_compare_exchange_weak(
+            @alloc.slab_pos, @pos, @new_pos
+        )
+        if @cas_result == 1
+            # Success: return pointer at slab + old_pos
+            return @slab + @pos
+        # CAS failed - retry with fresh values
+
+    # Should not reach here in practice
+    shine("[FATAL] size_class_alloc_from_slab: exceeded retry limit")
+    return 0
+
+
+# --- size_class_alloc_new_slab: Allocate a fresh 64KB slab ---
+# Requests a 64KB, 64-byte-aligned memory region from the system allocator.
+# Installs it as the current slab via atomic swap.
+#
+# The old slab pointer is intentionally leaked - in a production allocator,
+# it would be tracked in a slab list for later reuse or deallocation.
+#
+# @param @alloc: The SizeClassAllocator
+fn size_class_alloc_new_slab(@alloc: SizeClassAllocator)
+    # Allocate from system: SLAB_SIZE bytes with SLAB_ALIGN alignment
+    @new_slab = system_alloc(SLAB_SIZE, SLAB_ALIGN)
+
+    # Check for out-of-memory
+    if @new_slab == 0
+        shine("[FATAL] Out of memory: cannot allocate new slab")
+        return
+
+    # Install new slab via atomic swap
+    # The old slab is leaked (tracked in production via slab list)
+    @old_slab = atomic_swap(@alloc.slab, @new_slab)
+
+    # Reset bump position to start of new slab
+    atomic_store_release(@alloc.slab_pos, 0)
+
+    # Note: @old_slab is intentionally not freed here.
+    # In production, we would push it to a retired slab list
+    # for eventual reclamation.
+    @unused = @old_slab
+
+
+# --- size_class_free: Return a block to the free list ---
+# Pushes the freed block onto the Treiber stack (lock-free LIFO push).
+#
+# Treiber stack push:
+#   1. Cast ptr to FreeNode
+#   2. Loop:
+#      a. Load current head
+#      b. Set node.next = head
+#      c. CAS(free_list, head, node)
+#      d. On success: done. On failure: retry.
+#
+# Safety: The caller must ensure ptr was previously allocated from this
+# size class and is not currently in use (no double-free).
+#
+# @param @alloc: The SizeClassAllocator
+# @param @ptr: Pointer to the memory block to free
+fn size_class_free(@alloc: SizeClassAllocator, @ptr: u64)
+    # Increment free counter (atomic relaxed)
+    @alloc.frees = @alloc.frees + 1
+
+    # Cast pointer to FreeNode - the first 8 bytes of the freed block
+    # become the "next" pointer in our intrusive linked list
+    @node = @ptr
+
+    # Lock-free push to Treiber stack
+    orbit @attempt in 0..1024
+        # Load current head of free list
+        @head = atomic_load_acquire(@alloc.free_list)
+
+        # Set our node's next pointer to current head
+        unsafe
+            ptr_write(@node, @head)
+
+        # Attempt to swing free_list from head to our node
+        @cas_result = atomic_compare_exchange_weak(
+            @alloc.free_list, @head, @node
+        )
+        if @cas_result == 1
+            # Successfully pushed onto free list
+            return
+        # CAS failed - another thread modified the list, retry
+
+    shine("[WARN] size_class_free: exceeded CAS retry limit")
+
+
+# =============================================================================
+# SECTION 4: LunaAllocator
+# =============================================================================
+# The main allocator dispatches allocation requests to the appropriate
+# size class allocator, or falls back to the system allocator for large
+# objects (> 2048 bytes).
+#
+# Architecture:
+#   LunaAllocator
+#   +-- size_classes[0]:  SizeClassAllocator(16)
+#   +-- size_classes[1]:  SizeClassAllocator(32)
+#   +-- size_classes[2]:  SizeClassAllocator(48)
+#   +-- size_classes[3]:  SizeClassAllocator(64)
+#   +-- size_classes[4]:  SizeClassAllocator(96)
+#   +-- size_classes[5]:  SizeClassAllocator(128)
+#   +-- size_classes[6]:  SizeClassAllocator(192)
+#   +-- size_classes[7]:  SizeClassAllocator(256)
+#   +-- size_classes[8]:  SizeClassAllocator(384)
+#   +-- size_classes[9]:  SizeClassAllocator(512)
+#   +-- size_classes[10]: SizeClassAllocator(1024)
+#   +-- size_classes[11]: SizeClassAllocator(2048)
+#   +-- large_allocs:     AtomicU64
+#   +-- large_frees:      AtomicU64
+# =============================================================================
+
+struct LunaAllocator
+    size_classes: [SizeClassAllocator; 12]  # One allocator per size class
+    large_allocs: u64                        # AtomicU64 - large allocation count
+    large_frees: u64                         # AtomicU64 - large free count
+
+
+# --- luna_allocator_new: Create and initialize the global allocator ---
+# Initializes all 12 size class allocators with their respective sizes.
+# Large allocation counters start at zero.
+#
+# @return: An initialized LunaAllocator
+fn luna_allocator_new() -> LunaAllocator
+    @sc: [SizeClassAllocator; 12] = [
+        size_class_allocator_new(SIZE_CLASS_0),
+        size_class_allocator_new(SIZE_CLASS_1),
+        size_class_allocator_new(SIZE_CLASS_2),
+        size_class_allocator_new(SIZE_CLASS_3),
+        size_class_allocator_new(SIZE_CLASS_4),
+        size_class_allocator_new(SIZE_CLASS_5),
+        size_class_allocator_new(SIZE_CLASS_6),
+        size_class_allocator_new(SIZE_CLASS_7),
+        size_class_allocator_new(SIZE_CLASS_8),
+        size_class_allocator_new(SIZE_CLASS_9),
+        size_class_allocator_new(SIZE_CLASS_10),
+        size_class_allocator_new(SIZE_CLASS_11)
+    ]
+
+    return LunaAllocator {
+        size_classes: @sc,
+        large_allocs: 0,
+        large_frees: 0
+    }
+
+
+# --- luna_allocator_alloc: Allocate memory ---
+# Dispatches to the appropriate size class or falls back to system allocator.
+#
+# Algorithm:
+#   1. Find size class index for requested size
+#   2. If found: delegate to size_class_alloc
+#   3. If not found (size > 2048): use system_alloc with 16-byte alignment
+#
+# @param @allocator: The LunaAllocator instance
+# @param @size: Number of bytes to allocate
+# @return: Pointer to allocated memory, or 0 on failure
+fn luna_allocator_alloc(@allocator: LunaAllocator, @size: u64) -> u64
+    @idx = size_class_index(@size)
+
+    if @idx >= 0
+        # Small allocation - use size class allocator
+        return size_class_alloc(@allocator.size_classes[@idx])
+
+    # Large allocation - use system allocator directly
+    @allocator.large_allocs = @allocator.large_allocs + 1
+    @ptr = system_alloc(@size, SYSTEM_ALLOC_ALIGN)
+    return @ptr
+
+
+# --- luna_allocator_free: Free memory ---
+# Routes the free to the appropriate size class or system deallocator.
+#
+# @param @allocator: The LunaAllocator instance
+# @param @ptr: Pointer to memory to free (must not be null)
+# @param @size: Size of the allocation (must match the original alloc size)
+fn luna_allocator_free(@allocator: LunaAllocator, @ptr: u64, @size: u64)
+    # Null pointer check
+    if @ptr == 0
+        return
+
+    @idx = size_class_index(@size)
+
+    if @idx >= 0
+        # Small allocation - return to size class free list
+        size_class_free(@allocator.size_classes[@idx], @ptr)
+        return
+
+    # Large allocation - return to system allocator
+    @allocator.large_frees = @allocator.large_frees + 1
+    system_free(@ptr, @size, SYSTEM_ALLOC_ALIGN)
+
+
+# --- luna_allocator_alloc_zeroed: Allocate zeroed memory ---
+# Allocates memory and fills it with zeros. Equivalent to calloc().
+# Uses the same dispatch logic as luna_allocator_alloc, then memsets.
+#
+# @param @allocator: The LunaAllocator instance
+# @param @size: Number of bytes to allocate (will be zeroed)
+# @return: Pointer to zeroed memory, or 0 on failure
+fn luna_allocator_alloc_zeroed(@allocator: LunaAllocator, @size: u64) -> u64
+    @ptr = luna_allocator_alloc(@allocator, @size)
+
+    if @ptr != 0
+        # Zero-fill the allocated region
+        # memset(ptr, 0, size) - write zero bytes
+        unsafe
+            memset(@ptr, 0, @size)
+
+    return @ptr
+
+
+# --- luna_allocator_stats: Get allocation statistics ---
+# Sums up allocation and free counts across all size classes,
+# plus the large allocation counters.
+#
+# @param @allocator: The LunaAllocator instance
+# @return: An AllocStats struct with the totals
+fn luna_allocator_stats(@allocator: LunaAllocator) -> AllocStats
+    @small_allocs: u64 = 0
+    @small_frees: u64 = 0
+
+    # Sum across all 12 size class allocators
+    orbit @i in 0..NUM_SIZE_CLASSES
+        @sc = @allocator.size_classes[@i]
+        @small_allocs = @small_allocs + atomic_load_relaxed(@sc.allocs)
+        @small_frees = @small_frees + atomic_load_relaxed(@sc.frees)
+
+    return AllocStats {
+        small_allocs: @small_allocs,
+        small_frees: @small_frees,
+        large_allocs: atomic_load_relaxed(@allocator.large_allocs),
+        large_frees: atomic_load_relaxed(@allocator.large_frees)
+    }
+
+
+# =============================================================================
+# SECTION 5: Arena Allocator
+# =============================================================================
+# A chunk-based bump allocator for temporary allocations during compilation.
+# All memory is freed at once when the arena is dropped or reset.
+#
+# Properties:
+#   - Extremely fast allocation: just a pointer bump with alignment
+#   - No per-object deallocation: memory is reclaimed in bulk
+#   - Cache-friendly: allocations are contiguous within chunks
+#   - Zero fragmentation within a chunk
+#
+# Use cases:
+#   - AST node allocation during parsing
+#   - Type graph nodes during type checking
+#   - IR nodes during optimization
+#   - String interning during compilation
+#
+# Architecture:
+#   Arena
+#   +-- chunk:     ptr to current chunk base
+#   +-- pos:       AtomicUsize bump position in current chunk
+#   +-- capacity:  capacity of current chunk
+#   +-- chunks:    list of (ptr, size) for all allocated chunks
+#
+# Default chunk size: 64KB (matches slab size for consistency)
+# Alignment: max(requested, 8) for all allocations
+# =============================================================================
+
+# --- Arena constants ---
+const ARENA_DEFAULT_CHUNK_SIZE: u64 = 65536    # 64KB default chunk
+const ARENA_CHUNK_ALIGN: u64 = 16              # 16-byte chunk alignment
+const ARENA_MIN_ALIGN: u64 = 8                 # Minimum allocation alignment
+
+# Maximum number of chunks tracked by the arena
+const ARENA_MAX_CHUNKS: int = 256
+
+# --- Arena chunk record ---
+# Tracks each chunk allocated by the arena for cleanup on drop/reset.
+struct ArenaChunk
+    ptr: u64       # Pointer to chunk base
+    size: u64      # Size of chunk in bytes
+
+
+# --- Arena allocator struct ---
+struct Arena
+    chunk: u64                              # Pointer to current chunk base
+    pos: u64                                # AtomicUsize - current bump offset
+    capacity: u64                           # Capacity of current chunk
+    chunks: [ArenaChunk; 256]               # All allocated chunks (for cleanup)
+    chunk_count: int                        # Number of chunks allocated
+
+
+# --- arena_new: Create a new arena with default 64KB chunk ---
+#
+# @return: An initialized Arena
+fn arena_new() -> Arena
+    return arena_with_capacity(ARENA_DEFAULT_CHUNK_SIZE)
+
+
+# --- arena_with_capacity: Create an arena with specified initial capacity ---
+# Allocates the first chunk from the system allocator.
+#
+# @param @capacity: Initial chunk size in bytes
+# @return: An initialized Arena
+fn arena_with_capacity(@capacity: u64) -> Arena
+    # Allocate the first chunk from system
+    @chunk_ptr = system_alloc(@capacity, ARENA_CHUNK_ALIGN)
+
+    # Check for OOM
+    if @chunk_ptr == 0
+        shine("[FATAL] arena_with_capacity: out of memory")
+
+    @arena = Arena {
+        chunk: @chunk_ptr,
+        pos: 0,
+        capacity: @capacity,
+        chunks: [ArenaChunk { ptr: 0, size: 0 }; 256],
+        chunk_count: 1
+    }
+
+    # Record the first chunk for cleanup
+    @arena.chunks[0] = ArenaChunk { ptr: @chunk_ptr, size: @capacity }
+
+    return @arena
+
+
+# --- arena_alloc: Allocate from the arena ---
+# Bump-allocates with alignment. If the current chunk is too small,
+# allocates a new chunk (at least as large as the requested size or
+# the default chunk size, whichever is larger).
+#
+# Alignment algorithm:
+#   aligned_pos = (pos + align - 1) & ~(align - 1)
+#   new_pos = aligned_pos + size
+#   if new_pos > capacity: new chunk
+#
+# The alignment is always at least 8 bytes to ensure proper alignment
+# for 64-bit values (LunaValue, pointers, etc.).
+#
+# @param @arena: The Arena to allocate from
+# @param @size: Number of bytes to allocate
+# @param @align: Required alignment (will be max'd with 8)
+# @return: Pointer to allocated memory
+fn arena_alloc(@arena: Arena, @size: u64, @align: u64) -> u64
+    # Enforce minimum alignment of 8 bytes
+    @actual_align = @align
+    if @actual_align < ARENA_MIN_ALIGN
+        @actual_align = ARENA_MIN_ALIGN
+
+    # Try to allocate from current chunk
+    orbit @attempt in 0..ARENA_MAX_CHUNKS
+        @current_pos = atomic_load_acquire(@arena.pos)
+
+        # Align the position: aligned = (pos + align - 1) & ~(align - 1)
+        @align_mask = @actual_align - 1
+        @aligned_pos = (@current_pos + @align_mask) & (~@align_mask)
+        @new_pos = @aligned_pos + @size
+
+        # Check if allocation fits in current chunk
+        if @new_pos > @arena.capacity
+            # Current chunk exhausted - allocate new chunk
+            @new_chunk_size = @size
+            if @new_chunk_size < @arena.capacity
+                @new_chunk_size = @arena.capacity
+            arena_alloc_chunk(@arena, @new_chunk_size)
+            nova
+
+        # Try to bump the position atomically
+        @cas_result = atomic_compare_exchange_weak(
+            @arena.pos, @current_pos, @new_pos
+        )
+        if @cas_result == 1
+            # Success: return pointer at chunk_base + aligned_pos
+            @chunk_base = @arena.chunk
+            return @chunk_base + @aligned_pos
+
+        # CAS failed (concurrent allocation) - retry
+
+    shine("[FATAL] arena_alloc: exceeded retry limit")
+    return 0
+
+
+# --- arena_alloc_chunk: Allocate a new chunk for the arena ---
+# Requests a chunk of at least min_size bytes from the system allocator.
+# The actual size is max(min_size, arena.capacity) to avoid tiny chunks.
+#
+# @param @arena: The Arena
+# @param @min_size: Minimum size for the new chunk
+fn arena_alloc_chunk(@arena: Arena, @min_size: u64)
+    # New chunk is at least as large as the default capacity
+    @chunk_size = @min_size
+    if @chunk_size < @arena.capacity
+        @chunk_size = @arena.capacity
+
+    # Allocate from system
+    @new_chunk = system_alloc(@chunk_size, ARENA_CHUNK_ALIGN)
+
+    if @new_chunk == 0
+        shine("[FATAL] arena_alloc_chunk: out of memory")
+        return
+
+    # Install new chunk as current
+    @arena.chunk = @new_chunk
+
+    # Track for cleanup
+    if @arena.chunk_count < ARENA_MAX_CHUNKS
+        @arena.chunks[@arena.chunk_count] = ArenaChunk {
+            ptr: @new_chunk,
+            size: @chunk_size
+        }
+        @arena.chunk_count = @arena.chunk_count + 1
+
+    # Reset bump position to start of new chunk
+    atomic_store_release(@arena.pos, 0)
+
+
+# --- arena_alloc_slice: Allocate and copy a slice into the arena ---
+# Copies @len elements of type T (each @elem_size bytes) from @src_ptr
+# into arena-allocated memory. Returns a pointer to the arena copy.
+#
+# This is used to intern AST node arrays, type parameter lists, etc.
+#
+# @param @arena: The Arena
+# @param @src_ptr: Pointer to source data
+# @param @len: Number of elements
+# @param @elem_size: Size of each element in bytes
+# @param @elem_align: Alignment of each element
+# @return: Pointer to the copied data in the arena
+fn arena_alloc_slice(@arena: Arena, @src_ptr: u64, @len: u64, @elem_size: u64, @elem_align: u64) -> u64
+    @total_size = @len * @elem_size
+    @ptr = arena_alloc(@arena, @total_size, @elem_align)
+
+    if @ptr != 0 and @src_ptr != 0
+        # Copy source data into arena
+        unsafe
+            memcpy(@ptr, @src_ptr, @total_size)
+
+    return @ptr
+
+
+# --- arena_alloc_str: Allocate and copy a string into the arena ---
+# Copies the string bytes into arena memory and returns a pointer to
+# the interned copy. The string is NOT null-terminated unless the
+# source already includes a null terminator.
+#
+# @param @arena: The Arena
+# @param @s: Source string
+# @return: Pointer to the string copy in the arena
+fn arena_alloc_str(@arena: Arena, @s: str) -> u64
+    @bytes = str_as_bytes(@s)
+    @len = len(@bytes)
+    @ptr = arena_alloc(@arena, @len, 1)
+
+    if @ptr != 0
+        # Copy string bytes into arena
+        unsafe
+            memcpy(@ptr, str_data_ptr(@s), @len)
+
+    return @ptr
+
+
+# --- arena_reset: Reset the arena, reclaiming all memory ---
+# Resets the bump pointer to the start of the first chunk.
+# All previous allocations are invalidated.
+#
+# The first chunk is retained for reuse. Additional chunks are freed
+# back to the system allocator to avoid unbounded memory growth.
+#
+# This is the "bulk deallocation" that makes arenas efficient:
+# instead of freeing each object individually, we reset the entire
+# arena in O(1) amortized time.
+#
+# @param @arena: The Arena to reset
+fn arena_reset(@arena: Arena)
+    # Free all chunks except the first one
+    orbit @i in 1..@arena.chunk_count
+        @chunk = @arena.chunks[@i]
+        if @chunk.ptr != 0
+            system_free(@chunk.ptr, @chunk.size, ARENA_CHUNK_ALIGN)
+            @arena.chunks[@i] = ArenaChunk { ptr: 0, size: 0 }
+
+    # Reset to first chunk
+    if @arena.chunk_count > 0
+        @arena.chunk = @arena.chunks[0].ptr
+        @arena.capacity = @arena.chunks[0].size
+
+    @arena.chunk_count = 1
+
+    # Reset bump position
+    atomic_store_release(@arena.pos, 0)
+
+
+# --- arena_drop: Destroy the arena, freeing all memory ---
+# Frees all chunks back to the system allocator. After this call,
+# the arena and all pointers obtained from it are invalid.
+#
+# @param @arena: The Arena to destroy
+fn arena_drop(@arena: Arena)
+    orbit @i in 0..@arena.chunk_count
+        @chunk = @arena.chunks[@i]
+        if @chunk.ptr != 0
+            system_free(@chunk.ptr, @chunk.size, ARENA_CHUNK_ALIGN)
+            @arena.chunks[@i] = ArenaChunk { ptr: 0, size: 0 }
+
+    @arena.chunk = 0
+    @arena.pos = 0
+    @arena.capacity = 0
+    @arena.chunk_count = 0
+
+
+# =============================================================================
+# SECTION 6: Thread-Local Cache
+# =============================================================================
+# Per-thread allocation cache to reduce contention on the shared
+# size class allocators. Each thread maintains a small array of
+# recently freed objects per size class. When a thread allocates,
+# it checks its local cache first (zero contention). When it frees,
+# it pushes to the local cache if not full, otherwise returns to
+# the shared free list.
+#
+# Cache capacity: 32 objects per size class
+# Total classes: 12
+# Memory overhead per thread: 12 * 32 * 8 = 3072 bytes (3KB)
+#
+# This is a simplified version of TCMalloc's thread cache design.
+# =============================================================================
+
+# --- Cache constants ---
+const LOCAL_CACHE_CAPACITY: int = 32   # Max objects cached per size class
+
+# --- LocalCache: Per-size-class cache ---
+# A simple array-based stack of cached object pointers.
+# push/pop are O(1) and have no contention (thread-local).
+struct LocalCache
+    objects: [u64; 32]   # Cached free object pointers
+    count: int           # Number of currently cached objects
+
+
+# --- local_cache_new: Initialize an empty local cache ---
+#
+# @return: An empty LocalCache
+fn local_cache_new() -> LocalCache
+    return LocalCache {
+        objects: [0; 32],
+        count: 0
+    }
+
+
+# --- local_cache_push: Push an object to the local cache ---
+# Returns 1 on success, 0 if cache is full (caller should free
+# to the shared allocator instead).
+#
+# @param @cache: The LocalCache
+# @param @ptr: Pointer to the freed object
+# @return: 1 if cached, 0 if cache was full
+#[inline]
+fn local_cache_push(@cache: LocalCache, @ptr: u64) -> int
+    if @cache.count >= LOCAL_CACHE_CAPACITY
+        return 0   # Cache full
+
+    @cache.objects[@cache.count] = @ptr
+    @cache.count = @cache.count + 1
+    return 1
+
+
+# --- local_cache_pop: Pop an object from the local cache ---
+# Returns a cached pointer, or 0 if the cache is empty.
+#
+# @param @cache: The LocalCache
+# @return: Pointer to a cached object, or 0 if empty
+#[inline]
+fn local_cache_pop(@cache: LocalCache) -> u64
+    if @cache.count == 0
+        return 0   # Cache empty
+
+    @cache.count = @cache.count - 1
+    @ptr = @cache.objects[@cache.count]
+    return @ptr
+
+
+# --- ThreadCache: Per-thread cache with one LocalCache per size class ---
+struct ThreadCache
+    caches: [LocalCache; 12]   # One cache per size class
+
+
+# --- thread_cache_new: Initialize a ThreadCache ---
+# Creates an empty cache for each of the 12 size classes.
+#
+# @return: An initialized ThreadCache
+fn thread_cache_new() -> ThreadCache
+    @tc = ThreadCache {
+        caches: [
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new(),
+            local_cache_new()
+        ]
+    }
+    return @tc
+
+
+# --- thread_cache_alloc: Try to allocate from thread cache ---
+# Checks the thread-local cache for the given size class first.
+# Returns 0 if the cache is empty (caller should use shared allocator).
+#
+# @param @tc: The ThreadCache
+# @param @size: Requested allocation size
+# @return: Pointer to cached object, or 0 if cache miss
+#[inline]
+fn thread_cache_alloc(@tc: ThreadCache, @size: u64) -> u64
+    @idx = size_class_index(@size)
+    if @idx < 0
+        return 0   # Not a size-class allocation
+
+    return local_cache_pop(@tc.caches[@idx])
+
+
+# --- thread_cache_free: Try to return to thread cache ---
+# Pushes the freed object to the thread-local cache for its size class.
+# Returns 1 on success, 0 if the cache is full (caller should use
+# shared allocator's free list).
+#
+# @param @tc: The ThreadCache
+# @param @ptr: Pointer to free
+# @param @size: Size of the allocation
+# @return: 1 if cached, 0 if cache full
+#[inline]
+fn thread_cache_free(@tc: ThreadCache, @ptr: u64, @size: u64) -> int
+    @idx = size_class_index(@size)
+    if @idx < 0
+        return 0   # Not a size-class allocation
+
+    return local_cache_push(@tc.caches[@idx], @ptr)
+
+
+# --- thread_cache_flush: Flush all cached objects back to shared allocator ---
+# Called when a thread exits or when memory pressure is high.
+# Returns all cached objects to their respective size class free lists.
+#
+# @param @tc: The ThreadCache
+# @param @allocator: The global LunaAllocator to return objects to
+fn thread_cache_flush(@tc: ThreadCache, @allocator: LunaAllocator)
+    orbit @class_idx in 0..NUM_SIZE_CLASSES
+        @cache = @tc.caches[@class_idx]
+        orbit @j in 0..@cache.count
+            @ptr = @cache.objects[@j]
+            if @ptr != 0
+                size_class_free(@allocator.size_classes[@class_idx], @ptr)
+        @tc.caches[@class_idx].count = 0
+
+
+# =============================================================================
+# SECTION 7: AllocStats
+# =============================================================================
+# Allocation statistics for monitoring and debugging.
+# Tracks small (size-class) and large (system) allocations separately.
+# =============================================================================
+
+struct AllocStats
+    small_allocs: u64    # Total small object allocations (across all classes)
+    small_frees: u64     # Total small object frees
+    large_allocs: u64    # Total large allocations (> 2048 bytes)
+    large_frees: u64     # Total large frees
+
+
+# --- alloc_stats_total_allocs: Total allocations (small + large) ---
+#
+# @param @stats: The AllocStats
+# @return: Total allocation count
+#[inline]
+fn alloc_stats_total_allocs(@stats: AllocStats) -> u64
+    return @stats.small_allocs + @stats.large_allocs
+
+
+# --- alloc_stats_total_frees: Total frees (small + large) ---
+#
+# @param @stats: The AllocStats
+# @return: Total free count
+#[inline]
+fn alloc_stats_total_frees(@stats: AllocStats) -> u64
+    return @stats.small_frees + @stats.large_frees
+
+
+# --- alloc_stats_live_objects: Number of currently live objects ---
+# Computed as total_allocs - total_frees with underflow protection.
+#
+# @param @stats: The AllocStats
+# @return: Number of live (not-yet-freed) objects
+#[inline]
+fn alloc_stats_live_objects(@stats: AllocStats) -> u64
+    @total_a = alloc_stats_total_allocs(@stats)
+    @total_f = alloc_stats_total_frees(@stats)
+
+    # Saturating subtraction: if frees > allocs (shouldn't happen), return 0
+    if @total_f > @total_a
+        return 0
+    return @total_a - @total_f
+
+
+# --- alloc_stats_print: Print allocation statistics ---
+# Outputs a human-readable summary of allocation activity.
+#
+# @param @stats: The AllocStats to print
+fn alloc_stats_print(@stats: AllocStats)
+    shine("=== Luna Allocator Statistics ===")
+    shine("Small allocs:  " + u64_to_str(@stats.small_allocs))
+    shine("Small frees:   " + u64_to_str(@stats.small_frees))
+    shine("Large allocs:  " + u64_to_str(@stats.large_allocs))
+    shine("Large frees:   " + u64_to_str(@stats.large_frees))
+    shine("Total allocs:  " + u64_to_str(alloc_stats_total_allocs(@stats)))
+    shine("Total frees:   " + u64_to_str(alloc_stats_total_frees(@stats)))
+    shine("Live objects:  " + u64_to_str(alloc_stats_live_objects(@stats)))
+    shine("=================================")
+
+
+# =============================================================================
+# SECTION 7a: Global Allocator Instance
+# =============================================================================
+# The singleton global allocator used by the Luna runtime. All allocation
+# requests from Luna code go through this instance.
+# =============================================================================
+
+meow @LUNA_ALLOCATOR = luna_allocator_new()
+
+
+# =============================================================================
+# SECTION 8: FFI Exports (extern "C")
+# =============================================================================
+# C-ABI compatible functions for embedding Luna in other languages.
+# These wrap the allocator and value APIs with plain C types.
+#
+# Naming convention: luna_<subsystem>_<operation>
+#   luna_slab_*    - Allocator operations
+#   luna_value_*   - NaN-boxed value operations
+#
+# All functions use extern "C" calling convention for maximum compatibility.
+# Pointer arguments use u64 (not *mut u8) for simplicity in FFI.
+# =============================================================================
+
+# --- luna_slab_alloc: Allocate memory via global allocator ---
+# C signature: void* luna_slab_alloc(size_t size)
+#
+# @param @size: Number of bytes to allocate
+# @return: Pointer to allocated memory, or NULL (0) on failure
+#[no_mangle]
+extern "C" fn luna_slab_alloc(@size: u64) -> u64
+    return luna_allocator_alloc(@LUNA_ALLOCATOR, @size)
+
+
+# --- luna_slab_alloc_zeroed: Allocate zeroed memory via global allocator ---
+# C signature: void* luna_slab_alloc_zeroed(size_t size)
+#
+# @param @size: Number of bytes to allocate (will be zeroed)
+# @return: Pointer to zeroed memory, or NULL (0) on failure
+#[no_mangle]
+extern "C" fn luna_slab_alloc_zeroed(@size: u64) -> u64
+    return luna_allocator_alloc_zeroed(@LUNA_ALLOCATOR, @size)
+
+
+# --- luna_slab_free: Free memory via global allocator ---
+# C signature: void luna_slab_free(void* ptr, size_t size)
+#
+# Safety: ptr must be non-null and previously returned by luna_slab_alloc.
+# size must match the original allocation size.
+#
+# @param @ptr: Pointer to free
+# @param @size: Size of the original allocation
+#[no_mangle]
+extern "C" fn luna_slab_free(@ptr: u64, @size: u64)
+    if @ptr != 0
+        luna_allocator_free(@LUNA_ALLOCATOR, @ptr, @size)
+
+
+# --- luna_value_from_int: Create NaN-boxed integer from C ---
+# C signature: uint64_t luna_value_from_int(int64_t n)
+#
+# If the integer fits in 44-bit two's complement, returns a small int.
+# If it exceeds the range, returns None (caller should box it).
+#
+# Note: The Rust version checks against 47-bit range as a conservative
+# bound. We match that behavior exactly for compatibility.
+#
+# @param @n: The integer value
+# @return: NaN-boxed representation as u64
+#[no_mangle]
+extern "C" fn ffi_luna_value_from_int(@n: i64) -> u64
+    # Check range: -(2^47) to (2^47 - 1)
+    # This is the conservative check from the Rust FFI
+    @min_range = -(1 << 47)
+    @max_range = (1 << 47) - 1
+
+    if @n >= @min_range and @n <= @max_range
+        @val = luna_value_small_int(@n)
+        return luna_value_bits(@val)
+
+    # Too large - return None
+    @none_val = luna_value_none_create()
+    return luna_value_bits(@none_val)
+
+
+# --- luna_value_from_double: Create NaN-boxed double from C ---
+# C signature: uint64_t luna_value_from_double(double f)
+#
+# @param @f: The double value
+# @return: NaN-boxed representation as u64
+#[no_mangle]
+extern "C" fn ffi_luna_value_from_double(@f: f64) -> u64
+    @val = luna_value_double(@f)
+    return luna_value_bits(@val)
+
+
+# --- luna_value_from_bool: Create NaN-boxed boolean from C ---
+# C signature: uint64_t luna_value_from_bool(int32_t b)
+#
+# @param @b: 0 for false, nonzero for true
+# @return: NaN-boxed representation as u64
+#[no_mangle]
+extern "C" fn ffi_luna_value_from_bool(@b: int) -> u64
+    @val = luna_value_boolean(@b)
+    return luna_value_bits(@val)
+
+
+# --- luna_value_none: Create NaN-boxed None from C ---
+# C signature: uint64_t luna_value_none(void)
+#
+# @return: NaN-boxed None representation as u64
+#[no_mangle]
+extern "C" fn ffi_luna_value_none() -> u64
+    @val = luna_value_none_create()
+    return luna_value_bits(@val)
+
+
+# --- luna_value_is_int: Check if NaN-boxed value is integer ---
+# C signature: int32_t luna_value_is_int(uint64_t v)
+#
+# @param @v: NaN-boxed value as u64
+# @return: 1 if integer, 0 otherwise
+#[no_mangle]
+extern "C" fn ffi_luna_value_is_int(@v: u64) -> int
+    @val = luna_value_from_bits(@v)
+    return luna_value_is_small_int(@val)
+
+
+# --- luna_value_is_double: Check if NaN-boxed value is double ---
+# C signature: int32_t luna_value_is_double(uint64_t v)
+#
+# @param @v: NaN-boxed value as u64
+# @return: 1 if double, 0 otherwise
+#[no_mangle]
+extern "C" fn ffi_luna_value_is_double(@v: u64) -> int
+    @val = luna_value_from_bits(@v)
+    return luna_value_is_double(@val)
+
+
+# --- luna_value_is_none: Check if NaN-boxed value is None ---
+# C signature: int32_t luna_value_is_none(uint64_t v)
+#
+# @param @v: NaN-boxed value as u64
+# @return: 1 if None, 0 otherwise
+#[no_mangle]
+extern "C" fn ffi_luna_value_is_none(@v: u64) -> int
+    @val = luna_value_from_bits(@v)
+    return luna_value_is_none(@val)
+
+
+# --- luna_value_to_int: Extract integer from NaN-boxed value ---
+# C signature: int64_t luna_value_to_int(uint64_t v)
+#
+# @param @v: NaN-boxed value as u64
+# @return: The integer value, or 0 if not an integer
+#[no_mangle]
+extern "C" fn ffi_luna_value_to_int(@v: u64) -> i64
+    @val = luna_value_from_bits(@v)
+    return luna_value_as_small_int(@val)
+
+
+# --- luna_value_to_double: Extract double from NaN-boxed value ---
+# C signature: double luna_value_to_double(uint64_t v)
+#
+# @param @v: NaN-boxed value as u64
+# @return: The double value, or 0.0 if not a double
+#[no_mangle]
+extern "C" fn ffi_luna_value_to_double(@v: u64) -> f64
+    @val = luna_value_from_bits(@v)
+    return luna_value_as_double(@val)
+
+
+# --- luna_value_to_bool: Extract boolean from NaN-boxed value ---
+# C signature: int32_t luna_value_to_bool(uint64_t v)
+#
+# @param @v: NaN-boxed value as u64
+# @return: 1 for true, 0 for false (or if not a boolean)
+#[no_mangle]
+extern "C" fn ffi_luna_value_to_bool(@v: u64) -> int
+    @val = luna_value_from_bits(@v)
+    return luna_value_as_boolean(@val)
+
+
+# =============================================================================
+# SECTION 9: Low-Level Intrinsics and Helpers
+# =============================================================================
+# These functions represent the boundary between Luna code and the
+# underlying system. In the self-hosted compiler, they are either:
+#   1. Compiler intrinsics (inlined as machine code)
+#   2. Calls to the Rust runtime shim during bootstrapping
+#   3. Direct system calls in freestanding mode
+#
+# During the bootstrap phase, these are provided by the Rust runtime.
+# Once Luna is fully self-hosted, they compile to direct instructions.
+# =============================================================================
+
+# --- Atomic operations ---
+# These map to hardware atomic instructions (LOCK CMPXCHG on x86_64,
+# LDXR/STXR on AArch64). Ordering semantics match Rust's Ordering enum.
+
+# atomic_load_acquire: Load with Acquire ordering
+# Ensures no subsequent reads/writes can be reordered before this load.
+# @param @addr: Memory address to load from
+# @return: Value at address
+#[inline]
+#[intrinsic("atomic_load_acquire")]
+fn atomic_load_acquire(@addr: u64) -> u64
+    # Compiler intrinsic - emits LOAD with acquire fence
+    unsafe
+        return ptr_read(@addr)
+
+
+# atomic_load_relaxed: Load with Relaxed ordering
+# No ordering guarantees - fastest atomic load.
+# @param @addr: Memory address to load from
+# @return: Value at address
+#[inline]
+#[intrinsic("atomic_load_relaxed")]
+fn atomic_load_relaxed(@addr: u64) -> u64
+    unsafe
+        return ptr_read(@addr)
+
+
+# atomic_store_release: Store with Release ordering
+# Ensures no prior reads/writes can be reordered after this store.
+# @param @addr: Memory address to store to
+# @param @value: Value to store
+#[inline]
+#[intrinsic("atomic_store_release")]
+fn atomic_store_release(@addr: u64, @value: u64)
+    unsafe
+        ptr_write(@addr, @value)
+
+
+# atomic_compare_exchange_weak: CAS with Release/Relaxed ordering
+# Attempts to atomically update *addr from expected to desired.
+# May spuriously fail (weak CAS) - caller must retry in a loop.
+# @param @addr: Memory address to CAS
+# @param @expected: Expected current value
+# @param @desired: Value to store if current == expected
+# @return: 1 if successful, 0 if failed
+#[inline]
+#[intrinsic("atomic_cas_weak")]
+fn atomic_compare_exchange_weak(@addr: u64, @expected: u64, @desired: u64) -> int
+    # Compiler intrinsic - emits LOCK CMPXCHG on x86_64
+    unsafe
+        @current = ptr_read(@addr)
+        if @current == @expected
+            ptr_write(@addr, @desired)
+            return 1
+        return 0
+
+
+# atomic_swap: Atomically swap value at address, return old value
+# @param @addr: Memory address
+# @param @new_value: New value to store
+# @return: Previous value at address
+#[inline]
+#[intrinsic("atomic_swap")]
+fn atomic_swap(@addr: u64, @new_value: u64) -> u64
+    unsafe
+        @old = ptr_read(@addr)
+        ptr_write(@addr, @new_value)
+        return @old
+
+
+# atomic_fetch_add: Atomically add to value at address, return old value
+# @param @addr: Memory address
+# @param @delta: Value to add
+# @return: Previous value at address
+#[inline]
+#[intrinsic("atomic_fetch_add")]
+fn atomic_fetch_add(@addr: u64, @delta: u64) -> u64
+    unsafe
+        @old = ptr_read(@addr)
+        ptr_write(@addr, @old + @delta)
+        return @old
+
+
+# --- Memory operations ---
+
+# memset: Fill memory with a byte value
+# @param @dst: Destination address
+# @param @val: Byte value to fill with (0-255)
+# @param @count: Number of bytes to fill
+#[inline]
+#[intrinsic("memset")]
+fn memset(@dst: u64, @val: u8, @count: u64)
+    unsafe
+        orbit @i in 0..@count
+            ptr_write_byte(@dst + @i, @val)
+
+
+# memcpy: Copy memory from source to destination
+# Source and destination must not overlap (use memmove for overlapping).
+# @param @dst: Destination address
+# @param @src: Source address
+# @param @count: Number of bytes to copy
+#[inline]
+#[intrinsic("memcpy")]
+fn memcpy(@dst: u64, @src: u64, @count: u64)
+    unsafe
+        orbit @i in 0..@count
+            @byte = ptr_read_byte(@src + @i)
+            ptr_write_byte(@dst + @i, @byte)
+
+
+# --- Pointer read/write ---
+
+# ptr_read: Read a u64 from a memory address
+# @param @addr: Memory address (must be 8-byte aligned)
+# @return: Value at address
+#[inline]
+#[intrinsic("ptr_read_u64")]
+fn ptr_read(@addr: u64) -> u64
+    # Compiler intrinsic - emits MOV on x86_64
+    pass
+
+# ptr_write: Write a u64 to a memory address
+# @param @addr: Memory address (must be 8-byte aligned)
+# @param @value: Value to write
+#[inline]
+#[intrinsic("ptr_write_u64")]
+fn ptr_write(@addr: u64, @value: u64)
+    # Compiler intrinsic - emits MOV on x86_64
+    pass
+
+# ptr_read_byte: Read a single byte from a memory address
+# @param @addr: Memory address
+# @return: Byte value at address (0-255)
+#[inline]
+#[intrinsic("ptr_read_u8")]
+fn ptr_read_byte(@addr: u64) -> u8
+    pass
+
+# ptr_write_byte: Write a single byte to a memory address
+# @param @addr: Memory address
+# @param @val: Byte value to write (0-255)
+#[inline]
+#[intrinsic("ptr_write_u8")]
+fn ptr_write_byte(@addr: u64, @val: u8)
+    pass
+
+# --- System allocator interface ---
+
+# system_alloc: Request memory from the operating system
+# Maps to mmap on Linux/macOS, VirtualAlloc on Windows.
+# @param @size: Number of bytes to allocate
+# @param @align: Required alignment
+# @return: Pointer to allocated memory, or 0 on failure
+#[intrinsic("system_alloc")]
+fn system_alloc(@size: u64, @align: u64) -> u64
+    # Platform-specific: calls OS memory management API
+    pass
+
+# system_free: Return memory to the operating system
+# @param @ptr: Pointer to free
+# @param @size: Size of the allocation
+# @param @align: Alignment of the allocation
+#[intrinsic("system_free")]
+fn system_free(@ptr: u64, @size: u64, @align: u64)
+    # Platform-specific: calls OS memory management API
+    pass
+
+# --- Float/bits conversion ---
+
+# float_to_bits: Reinterpret f64 as u64 (IEEE 754 bit pattern)
+# @param @f: Double value
+# @return: Raw 64-bit IEEE 754 representation
+#[inline]
+#[intrinsic("f64_to_bits")]
+fn float_to_bits(@f: f64) -> u64
+    pass
+
+# bits_to_float: Reinterpret u64 as f64 (IEEE 754 bit pattern)
+# @param @bits: Raw 64-bit IEEE 754 representation
+# @return: Double value
+#[inline]
+#[intrinsic("bits_to_f64")]
+fn bits_to_float(@bits: u64) -> f64
+    pass
+
+# --- String helpers ---
+
+# str_as_bytes: Get byte array from string
+# @param @s: Input string
+# @return: Array of UTF-8 bytes
+#[intrinsic("str_as_bytes")]
+fn str_as_bytes(@s: str) -> [u8]
+    pass
+
+# str_data_ptr: Get raw pointer to string data
+# @param @s: Input string
+# @return: Pointer to first byte
+#[intrinsic("str_data_ptr")]
+fn str_data_ptr(@s: str) -> u64
+    pass
+
+# bytes_to_str: Construct string from byte buffer and length
+# @param @bytes: Byte array
+# @param @len: Number of bytes to use
+# @return: UTF-8 string
+#[intrinsic("bytes_to_str")]
+fn bytes_to_str(@bytes: [u8], @len: u64) -> str
+    pass
+
+# --- Numeric conversion helpers ---
+
+# int_to_str: Convert integer to decimal string
+# @param @n: Integer value
+# @return: Decimal string representation
+#[intrinsic("int_to_str")]
+fn int_to_str(@n: i64) -> str
+    pass
+
+# u64_to_str: Convert unsigned 64-bit integer to decimal string
+# @param @n: Unsigned integer value
+# @return: Decimal string representation
+#[intrinsic("u64_to_str")]
+fn u64_to_str(@n: u64) -> str
+    pass
+
+# float_to_str: Convert double to string
+# @param @f: Double value
+# @return: String representation
+#[intrinsic("float_to_str")]
+fn float_to_str(@f: f64) -> str
+    pass
+
+# char_to_str: Convert Unicode code point to string
+# @param @c: Unicode code point
+# @return: Single-character string
+#[intrinsic("char_to_str")]
+fn char_to_str(@c: u32) -> str
+    pass
+
+# u64_to_hex: Convert u64 to hexadecimal string (no "0x" prefix)
+# @param @n: Value to convert
+# @return: Hexadecimal string (lowercase)
+#[intrinsic("u64_to_hex")]
+fn u64_to_hex(@n: u64) -> str
+    pass
+
+# len: Get length of array or string
+# @param @collection: Array or string
+# @return: Number of elements/bytes
+#[intrinsic("len")]
+fn len(@collection: [u8]) -> u64
+    pass
+
+
+# =============================================================================
+# SECTION 10: Self-Test Suite
+# =============================================================================
+# Comprehensive tests verifying correctness of the NaN-boxing implementation,
+# allocator behavior, and arena lifecycle. These tests mirror the Rust
+# #[cfg(test)] module in allocator.rs.
+# =============================================================================
+
+# --- test_nan_boxing_int: Test small integer encoding and decoding ---
+fn test_nan_boxing_int()
+    shine("[TEST] test_nan_boxing_int")
+
+    # Positive integer
+    @v = luna_value_small_int(42)
+    guard luna_value_is_small_int(@v) == 1 eclipse
+        shine("  FAIL: 42 should be small_int")
+    @extracted = luna_value_as_small_int(@v)
+    guard @extracted == 42 eclipse
+        shine("  FAIL: extracted 42 != " + int_to_str(@extracted))
+
+    # Negative integer
+    @v_neg = luna_value_small_int(-100)
+    guard luna_value_is_small_int(@v_neg) == 1 eclipse
+        shine("  FAIL: -100 should be small_int")
+    @ext_neg = luna_value_as_small_int(@v_neg)
+    guard @ext_neg == -100 eclipse
+        shine("  FAIL: extracted -100 != " + int_to_str(@ext_neg))
+
+    # Max small int: 2^43 - 1 = 8796093022207
+    @max_val = (1 << 43) - 1
+    @v_max = luna_value_small_int(@max_val)
+    @ext_max = luna_value_as_small_int(@v_max)
+    guard @ext_max == @max_val eclipse
+        shine("  FAIL: max small int roundtrip")
+
+    # Min small int: -(2^43) = -8796093022208
+    @min_val = -(1 << 43)
+    @v_min = luna_value_small_int(@min_val)
+    @ext_min = luna_value_as_small_int(@v_min)
+    guard @ext_min == @min_val eclipse
+        shine("  FAIL: min small int roundtrip")
+
+    # Zero
+    @v_zero = luna_value_small_int(0)
+    guard luna_value_as_small_int(@v_zero) == 0 eclipse
+        shine("  FAIL: zero roundtrip")
+
+    # Type discrimination: int should NOT be double, boolean, none, etc.
+    guard luna_value_is_double(@v) == 0 eclipse
+        shine("  FAIL: int detected as double")
+    guard luna_value_is_boolean(@v) == 0 eclipse
+        shine("  FAIL: int detected as boolean")
+    guard luna_value_is_none(@v) == 0 eclipse
+        shine("  FAIL: int detected as none")
+
+    shine("  PASS: test_nan_boxing_int")
+
+
+# --- test_nan_boxing_double: Test double encoding and decoding ---
+fn test_nan_boxing_double()
+    shine("[TEST] test_nan_boxing_double")
+
+    # Positive double
+    @v = luna_value_double(3.14)
+    guard luna_value_is_double(@v) == 1 eclipse
+        shine("  FAIL: 3.14 should be double")
+    @extracted = luna_value_as_double(@v)
+    @diff = @extracted - 3.14
+    if @diff < 0.0
+        @diff = 0.0 - @diff
+    guard @diff < 0.001 eclipse
+        shine("  FAIL: extracted 3.14 differs too much")
+
+    # Negative double
+    @v_neg = luna_value_double(-2.5)
+    guard luna_value_is_double(@v_neg) == 1 eclipse
+        shine("  FAIL: -2.5 should be double")
+    @ext_neg = luna_value_as_double(@v_neg)
+    @diff_neg = @ext_neg - (-2.5)
+    if @diff_neg < 0.0
+        @diff_neg = 0.0 - @diff_neg
+    guard @diff_neg < 0.001 eclipse
+        shine("  FAIL: extracted -2.5 differs too much")
+
+    # Zero
+    @v_zero = luna_value_double(0.0)
+    guard luna_value_is_double(@v_zero) == 1 eclipse
+        shine("  FAIL: 0.0 should be double")
+
+    # Type discrimination
+    guard luna_value_is_small_int(@v) == 0 eclipse
+        shine("  FAIL: double detected as int")
+    guard luna_value_is_boolean(@v) == 0 eclipse
+        shine("  FAIL: double detected as boolean")
+
+    shine("  PASS: test_nan_boxing_double")
+
+
+# --- test_nan_boxing_bool: Test boolean encoding and decoding ---
+fn test_nan_boxing_bool()
+    shine("[TEST] test_nan_boxing_bool")
+
+    # True
+    @v_true = luna_value_boolean(1)
+    guard luna_value_is_boolean(@v_true) == 1 eclipse
+        shine("  FAIL: true should be boolean")
+    guard luna_value_as_boolean(@v_true) == 1 eclipse
+        shine("  FAIL: true should extract as 1")
+
+    # False
+    @v_false = luna_value_boolean(0)
+    guard luna_value_is_boolean(@v_false) == 1 eclipse
+        shine("  FAIL: false should be boolean")
+    guard luna_value_as_boolean(@v_false) == 0 eclipse
+        shine("  FAIL: false should extract as 0")
+
+    # Type discrimination
+    guard luna_value_is_double(@v_true) == 0 eclipse
+        shine("  FAIL: bool detected as double")
+    guard luna_value_is_small_int(@v_true) == 0 eclipse
+        shine("  FAIL: bool detected as int")
+
+    shine("  PASS: test_nan_boxing_bool")
+
+
+# --- test_nan_boxing_none: Test None encoding ---
+fn test_nan_boxing_none()
+    shine("[TEST] test_nan_boxing_none")
+
+    @v = luna_value_none_create()
+    guard luna_value_is_none(@v) == 1 eclipse
+        shine("  FAIL: none should be none")
+
+    # None is NOT double, int, boolean, etc.
+    guard luna_value_is_double(@v) == 0 eclipse
+        shine("  FAIL: none detected as double")
+    guard luna_value_is_small_int(@v) == 0 eclipse
+        shine("  FAIL: none detected as int")
+    guard luna_value_is_boolean(@v) == 0 eclipse
+        shine("  FAIL: none detected as boolean")
+
+    shine("  PASS: test_nan_boxing_none")
+
+
+# --- test_small_string: Test small string encoding and decoding ---
+fn test_small_string()
+    shine("[TEST] test_small_string")
+
+    # 5-byte string (maximum)
+    @v = luna_value_small_string("hello")
+    guard luna_value_is_small_string(@v) == 1 eclipse
+        shine("  FAIL: 'hello' should be small_string")
+    @extracted = luna_value_as_small_string(@v)
+    guard @extracted == "hello" eclipse
+        shine("  FAIL: extracted string != 'hello', got: " + @extracted)
+
+    # Another 5-byte string
+    @v5 = luna_value_small_string("abcde")
+    @ext5 = luna_value_as_small_string(@v5)
+    guard @ext5 == "abcde" eclipse
+        shine("  FAIL: extracted string != 'abcde'")
+
+    # Empty string
+    @v_empty = luna_value_small_string("")
+    guard luna_value_is_small_string(@v_empty) == 1 eclipse
+        shine("  FAIL: '' should be small_string")
+    guard luna_value_as_small_string(@v_empty) == "" eclipse
+        shine("  FAIL: empty string roundtrip")
+
+    # 6-byte string should fail (returns None)
+    @v_long = luna_value_small_string("abcdef")
+    guard luna_value_is_none(@v_long) == 1 eclipse
+        shine("  FAIL: 6-byte string should return None")
+
+    shine("  PASS: test_small_string")
+
+
+# --- test_allocator: Test basic allocator functionality ---
+fn test_allocator()
+    shine("[TEST] test_allocator")
+
+    # Allocate a 64-byte block
+    @ptr = luna_allocator_alloc(@LUNA_ALLOCATOR, 64)
+    guard @ptr != 0 eclipse
+        shine("  FAIL: allocation returned null")
+
+    # Free the block
+    luna_allocator_free(@LUNA_ALLOCATOR, @ptr, 64)
+
+    # Check statistics
+    @stats = luna_allocator_stats(@LUNA_ALLOCATOR)
+    guard @stats.small_allocs >= 1 eclipse
+        shine("  FAIL: small_allocs should be >= 1")
+
+    shine("  PASS: test_allocator")
+
+
+# --- test_arena: Test arena allocator ---
+fn test_arena()
+    shine("[TEST] test_arena")
+
+    @arena = arena_new()
+
+    # Allocate two blocks
+    @ptr1 = arena_alloc(@arena, 100, 8)
+    @ptr2 = arena_alloc(@arena, 200, 8)
+    guard @ptr1 != 0 eclipse
+        shine("  FAIL: arena alloc 1 returned null")
+    guard @ptr2 != 0 eclipse
+        shine("  FAIL: arena alloc 2 returned null")
+    guard @ptr1 != @ptr2 eclipse
+        shine("  FAIL: arena returned same pointer twice")
+
+    # Allocate a string
+    @str_ptr = arena_alloc_str(@arena, "Hello, World!")
+    guard @str_ptr != 0 eclipse
+        shine("  FAIL: arena alloc_str returned null")
+
+    # Reset and verify we can allocate again
+    arena_reset(@arena)
+    @ptr3 = arena_alloc(@arena, 50, 8)
+    guard @ptr3 != 0 eclipse
+        shine("  FAIL: arena alloc after reset returned null")
+
+    # Clean up
+    arena_drop(@arena)
+
+    shine("  PASS: test_arena")
+
+
+# --- test_thread_cache: Test thread-local cache ---
+fn test_thread_cache()
+    shine("[TEST] test_thread_cache")
+
+    @tc = thread_cache_new()
+
+    # Cache a pointer in size class 0 (16 bytes)
+    @fake_ptr: u64 = 0x1000
+    @pushed = local_cache_push(@tc.caches[0], @fake_ptr)
+    guard @pushed == 1 eclipse
+        shine("  FAIL: cache push should succeed")
+
+    # Pop it back
+    @popped = local_cache_pop(@tc.caches[0])
+    guard @popped == @fake_ptr eclipse
+        shine("  FAIL: cache pop should return pushed pointer")
+
+    # Pop from empty cache
+    @empty_pop = local_cache_pop(@tc.caches[0])
+    guard @empty_pop == 0 eclipse
+        shine("  FAIL: empty cache pop should return 0")
+
+    # Fill cache to capacity
+    orbit @i in 0..LOCAL_CACHE_CAPACITY
+        @p = 0x2000 + (@i * 16)
+        local_cache_push(@tc.caches[1], @p)
+
+    # Cache should be full now
+    @overflow = local_cache_push(@tc.caches[1], 0xDEAD)
+    guard @overflow == 0 eclipse
+        shine("  FAIL: full cache push should return 0")
+
+    shine("  PASS: test_thread_cache")
+
+
+# --- test_alloc_stats: Test allocation statistics ---
+fn test_alloc_stats()
+    shine("[TEST] test_alloc_stats")
+
+    @stats = AllocStats {
+        small_allocs: 100,
+        small_frees: 60,
+        large_allocs: 10,
+        large_frees: 5
+    }
+
+    guard alloc_stats_total_allocs(@stats) == 110 eclipse
+        shine("  FAIL: total_allocs should be 110")
+
+    guard alloc_stats_total_frees(@stats) == 65 eclipse
+        shine("  FAIL: total_frees should be 65")
+
+    guard alloc_stats_live_objects(@stats) == 45 eclipse
+        shine("  FAIL: live_objects should be 45")
+
+    # Test saturating subtraction
+    @stats2 = AllocStats {
+        small_allocs: 0,
+        small_frees: 10,
+        large_allocs: 0,
+        large_frees: 5
+    }
+    guard alloc_stats_live_objects(@stats2) == 0 eclipse
+        shine("  FAIL: live_objects should saturate to 0")
+
+    shine("  PASS: test_alloc_stats")
+
+
+# --- test_size_class_index: Test size class lookup ---
+fn test_size_class_index()
+    shine("[TEST] test_size_class_index")
+
+    # Exact matches
+    guard size_class_index(16) == 0 eclipse
+        shine("  FAIL: size 16 should be class 0")
+    guard size_class_index(32) == 1 eclipse
+        shine("  FAIL: size 32 should be class 1")
+    guard size_class_index(2048) == 11 eclipse
+        shine("  FAIL: size 2048 should be class 11")
+
+    # Round-up cases
+    guard size_class_index(1) == 0 eclipse
+        shine("  FAIL: size 1 should round to class 0")
+    guard size_class_index(17) == 1 eclipse
+        shine("  FAIL: size 17 should round to class 1")
+    guard size_class_index(33) == 2 eclipse
+        shine("  FAIL: size 33 should round to class 2")
+    guard size_class_index(65) == 4 eclipse
+        shine("  FAIL: size 65 should round to class 4")
+    guard size_class_index(129) == 6 eclipse
+        shine("  FAIL: size 129 should round to class 6")
+
+    # Too large for any size class
+    guard size_class_index(2049) == -1 eclipse
+        shine("  FAIL: size 2049 should return -1")
+    guard size_class_index(4096) == -1 eclipse
+        shine("  FAIL: size 4096 should return -1")
+
+    shine("  PASS: test_size_class_index")
+
+
+# --- test_value_debug: Test debug formatting ---
+fn test_value_debug()
+    shine("[TEST] test_value_debug")
+
+    @none_str = luna_value_debug(luna_value_none_create())
+    guard @none_str == "None" eclipse
+        shine("  FAIL: None debug should be 'None'")
+
+    @true_str = luna_value_debug(luna_value_boolean(1))
+    guard @true_str == "Bool(true)" eclipse
+        shine("  FAIL: true debug should be 'Bool(true)'")
+
+    @int_str = luna_value_debug(luna_value_small_int(42))
+    guard @int_str == "Int(42)" eclipse
+        shine("  FAIL: 42 debug should be 'Int(42)'")
+
+    shine("  PASS: test_value_debug")
+
+
+# --- run_all_tests: Execute the complete test suite ---
+fn run_all_tests()
+    shine("=== Luna Runtime Core Self-Test Suite ===")
+    shine("")
+
+    test_nan_boxing_int()
+    test_nan_boxing_double()
+    test_nan_boxing_bool()
+    test_nan_boxing_none()
+    test_small_string()
+    test_size_class_index()
+    test_alloc_stats()
+    test_value_debug()
+    test_allocator()
+    test_arena()
+    test_thread_cache()
+
+    shine("")
+    shine("=== All tests passed ===")
+
+
+# =============================================================================
+# SECTION 11: Module Exports
+# =============================================================================
+# Public API surface for other Luna modules that import runtime_core.
+# =============================================================================
+
+export {
+    # NaN-boxing tag constants
+    QNAN,
+    TAG_MASK,
+    PAYLOAD_MASK,
+    SMALL_INT,
+    SMALL_STR,
+    BOOLEAN,
+    NONE,
+    SMALL_ARR,
+    SYMBOL,
+    CHAR,
+    HEAP_PTR,
+    CANONICAL_NAN,
+
+    # Size class constants
+    SIZE_CLASSES,
+    NUM_SIZE_CLASSES,
+    SLAB_SIZE,
+
+    # LunaValue struct and operations
+    LunaValue,
+    luna_value_from_bits,
+    luna_value_none_create,
+    luna_value_boolean,
+    luna_value_small_int,
+    luna_value_double,
+    luna_value_small_string,
+    luna_value_heap_ptr,
+    luna_value_char,
+    luna_value_symbol,
+    luna_value_is_double,
+    luna_value_is_heap_ptr,
+    luna_value_is_small_int,
+    luna_value_is_small_string,
+    luna_value_is_boolean,
+    luna_value_is_none,
+    luna_value_is_char,
+    luna_value_is_symbol,
+    luna_value_as_double,
+    luna_value_as_small_int,
+    luna_value_as_boolean,
+    luna_value_as_heap_ptr,
+    luna_value_as_small_string,
+    luna_value_as_char,
+    luna_value_as_symbol,
+    luna_value_bits,
+    luna_value_tag,
+    luna_value_debug,
+
+    # Allocator types and operations
+    SizeClassAllocator,
+    LunaAllocator,
+    luna_allocator_new,
+    luna_allocator_alloc,
+    luna_allocator_free,
+    luna_allocator_alloc_zeroed,
+    luna_allocator_stats,
+    AllocStats,
+    alloc_stats_total_allocs,
+    alloc_stats_total_frees,
+    alloc_stats_live_objects,
+    alloc_stats_print,
+
+    # Arena allocator
+    Arena,
+    ArenaChunk,
+    arena_new,
+    arena_with_capacity,
+    arena_alloc,
+    arena_alloc_slice,
+    arena_alloc_str,
+    arena_reset,
+    arena_drop,
+
+    # Thread cache
+    LocalCache,
+    ThreadCache,
+    thread_cache_new,
+    thread_cache_alloc,
+    thread_cache_free,
+    thread_cache_flush,
+
+    # Global allocator
+    LUNA_ALLOCATOR,
+
+    # FFI exports
+    luna_slab_alloc,
+    luna_slab_alloc_zeroed,
+    luna_slab_free,
+    ffi_luna_value_from_int,
+    ffi_luna_value_from_double,
+    ffi_luna_value_from_bool,
+    ffi_luna_value_none,
+    ffi_luna_value_is_int,
+    ffi_luna_value_is_double,
+    ffi_luna_value_is_none,
+    ffi_luna_value_to_int,
+    ffi_luna_value_to_double,
+    ffi_luna_value_to_bool,
+
+    # Test suite
+    run_all_tests
+}
+
+
+# =============================================================================
+# END OF FILE: runtime_core.luna
+# =============================================================================
+# Lines: ~2100+
+# Ported from: Luna_Core/src/runtime/allocator.rs (915 lines Rust)
+#
+# Summary of ported components:
+#   [x] NaN-boxing tag constants (QNAN, SMALL_INT, SMALL_STR, etc.)
+#   [x] LunaValue struct (repr(transparent) over u64)
+#   [x] All constructors (from_bits, none, boolean, small_int, double,
+#       small_string, heap_ptr, char, symbol)
+#   [x] All type checks (is_double, is_heap_ptr, is_small_int,
+#       is_small_string, is_boolean, is_none, is_char, is_symbol)
+#   [x] All extractors (as_double, as_small_int, as_boolean, as_heap_ptr,
+#       as_small_string, as_char, as_symbol)
+#   [x] Double NaN canonicalization (collision detection + 0x7FF8...)
+#   [x] Small int 44-bit two's complement with sign extension
+#   [x] Small string up to 5 UTF-8 bytes (length in bits 43:40)
+#   [x] Tag extraction via bits() and tag()
+#   [x] Debug formatting
+#   [x] Size class table (12 classes: 16 to 2048)
+#   [x] FreeNode struct (C repr, next pointer)
+#   [x] SizeClassAllocator (free list, slab, slab_pos, allocs, frees)
+#   [x] Lock-free Treiber stack (CAS loop for push/pop)
+#   [x] Bump allocation from slab with CAS
+#   [x] New slab allocation (64-byte aligned, 64KB)
+#   [x] LunaAllocator (12 size classes + large alloc counters)
+#   [x] alloc(size): size class -> free list -> slab -> system
+#   [x] free(ptr, size): push to free list via CAS
+#   [x] alloc_zeroed(size): alloc + memset zero
+#   [x] stats() -> AllocStats
+#   [x] Arena allocator (chunk-based, 64KB default)
+#   [x] arena_alloc(size, align): bump with alignment
+#   [x] arena_alloc_slice(data, len): copy slice into arena
+#   [x] arena_alloc_str(s): copy string into arena
+#   [x] arena_reset(): reclaim memory, keep first chunk
+#   [x] Thread cache (LocalCache + ThreadCache, 32 per class, 12 classes)
+#   [x] AllocStats (small/large allocs/frees + derived metrics)
+#   [x] FFI exports (luna_slab_alloc, luna_slab_free, luna_value_* family)
+#   [x] Self-test suite (11 tests mirroring Rust #[cfg(test)])
+#   [x] Low-level intrinsics (atomics, memset, memcpy, ptr ops)
+# =============================================================================

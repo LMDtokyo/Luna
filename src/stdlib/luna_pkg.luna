@@ -1,0 +1,637 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Package Manager (luna-pkg) v2.0
+# =============================================================================
+# Build system and package manager for Luna projects.
+#
+# Features:
+# - Luna.toml parsing
+# - Multi-module project builds
+# - Cross-compilation support
+# - Dependency resolution
+# =============================================================================
+
+# === CONSTANTS ===
+
+const MAX_DEPS: int = 64
+const MAX_TARGETS: int = 16
+const MAX_PATH_LEN: int = 256
+const MAX_LINE_LEN: int = 1024
+
+# Build modes
+const BUILD_DEBUG: int = 0
+const BUILD_RELEASE: int = 1
+
+# Target architectures
+const TARGET_X86_64: int = 1
+const TARGET_AARCH64: int = 2
+const TARGET_RISCV64: int = 3
+const TARGET_WASM32: int = 4
+
+# Target OS
+const OS_LINUX: int = 1
+const OS_WINDOWS: int = 2
+const OS_MACOS: int = 3
+const OS_FREESTANDING: int = 4
+
+# === TOML VALUE TYPES ===
+const TOML_STRING: int = 1
+const TOML_INT: int = 2
+const TOML_BOOL: int = 3
+const TOML_ARRAY: int = 4
+const TOML_TABLE: int = 5
+
+# === DATA STRUCTURES ===
+
+struct TomlValue
+    kind: int
+    str_start: int
+    str_len: int
+    int_value: int
+    bool_value: int
+
+struct Dependency
+    name: [int; 64]         # Package name
+    name_len: int
+    version: [int; 32]      # Version string
+    version_len: int
+    path: [int; 256]        # Local path (if any)
+    path_len: int
+    git: [int; 256]         # Git URL (if any)
+    git_len: int
+
+struct BuildTarget
+    name: [int; 64]
+    name_len: int
+    arch: int               # TARGET_* constant
+    os: int                 # OS_* constant
+    features: [int; 32]     # Feature flags
+
+struct LunaProject
+    # [package] section
+    name: [int; 64]
+    name_len: int
+    version: [int; 32]
+    version_len: int
+    authors: [int; 256]
+    authors_len: int
+    edition: int            # Luna edition (2024, etc.)
+
+    # [dependencies]
+    deps: [Dependency; 64]
+    dep_count: int
+
+    # [build]
+    build_mode: int
+    opt_level: int          # 0-3
+    debug_info: int         # 0 or 1
+    lto: int                # Link-time optimization
+
+    # [target]
+    targets: [BuildTarget; 16]
+    target_count: int
+    default_target: int
+
+    # Paths
+    src_dir: [int; 256]
+    src_dir_len: int
+    out_dir: [int; 256]
+    out_dir_len: int
+
+    # Native linking
+    link_libs: [int; 1024]  # Library names (comma-separated)
+    link_libs_len: int
+    link_flags: [int; 1024] # Raw linker flags
+    link_flags_len: int
+
+# === TOML PARSER ===
+
+struct TomlParser
+    source: str
+    source_len: int
+    pos: int
+    line: int
+    current_section: [int; 64]
+    section_len: int
+
+fn toml_parser_new(@src: str, @len: int) -> TomlParser
+    return TomlParser {
+        source: @src,
+        source_len: @len,
+        pos: 0,
+        line: 1,
+        current_section: [0; 64],
+        section_len: 0
+    }
+
+# Skip whitespace and comments
+fn toml_skip_ws(@p: TomlParser)
+    orbit _ in 0..@p.source_len
+        if @p.pos >= @p.source_len
+            break
+
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@p.source + @p.pos)
+
+        if @ch == 32 || @ch == 9  # space or tab
+            @p.pos = @p.pos + 1
+        eclipse if @ch == 35  # '#' comment
+            orbit _ in 0..MAX_LINE_LEN
+                if @p.pos >= @p.source_len
+                    break
+                unsafe
+                    @ch = volatile_read(@p.source + @p.pos)
+                if @ch == 10  # newline
+                    break
+                @p.pos = @p.pos + 1
+        else
+            break
+
+# Skip to next line
+fn toml_skip_line(@p: TomlParser)
+    orbit _ in 0..MAX_LINE_LEN
+        if @p.pos >= @p.source_len
+            break
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@p.source + @p.pos)
+        @p.pos = @p.pos + 1
+        if @ch == 10
+            @p.line = @p.line + 1
+            break
+
+# Parse section header [section]
+fn toml_parse_section(@p: TomlParser) -> int
+    if @p.pos >= @p.source_len
+        return 0
+
+    @ch = 0
+    unsafe
+        @ch = volatile_read(@p.source + @p.pos)
+
+    if @ch != 91  # '['
+        return 0
+
+    @p.pos = @p.pos + 1
+    @p.section_len = 0
+
+    orbit _ in 0..64
+        if @p.pos >= @p.source_len
+            break
+        unsafe
+            @ch = volatile_read(@p.source + @p.pos)
+        if @ch == 93  # ']'
+            @p.pos = @p.pos + 1
+            break
+        if @p.section_len < 64
+            @p.current_section[@p.section_len] = @ch
+            @p.section_len = @p.section_len + 1
+        @p.pos = @p.pos + 1
+
+    return 1
+
+# Parse key name
+fn toml_parse_key(@p: TomlParser, @key: [int; 64]) -> int
+    @len = 0
+    toml_skip_ws(@p)
+
+    orbit _ in 0..64
+        if @p.pos >= @p.source_len
+            break
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@p.source + @p.pos)
+
+        # Valid key characters: a-z, A-Z, 0-9, _, -
+        @valid = (@ch >= 97 && @ch <= 122) || (@ch >= 65 && @ch <= 90) || (@ch >= 48 && @ch <= 57) || @ch == 95 || @ch == 45
+
+        if @valid == 0
+            break
+
+        if @len < 64
+            @key[@len] = @ch
+            @len = @len + 1
+        @p.pos = @p.pos + 1
+
+    return @len
+
+# Parse string value (quoted)
+fn toml_parse_string(@p: TomlParser, @out: [int; 256]) -> int
+    @len = 0
+    @ch = 0
+    unsafe
+        @ch = volatile_read(@p.source + @p.pos)
+
+    if @ch != 34 && @ch != 39  # " or '
+        return 0
+
+    @quote = @ch
+    @p.pos = @p.pos + 1
+
+    orbit _ in 0..256
+        if @p.pos >= @p.source_len
+            break
+        unsafe
+            @ch = volatile_read(@p.source + @p.pos)
+
+        if @ch == @quote
+            @p.pos = @p.pos + 1
+            break
+
+        if @ch == 92  # backslash escape
+            @p.pos = @p.pos + 1
+            if @p.pos < @p.source_len
+                unsafe
+                    @ch = volatile_read(@p.source + @p.pos)
+
+        if @len < 256
+            @out[@len] = @ch
+            @len = @len + 1
+        @p.pos = @p.pos + 1
+
+    return @len
+
+# Parse integer value
+fn toml_parse_int(@p: TomlParser) -> int
+    @value = 0
+    @negative = 0
+
+    @ch = 0
+    unsafe
+        @ch = volatile_read(@p.source + @p.pos)
+
+    if @ch == 45  # '-'
+        @negative = 1
+        @p.pos = @p.pos + 1
+
+    orbit _ in 0..20
+        if @p.pos >= @p.source_len
+            break
+        unsafe
+            @ch = volatile_read(@p.source + @p.pos)
+
+        if @ch < 48 || @ch > 57  # not digit
+            break
+
+        @value = @value * 10 + (@ch - 48)
+        @p.pos = @p.pos + 1
+
+    if @negative
+        @value = -@value
+
+    return @value
+
+# Parse boolean value
+fn toml_parse_bool(@p: TomlParser) -> int
+    @ch = 0
+    unsafe
+        @ch = volatile_read(@p.source + @p.pos)
+
+    if @ch == 116  # 't' for true
+        @p.pos = @p.pos + 4
+        return 1
+    if @ch == 102  # 'f' for false
+        @p.pos = @p.pos + 5
+        return 0
+
+    return 0
+
+# Check if string equals target
+fn str_eq(@arr: [int; 64], @len: int, @target: str, @target_len: int) -> int
+    if @len != @target_len
+        return 0
+    orbit @i in 0..@len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@target + @i)
+        if @arr[@i] != @ch
+            return 0
+    return 1
+
+# === LUNA.TOML PARSER ===
+
+fn parse_luna_toml(@source: str, @source_len: int) -> LunaProject
+    @proj = LunaProject {
+        name: [0; 64],
+        name_len: 0,
+        version: [0; 32],
+        version_len: 0,
+        authors: [0; 256],
+        authors_len: 0,
+        edition: 2024,
+        deps: [Dependency {}; 64],
+        dep_count: 0,
+        build_mode: BUILD_DEBUG,
+        opt_level: 0,
+        debug_info: 1,
+        lto: 0,
+        targets: [BuildTarget {}; 16],
+        target_count: 0,
+        default_target: 0,
+        src_dir: [0; 256],
+        src_dir_len: 0,
+        out_dir: [0; 256],
+        out_dir_len: 0,
+        link_libs: [0; 1024],
+        link_libs_len: 0,
+        link_flags: [0; 1024],
+        link_flags_len: 0
+    }
+
+    # Set default paths
+    @proj.src_dir[0] = 115  # 's'
+    @proj.src_dir[1] = 114  # 'r'
+    @proj.src_dir[2] = 99   # 'c'
+    @proj.src_dir_len = 3
+
+    @proj.out_dir[0] = 116  # 't'
+    @proj.out_dir[1] = 97   # 'a'
+    @proj.out_dir[2] = 114  # 'r'
+    @proj.out_dir[3] = 103  # 'g'
+    @proj.out_dir[4] = 101  # 'e'
+    @proj.out_dir[5] = 116  # 't'
+    @proj.out_dir_len = 6
+
+    @p = toml_parser_new(@source, @source_len)
+
+    orbit _ in 0..1000
+        toml_skip_ws(@p)
+
+        if @p.pos >= @p.source_len
+            break
+
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@p.source + @p.pos)
+
+        # Skip newlines
+        if @ch == 10 || @ch == 13
+            toml_skip_line(@p)
+            continue
+
+        # Section header
+        if @ch == 91  # '['
+            toml_parse_section(@p)
+            toml_skip_line(@p)
+            continue
+
+        # Key-value pair
+        @key: [int; 64] = [0; 64]
+        @key_len = toml_parse_key(@p, @key)
+
+        if @key_len == 0
+            toml_skip_line(@p)
+            continue
+
+        toml_skip_ws(@p)
+
+        # Expect '='
+        unsafe
+            @ch = volatile_read(@p.source + @p.pos)
+        if @ch != 61  # '='
+            toml_skip_line(@p)
+            continue
+        @p.pos = @p.pos + 1
+
+        toml_skip_ws(@p)
+
+        # Parse value based on current section
+        if str_eq(@p.current_section, @p.section_len, "package", 7)
+            if str_eq(@key, @key_len, "name", 4)
+                @proj.name_len = toml_parse_string(@p, @proj.name)
+            eclipse if str_eq(@key, @key_len, "version", 7)
+                @proj.version_len = toml_parse_string(@p, @proj.version)
+            eclipse if str_eq(@key, @key_len, "edition", 7)
+                @proj.edition = toml_parse_int(@p)
+
+        eclipse if str_eq(@p.current_section, @p.section_len, "build", 5)
+            if str_eq(@key, @key_len, "opt-level", 9)
+                @proj.opt_level = toml_parse_int(@p)
+            eclipse if str_eq(@key, @key_len, "debug", 5)
+                @proj.debug_info = toml_parse_bool(@p)
+            eclipse if str_eq(@key, @key_len, "lto", 3)
+                @proj.lto = toml_parse_bool(@p)
+
+        eclipse if str_eq(@p.current_section, @p.section_len, "target", 6)
+            if str_eq(@key, @key_len, "arch", 4)
+                @val: [int; 256] = [0; 256]
+                @val_len = toml_parse_string(@p, @val)
+                if str_eq(@val, @val_len, "x86_64", 6)
+                    @proj.targets[@proj.target_count].arch = TARGET_X86_64
+                eclipse if str_eq(@val, @val_len, "aarch64", 7)
+                    @proj.targets[@proj.target_count].arch = TARGET_AARCH64
+                eclipse if str_eq(@val, @val_len, "riscv64", 7)
+                    @proj.targets[@proj.target_count].arch = TARGET_RISCV64
+                eclipse if str_eq(@val, @val_len, "wasm32", 6)
+                    @proj.targets[@proj.target_count].arch = TARGET_WASM32
+
+            eclipse if str_eq(@key, @key_len, "os", 2)
+                @val: [int; 256] = [0; 256]
+                @val_len = toml_parse_string(@p, @val)
+                if str_eq(@val, @val_len, "linux", 5)
+                    @proj.targets[@proj.target_count].os = OS_LINUX
+                eclipse if str_eq(@val, @val_len, "windows", 7)
+                    @proj.targets[@proj.target_count].os = OS_WINDOWS
+                eclipse if str_eq(@val, @val_len, "macos", 5)
+                    @proj.targets[@proj.target_count].os = OS_MACOS
+                eclipse if str_eq(@val, @val_len, "freestanding", 12)
+                    @proj.targets[@proj.target_count].os = OS_FREESTANDING
+
+        eclipse if str_eq(@p.current_section, @p.section_len, "link", 4)
+            if str_eq(@key, @key_len, "libs", 4)
+                @proj.link_libs_len = toml_parse_string(@p, @proj.link_libs)
+            eclipse if str_eq(@key, @key_len, "flags", 5)
+                @proj.link_flags_len = toml_parse_string(@p, @proj.link_flags)
+
+        toml_skip_line(@p)
+
+    return @proj
+
+# === BUILD SYSTEM ===
+
+struct BuildContext
+    project: LunaProject
+    source_files: [int; 1024]    # File path offsets
+    file_count: int
+    output_file: [int; 256]
+    output_len: int
+    verbose: int
+    target_idx: int
+
+fn build_context_new(@proj: LunaProject) -> BuildContext
+    return BuildContext {
+        project: @proj,
+        source_files: [0; 1024],
+        file_count: 0,
+        output_file: [0; 256],
+        output_len: 0,
+        verbose: 0,
+        target_idx: 0
+    }
+
+# Collect source files from directory
+fn collect_sources(@ctx: BuildContext, @dir: str, @dir_len: int) -> int
+    # This would use filesystem APIs to scan directory
+    # For now, we just track that we need to scan
+    @ctx.file_count = 1  # Placeholder
+    return @ctx.file_count
+
+# Build single file
+fn build_file(@ctx: BuildContext, @file: str, @file_len: int) -> int
+    # This would invoke the Luna compiler
+    # luna compile <file> -o <output> --target <target>
+
+    if @ctx.verbose
+        # Print: "Compiling: <file>"
+        pass
+
+    # TODO: Invoke compiler subprocess
+    return 1  # Success
+
+# Build entire project
+fn build_project(@ctx: BuildContext) -> int
+    # Collect source files
+    collect_sources(@ctx, @ctx.project.src_dir, @ctx.project.src_dir_len)
+
+    # Build each file
+    @success = 1
+    orbit @i in 0..@ctx.file_count
+        # Build file at index i
+        # If any fails, set success = 0
+        pass
+
+    return @success
+
+# === CROSS-COMPILATION ===
+
+fn get_target_triple(@arch: int, @os: int) -> str
+    # Returns target triple string like "x86_64-unknown-linux-gnu"
+    if @arch == TARGET_X86_64
+        if @os == OS_LINUX
+            return "x86_64-unknown-linux-gnu"
+        eclipse if @os == OS_WINDOWS
+            return "x86_64-pc-windows-msvc"
+        eclipse if @os == OS_MACOS
+            return "x86_64-apple-darwin"
+        eclipse if @os == OS_FREESTANDING
+            return "x86_64-unknown-none"
+
+    eclipse if @arch == TARGET_AARCH64
+        if @os == OS_LINUX
+            return "aarch64-unknown-linux-gnu"
+        eclipse if @os == OS_MACOS
+            return "aarch64-apple-darwin"
+        eclipse if @os == OS_FREESTANDING
+            return "aarch64-unknown-none"
+
+    eclipse if @arch == TARGET_RISCV64
+        if @os == OS_LINUX
+            return "riscv64gc-unknown-linux-gnu"
+        eclipse if @os == OS_FREESTANDING
+            return "riscv64gc-unknown-none-elf"
+
+    eclipse if @arch == TARGET_WASM32
+        return "wasm32-unknown-unknown"
+
+    return "x86_64-unknown-linux-gnu"  # Default
+
+# === CLI INTERFACE ===
+
+const CMD_BUILD: int = 1
+const CMD_RUN: int = 2
+const CMD_TEST: int = 3
+const CMD_CLEAN: int = 4
+const CMD_NEW: int = 5
+const CMD_INIT: int = 6
+
+fn parse_cli_args(@argc: int, @argv: [[int; 256]; 32]) -> int
+    if @argc < 2
+        return 0
+
+    # Check first argument
+    if str_eq(@argv[1], len_str(@argv[1]), "build", 5)
+        return CMD_BUILD
+    eclipse if str_eq(@argv[1], len_str(@argv[1]), "run", 3)
+        return CMD_RUN
+    eclipse if str_eq(@argv[1], len_str(@argv[1]), "test", 4)
+        return CMD_TEST
+    eclipse if str_eq(@argv[1], len_str(@argv[1]), "clean", 5)
+        return CMD_CLEAN
+    eclipse if str_eq(@argv[1], len_str(@argv[1]), "new", 3)
+        return CMD_NEW
+    eclipse if str_eq(@argv[1], len_str(@argv[1]), "init", 4)
+        return CMD_INIT
+
+    return 0
+
+fn len_str(@arr: [int; 256]) -> int
+    @len = 0
+    orbit @i in 0..256
+        if @arr[@i] == 0
+            break
+        @len = @len + 1
+    return @len
+
+# Main entry point
+fn luna_pkg_main(@argc: int, @argv: [[int; 256]; 32]) -> int
+    @cmd = parse_cli_args(@argc, @argv)
+
+    if @cmd == 0
+        # Print usage
+        return 1
+
+    # Read Luna.toml
+    # @toml_content = read_file("Luna.toml")
+    # @proj = parse_luna_toml(@toml_content, len(@toml_content))
+
+    match @cmd
+        CMD_BUILD =>
+            # @ctx = build_context_new(@proj)
+            # return build_project(@ctx)
+            return 0
+
+        CMD_RUN =>
+            # Build then execute
+            return 0
+
+        CMD_TEST =>
+            # Build and run tests
+            return 0
+
+        CMD_CLEAN =>
+            # Remove target directory
+            return 0
+
+        CMD_NEW =>
+            # Create new project
+            return 0
+
+        CMD_INIT =>
+            # Initialize in current directory
+            return 0
+
+    return 0
+
+# === EXPORTS ===
+export {
+    # Types
+    LunaProject,
+    Dependency,
+    BuildTarget,
+    BuildContext,
+
+    # Constants
+    BUILD_DEBUG, BUILD_RELEASE,
+    TARGET_X86_64, TARGET_AARCH64, TARGET_RISCV64, TARGET_WASM32,
+    OS_LINUX, OS_WINDOWS, OS_MACOS, OS_FREESTANDING,
+
+    # Functions
+    parse_luna_toml,
+    build_project,
+    build_context_new,
+    get_target_triple,
+    luna_pkg_main
+}

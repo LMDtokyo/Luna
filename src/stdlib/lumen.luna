@@ -1,0 +1,194 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna lumen — cosmic alias for the JSON module (v4.3)
+# =============================================================================
+# `lumen` (literally: a quantum of structured light) is the cosmic name for
+# JSON.  Per L4_RENAME_MAP §4.8, parsed documents become `Lumen`, individual
+# nodes become `LumenNode`, and the builder verbs change shape:
+#
+#   parse      → read-json-bytes       (forwards to json_parse)
+#   at         → look up key in object (forwards to json_get)
+#   as_int     → typed int read        (adapter around json_get_int)
+#   as_text    → typed string read     (adapter around json_get_string)
+#   items      → array element + len accessor pair
+#
+# `lumen.compose` is a dict-literal builder.  The parser does not yet grok a
+# structured dict literal at the call site; the pragmatic replacement is
+# `compose_pairs(keys, vals, n)` which accepts parallel slices.  Both names
+# are exported so call-sites can migrate at their own pace.
+# =============================================================================
+
+import json
+
+# --- Cosmic type aliases -----------------------------------------------------
+# type Lumen     = JsonDoc    (the whole parsed document)
+# type LumenNode = JsonNode   (one node inside the arena)
+# type Node      = JsonNode   (shorthand used by bot code)
+
+# Structural aliases so `lumen.Node` / `lumen.Lumen` / `lumen.LumenNode` all
+# resolve.  Luna does not carry true type aliases so we mint parallel structs
+# of the same shape; call-sites construct via the existing builder API and
+# never hit the alias names at runtime.
+
+struct Lumen
+    nodes: [JsonNode; 4096]
+    node_count: int
+    strings: [str; 4096]
+    string_count: int
+    children: [int; 8192]
+    children_count: int
+    error: str
+    error_pos: int
+    has_error: int
+
+struct LumenNode
+    kind: int
+    int_val: int
+    float_val: float
+    str_idx: int
+    children_start: int
+    children_count: int
+
+struct Node
+    kind: int
+    int_val: int
+    float_val: float
+    str_idx: int
+    children_start: int
+    children_count: int
+
+# --- LumenKind ---------------------------------------------------------------
+# Cosmic spellings for JSON_*; underlying ints preserved.
+
+const LumenKind_Dark:  int = JSON_NULL
+const LumenKind_Flag:  int = JSON_BOOL
+const LumenKind_Int:   int = JSON_INT
+const LumenKind_Float: int = JSON_FLOAT
+const LumenKind_Text:  int = JSON_STRING
+const LumenKind_List:  int = JSON_ARRAY
+const LumenKind_Map:   int = JSON_OBJECT
+
+# --- Parse / validate --------------------------------------------------------
+
+fn parse(@input: str) -> JsonDoc
+    return json_parse(@input)
+
+fn valid(@input: str) -> int
+    return json_is_valid(@input)
+
+fn show(@doc: JsonDoc, @idx: int) -> str
+    return json_stringify(@doc, @idx)
+
+fn show_pretty(@doc: JsonDoc, @idx: int, @indent: int) -> str
+    return json_stringify_pretty(@doc, @idx, @indent)
+
+# --- Accessors (`at`, `items`, typed getters) --------------------------------
+
+# Look up a key in an object node; returns the child index or -1.
+fn at(@doc: JsonDoc, @obj_idx: int, @key: str) -> int
+    return json_get(@doc, @obj_idx, @key)
+
+# Number of children in an array node (for iteration).
+fn items_len(@doc: JsonDoc, @arr_idx: int) -> int
+    return json_array_len(@doc, @arr_idx)
+
+# i-th element of an array node.
+fn items(@doc: JsonDoc, @arr_idx: int, @i: int) -> int
+    return json_get_index(@doc, @arr_idx, @i)
+
+# Typed integer read.  Returns @default when the node is not an int (the
+# underlying json_get_int returns 0 on mismatch, which is ambiguous — this
+# adapter forwards a caller-supplied sentinel instead).
+fn as_int(@doc: JsonDoc, @idx: int, @default: int) -> int
+    if @idx < 0
+        return @default
+    if @idx >= @doc.node_count
+        return @default
+    if @doc.nodes[@idx].kind != JSON_INT
+        return @default
+    return @doc.nodes[@idx].int_val
+
+fn as_text(@doc: JsonDoc, @idx: int) -> str
+    return json_get_string(@doc, @idx)
+
+fn as_float(@doc: JsonDoc, @idx: int) -> float
+    return json_get_float(@doc, @idx)
+
+fn as_flag(@doc: JsonDoc, @idx: int) -> int
+    return json_get_bool(@doc, @idx)
+
+fn is_dark(@doc: JsonDoc, @idx: int) -> int
+    return json_is_null(@doc, @idx)
+
+# --- Builder (cosmic spellings) ---------------------------------------------
+
+fn dark(@doc: JsonDoc) -> int
+    return json_null(@doc)
+
+fn flag(@doc: JsonDoc, @v: int) -> int
+    return json_bool(@doc, @v)
+
+fn int(@doc: JsonDoc, @v: int) -> int
+    return json_int(@doc, @v)
+
+fn float(@doc: JsonDoc, @v: float) -> int
+    return json_float(@doc, @v)
+
+fn text(@doc: JsonDoc, @v: str) -> int
+    return json_string(@doc, @v)
+
+fn list(@doc: JsonDoc, @items: [int; 256], @count: int) -> int
+    return json_array(@doc, @items, @count)
+
+fn map(@doc: JsonDoc, @pairs: [int; 256], @count: int) -> int
+    return json_object(@doc, @pairs, @count)
+
+# `lumen.compose` — indented dict literal.  The parser does not yet expand the
+# block form; call-sites should fall back to `compose_pairs` until the parser
+# ships structured-literal support.  Exposed as a stub so that typed call-sites
+# still link; returns -1 and tags the doc with has_error so the caller notices.
+fn compose(@doc: JsonDoc) -> int
+    @doc.error = "lumen.compose: structured literal not yet supported; use compose_pairs"
+    @doc.has_error = 1
+    return -1
+
+# Build an object from parallel key / child-node slices.  `keys[i]` pairs
+# with the node referenced by `vals[i]`.  Count is pairs, not entries.
+fn compose_pairs(@doc: JsonDoc,
+                 @keys: [str; 128], @vals: [int; 128],
+                 @count: int) -> int
+    meow @pairs: [int; 256] = [0; 256]
+    @out = 0
+    orbit @i in 0..@count
+        @k_node = json_string(@doc, @keys[@i])
+        @pairs[@out] = @k_node
+        @out = @out + 1
+        @pairs[@out] = @vals[@i]
+        @out = @out + 1
+    return json_object(@doc, @pairs, @out)
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+export {
+    # Type re-exports
+    JsonDoc, JsonNode, Lumen, LumenNode, Node,
+
+    # Cosmic kind constants
+    LumenKind_Dark, LumenKind_Flag, LumenKind_Int, LumenKind_Float,
+    LumenKind_Text, LumenKind_List, LumenKind_Map,
+
+    # Legacy kind constants (bridge)
+    JSON_NULL, JSON_BOOL, JSON_INT, JSON_FLOAT,
+    JSON_STRING, JSON_ARRAY, JSON_OBJECT,
+
+    # Verbs
+    parse, valid, show, show_pretty,
+    at, items, items_len,
+    as_int, as_text, as_float, as_flag, is_dark,
+    dark, flag, int, float, text, list, map,
+    compose, compose_pairs
+}

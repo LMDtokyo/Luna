@@ -1,0 +1,443 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Forge DWARF — Debug Information Emitter (v4.3, phase L1 extended)
+# =============================================================================
+# Produces the `.debug_line` section (DWARF 4 line-number information) that
+# gdb, lldb, perf, and gprof consume to map machine-code addresses back to
+# Luna source file + line number.  Without this, a debugger steps a Luna
+# binary by instruction; with it, users see their source side-by-side.
+#
+# Scope: DWARF 4, 64-bit ELF host, line-table-only debug info.  We do NOT
+# emit `.debug_info` / `.debug_abbrev` (which would give us type info for
+# printing locals) — that's a much bigger undertaking and lives in a
+# follow-up `forge_dwarf_types.luna`.  Line tables alone already give
+# users "step through source" and are 90% of the pay-off.
+#
+# # Line-table encoding (DWARF 4 §6.2)
+#
+# A line-number program is a stream of opcodes that drives a state
+# machine tracking (address, file, line, column, ...).  Three opcode
+# classes:
+#
+#   * Standard (DW_LNS_*)  — 1-byte opcode + LEB128 operands
+#   * Extended (DW_LNE_*)  — escape 0x00 + LEB128 length + sub-opcode
+#   * Special              — opcode >= opcode_base; encodes both an
+#                            address advance and a line advance in ONE
+#                            byte.  Very compact for straight-line code.
+#
+# We emit a tiny standard-only subset: DW_LNS_advance_pc, DW_LNS_advance_line,
+# DW_LNS_copy (the "row emitted" sentinel), DW_LNE_end_sequence.  Slightly
+# less compact than a fully-tuned special-opcode stream, but easier to
+# audit and still accepted by every consumer.
+# =============================================================================
+
+import forge
+
+# =============================================================================
+# SECTION 1 — DWARF CONSTANTS
+# =============================================================================
+
+# Standard opcodes
+const DW_LNS_copy:               int = 0x01
+const DW_LNS_advance_pc:         int = 0x02
+const DW_LNS_advance_line:       int = 0x03
+const DW_LNS_set_file:           int = 0x04
+const DW_LNS_set_column:         int = 0x05
+const DW_LNS_negate_stmt:        int = 0x06
+const DW_LNS_set_basic_block:    int = 0x07
+const DW_LNS_const_add_pc:       int = 0x08
+const DW_LNS_fixed_advance_pc:   int = 0x09
+const DW_LNS_set_prologue_end:   int = 0x0A
+const DW_LNS_set_epilogue_begin: int = 0x0B
+
+# Extended opcodes (prefixed by 0x00 and a length ULEB)
+const DW_LNE_end_sequence:       int = 0x01
+const DW_LNE_set_address:        int = 0x02
+const DW_LNE_define_file:        int = 0x03
+
+# Header-constants we set once up front
+const DW_VERSION:                int = 4
+const DW_MIN_INSN_LEN:           int = 1
+const DW_MAX_OPS_PER_INSN:       int = 1
+const DW_DEFAULT_IS_STMT:        int = 1
+const DW_LINE_BASE:              int = -5
+const DW_LINE_RANGE:             int = 14
+const DW_OPCODE_BASE:            int = 13
+
+# =============================================================================
+# SECTION 2 — LINE ENTRY ACCUMULATOR
+# =============================================================================
+# Lowerer streams (address, file_idx, line) triples into this struct while
+# emitting bytes into Forge.  At container-emission time we render the
+# accumulated entries into a DWARF line-number program.
+
+const DWARF_MAX_ENTRIES: int = 16384
+const DWARF_MAX_FILES:   int = 256
+const DWARF_MAX_STR_BLOB: int = 32768
+
+struct DwarfEntry
+    address: int       # byte offset within the text section
+    file_idx: int      # 1-based index into the file table (0 = "unknown")
+    line: int          # 1-based line number
+
+struct DwarfFile
+    name_offset: int   # byte offset into the string blob
+    name_len:    int
+    dir_idx:     int   # 0 = the current (implicit) directory
+
+struct DwarfState
+    entries:       [DwarfEntry; 16384]
+    entry_count:   int
+
+    files:         [DwarfFile; 256]
+    file_count:    int
+
+    strings:       [int; 32768]   # raw bytes, 0-terminated names
+    strings_len:   int
+
+fn dwarf_new() -> DwarfState
+    return DwarfState {
+        entries:     [DwarfEntry { address: 0, file_idx: 0, line: 0 }; 16384],
+        entry_count: 0,
+        files:       [DwarfFile  { name_offset: 0, name_len: 0, dir_idx: 0 }; 256],
+        file_count:  0,
+        strings:     [0; 32768],
+        strings_len: 0
+    }
+
+# Record a source-line boundary at the current text offset.  Called by
+# the lowerer whenever it emits code for a fresh AST node on a new line.
+fn dwarf_record(@d: DwarfState, @address: int, @file_idx: int, @line: int)
+    if @d.entry_count >= DWARF_MAX_ENTRIES
+        return
+    @d.entries[@d.entry_count] = DwarfEntry {
+        address: @address,
+        file_idx: @file_idx,
+        line: @line
+    }
+    @d.entry_count = @d.entry_count + 1
+
+# Register a source file; returns its 1-based index for dwarf_record().
+fn dwarf_add_file(@d: DwarfState, @name: str, @name_len: int) -> int
+    if @d.file_count >= DWARF_MAX_FILES
+        return 0
+    seal @off = @d.strings_len
+    orbit @i in 0..@name_len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@name + @i)
+        @d.strings[@d.strings_len] = @ch
+        @d.strings_len = @d.strings_len + 1
+    @d.strings[@d.strings_len] = 0
+    @d.strings_len = @d.strings_len + 1
+    @d.files[@d.file_count] = DwarfFile {
+        name_offset: @off,
+        name_len: @name_len,
+        dir_idx: 0
+    }
+    @d.file_count = @d.file_count + 1
+    return @d.file_count     # 1-based index
+
+# =============================================================================
+# SECTION 3 — ULEB / SLEB128 ENCODERS
+# =============================================================================
+# DWARF length and integer fields use variable-length little-endian 128
+# encoding.  Small numbers pack into 1 byte; every byte's high bit is the
+# continuation flag.
+
+# Append an unsigned LEB128 value to a byte buffer.  Returns new length.
+fn uleb128_emit(@buf: [int; 65536], @pos: int, @value: int) -> int
+    @p = @pos
+    @v = @value
+    orbit _ in 0..10
+        @byte = @v & 0x7F
+        @v = @v >> 7
+        if @v != 0
+            @buf[@p] = @byte | 0x80
+            @p = @p + 1
+        else
+            @buf[@p] = @byte
+            @p = @p + 1
+            break
+    return @p
+
+# Signed LEB128.  Same layout, but sign-extends the high bit of the last byte.
+fn sleb128_emit(@buf: [int; 65536], @pos: int, @value: int) -> int
+    @p = @pos
+    @v = @value
+    @more = 1
+    orbit _ in 0..10
+        if @more == 0
+            break
+        @byte = @v & 0x7F
+        # Arithmetic right shift by 7 — sign-preserving
+        @v = @v >> 7
+        # Determine if we have more bytes to emit
+        @sign_bit = @byte & 0x40
+        if (@v == 0 and @sign_bit == 0) or (@v == -1 and @sign_bit != 0)
+            @more = 0
+            @buf[@p] = @byte
+            @p = @p + 1
+        else
+            @buf[@p] = @byte | 0x80
+            @p = @p + 1
+    return @p
+
+# =============================================================================
+# SECTION 4 — LINE-NUMBER PROGRAM EMITTER
+# =============================================================================
+# Produce a full `.debug_line` section from a DwarfState.  Layout:
+#
+#   +0 unit_length        (u32)        — bytes after this field
+#   +4 version            (u16)        — 4
+#   +6 header_length      (u32)        — bytes after this field up to end of header
+#  +10 min_inst_length    (u8)         — 1
+#  +11 max_ops_per_inst   (u8)         — 1
+#  +12 default_is_stmt    (u8)         — 1
+#  +13 line_base          (i8)         — -5
+#  +14 line_range         (u8)         — 14
+#  +15 opcode_base        (u8)         — 13
+#  +16 standard_opcode_lengths[12]     — per-opcode operand count
+#  +28 include_directories (list, NUL-terminated; terminated by NUL)
+#  +?? file_names         (list of {name, dir_idx, mtime, size}; terminated by NUL)
+#  +?? program            (line-number opcodes)
+#
+# We encode include_directories as an empty list (just a single 0 byte).
+# File names use dir_idx=0 (current directory) and zero mtime/size.
+
+fn dwarf_emit_line_section(@d: DwarfState, @text_rva: int,
+                           @out: [int; 65536], @out_cap: int) -> int
+    # Placeholder offsets for fields we patch at the end.
+    meow @pos: int = 0
+    seal @unit_length_at = @pos
+    @pos = dwarf_write_u32(@out, @pos, 0)                 # patched
+    @pos = dwarf_write_u16(@out, @pos, DW_VERSION)
+    seal @header_length_at = @pos
+    @pos = dwarf_write_u32(@out, @pos, 0)                 # patched
+    seal @header_start = @pos
+    @pos = dwarf_write_u8(@out, @pos, DW_MIN_INSN_LEN)
+    @pos = dwarf_write_u8(@out, @pos, DW_MAX_OPS_PER_INSN)
+    @pos = dwarf_write_u8(@out, @pos, DW_DEFAULT_IS_STMT)
+    @pos = dwarf_write_i8(@out, @pos, DW_LINE_BASE)
+    @pos = dwarf_write_u8(@out, @pos, DW_LINE_RANGE)
+    @pos = dwarf_write_u8(@out, @pos, DW_OPCODE_BASE)
+    # standard_opcode_lengths[opcode_base - 1] = 12 entries — one per
+    # standard opcode, indicating the count of LEB operands.  Values
+    # follow the DWARF 4 spec table.
+    @standard_lengths: [int; 12] = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]
+    orbit @i in 0..12
+        @pos = dwarf_write_u8(@out, @pos, @standard_lengths[@i])
+    # include_directories: empty list → single 0 byte
+    @pos = dwarf_write_u8(@out, @pos, 0)
+    # file_names: one entry per registered file, terminator = 0 byte
+    orbit @i in 0..@d.file_count
+        @f = @d.files[@i]
+        # Name bytes
+        orbit @j in 0..@f.name_len
+            @pos = dwarf_write_u8(@out, @pos, @d.strings[@f.name_offset + @j])
+        @pos = dwarf_write_u8(@out, @pos, 0)      # NUL-terminate name
+        @pos = uleb128_emit(@out, @pos, @f.dir_idx)
+        @pos = uleb128_emit(@out, @pos, 0)        # last modified time
+        @pos = uleb128_emit(@out, @pos, 0)        # length of file
+    @pos = dwarf_write_u8(@out, @pos, 0)          # end of file-names list
+    seal @header_end = @pos
+
+    # --- Line-number program -------------------------------------------
+    # Set the initial address with an extended opcode:
+    #   DW_LNE_set_address <text_rva>
+    # Then for each entry, advance pc + advance line + copy.
+    meow @cur_addr: int = 0
+    meow @cur_line: int = 1
+    meow @cur_file: int = 1
+    # Extended opcode prefix: 0x00 + ULEB(length) + sub-opcode + operand
+    @pos = dwarf_write_u8(@out, @pos, 0x00)
+    @pos = uleb128_emit(@out, @pos, 9)            # 1 byte sub-opcode + 8 byte address
+    @pos = dwarf_write_u8(@out, @pos, DW_LNE_set_address)
+    @pos = dwarf_write_u64(@out, @pos, @text_rva)
+
+    orbit @i in 0..@d.entry_count
+        @e = @d.entries[@i]
+        # Switch file if needed
+        if @e.file_idx != @cur_file and @e.file_idx > 0
+            @pos = dwarf_write_u8(@out, @pos, DW_LNS_set_file)
+            @pos = uleb128_emit(@out, @pos, @e.file_idx)
+            @cur_file = @e.file_idx
+        # Advance pc
+        @addr_delta = @e.address - @cur_addr
+        if @addr_delta > 0
+            @pos = dwarf_write_u8(@out, @pos, DW_LNS_advance_pc)
+            @pos = uleb128_emit(@out, @pos, @addr_delta)
+            @cur_addr = @e.address
+        # Advance line
+        @line_delta = @e.line - @cur_line
+        if @line_delta != 0
+            @pos = dwarf_write_u8(@out, @pos, DW_LNS_advance_line)
+            @pos = sleb128_emit(@out, @pos, @line_delta)
+            @cur_line = @e.line
+        # Emit a row
+        @pos = dwarf_write_u8(@out, @pos, DW_LNS_copy)
+
+    # Terminate with DW_LNE_end_sequence
+    @pos = dwarf_write_u8(@out, @pos, 0x00)
+    @pos = uleb128_emit(@out, @pos, 1)
+    @pos = dwarf_write_u8(@out, @pos, DW_LNE_end_sequence)
+
+    # Patch lengths.  unit_length is "bytes after the length field", so
+    # everything from byte 4 onwards.  header_length is "bytes after the
+    # length field up to the end of the header", so `header_end - header_start`.
+    @unit_length_val = @pos - 4
+    @header_length_val = @header_end - @header_start
+    dwarf_patch_u32(@out, @unit_length_at, @unit_length_val)
+    dwarf_patch_u32(@out, @header_length_at, @header_length_val)
+
+    return @pos
+
+# =============================================================================
+# SECTION 5 — BYTE WRITERS
+# =============================================================================
+
+fn dwarf_write_u8(@out: [int; 65536], @pos: int, @v: int) -> int
+    @out[@pos] = @v & 0xFF
+    return @pos + 1
+
+fn dwarf_write_i8(@out: [int; 65536], @pos: int, @v: int) -> int
+    @out[@pos] = @v & 0xFF
+    return @pos + 1
+
+fn dwarf_write_u16(@out: [int; 65536], @pos: int, @v: int) -> int
+    @out[@pos + 0] = @v & 0xFF
+    @out[@pos + 1] = (@v >> 8) & 0xFF
+    return @pos + 2
+
+fn dwarf_write_u32(@out: [int; 65536], @pos: int, @v: int) -> int
+    @out[@pos + 0] = @v & 0xFF
+    @out[@pos + 1] = (@v >> 8) & 0xFF
+    @out[@pos + 2] = (@v >> 16) & 0xFF
+    @out[@pos + 3] = (@v >> 24) & 0xFF
+    return @pos + 4
+
+fn dwarf_write_u64(@out: [int; 65536], @pos: int, @v: int) -> int
+    @pos2 = dwarf_write_u32(@out, @pos, @v & 0xFFFFFFFF)
+    return dwarf_write_u32(@out, @pos2, (@v >> 32) & 0xFFFFFFFF)
+
+fn dwarf_patch_u32(@out: [int; 65536], @at: int, @v: int)
+    @out[@at + 0] = @v & 0xFF
+    @out[@at + 1] = (@v >> 8) & 0xFF
+    @out[@at + 2] = (@v >> 16) & 0xFF
+    @out[@at + 3] = (@v >> 24) & 0xFF
+
+# =============================================================================
+# SECTION 6 — SELF-TESTS
+# =============================================================================
+
+fn dwarf_selftest_uleb_small() -> int
+    meow @buf: [int; 65536] = [0; 65536]
+    @p = uleb128_emit(@buf, 0, 42)
+    if @p != 1
+        return 1
+    if @buf[0] != 42
+        return 2
+    return 0
+
+fn dwarf_selftest_uleb_multibyte() -> int
+    meow @buf: [int; 65536] = [0; 65536]
+    @p = uleb128_emit(@buf, 0, 200)       # 0xC8 → 11001000 → bytes C8 01
+    if @p != 2
+        return 1
+    if @buf[0] != 0xC8 or @buf[1] != 0x01
+        return 2
+    return 0
+
+fn dwarf_selftest_sleb_negative() -> int
+    meow @buf: [int; 65536] = [0; 65536]
+    @p = sleb128_emit(@buf, 0, -1)         # byte: 01111111 = 0x7F
+    if @p != 1
+        return 1
+    if @buf[0] != 0x7F
+        return 2
+    return 0
+
+fn dwarf_selftest_empty_section() -> int
+    @d = dwarf_new()
+    dwarf_add_file(@d, "hello.luna", 10)
+    meow @out: [int; 65536] = [0; 65536]
+    @n = dwarf_emit_line_section(@d, 0x401000, @out, 65536)
+    if @n < 30
+        return 1
+    # Version field at offset 4 should be 4
+    if @out[4] != 4 or @out[5] != 0
+        return 2
+    return 0
+
+fn dwarf_selftest_one_entry() -> int
+    @d = dwarf_new()
+    dwarf_add_file(@d, "main.luna", 9)
+    dwarf_record(@d, 0, 1, 5)         # address 0, file 1, line 5
+    dwarf_record(@d, 7, 1, 6)
+    meow @out: [int; 65536] = [0; 65536]
+    @n = dwarf_emit_line_section(@d, 0x401000, @out, 65536)
+    # Look for a DW_LNS_advance_pc opcode byte (0x02) somewhere in the
+    # program region.  Past the end of file_names table.
+    meow @found: int = 0
+    orbit @i in 0..@n
+        if @out[@i] == 0x02
+            @found = 1
+            break
+    return if @found == 1 then 0 else 1
+
+fn run_forge_dwarf_selftests() -> int
+    @pass = 0
+    if dwarf_selftest_uleb_small() == 0
+        @pass = @pass + 1
+    if dwarf_selftest_uleb_multibyte() == 0
+        @pass = @pass + 1
+    if dwarf_selftest_sleb_negative() == 0
+        @pass = @pass + 1
+    if dwarf_selftest_empty_section() == 0
+        @pass = @pass + 1
+    if dwarf_selftest_one_entry() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+# SECTION 7 — ROADMAP
+# =============================================================================
+# What this file produces: a legal `.debug_line` section that gdb and lldb
+# accept.  Combined with an ELF writer that emits the section, users get
+# `list`, `break main:N`, and source-level `step`.
+#
+# Still to add for a full debugger experience (out of scope here):
+#   1. .debug_info       — compile-unit DIE + subprogram DIEs + types
+#   2. .debug_abbrev     — DIE abbreviation table
+#   3. .debug_str        — string pool used by .debug_info
+#   4. .debug_aranges    — address ranges for fast CU lookup
+#   5. .debug_frame / .eh_frame — unwind info for backtraces
+#   6. Better opcode compression — special-opcode encoding is ~50% smaller
+#      for typical straight-line code
+#   7. DWARF 5 — optional; gdb accepts both, DWARF 5 has a cleaner file
+#      table format that skips the implicit "file 0 = compilation unit"
+#      rule
+# =============================================================================
+
+export {
+    # opcodes
+    DW_LNS_copy, DW_LNS_advance_pc, DW_LNS_advance_line, DW_LNS_set_file,
+    DW_LNE_end_sequence, DW_LNE_set_address,
+
+    # state
+    DwarfState, DwarfEntry, DwarfFile,
+    dwarf_new, dwarf_record, dwarf_add_file,
+
+    # encoders
+    uleb128_emit, sleb128_emit,
+    dwarf_write_u8, dwarf_write_u16, dwarf_write_u32, dwarf_write_u64,
+    dwarf_patch_u32,
+
+    # top-level emit
+    dwarf_emit_line_section,
+
+    # tests
+    run_forge_dwarf_selftests
+}

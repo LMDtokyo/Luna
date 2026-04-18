@@ -1,0 +1,4163 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Veil: Pure-Luna TLS 1.3 Client v1.0 "Lunar Independence L3"
+# =============================================================================
+# A fully self-contained TLS 1.3 client implementation. No rustls. No OpenSSL.
+# No luna_tls_* FFI. Only net.tcp_* for raw transport and crypto.* for the
+# hash/cipher primitives we already own.
+#
+# This module is the third pillar of Lunar Independence (L3). It gives Luna
+# a cryptographic veil of its own — a moonlit handshake negotiated on our
+# own terms, with keys we whisper into existence ourselves.
+#
+# Protocol:
+#   1.  TLS 1.3 client handshake (RFC 8446)
+#   2.  ChaCha20-Poly1305 AEAD record layer (RFC 8439)
+#   3.  HKDF-SHA256 key schedule (RFC 5869 / RFC 8446 Section 7.1)
+#   4.  X25519 ECDH key exchange (RFC 7748)
+#   5.  X.509 chain parse + verify (RFC 5280, reduced profile)
+#   6.  SNI, ALPN, supported_groups, signature_algorithms extensions
+#   7.  ECDSA P-256 + Ed25519 leaf signature check over CertificateVerify
+#
+# Cosmic vocabulary (user-facing):
+#   veil             — a TLS connection
+#   veil_link_forge  — open a connection
+#   veil_link_whisper — send encrypted bytes
+#   veil_link_hear    — receive decrypted bytes
+#   veil_link_dissolve — close
+#   veil_last_tremor  — most-recent error
+#   moon_phase       — handshake FSM state
+#
+# Non-cosmic (internal crypto — keep precise):
+#   x25519_scalarmult, chacha20_poly1305_seal, hkdf_expand_label,
+#   asn1_parse_length, x509_parse, key_schedule_*.
+#
+# Build: luna compile --release veil.luna -o veil.o
+# =============================================================================
+
+import types
+import borrow_checker
+import crypto
+import net
+import x509_roots
+
+# =============================================================================
+# SECTION 1: CONSTANTS
+# =============================================================================
+
+# --- Pool sizes (flat parallel arrays, net.luna style) ---
+const MAX_VEIL_LINKS: int = 256
+const MAX_HANDSHAKE_BYTES: int = 65536
+const MAX_RECORD_PAYLOAD: int = 16384          # RFC 8446 5.1: 2^14
+const MAX_RECORD_CIPHERTEXT: int = 16384 + 256 # plaintext + inner type + tag + slack
+const MAX_TRANSCRIPT_BYTES: int = 65536
+const MAX_ALPN_NAME: int = 64
+const MAX_PEER_CN: int = 256
+const MAX_CERT_BYTES: int = 8192
+const MAX_CHAIN_CERTS: int = 8
+const MAX_LAST_ERROR: int = 256
+
+# --- Connection state (veil moon_phase) ---
+const VEIL_INIT: int = 0
+const VEIL_HANDSHAKING: int = 1
+const VEIL_WAIT_SERVER_HELLO: int = 2
+const VEIL_WAIT_ENCRYPTED_EXT: int = 3
+const VEIL_WAIT_CERTIFICATE: int = 4
+const VEIL_WAIT_CERT_VERIFY: int = 5
+const VEIL_WAIT_FINISHED: int = 6
+const VEIL_READY: int = 7
+const VEIL_CLOSED: int = 8
+const VEIL_FAILED: int = 9
+
+# --- TLS 1.3 Record Content Types (RFC 8446 Section 5.1) ---
+const TLS_CT_CHANGE_CIPHER_SPEC: int = 20
+const TLS_CT_ALERT: int = 21
+const TLS_CT_HANDSHAKE: int = 22
+const TLS_CT_APPLICATION_DATA: int = 23
+
+# --- Handshake Message Types (RFC 8446 Section 4) ---
+const HS_CLIENT_HELLO: int = 1
+const HS_SERVER_HELLO: int = 2
+const HS_NEW_SESSION_TICKET: int = 4
+const HS_END_OF_EARLY_DATA: int = 5
+const HS_ENCRYPTED_EXTENSIONS: int = 8
+const HS_CERTIFICATE: int = 11
+const HS_CERTIFICATE_REQUEST: int = 13
+const HS_CERTIFICATE_VERIFY: int = 15
+const HS_FINISHED: int = 20
+const HS_KEY_UPDATE: int = 24
+const HS_MESSAGE_HASH: int = 254
+
+# --- Extension Types (RFC 8446 Section 4.2) ---
+const EXT_SERVER_NAME: int = 0
+const EXT_SUPPORTED_GROUPS: int = 10
+const EXT_SIGNATURE_ALGORITHMS: int = 13
+const EXT_ALPN: int = 16
+const EXT_SUPPORTED_VERSIONS: int = 43
+const EXT_PSK_KEY_EXCHANGE_MODES: int = 45
+const EXT_KEY_SHARE: int = 51
+
+# --- TLS 1.3 Versions ---
+const TLS_V1_0: int = 0x0301
+const TLS_V1_2: int = 0x0303
+const TLS_V1_3: int = 0x0304
+
+# --- Named groups (RFC 8446 Section 4.2.7) ---
+const GROUP_SECP256R1: int = 0x0017
+const GROUP_X25519: int = 0x001D
+const GROUP_X448: int = 0x001E
+
+# --- Signature schemes (RFC 8446 Section 4.2.3) ---
+const SIG_RSA_PKCS1_SHA256: int = 0x0401
+const SIG_ECDSA_SECP256R1_SHA256: int = 0x0403
+const SIG_RSA_PSS_RSAE_SHA256: int = 0x0804
+const SIG_ED25519: int = 0x0807
+const SIG_ED448: int = 0x0808
+
+# --- Cipher suites (RFC 8446 Appendix B.4) ---
+const TLS_AES_128_GCM_SHA256: int = 0x1301
+const TLS_AES_256_GCM_SHA384: int = 0x1302
+const TLS_CHACHA20_POLY1305_SHA256: int = 0x1303
+
+# --- Alert levels / descriptions ---
+const ALERT_LEVEL_WARNING: int = 1
+const ALERT_LEVEL_FATAL: int = 2
+const ALERT_CLOSE_NOTIFY: int = 0
+const ALERT_UNEXPECTED_MESSAGE: int = 10
+const ALERT_BAD_RECORD_MAC: int = 20
+const ALERT_HANDSHAKE_FAILURE: int = 40
+const ALERT_BAD_CERTIFICATE: int = 42
+const ALERT_CERTIFICATE_EXPIRED: int = 45
+const ALERT_ILLEGAL_PARAMETER: int = 47
+const ALERT_DECODE_ERROR: int = 50
+const ALERT_DECRYPT_ERROR: int = 51
+const ALERT_PROTOCOL_VERSION: int = 70
+const ALERT_INTERNAL_ERROR: int = 80
+
+# --- ASN.1 DER tags ---
+const DER_BOOLEAN: int = 0x01
+const DER_INTEGER: int = 0x02
+const DER_BIT_STRING: int = 0x03
+const DER_OCTET_STRING: int = 0x04
+const DER_NULL: int = 0x05
+const DER_OID: int = 0x06
+const DER_UTF8_STRING: int = 0x0C
+const DER_PRINTABLE_STRING: int = 0x13
+const DER_IA5_STRING: int = 0x16
+const DER_UTC_TIME: int = 0x17
+const DER_GENERALIZED_TIME: int = 0x18
+const DER_SEQUENCE: int = 0x30
+const DER_SET: int = 0x31
+const DER_CONTEXT_0: int = 0xA0
+const DER_CONTEXT_1: int = 0xA1
+const DER_CONTEXT_2: int = 0xA2
+const DER_CONTEXT_3: int = 0xA3
+
+# --- Return codes ---
+const VEIL_OK: int = 0
+const VEIL_ERROR: int = -1
+const VEIL_EAGAIN: int = -2
+const VEIL_CLOSED_BY_PEER: int = -3
+const VEIL_BAD_MAC: int = -4
+const VEIL_BAD_CERT: int = -5
+const VEIL_PROTOCOL: int = -6
+const VEIL_TIMEOUT: int = -7
+
+# --- X25519 parameters (RFC 7748) ---
+# p = 2^255 - 19; A = 486662; a24 = (A - 2) / 4 = 121665
+const X25519_A24: int = 121665
+const X25519_KEY_LEN: int = 32
+
+# --- SHA-256 digest length ---
+const HASH_LEN: int = 32
+const AEAD_KEY_LEN: int = 32
+const AEAD_IV_LEN: int = 12
+const AEAD_TAG_LEN: int = 16
+
+# --- HKDF label prefix (RFC 8446 Section 7.1) ---
+# "tls13 " — these get concatenated to the label in HkdfLabel.
+const TLS13_LABEL_PREFIX: int = 0  # sentinel; real bytes built in hkdf_expand_label
+
+# =============================================================================
+# SECTION 2: GLOBAL ERROR SLOT
+# =============================================================================
+# The last-tremor slot is shared; simpler than per-link error strings.
+# Callers who care about thread-safety should capture it immediately after
+# the failing call.
+
+@last_tremor_bytes: array[int, 256]
+@last_tremor_len: int = 0
+
+fn record_tremor(@msg_ptr: int, @msg_len: int) -> int
+    guard @msg_len < 0 else @msg_len = 0
+    @n = @msg_len
+    guard @n > MAX_LAST_ERROR else @n = MAX_LAST_ERROR
+    orbit @i in range(0, @n)
+        @last_tremor_bytes[@i] = __read_byte(@msg_ptr + @i)
+    @last_tremor_len = @n
+    return VEIL_ERROR
+
+fn record_tremor_lit(@msg: string) -> int
+    @bytes = str_to_bytes(@msg)
+    @n = array_len(@bytes)
+    guard @n > MAX_LAST_ERROR else @n = MAX_LAST_ERROR
+    orbit @i in range(0, @n)
+        @last_tremor_bytes[@i] = @bytes[@i]
+    @last_tremor_len = @n
+    return VEIL_ERROR
+
+# =============================================================================
+# SECTION 3: LINK STORAGE (parallel arrays)
+# =============================================================================
+# We never allocate a heap of VeilLink structs; every field lives in a parallel
+# fixed-capacity array, keyed by handle id. This matches net.luna style and
+# keeps the cache footprint predictable.
+
+# Core identity
+@veil_tcp_fds: array[int, 256]
+@veil_states: array[int, 256]
+@veil_alloc: array[int, 256]         # 1 if slot is live
+
+# Peer metadata
+@veil_host_ids: array[int, 256]       # interned string id
+@veil_host_lens: array[int, 256]
+@veil_ports: array[int, 256]
+@veil_peer_cn_ids: array[int, 256]    # interned string id, 0 if none
+@veil_alpn_ids: array[int, 256]       # negotiated ALPN
+@veil_alpn_lens: array[int, 256]
+
+# Key schedule — seal semantics: set once during handshake, immutable thereafter.
+# All values are 32-byte arrays stored as "array[int, 32]" — we use a flat
+# 256*32 buffer and slice.
+@veil_client_random: array[int, 8192]      # 256 * 32
+@veil_server_random: array[int, 8192]
+@veil_early_secret: array[int, 8192]
+@veil_handshake_secret: array[int, 8192]
+@veil_master_secret: array[int, 8192]
+@veil_client_hs_traffic: array[int, 8192]   # client_handshake_traffic_secret
+@veil_server_hs_traffic: array[int, 8192]
+@veil_client_ap_traffic: array[int, 8192]   # client_application_traffic_secret_0
+@veil_server_ap_traffic: array[int, 8192]
+@veil_resumption_master: array[int, 8192]
+
+# Traffic keys derived from the secrets (AEAD key + IV).
+@veil_client_key: array[int, 8192]          # 256 * 32 (max for chacha20)
+@veil_server_key: array[int, 8192]
+@veil_client_iv: array[int, 3072]           # 256 * 12
+@veil_server_iv: array[int, 3072]
+
+# Sequence numbers (mutable — meow). Incremented per record in that direction.
+# Reset to zero when keys rotate (handshake->application, key_update).
+@veil_client_seq: array[int, 256]
+@veil_server_seq: array[int, 256]
+
+# Handshake context: the running transcript hash, plus the raw bytes for
+# re-hashing after HelloRetryRequest (optional; we skip HRR for now).
+@veil_transcript_h0: array[int, 256]
+@veil_transcript_h1: array[int, 256]
+@veil_transcript_h2: array[int, 256]
+@veil_transcript_h3: array[int, 256]
+@veil_transcript_h4: array[int, 256]
+@veil_transcript_h5: array[int, 256]
+@veil_transcript_h6: array[int, 256]
+@veil_transcript_h7: array[int, 256]
+@veil_transcript_blocked: array[int, 256]   # bytes buffered into current SHA block
+@veil_transcript_blocked_len: array[int, 256]
+@veil_transcript_total: array[int, 256]
+
+# X25519 ephemeral keys (sealed at ClientHello time, wiped after handshake).
+@veil_x25519_priv: array[int, 8192]
+@veil_x25519_pub: array[int, 8192]
+@veil_x25519_shared: array[int, 8192]
+
+# Negotiated cipher suite / group (only chacha20_poly1305_sha256 in v1.0)
+@veil_cipher_suite: array[int, 256]
+@veil_group: array[int, 256]
+@veil_sig_scheme: array[int, 256]
+
+# Receive buffer for partial records
+@veil_rx_buf: array[int, 4194304]     # 256 * 16384
+@veil_rx_have: array[int, 256]         # bytes currently in rx buffer
+
+@veil_count: int = 0
+
+# =============================================================================
+# SECTION 4: LINK STRUCT (the user-facing handle)
+# =============================================================================
+# The struct is a thin wrapper over the handle id. All real state lives in
+# the parallel arrays above; this struct is the public API surface so callers
+# can dot-access a stable handle rather than juggle raw ints.
+
+struct VeilLink
+    handle: int         # index into @veil_* arrays
+    tcp_fd: int         # shadow copy of veil_tcp_fds[handle] for cheap reads
+    state: int          # shadow copy of veil_states[handle]
+
+# =============================================================================
+# SECTION 5: SLOT HELPERS
+# =============================================================================
+
+fn veil_slot_alloc() -> int
+    orbit @i in range(0, MAX_VEIL_LINKS)
+        guard @veil_alloc[@i] == 0
+            @veil_alloc[@i] = 1
+            @veil_states[@i] = VEIL_INIT
+            @veil_client_seq[@i] = 0
+            @veil_server_seq[@i] = 0
+            @veil_rx_have[@i] = 0
+            @veil_alpn_lens[@i] = 0
+            @veil_peer_cn_ids[@i] = 0
+            @veil_transcript_blocked_len[@i] = 0
+            @veil_transcript_total[@i] = 0
+            guard @i >= @veil_count
+                @veil_count = @i + 1
+            return @i
+    return -1
+
+fn veil_slot_free(@h: int)
+    guard @h < 0 or @h >= MAX_VEIL_LINKS else return
+    @veil_alloc[@h] = 0
+    @veil_states[@h] = VEIL_CLOSED
+
+# ---- 32-byte slice helpers -------------------------------------------------
+# The 32-byte secrets live in flat 8192-entry buffers; these helpers slice by
+# handle id for us.
+
+fn slot32_read(@buf_ptr: int, @h: int) -> array
+    @off = @h * 32
+    @out = array_new(32, 0)
+    orbit @i in range(0, 32)
+        @out[@i] = __read_int_at(@buf_ptr, @off + @i)
+    return @out
+
+fn slot32_write(@buf_ptr: int, @h: int, @data: array)
+    @off = @h * 32
+    @n = array_len(@data)
+    guard @n > 32 else @n = 32
+    orbit @i in range(0, @n)
+        __write_int_at(@buf_ptr, @off + @i, @data[@i])
+    # Zero any trailing bytes
+    orbit @i in range(@n, 32)
+        __write_int_at(@buf_ptr, @off + @i, 0)
+
+fn slot12_read(@buf_ptr: int, @h: int) -> array
+    @off = @h * 12
+    @out = array_new(12, 0)
+    orbit @i in range(0, 12)
+        @out[@i] = __read_int_at(@buf_ptr, @off + @i)
+    return @out
+
+fn slot12_write(@buf_ptr: int, @h: int, @data: array)
+    @off = @h * 12
+    @n = array_len(@data)
+    guard @n > 12 else @n = 12
+    orbit @i in range(0, @n)
+        __write_int_at(@buf_ptr, @off + @i, @data[@i])
+
+# =============================================================================
+# SECTION 6: BIG-ENDIAN / LITTLE-ENDIAN BYTE HELPERS
+# =============================================================================
+
+fn u16_be(@buf: array, @off: int) -> int
+    return (@buf[@off] << 8) | @buf[@off + 1]
+
+fn u24_be(@buf: array, @off: int) -> int
+    return (@buf[@off] << 16) | (@buf[@off + 1] << 8) | @buf[@off + 2]
+
+fn u32_be_read(@buf: array, @off: int) -> int
+    return (@buf[@off] << 24) | (@buf[@off + 1] << 16) | (@buf[@off + 2] << 8) | @buf[@off + 3]
+
+fn write_u16_be(@buf: array, @off: int, @v: int)
+    @buf[@off] = (@v >> 8) % 256
+    @buf[@off + 1] = @v % 256
+
+fn write_u24_be(@buf: array, @off: int, @v: int)
+    @buf[@off] = (@v >> 16) % 256
+    @buf[@off + 1] = (@v >> 8) % 256
+    @buf[@off + 2] = @v % 256
+
+fn write_u32_be(@buf: array, @off: int, @v: int)
+    @buf[@off] = (@v >> 24) % 256
+    @buf[@off + 1] = (@v >> 16) % 256
+    @buf[@off + 2] = (@v >> 8) % 256
+    @buf[@off + 3] = @v % 256
+
+fn bytes_equal_ct(@a: array, @b: array, @len: int) -> int
+    # Delegate to crypto.ct_eq for constant-time comparison
+    return ct_eq(@a, @b, @len)
+
+fn bytes_copy(@dst: array, @dst_off: int, @src: array, @src_off: int, @len: int)
+    orbit @i in range(0, @len)
+        @dst[@dst_off + @i] = @src[@src_off + @i]
+
+fn bytes_zero(@buf: array)
+    @n = array_len(@buf)
+    orbit @i in range(0, @n)
+        @buf[@i] = 0
+
+# =============================================================================
+# SECTION 7: HKDF (RFC 5869) — Extract + Expand, plus RFC 8446 Expand-Label
+# =============================================================================
+
+fn hkdf_extract(@salt: array, @ikm: array) -> array
+    # HKDF-Extract(salt, IKM) = HMAC-Hash(salt, IKM)
+    # If salt is empty, use HashLen zero bytes.
+    @s = @salt
+    guard array_len(@s) == 0
+        @s = array_new(HASH_LEN, 0)
+    return hmac_sha256(@s, @ikm)
+
+fn hkdf_expand(@prk: array, @info: array, @length: int) -> array
+    # RFC 5869 HKDF-Expand.
+    # N = ceil(L / HashLen); T = T(1) | T(2) | ... | T(N).
+    @n_blocks = (@length + HASH_LEN - 1) / HASH_LEN
+    @output = array_new(@length, 0)
+    @prev = []
+    @counter = 1
+    @out_pos = 0
+    orbit @_ in range(0, @n_blocks)
+        # T(i) = HMAC(PRK, T(i-1) | info | i)
+        @block_in = array_concat(@prev, @info)
+        @block_in = array_concat(@block_in, array_from(@counter))
+        @t = hmac_sha256(@prk, @block_in)
+        @remaining = @length - @out_pos
+        @take = @remaining
+        guard @take > HASH_LEN else @take = HASH_LEN
+        orbit @i in range(0, @take)
+            @output[@out_pos + @i] = @t[@i]
+        @out_pos = @out_pos + @take
+        @prev = @t
+        @counter = @counter + 1
+    return @output
+
+fn hkdf_build_label(@label: array, @context: array, @length: int) -> array
+    # HkdfLabel struct (RFC 8446 Section 7.1):
+    #   uint16 length
+    #   opaque label<7..255> = "tls13 " + Label
+    #   opaque context<0..255> = HashValue
+    @full_label = array_concat(str_to_bytes("tls13 "), @label)
+    @full_label_len = array_len(@full_label)
+    @context_len = array_len(@context)
+
+    @out = array_new(2 + 1 + @full_label_len + 1 + @context_len, 0)
+    @out[0] = (@length >> 8) % 256
+    @out[1] = @length % 256
+    @out[2] = @full_label_len
+    orbit @i in range(0, @full_label_len)
+        @out[3 + @i] = @full_label[@i]
+    @out[3 + @full_label_len] = @context_len
+    orbit @i in range(0, @context_len)
+        @out[3 + @full_label_len + 1 + @i] = @context[@i]
+    return @out
+
+fn hkdf_expand_label(@secret: array, @label: array, @context: array, @length: int) -> array
+    # RFC 8446 Section 7.1 HKDF-Expand-Label.
+    @info = hkdf_build_label(@label, @context, @length)
+    return hkdf_expand(@secret, @info, @length)
+
+fn derive_secret(@secret: array, @label: array, @transcript_hash: array) -> array
+    # RFC 8446 Section 7.1 Derive-Secret(Secret, Label, Messages).
+    # = HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length)
+    return hkdf_expand_label(@secret, @label, @transcript_hash, HASH_LEN)
+
+# =============================================================================
+# SECTION 8: TRANSCRIPT HASH (SHA-256 of all handshake messages)
+# =============================================================================
+# The TLS 1.3 key schedule needs Transcript-Hash(m1 | m2 | ...) at many
+# intermediate points. Rather than stash every byte and re-hash, we keep an
+# incremental SHA-256 context per link. Because crypto.sha256_transform operates
+# on a full 64-byte block, we keep the straggler byte in a per-link buffer.
+
+@veil_transcript_pending: array[int, 16384]  # 256 * 64
+
+fn transcript_init(@h: int)
+    # Seed state with SHA-256 IV.
+    @veil_transcript_h0[@h] = SHA256_H0
+    @veil_transcript_h1[@h] = SHA256_H1
+    @veil_transcript_h2[@h] = SHA256_H2
+    @veil_transcript_h3[@h] = SHA256_H3
+    @veil_transcript_h4[@h] = SHA256_H4
+    @veil_transcript_h5[@h] = SHA256_H5
+    @veil_transcript_h6[@h] = SHA256_H6
+    @veil_transcript_h7[@h] = SHA256_H7
+    @veil_transcript_blocked_len[@h] = 0
+    @veil_transcript_total[@h] = 0
+
+fn transcript_state_load(@h: int) -> array
+    @s = array_new(8, 0)
+    @s[0] = @veil_transcript_h0[@h]
+    @s[1] = @veil_transcript_h1[@h]
+    @s[2] = @veil_transcript_h2[@h]
+    @s[3] = @veil_transcript_h3[@h]
+    @s[4] = @veil_transcript_h4[@h]
+    @s[5] = @veil_transcript_h5[@h]
+    @s[6] = @veil_transcript_h6[@h]
+    @s[7] = @veil_transcript_h7[@h]
+    return @s
+
+fn transcript_state_store(@h: int, @s: array)
+    @veil_transcript_h0[@h] = @s[0]
+    @veil_transcript_h1[@h] = @s[1]
+    @veil_transcript_h2[@h] = @s[2]
+    @veil_transcript_h3[@h] = @s[3]
+    @veil_transcript_h4[@h] = @s[4]
+    @veil_transcript_h5[@h] = @s[5]
+    @veil_transcript_h6[@h] = @s[6]
+    @veil_transcript_h7[@h] = @s[7]
+
+fn transcript_update(@h: int, @data: array)
+    @n = array_len(@data)
+    @buf_off = @h * 64
+    @pending = @veil_transcript_blocked_len[@h]
+    @state = transcript_state_load(@h)
+    @pos = 0
+
+    # Fill pending block first.
+    guard @pending > 0
+        @need = 64 - @pending
+        @take = @need
+        guard @take > @n else @take = @n
+        orbit @i in range(0, @take)
+            __write_int_at(__addr(@veil_transcript_pending), @buf_off + @pending + @i, @data[@i])
+        @pending = @pending + @take
+        @pos = @pos + @take
+        guard @pending == 64
+            @block = array_new(64, 0)
+            orbit @i in range(0, 64)
+                @block[@i] = __read_int_at(__addr(@veil_transcript_pending), @buf_off + @i)
+            sha256_transform(@state, @block)
+            @pending = 0
+
+    # Consume full 64-byte chunks directly.
+    orbit @_ in range(0, (@n - @pos) / 64)
+        @block = array_new(64, 0)
+        orbit @i in range(0, 64)
+            @block[@i] = @data[@pos + @i]
+        sha256_transform(@state, @block)
+        @pos = @pos + 64
+
+    # Store tail in pending.
+    orbit @i in range(@pos, @n)
+        __write_int_at(__addr(@veil_transcript_pending), @buf_off + @pending, @data[@i])
+        @pending = @pending + 1
+
+    @veil_transcript_blocked_len[@h] = @pending
+    @veil_transcript_total[@h] = @veil_transcript_total[@h] + @n
+    transcript_state_store(@h, @state)
+
+fn transcript_snapshot(@h: int) -> array
+    # Produce the current Transcript-Hash without disturbing the running state.
+    # RFC requires we be able to snapshot at arbitrary handshake boundaries.
+    @state = array_copy(transcript_state_load(@h))
+    @pending = @veil_transcript_blocked_len[@h]
+    @total = @veil_transcript_total[@h]
+    @buf_off = @h * 64
+
+    @block = array_new(64, 0)
+    orbit @i in range(0, @pending)
+        @block[@i] = __read_int_at(__addr(@veil_transcript_pending), @buf_off + @i)
+    @block[@pending] = 128   # 0x80 terminator
+    @pos = @pending + 1
+    guard @pos > 56
+        orbit @i in range(@pos, 64)
+            @block[@i] = 0
+        sha256_transform(@state, @block)
+        @block = array_new(64, 0)
+        @pos = 0
+    orbit @i in range(@pos, 56)
+        @block[@i] = 0
+    @bit_len = @total * 8
+    @block[56] = (@bit_len >> 56) % 256
+    @block[57] = (@bit_len >> 48) % 256
+    @block[58] = (@bit_len >> 40) % 256
+    @block[59] = (@bit_len >> 32) % 256
+    @block[60] = (@bit_len >> 24) % 256
+    @block[61] = (@bit_len >> 16) % 256
+    @block[62] = (@bit_len >> 8) % 256
+    @block[63] = @bit_len % 256
+    sha256_transform(@state, @block)
+
+    @out = array_new(32, 0)
+    orbit @i in range(0, 8)
+        @out[@i * 4] = (@state[@i] >> 24) % 256
+        @out[@i * 4 + 1] = (@state[@i] >> 16) % 256
+        @out[@i * 4 + 2] = (@state[@i] >> 8) % 256
+        @out[@i * 4 + 3] = @state[@i] % 256
+    return @out
+
+# =============================================================================
+# SECTION 9: X25519 (RFC 7748) — scalar multiplication on Curve25519
+# =============================================================================
+# Constant-time Curve25519 using the 10-limb "radix 2^25.5" representation
+# (aka ref10). Field elements are arrays of 10 signed ints; even-indexed
+# limbs hold 26 bits, odd-indexed hold 25 bits; the effective radix alternates
+# 2^26, 2^(26+25)=2^51, etc. — averaging 2^25.5.
+#
+# All arithmetic is branch-free on secret limbs. No table lookups indexed by
+# secret material. The only data-dependent loop bound is the Fermat inversion
+# addition chain, which uses public exponents.
+
+const X25519_CLAMP_LO: int = 248
+const X25519_CLAMP_HI_CLR: int = 127
+const X25519_CLAMP_HI_SET: int = 64
+
+fn x25519_clamp(@scalar: array) -> array
+    # Clamp per RFC 7748 Section 5.
+    @out = array_copy(@scalar)
+    @out[0] = @out[0] & X25519_CLAMP_LO
+    @out[31] = @out[31] & X25519_CLAMP_HI_CLR
+    @out[31] = @out[31] | X25519_CLAMP_HI_SET
+    return @out
+
+# ---- Field element helpers: fe25519 = array of 10 signed limbs -------------
+
+fn fe25519_zero() -> array
+    return array_new(10, 0)
+
+fn fe25519_one() -> array
+    @r = array_new(10, 0)
+    @r[0] = 1
+    return @r
+
+fn fe25519_copy(@a: array) -> array
+    @r = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @r[@i] = @a[@i]
+    return @r
+
+fn fe25519_from_bytes(@b: array) -> array
+    # Load 32 little-endian bytes as a field element in 10-limb form.
+    # Layout per ref10: limb widths 26,25,26,25,26,25,26,25,26,25 bits.
+    @h = array_new(10, 0)
+    @h[0] = (@b[0]) | (@b[1] << 8) | (@b[2] << 16) | ((@b[3] & 0x03) << 24)
+    @h[1] = ((@b[3] >> 2) | (@b[4] << 6) | (@b[5] << 14) | ((@b[6] & 0x07) << 22))
+    @h[2] = ((@b[6] >> 3) | (@b[7] << 5) | (@b[8] << 13) | ((@b[9] & 0x1F) << 21))
+    @h[3] = ((@b[9] >> 5) | (@b[10] << 3) | (@b[11] << 11) | ((@b[12] & 0x3F) << 19))
+    @h[4] = ((@b[12] >> 6) | (@b[13] << 2) | (@b[14] << 10) | (@b[15] << 18))
+    @h[5] = ((@b[16]) | (@b[17] << 8) | (@b[18] << 16) | ((@b[19] & 0x01) << 24))
+    @h[6] = ((@b[19] >> 1) | (@b[20] << 7) | (@b[21] << 15) | ((@b[22] & 0x07) << 23))
+    @h[7] = ((@b[22] >> 3) | (@b[23] << 5) | (@b[24] << 13) | ((@b[25] & 0x0F) << 21))
+    @h[8] = ((@b[25] >> 4) | (@b[26] << 4) | (@b[27] << 12) | ((@b[28] & 0x3F) << 20))
+    # High limb — mask top bit (2^255 - 19 means bit 255 is clamped).
+    @h[9] = ((@b[28] >> 6) | (@b[29] << 2) | (@b[30] << 10) | ((@b[31] & 0x7F) << 18))
+    return @h
+
+fn fe25519_carry(@h: array) -> array
+    # Normalize limbs: propagate carry 9 -> 0 with the *19 wrap, then once more.
+    # Even limbs target 26 bits, odd target 25 bits.
+    @c = array_new(10, 0)
+    @c[0] = 1 << 25
+    @c[1] = 1 << 24
+    @c[2] = 1 << 25
+    @c[3] = 1 << 24
+    @c[4] = 1 << 25
+    @c[5] = 1 << 24
+    @c[6] = 1 << 25
+    @c[7] = 1 << 24
+    @c[8] = 1 << 25
+    @c[9] = 1 << 24
+
+    # Pass 1: carry 9 -> 0 with *19 reduction at the wrap.
+    @carry9 = (@h[9] + @c[9]) >> 25
+    @h[0] = @h[0] + @carry9 * 19
+    @h[9] = @h[9] - (@carry9 << 25)
+    @carry1 = (@h[1] + @c[1]) >> 25
+    @h[2] = @h[2] + @carry1
+    @h[1] = @h[1] - (@carry1 << 25)
+    @carry3 = (@h[3] + @c[3]) >> 25
+    @h[4] = @h[4] + @carry3
+    @h[3] = @h[3] - (@carry3 << 25)
+    @carry5 = (@h[5] + @c[5]) >> 25
+    @h[6] = @h[6] + @carry5
+    @h[5] = @h[5] - (@carry5 << 25)
+    @carry7 = (@h[7] + @c[7]) >> 25
+    @h[8] = @h[8] + @carry7
+    @h[7] = @h[7] - (@carry7 << 25)
+
+    @carry0 = (@h[0] + @c[0]) >> 26
+    @h[1] = @h[1] + @carry0
+    @h[0] = @h[0] - (@carry0 << 26)
+    @carry2 = (@h[2] + @c[2]) >> 26
+    @h[3] = @h[3] + @carry2
+    @h[2] = @h[2] - (@carry2 << 26)
+    @carry4 = (@h[4] + @c[4]) >> 26
+    @h[5] = @h[5] + @carry4
+    @h[4] = @h[4] - (@carry4 << 26)
+    @carry6 = (@h[6] + @c[6]) >> 26
+    @h[7] = @h[7] + @carry6
+    @h[6] = @h[6] - (@carry6 << 26)
+    @carry8 = (@h[8] + @c[8]) >> 26
+    @h[9] = @h[9] + @carry8
+    @h[8] = @h[8] - (@carry8 << 26)
+
+    return @h
+
+fn fe25519_to_bytes(@h_in: array) -> array
+    # Freeze to canonical bytes per RFC 7748. We carry, then subtract p when
+    # the value is >= p (constant-time via mask).
+    @h = fe25519_copy(@h_in)
+    # First, ensure a valid partially-reduced form via carry.
+    @h = fe25519_carry(@h)
+    # Compute q = (h + 19) / 2^255 (0 or 1); if q=1, value is >= p.
+    @q = (@h[0] + 19) >> 26
+    @q = (@h[1] + @q) >> 25
+    @q = (@h[2] + @q) >> 26
+    @q = (@h[3] + @q) >> 25
+    @q = (@h[4] + @q) >> 26
+    @q = (@h[5] + @q) >> 25
+    @q = (@h[6] + @q) >> 26
+    @q = (@h[7] + @q) >> 25
+    @q = (@h[8] + @q) >> 26
+    @q = (@h[9] + @q) >> 25
+    # Add 19*q then drop the leading bit by masking after packing.
+    @h[0] = @h[0] + 19 * @q
+    # Final carry chain — no reduction at the top this time.
+    @carry = @h[0] >> 26
+    @h[1] = @h[1] + @carry
+    @h[0] = @h[0] - (@carry << 26)
+    @carry = @h[1] >> 25
+    @h[2] = @h[2] + @carry
+    @h[1] = @h[1] - (@carry << 25)
+    @carry = @h[2] >> 26
+    @h[3] = @h[3] + @carry
+    @h[2] = @h[2] - (@carry << 26)
+    @carry = @h[3] >> 25
+    @h[4] = @h[4] + @carry
+    @h[3] = @h[3] - (@carry << 25)
+    @carry = @h[4] >> 26
+    @h[5] = @h[5] + @carry
+    @h[4] = @h[4] - (@carry << 26)
+    @carry = @h[5] >> 25
+    @h[6] = @h[6] + @carry
+    @h[5] = @h[5] - (@carry << 25)
+    @carry = @h[6] >> 26
+    @h[7] = @h[7] + @carry
+    @h[6] = @h[6] - (@carry << 26)
+    @carry = @h[7] >> 25
+    @h[8] = @h[8] + @carry
+    @h[7] = @h[7] - (@carry << 25)
+    @carry = @h[8] >> 26
+    @h[9] = @h[9] + @carry
+    @h[8] = @h[8] - (@carry << 26)
+    @carry = @h[9] >> 25
+    @h[9] = @h[9] - (@carry << 25)
+
+    @out = array_new(32, 0)
+    @out[0] = @h[0] & 0xFF
+    @out[1] = (@h[0] >> 8) & 0xFF
+    @out[2] = (@h[0] >> 16) & 0xFF
+    @out[3] = ((@h[0] >> 24) | (@h[1] << 2)) & 0xFF
+    @out[4] = (@h[1] >> 6) & 0xFF
+    @out[5] = (@h[1] >> 14) & 0xFF
+    @out[6] = ((@h[1] >> 22) | (@h[2] << 3)) & 0xFF
+    @out[7] = (@h[2] >> 5) & 0xFF
+    @out[8] = (@h[2] >> 13) & 0xFF
+    @out[9] = ((@h[2] >> 21) | (@h[3] << 5)) & 0xFF
+    @out[10] = (@h[3] >> 3) & 0xFF
+    @out[11] = (@h[3] >> 11) & 0xFF
+    @out[12] = ((@h[3] >> 19) | (@h[4] << 6)) & 0xFF
+    @out[13] = (@h[4] >> 2) & 0xFF
+    @out[14] = (@h[4] >> 10) & 0xFF
+    @out[15] = (@h[4] >> 18) & 0xFF
+    @out[16] = @h[5] & 0xFF
+    @out[17] = (@h[5] >> 8) & 0xFF
+    @out[18] = (@h[5] >> 16) & 0xFF
+    @out[19] = ((@h[5] >> 24) | (@h[6] << 1)) & 0xFF
+    @out[20] = (@h[6] >> 7) & 0xFF
+    @out[21] = (@h[6] >> 15) & 0xFF
+    @out[22] = ((@h[6] >> 23) | (@h[7] << 3)) & 0xFF
+    @out[23] = (@h[7] >> 5) & 0xFF
+    @out[24] = (@h[7] >> 13) & 0xFF
+    @out[25] = ((@h[7] >> 21) | (@h[8] << 4)) & 0xFF
+    @out[26] = (@h[8] >> 4) & 0xFF
+    @out[27] = (@h[8] >> 12) & 0xFF
+    @out[28] = ((@h[8] >> 20) | (@h[9] << 6)) & 0xFF
+    @out[29] = (@h[9] >> 2) & 0xFF
+    @out[30] = (@h[9] >> 10) & 0xFF
+    @out[31] = (@h[9] >> 18) & 0xFF
+    return @out
+
+fn fe25519_add(@a: array, @b: array) -> array
+    @r = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @r[@i] = @a[@i] + @b[@i]
+    return @r
+
+fn fe25519_sub(@a: array, @b: array) -> array
+    @r = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @r[@i] = @a[@i] - @b[@i]
+    return @r
+
+fn fe25519_neg(@a: array) -> array
+    @r = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @r[@i] = 0 - @a[@i]
+    return @r
+
+fn fe25519_mul(@f: array, @g: array) -> array
+    # Schoolbook 10x10 with the 19x trick for limbs that "wrap" past 2^255.
+    # Port of ref10's crypto_sign/ed25519/ref10/fe_mul.c.
+    @f0 = @f[0]
+    @f1 = @f[1]
+    @f2 = @f[2]
+    @f3 = @f[3]
+    @f4 = @f[4]
+    @f5 = @f[5]
+    @f6 = @f[6]
+    @f7 = @f[7]
+    @f8 = @f[8]
+    @f9 = @f[9]
+    @g0 = @g[0]
+    @g1 = @g[1]
+    @g2 = @g[2]
+    @g3 = @g[3]
+    @g4 = @g[4]
+    @g5 = @g[5]
+    @g6 = @g[6]
+    @g7 = @g[7]
+    @g8 = @g[8]
+    @g9 = @g[9]
+
+    # Precompute 19*g_i for "wraparound" contributions, and 2*f_odd for the
+    # radix-2^25.5 interleaving bias.
+    @g1_19 = 19 * @g1
+    @g2_19 = 19 * @g2
+    @g3_19 = 19 * @g3
+    @g4_19 = 19 * @g4
+    @g5_19 = 19 * @g5
+    @g6_19 = 19 * @g6
+    @g7_19 = 19 * @g7
+    @g8_19 = 19 * @g8
+    @g9_19 = 19 * @g9
+    @f1_2 = 2 * @f1
+    @f3_2 = 2 * @f3
+    @f5_2 = 2 * @f5
+    @f7_2 = 2 * @f7
+    @f9_2 = 2 * @f9
+
+    @h0 = @f0 * @g0 + @f1_2 * @g9_19 + @f2 * @g8_19 + @f3_2 * @g7_19 + @f4 * @g6_19 + @f5_2 * @g5_19 + @f6 * @g4_19 + @f7_2 * @g3_19 + @f8 * @g2_19 + @f9_2 * @g1_19
+    @h1 = @f0 * @g1 + @f1 * @g0 + @f2 * @g9_19 + @f3 * @g8_19 + @f4 * @g7_19 + @f5 * @g6_19 + @f6 * @g5_19 + @f7 * @g4_19 + @f8 * @g3_19 + @f9 * @g2_19
+    @h2 = @f0 * @g2 + @f1_2 * @g1 + @f2 * @g0 + @f3_2 * @g9_19 + @f4 * @g8_19 + @f5_2 * @g7_19 + @f6 * @g6_19 + @f7_2 * @g5_19 + @f8 * @g4_19 + @f9_2 * @g3_19
+    @h3 = @f0 * @g3 + @f1 * @g2 + @f2 * @g1 + @f3 * @g0 + @f4 * @g9_19 + @f5 * @g8_19 + @f6 * @g7_19 + @f7 * @g6_19 + @f8 * @g5_19 + @f9 * @g4_19
+    @h4 = @f0 * @g4 + @f1_2 * @g3 + @f2 * @g2 + @f3_2 * @g1 + @f4 * @g0 + @f5_2 * @g9_19 + @f6 * @g8_19 + @f7_2 * @g7_19 + @f8 * @g6_19 + @f9_2 * @g5_19
+    @h5 = @f0 * @g5 + @f1 * @g4 + @f2 * @g3 + @f3 * @g2 + @f4 * @g1 + @f5 * @g0 + @f6 * @g9_19 + @f7 * @g8_19 + @f8 * @g7_19 + @f9 * @g6_19
+    @h6 = @f0 * @g6 + @f1_2 * @g5 + @f2 * @g4 + @f3_2 * @g3 + @f4 * @g2 + @f5_2 * @g1 + @f6 * @g0 + @f7_2 * @g9_19 + @f8 * @g8_19 + @f9_2 * @g7_19
+    @h7 = @f0 * @g7 + @f1 * @g6 + @f2 * @g5 + @f3 * @g4 + @f4 * @g3 + @f5 * @g2 + @f6 * @g1 + @f7 * @g0 + @f8 * @g9_19 + @f9 * @g8_19
+    @h8 = @f0 * @g8 + @f1_2 * @g7 + @f2 * @g6 + @f3_2 * @g5 + @f4 * @g4 + @f5_2 * @g3 + @f6 * @g2 + @f7_2 * @g1 + @f8 * @g0 + @f9_2 * @g9_19
+    @h9 = @f0 * @g9 + @f1 * @g8 + @f2 * @g7 + @f3 * @g6 + @f4 * @g5 + @f5 * @g4 + @f6 * @g3 + @f7 * @g2 + @f8 * @g1 + @f9 * @g0
+
+    # Two-pass carry chain: 0->1->2->3->4->5->6->7->8->9, then wrap 9->0 (*19),
+    # then a short second pass 0->1 and 4->5 to settle the wrap.
+    @carry = (@h0 + (1 << 25)) >> 26
+    @h1 = @h1 + @carry
+    @h0 = @h0 - (@carry << 26)
+    @carry = (@h4 + (1 << 25)) >> 26
+    @h5 = @h5 + @carry
+    @h4 = @h4 - (@carry << 26)
+
+    @carry = (@h1 + (1 << 24)) >> 25
+    @h2 = @h2 + @carry
+    @h1 = @h1 - (@carry << 25)
+    @carry = (@h5 + (1 << 24)) >> 25
+    @h6 = @h6 + @carry
+    @h5 = @h5 - (@carry << 25)
+
+    @carry = (@h2 + (1 << 25)) >> 26
+    @h3 = @h3 + @carry
+    @h2 = @h2 - (@carry << 26)
+    @carry = (@h6 + (1 << 25)) >> 26
+    @h7 = @h7 + @carry
+    @h6 = @h6 - (@carry << 26)
+
+    @carry = (@h3 + (1 << 24)) >> 25
+    @h4 = @h4 + @carry
+    @h3 = @h3 - (@carry << 25)
+    @carry = (@h7 + (1 << 24)) >> 25
+    @h8 = @h8 + @carry
+    @h7 = @h7 - (@carry << 25)
+
+    @carry = (@h4 + (1 << 25)) >> 26
+    @h5 = @h5 + @carry
+    @h4 = @h4 - (@carry << 26)
+    @carry = (@h8 + (1 << 25)) >> 26
+    @h9 = @h9 + @carry
+    @h8 = @h8 - (@carry << 26)
+
+    @carry = (@h9 + (1 << 24)) >> 25
+    @h0 = @h0 + @carry * 19
+    @h9 = @h9 - (@carry << 25)
+
+    @carry = (@h0 + (1 << 25)) >> 26
+    @h1 = @h1 + @carry
+    @h0 = @h0 - (@carry << 26)
+
+    @r = array_new(10, 0)
+    @r[0] = @h0
+    @r[1] = @h1
+    @r[2] = @h2
+    @r[3] = @h3
+    @r[4] = @h4
+    @r[5] = @h5
+    @r[6] = @h6
+    @r[7] = @h7
+    @r[8] = @h8
+    @r[9] = @h9
+    return @r
+
+fn fe25519_square(@f: array) -> array
+    # Specialized squaring — same structure but each cross-term appears twice.
+    @f0 = @f[0]
+    @f1 = @f[1]
+    @f2 = @f[2]
+    @f3 = @f[3]
+    @f4 = @f[4]
+    @f5 = @f[5]
+    @f6 = @f[6]
+    @f7 = @f[7]
+    @f8 = @f[8]
+    @f9 = @f[9]
+    @f0_2 = 2 * @f0
+    @f1_2 = 2 * @f1
+    @f2_2 = 2 * @f2
+    @f3_2 = 2 * @f3
+    @f4_2 = 2 * @f4
+    @f5_2 = 2 * @f5
+    @f6_2 = 2 * @f6
+    @f7_2 = 2 * @f7
+    @f5_38 = 38 * @f5
+    @f6_19 = 19 * @f6
+    @f7_38 = 38 * @f7
+    @f8_19 = 19 * @f8
+    @f9_38 = 38 * @f9
+
+    @h0 = @f0 * @f0 + @f1_2 * @f9_38 + @f2_2 * @f8_19 + @f3_2 * @f7_38 + @f4_2 * @f6_19 + @f5 * @f5_38
+    @h1 = @f0_2 * @f1 + @f2 * @f9_38 + @f3_2 * @f8_19 + @f4 * @f7_38 + @f5_2 * @f6_19
+    @h2 = @f0_2 * @f2 + @f1_2 * @f1 + @f3_2 * @f9_38 + @f4_2 * @f8_19 + @f5_2 * @f7_38 + @f6 * @f6_19
+    @h3 = @f0_2 * @f3 + @f1_2 * @f2 + @f4 * @f9_38 + @f5_2 * @f8_19 + @f6 * @f7_38
+    @h4 = @f0_2 * @f4 + @f1_2 * @f3_2 + @f2 * @f2 + @f5_2 * @f9_38 + @f6_2 * @f8_19 + @f7 * @f7_38
+    @h5 = @f0_2 * @f5 + @f1_2 * @f4 + @f2_2 * @f3 + @f6 * @f9_38 + @f7_2 * @f8_19
+    @h6 = @f0_2 * @f6 + @f1_2 * @f5_2 + @f2_2 * @f4 + @f3_2 * @f3 + @f7_2 * @f9_38 + @f8 * @f8_19
+    @h7 = @f0_2 * @f7 + @f1_2 * @f6 + @f2_2 * @f5 + @f3_2 * @f4 + @f8 * @f9_38
+    @h8 = @f0_2 * @f8 + @f1_2 * @f7_2 + @f2_2 * @f6 + @f3_2 * @f5_2 + @f4 * @f4 + @f9 * @f9_38
+    @h9 = @f0_2 * @f9 + @f1_2 * @f8 + @f2_2 * @f7 + @f3_2 * @f6 + @f4_2 * @f5
+
+    @carry = (@h0 + (1 << 25)) >> 26
+    @h1 = @h1 + @carry
+    @h0 = @h0 - (@carry << 26)
+    @carry = (@h4 + (1 << 25)) >> 26
+    @h5 = @h5 + @carry
+    @h4 = @h4 - (@carry << 26)
+
+    @carry = (@h1 + (1 << 24)) >> 25
+    @h2 = @h2 + @carry
+    @h1 = @h1 - (@carry << 25)
+    @carry = (@h5 + (1 << 24)) >> 25
+    @h6 = @h6 + @carry
+    @h5 = @h5 - (@carry << 25)
+
+    @carry = (@h2 + (1 << 25)) >> 26
+    @h3 = @h3 + @carry
+    @h2 = @h2 - (@carry << 26)
+    @carry = (@h6 + (1 << 25)) >> 26
+    @h7 = @h7 + @carry
+    @h6 = @h6 - (@carry << 26)
+
+    @carry = (@h3 + (1 << 24)) >> 25
+    @h4 = @h4 + @carry
+    @h3 = @h3 - (@carry << 25)
+    @carry = (@h7 + (1 << 24)) >> 25
+    @h8 = @h8 + @carry
+    @h7 = @h7 - (@carry << 25)
+
+    @carry = (@h4 + (1 << 25)) >> 26
+    @h5 = @h5 + @carry
+    @h4 = @h4 - (@carry << 26)
+    @carry = (@h8 + (1 << 25)) >> 26
+    @h9 = @h9 + @carry
+    @h8 = @h8 - (@carry << 26)
+
+    @carry = (@h9 + (1 << 24)) >> 25
+    @h0 = @h0 + @carry * 19
+    @h9 = @h9 - (@carry << 25)
+
+    @carry = (@h0 + (1 << 25)) >> 26
+    @h1 = @h1 + @carry
+    @h0 = @h0 - (@carry << 26)
+
+    @r = array_new(10, 0)
+    @r[0] = @h0
+    @r[1] = @h1
+    @r[2] = @h2
+    @r[3] = @h3
+    @r[4] = @h4
+    @r[5] = @h5
+    @r[6] = @h6
+    @r[7] = @h7
+    @r[8] = @h8
+    @r[9] = @h9
+    return @r
+
+fn fe25519_mul_small(@f: array, @s: int) -> array
+    # Multiply by a small positive integer and carry — used for X25519's a24.
+    @h = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @h[@i] = @f[@i] * @s
+    # Single-pass carry sufficient for small s (a24 = 121665 is < 2^17).
+    @carry = (@h[0] + (1 << 25)) >> 26
+    @h[1] = @h[1] + @carry
+    @h[0] = @h[0] - (@carry << 26)
+    @carry = (@h[4] + (1 << 25)) >> 26
+    @h[5] = @h[5] + @carry
+    @h[4] = @h[4] - (@carry << 26)
+    @carry = (@h[1] + (1 << 24)) >> 25
+    @h[2] = @h[2] + @carry
+    @h[1] = @h[1] - (@carry << 25)
+    @carry = (@h[5] + (1 << 24)) >> 25
+    @h[6] = @h[6] + @carry
+    @h[5] = @h[5] - (@carry << 25)
+    @carry = (@h[2] + (1 << 25)) >> 26
+    @h[3] = @h[3] + @carry
+    @h[2] = @h[2] - (@carry << 26)
+    @carry = (@h[6] + (1 << 25)) >> 26
+    @h[7] = @h[7] + @carry
+    @h[6] = @h[6] - (@carry << 26)
+    @carry = (@h[3] + (1 << 24)) >> 25
+    @h[4] = @h[4] + @carry
+    @h[3] = @h[3] - (@carry << 25)
+    @carry = (@h[7] + (1 << 24)) >> 25
+    @h[8] = @h[8] + @carry
+    @h[7] = @h[7] - (@carry << 25)
+    @carry = (@h[4] + (1 << 25)) >> 26
+    @h[5] = @h[5] + @carry
+    @h[4] = @h[4] - (@carry << 26)
+    @carry = (@h[8] + (1 << 25)) >> 26
+    @h[9] = @h[9] + @carry
+    @h[8] = @h[8] - (@carry << 26)
+    @carry = (@h[9] + (1 << 24)) >> 25
+    @h[0] = @h[0] + @carry * 19
+    @h[9] = @h[9] - (@carry << 25)
+    @carry = (@h[0] + (1 << 25)) >> 26
+    @h[1] = @h[1] + @carry
+    @h[0] = @h[0] - (@carry << 26)
+    return @h
+
+fn fe25519_cswap(@swap: int, @a: array, @b: array)
+    # Branch-free conditional swap on every limb.
+    @mask = 0 - (@swap & 1)
+    orbit @i in range(0, 10)
+        @t = @mask & (@a[@i] ^ @b[@i])
+        @a[@i] = @a[@i] ^ @t
+        @b[@i] = @b[@i] ^ @t
+
+fn fe25519_inv(@z: array) -> array
+    # 1/z = z^(2^255 - 21) via an addition chain (public exponent; timing-safe).
+    # Port of ref10's fe_invert — 254 squarings + 11 multiplies.
+    @t0 = fe25519_square(@z)
+    @t1 = fe25519_square(@t0)
+    @t1 = fe25519_square(@t1)
+    @t1 = fe25519_mul(@z, @t1)
+    @t0 = fe25519_mul(@t0, @t1)
+    @t2 = fe25519_square(@t0)
+    @t1 = fe25519_mul(@t1, @t2)
+    @t2 = fe25519_square(@t1)
+    orbit @_ in range(1, 5)
+        @t2 = fe25519_square(@t2)
+    @t1 = fe25519_mul(@t2, @t1)
+    @t2 = fe25519_square(@t1)
+    orbit @_ in range(1, 10)
+        @t2 = fe25519_square(@t2)
+    @t2 = fe25519_mul(@t2, @t1)
+    @t3 = fe25519_square(@t2)
+    orbit @_ in range(1, 20)
+        @t3 = fe25519_square(@t3)
+    @t2 = fe25519_mul(@t3, @t2)
+    @t2 = fe25519_square(@t2)
+    orbit @_ in range(1, 10)
+        @t2 = fe25519_square(@t2)
+    @t1 = fe25519_mul(@t2, @t1)
+    @t2 = fe25519_square(@t1)
+    orbit @_ in range(1, 50)
+        @t2 = fe25519_square(@t2)
+    @t2 = fe25519_mul(@t2, @t1)
+    @t3 = fe25519_square(@t2)
+    orbit @_ in range(1, 100)
+        @t3 = fe25519_square(@t3)
+    @t2 = fe25519_mul(@t3, @t2)
+    @t2 = fe25519_square(@t2)
+    orbit @_ in range(1, 50)
+        @t2 = fe25519_square(@t2)
+    @t1 = fe25519_mul(@t2, @t1)
+    @t1 = fe25519_square(@t1)
+    orbit @_ in range(1, 5)
+        @t1 = fe25519_square(@t1)
+    return fe25519_mul(@t1, @t0)
+
+fn fe25519_pow22523(@z: array) -> array
+    # z^((p - 5) / 8) — used for Edwards25519 point decompression (RFC 8032).
+    @t0 = fe25519_square(@z)
+    @t1 = fe25519_square(@t0)
+    @t1 = fe25519_square(@t1)
+    @t1 = fe25519_mul(@z, @t1)
+    @t0 = fe25519_mul(@t0, @t1)
+    @t0 = fe25519_square(@t0)
+    @t0 = fe25519_mul(@t1, @t0)
+    @t1 = fe25519_square(@t0)
+    orbit @_ in range(1, 5)
+        @t1 = fe25519_square(@t1)
+    @t0 = fe25519_mul(@t1, @t0)
+    @t1 = fe25519_square(@t0)
+    orbit @_ in range(1, 10)
+        @t1 = fe25519_square(@t1)
+    @t1 = fe25519_mul(@t1, @t0)
+    @t2 = fe25519_square(@t1)
+    orbit @_ in range(1, 20)
+        @t2 = fe25519_square(@t2)
+    @t1 = fe25519_mul(@t2, @t1)
+    @t1 = fe25519_square(@t1)
+    orbit @_ in range(1, 10)
+        @t1 = fe25519_square(@t1)
+    @t0 = fe25519_mul(@t1, @t0)
+    @t1 = fe25519_square(@t0)
+    orbit @_ in range(1, 50)
+        @t1 = fe25519_square(@t1)
+    @t1 = fe25519_mul(@t1, @t0)
+    @t2 = fe25519_square(@t1)
+    orbit @_ in range(1, 100)
+        @t2 = fe25519_square(@t2)
+    @t1 = fe25519_mul(@t2, @t1)
+    @t1 = fe25519_square(@t1)
+    orbit @_ in range(1, 50)
+        @t1 = fe25519_square(@t1)
+    @t0 = fe25519_mul(@t1, @t0)
+    @t0 = fe25519_square(@t0)
+    @t0 = fe25519_square(@t0)
+    return fe25519_mul(@t0, @z)
+
+fn fe25519_is_zero_bytes(@bytes: array) -> int
+    # Constant-time: returns 1 if all 32 bytes are zero, else 0.
+    @acc = 0
+    orbit @i in range(0, 32)
+        @acc = @acc | @bytes[@i]
+    @neg = 0 - @acc
+    @combined = @acc | @neg
+    @bit = (@combined >> 63) & 1
+    return @bit ^ 1
+
+fn fe25519_is_negative(@f: array) -> int
+    # The "sign" bit of a field element is the LSB of its canonical byte form.
+    @bytes = fe25519_to_bytes(@f)
+    return @bytes[0] & 1
+
+# ---- Legacy byte-level wrappers (kept as exports for external callers) -----
+# These used to be placeholders. They now route through the real field ops
+# via to_bytes / from_bytes, so anything that imported the old symbols
+# (x25519_field_mul etc.) keeps working.
+
+fn x25519_field_mul(@a: array, @b: array) -> array
+    return fe25519_to_bytes(fe25519_mul(fe25519_from_bytes(@a), fe25519_from_bytes(@b)))
+
+fn x25519_field_add(@a: array, @b: array) -> array
+    return fe25519_to_bytes(fe25519_add(fe25519_from_bytes(@a), fe25519_from_bytes(@b)))
+
+fn x25519_field_sub(@a: array, @b: array) -> array
+    return fe25519_to_bytes(fe25519_sub(fe25519_from_bytes(@a), fe25519_from_bytes(@b)))
+
+fn x25519_field_inv(@a: array) -> array
+    return fe25519_to_bytes(fe25519_inv(fe25519_from_bytes(@a)))
+
+fn x25519_cswap(@swap: int, @a: array, @b: array)
+    # Byte-level cswap; field-level fe25519_cswap is used inside the ladder.
+    @mask = 0 - (@swap & 1)
+    orbit @i in range(0, 32)
+        @t = @mask & (@a[@i] ^ @b[@i])
+        @a[@i] = @a[@i] ^ @t
+        @b[@i] = @b[@i] ^ @t
+
+# ---- Montgomery ladder ----------------------------------------------------
+
+fn x25519_scalarmult(@scalar: array, @point: array) -> array
+    # RFC 7748 §5 algorithm. Clamp scalar, clear high bit of u, run 255 ladder
+    # steps (double+add on Montgomery form Curve25519). All conditional work
+    # is via fe25519_cswap — no data-dependent branches on secret bits.
+    @k = x25519_clamp(@scalar)
+
+    @u_bytes = array_copy(@point)
+    # RFC 7748 §5: mask the top bit of u before decoding.
+    @u_bytes[31] = @u_bytes[31] & 0x7F
+
+    @x1 = fe25519_from_bytes(@u_bytes)
+    @x2 = fe25519_one()
+    @z2 = fe25519_zero()
+    @x3 = fe25519_copy(@x1)
+    @z3 = fe25519_one()
+
+    @swap = 0
+    orbit @t in range(0, 255)
+        @bit_idx = 254 - @t
+        @byte = @k[@bit_idx / 8]
+        @bit = (@byte >> (@bit_idx % 8)) & 1
+        @swap = @swap ^ @bit
+        fe25519_cswap(@swap, @x2, @x3)
+        fe25519_cswap(@swap, @z2, @z3)
+        @swap = @bit
+
+        # RFC 7748 §5 ladder step (Montgomery XZ formulas).
+        @A = fe25519_add(@x2, @z2)
+        @AA = fe25519_square(@A)
+        @B = fe25519_sub(@x2, @z2)
+        @BB = fe25519_square(@B)
+        @E = fe25519_sub(@AA, @BB)
+        @C = fe25519_add(@x3, @z3)
+        @D = fe25519_sub(@x3, @z3)
+        @DA = fe25519_mul(@D, @A)
+        @CB = fe25519_mul(@C, @B)
+
+        @t0 = fe25519_add(@DA, @CB)
+        @x3 = fe25519_square(@t0)
+        @t1 = fe25519_sub(@DA, @CB)
+        @t2 = fe25519_square(@t1)
+        @z3 = fe25519_mul(@x1, @t2)
+        @x2 = fe25519_mul(@AA, @BB)
+        @t3 = fe25519_mul_small(@E, X25519_A24)
+        @t4 = fe25519_add(@AA, @t3)
+        @z2 = fe25519_mul(@E, @t4)
+
+    fe25519_cswap(@swap, @x2, @x3)
+    fe25519_cswap(@swap, @z2, @z3)
+
+    # u = X2 * Z2^(p-2) — the Fermat inversion gives us the affine x-coord.
+    @z2_inv = fe25519_inv(@z2)
+    @u = fe25519_mul(@x2, @z2_inv)
+    return fe25519_to_bytes(@u)
+
+fn x25519_base() -> array
+    # Base point u = 9, all other bytes zero.
+    @out = array_new(32, 0)
+    @out[0] = 9
+    return @out
+
+fn x25519_keypair(@scalar_out: array, @public_out: array)
+    # Generate a fresh X25519 keypair using crypto.csprng_bytes.
+    @raw = csprng_bytes(32)
+    orbit @i in range(0, 32)
+        @scalar_out[@i] = @raw[@i]
+    @pub = x25519_scalarmult(@scalar_out, x25519_base())
+    orbit @i in range(0, 32)
+        @public_out[@i] = @pub[@i]
+
+# =============================================================================
+# SECTION 10: Ed25519 SIGNATURE VERIFY (RFC 8032)
+# =============================================================================
+# Verification only — we never sign in veil, only check the server's
+# CertificateVerify. Uses the same underlying field (GF(2^255-19)) as X25519
+# but operates on Edwards25519, not Montgomery25519. Points are kept in
+# extended homogeneous coordinates (X:Y:Z:T) with T = X*Y/Z.
+#
+# Curve constant d = -121665/121666.  Group order ell = 2^252 + 27742317...
+#
+# Algorithm (RFC 8032 §5.1.7):
+#   1. Decode signature as (R_bytes || S_bytes) — 32+32.
+#   2. Decode R and A (public key) as Edwards points via point decompression.
+#   3. Reject if S is not in [0, ell).
+#   4. h = SHA-512(R_bytes || A_bytes || M) reduced mod ell.
+#   5. Check [S]B = R + [h]A, i.e. [S]B - R - [h]A = identity.
+
+# Edwards curve constant d in fe25519 form. d = -121665/121666 mod p.
+# We store the canonical 10-limb representation of d directly.
+fn ed25519_d() -> array
+    @d = array_new(10, 0)
+    @d[0] = -10913610
+    @d[1] = 13857413
+    @d[2] = -15372611
+    @d[3] = 6949391
+    @d[4] = 114729
+    @d[5] = -8787816
+    @d[6] = -6275908
+    @d[7] = -3247719
+    @d[8] = -18696448
+    @d[9] = -12055116
+    return @d
+
+fn ed25519_sqrtm1() -> array
+    # sqrt(-1) in GF(p). Used in point decompression when y^2 - 1 sits in
+    # the non-quadratic-residue coset.
+    @r = array_new(10, 0)
+    @r[0] = -32595792
+    @r[1] = -7943725
+    @r[2] = 9377950
+    @r[3] = 3500415
+    @r[4] = 12389472
+    @r[5] = -272473
+    @r[6] = -25146209
+    @r[7] = -2005654
+    @r[8] = 326686
+    @r[9] = 11406482
+    return @r
+
+fn ed25519_2d() -> array
+    # 2 * d — used in point addition.
+    @d = ed25519_d()
+    @r = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @r[@i] = 2 * @d[@i]
+    return @r
+
+# ---- Point type: projective (X, Y, Z) and extended (X, Y, Z, T) ----
+# Luna lacks structs we can swap inline, so we use parallel-array convention:
+# each point is a 40-element array — 4 limb-arrays concatenated (X|Y|Z|T).
+
+fn ed_point_new() -> array
+    return array_new(40, 0)
+
+fn ed_point_set_zero(@p: array)
+    # Identity in extended coords: (0, 1, 1, 0).
+    orbit @i in range(0, 40)
+        @p[@i] = 0
+    @p[10] = 1    # Y[0] = 1
+    @p[20] = 1    # Z[0] = 1
+
+fn ed_point_get_x(@p: array) -> array
+    @x = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @x[@i] = @p[@i]
+    return @x
+
+fn ed_point_get_y(@p: array) -> array
+    @y = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @y[@i] = @p[10 + @i]
+    return @y
+
+fn ed_point_get_z(@p: array) -> array
+    @z = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @z[@i] = @p[20 + @i]
+    return @z
+
+fn ed_point_get_t(@p: array) -> array
+    @t = array_new(10, 0)
+    orbit @i in range(0, 10)
+        @t[@i] = @p[30 + @i]
+    return @t
+
+fn ed_point_set(@p: array, @x: array, @y: array, @z: array, @t: array)
+    orbit @i in range(0, 10)
+        @p[@i] = @x[@i]
+        @p[10 + @i] = @y[@i]
+        @p[20 + @i] = @z[@i]
+        @p[30 + @i] = @t[@i]
+
+fn ed_point_copy_from(@dst: array, @src: array)
+    orbit @i in range(0, 40)
+        @dst[@i] = @src[@i]
+
+fn ed_point_decompress(@bytes: array) -> array
+    # Edwards25519 point decompression (RFC 8032 §5.1.3).
+    # Returns a 40-elem extended point, or a 1-elem array [0] on failure.
+    # 1. y = bytes with high bit cleared as y-coordinate.
+    # 2. x_sign = high bit of bytes[31].
+    # 3. u = y^2 - 1; v = d*y^2 + 1.  x^2 = u/v.
+    # 4. Compute x via the "always compute x, maybe multiply by sqrt(-1)" rule.
+    @y_bytes = array_copy(@bytes)
+    @x_sign = (@y_bytes[31] >> 7) & 1
+    @y_bytes[31] = @y_bytes[31] & 0x7F
+
+    @y = fe25519_from_bytes(@y_bytes)
+    @y2 = fe25519_square(@y)
+    @u = fe25519_sub(@y2, fe25519_one())
+    @v = fe25519_add(fe25519_mul(ed25519_d(), @y2), fe25519_one())
+
+    # x = u*v^3 * (u*v^7)^((p-5)/8)   — then square-test + sqrt(-1) fixup.
+    @v3 = fe25519_mul(@v, fe25519_square(@v))
+    @uv7 = fe25519_mul(@v3, fe25519_mul(@u, fe25519_square(@v)))
+    @x = fe25519_mul(fe25519_mul(@u, @v3), fe25519_pow22523(@uv7))
+
+    # Check v*x^2 == u (candidate valid) or v*x^2 == -u (multiply by sqrt(-1)).
+    @vxx = fe25519_mul(@v, fe25519_square(@x))
+    @check1 = fe25519_sub(@vxx, @u)
+    @check1_bytes = fe25519_to_bytes(@check1)
+    @check2 = fe25519_add(@vxx, @u)
+    @check2_bytes = fe25519_to_bytes(@check2)
+
+    guard fe25519_is_zero_bytes(@check1_bytes) == 0
+        guard fe25519_is_zero_bytes(@check2_bytes) == 0
+            return array_from(0)
+        @x = fe25519_mul(@x, ed25519_sqrtm1())
+
+    # If sign of x disagrees with x_sign bit, negate x.
+    @x_is_neg = fe25519_is_negative(@x)
+    guard @x_is_neg == 0 and @x_sign == 1
+        # y=0 and sign=1 is invalid (would be zero point with wrong sign).
+        @x_bytes = fe25519_to_bytes(@x)
+        guard fe25519_is_zero_bytes(@x_bytes) == 1
+            return array_from(0)
+        @x = fe25519_neg(@x)
+    guard @x_is_neg == 1 and @x_sign == 0
+        @x = fe25519_neg(@x)
+
+    @p = ed_point_new()
+    @t = fe25519_mul(@x, @y)
+    ed_point_set(@p, @x, @y, fe25519_one(), @t)
+    return @p
+
+fn ed_point_double(@p: array) -> array
+    # RFC 8032 §5.1.4 doubling in extended coords (no T needed on input).
+    @X1 = ed_point_get_x(@p)
+    @Y1 = ed_point_get_y(@p)
+    @Z1 = ed_point_get_z(@p)
+
+    @A = fe25519_square(@X1)
+    @B = fe25519_square(@Y1)
+    @C = fe25519_mul_small(fe25519_square(@Z1), 2)
+    @H = fe25519_add(@A, @B)
+    @t0 = fe25519_add(@X1, @Y1)
+    @E = fe25519_sub(@H, fe25519_square(@t0))
+    @G = fe25519_sub(@A, @B)
+    @F = fe25519_add(@C, @G)
+
+    @X3 = fe25519_mul(@E, @F)
+    @Y3 = fe25519_mul(@G, @H)
+    @Z3 = fe25519_mul(@F, @G)
+    @T3 = fe25519_mul(@E, @H)
+
+    @r = ed_point_new()
+    ed_point_set(@r, @X3, @Y3, @Z3, @T3)
+    return @r
+
+fn ed_point_add(@p: array, @q: array) -> array
+    # Extended twisted Edwards addition, RFC 8032 §5.1.4.
+    @X1 = ed_point_get_x(@p)
+    @Y1 = ed_point_get_y(@p)
+    @Z1 = ed_point_get_z(@p)
+    @T1 = ed_point_get_t(@p)
+    @X2 = ed_point_get_x(@q)
+    @Y2 = ed_point_get_y(@q)
+    @Z2 = ed_point_get_z(@q)
+    @T2 = ed_point_get_t(@q)
+
+    @A = fe25519_mul(fe25519_sub(@Y1, @X1), fe25519_sub(@Y2, @X2))
+    @B = fe25519_mul(fe25519_add(@Y1, @X1), fe25519_add(@Y2, @X2))
+    @C = fe25519_mul(fe25519_mul(ed25519_2d(), @T1), @T2)
+    @D = fe25519_mul(fe25519_mul_small(@Z1, 2), @Z2)
+    @E = fe25519_sub(@B, @A)
+    @F = fe25519_sub(@D, @C)
+    @G = fe25519_add(@D, @C)
+    @H = fe25519_add(@B, @A)
+
+    @X3 = fe25519_mul(@E, @F)
+    @Y3 = fe25519_mul(@G, @H)
+    @Z3 = fe25519_mul(@F, @G)
+    @T3 = fe25519_mul(@E, @H)
+
+    @r = ed_point_new()
+    ed_point_set(@r, @X3, @Y3, @Z3, @T3)
+    return @r
+
+fn ed_point_neg(@p: array) -> array
+    # Negation in Edwards coords: (-X, Y, Z, -T).
+    @r = ed_point_new()
+    ed_point_set(@r, fe25519_neg(ed_point_get_x(@p)), ed_point_get_y(@p), ed_point_get_z(@p), fe25519_neg(ed_point_get_t(@p)))
+    return @r
+
+fn ed_point_equal(@p: array, @q: array) -> int
+    # Projective equality: X1*Z2 == X2*Z1 and Y1*Z2 == Y2*Z1.
+    @X1 = ed_point_get_x(@p)
+    @Y1 = ed_point_get_y(@p)
+    @Z1 = ed_point_get_z(@p)
+    @X2 = ed_point_get_x(@q)
+    @Y2 = ed_point_get_y(@q)
+    @Z2 = ed_point_get_z(@q)
+    @lhs1 = fe25519_to_bytes(fe25519_sub(fe25519_mul(@X1, @Z2), fe25519_mul(@X2, @Z1)))
+    @lhs2 = fe25519_to_bytes(fe25519_sub(fe25519_mul(@Y1, @Z2), fe25519_mul(@Y2, @Z1)))
+    @ok1 = fe25519_is_zero_bytes(@lhs1)
+    @ok2 = fe25519_is_zero_bytes(@lhs2)
+    return @ok1 & @ok2
+
+fn ed_basepoint() -> array
+    # Ed25519 base point B (RFC 8032 §5.1), y = 4/5 mod p.
+    # The compressed encoding is the 32-byte little-endian y-coordinate with
+    # the sign-bit of x in bit 7 of byte 31. For B the sign bit is 0.
+    # Decoding once per verify is cheap (< 1% of verify cost) and keeps the
+    # constant table short and auditable against RFC 8032.
+    @B_bytes = array_new(32, 0)
+    @B_bytes[0] = 0x58
+    orbit @i in range(1, 32)
+        @B_bytes[@i] = 0x66
+    return ed_point_decompress(@B_bytes)
+
+fn ed_scalar_mult(@n: array, @P: array) -> array
+    # 256-bit double-and-add using n as a 32-byte little-endian scalar.
+    # Because n here is public (reduced-mod-ell hash or parsed S), we don't
+    # need constant-time branching — still we use add+double uniformly.
+    @r = ed_point_new()
+    ed_point_set_zero(@r)
+    orbit @i in range(0, 256)
+        @bit_idx = 255 - @i
+        @byte = @n[@bit_idx / 8]
+        @bit = (@byte >> (@bit_idx % 8)) & 1
+        @r = ed_point_double(@r)
+        guard @bit == 1
+            @r = ed_point_add(@r, @P)
+    return @r
+
+# ---- Scalar reduction mod ell (RFC 8032 §5.1) ----
+# ell = 2^252 + 27742317777372353535851937790883648493. The reduction
+# constants used below (666643, 470296, 654183, 997805, 136657, 683901)
+# come from expanding -ell's polynomial in 21-bit signed limbs. Ported
+# verbatim from the ref10 / supercop `crypto_sign/ed25519/ref10/sc_reduce.c`.
+
+fn ed25519_sc_reduce(@s: array) -> array
+    # s is a 64-byte little-endian input (SHA-512 output). Returns a 32-byte
+    # little-endian scalar reduced mod ell.
+    # Load into 24 21-bit signed limbs (bit layout from ref10 sc_reduce.c).
+    @s0 = 0x1FFFFF & (@s[0] | (@s[1] << 8) | (@s[2] << 16))
+    @s1 = 0x1FFFFF & ((@s[2] | (@s[3] << 8) | (@s[4] << 16) | (@s[5] << 24)) >> 5)
+    @s2 = 0x1FFFFF & ((@s[5] | (@s[6] << 8) | (@s[7] << 16)) >> 2)
+    @s3 = 0x1FFFFF & ((@s[7] | (@s[8] << 8) | (@s[9] << 16) | (@s[10] << 24)) >> 7)
+    @s4 = 0x1FFFFF & ((@s[10] | (@s[11] << 8) | (@s[12] << 16) | (@s[13] << 24)) >> 4)
+    @s5 = 0x1FFFFF & ((@s[13] | (@s[14] << 8) | (@s[15] << 16)) >> 1)
+    @s6 = 0x1FFFFF & ((@s[15] | (@s[16] << 8) | (@s[17] << 16) | (@s[18] << 24)) >> 6)
+    @s7 = 0x1FFFFF & ((@s[18] | (@s[19] << 8) | (@s[20] << 16)) >> 3)
+    @s8 = 0x1FFFFF & (@s[21] | (@s[22] << 8) | (@s[23] << 16))
+    @s9 = 0x1FFFFF & ((@s[23] | (@s[24] << 8) | (@s[25] << 16) | (@s[26] << 24)) >> 5)
+    @s10 = 0x1FFFFF & ((@s[26] | (@s[27] << 8) | (@s[28] << 16)) >> 2)
+    @s11 = 0x1FFFFF & ((@s[28] | (@s[29] << 8) | (@s[30] << 16) | (@s[31] << 24)) >> 7)
+    @s12 = 0x1FFFFF & ((@s[31] | (@s[32] << 8) | (@s[33] << 16) | (@s[34] << 24)) >> 4)
+    @s13 = 0x1FFFFF & ((@s[34] | (@s[35] << 8) | (@s[36] << 16)) >> 1)
+    @s14 = 0x1FFFFF & ((@s[36] | (@s[37] << 8) | (@s[38] << 16) | (@s[39] << 24)) >> 6)
+    @s15 = 0x1FFFFF & ((@s[39] | (@s[40] << 8) | (@s[41] << 16)) >> 3)
+    @s16 = 0x1FFFFF & (@s[42] | (@s[43] << 8) | (@s[44] << 16))
+    @s17 = 0x1FFFFF & ((@s[44] | (@s[45] << 8) | (@s[46] << 16) | (@s[47] << 24)) >> 5)
+    @s18 = 0x1FFFFF & ((@s[47] | (@s[48] << 8) | (@s[49] << 16)) >> 2)
+    @s19 = 0x1FFFFF & ((@s[49] | (@s[50] << 8) | (@s[51] << 16) | (@s[52] << 24)) >> 7)
+    @s20 = 0x1FFFFF & ((@s[52] | (@s[53] << 8) | (@s[54] << 16) | (@s[55] << 24)) >> 4)
+    @s21 = 0x1FFFFF & ((@s[55] | (@s[56] << 8) | (@s[57] << 16)) >> 1)
+    @s22 = 0x1FFFFF & ((@s[57] | (@s[58] << 8) | (@s[59] << 16) | (@s[60] << 24)) >> 6)
+    @s23 = (@s[60] | (@s[61] << 8) | (@s[62] << 16) | (@s[63] << 24)) >> 3
+
+    # Fold top 12 limbs into bottom 12 using the identity
+    #   2^252 = -27742317...  (i.e., subtract L's polynomial form).
+    # These magic constants come from ell's limb form:
+    #   L = 16110573 + 10012311*2^21 + 6039697*2^42 + 11568601*2^63
+    #     + 14886*2^84 + 2^252
+    @s11 = @s11 + @s23 * 666643
+    @s12 = @s12 + @s23 * 470296
+    @s13 = @s13 + @s23 * 654183
+    @s14 = @s14 - @s23 * 997805
+    @s15 = @s15 + @s23 * 136657
+    @s16 = @s16 - @s23 * 683901
+    @s23 = 0
+
+    @s10 = @s10 + @s22 * 666643
+    @s11 = @s11 + @s22 * 470296
+    @s12 = @s12 + @s22 * 654183
+    @s13 = @s13 - @s22 * 997805
+    @s14 = @s14 + @s22 * 136657
+    @s15 = @s15 - @s22 * 683901
+    @s22 = 0
+
+    @s9 = @s9 + @s21 * 666643
+    @s10 = @s10 + @s21 * 470296
+    @s11 = @s11 + @s21 * 654183
+    @s12 = @s12 - @s21 * 997805
+    @s13 = @s13 + @s21 * 136657
+    @s14 = @s14 - @s21 * 683901
+    @s21 = 0
+
+    @s8 = @s8 + @s20 * 666643
+    @s9 = @s9 + @s20 * 470296
+    @s10 = @s10 + @s20 * 654183
+    @s11 = @s11 - @s20 * 997805
+    @s12 = @s12 + @s20 * 136657
+    @s13 = @s13 - @s20 * 683901
+    @s20 = 0
+
+    @s7 = @s7 + @s19 * 666643
+    @s8 = @s8 + @s19 * 470296
+    @s9 = @s9 + @s19 * 654183
+    @s10 = @s10 - @s19 * 997805
+    @s11 = @s11 + @s19 * 136657
+    @s12 = @s12 - @s19 * 683901
+    @s19 = 0
+
+    @s6 = @s6 + @s18 * 666643
+    @s7 = @s7 + @s18 * 470296
+    @s8 = @s8 + @s18 * 654183
+    @s9 = @s9 - @s18 * 997805
+    @s10 = @s10 + @s18 * 136657
+    @s11 = @s11 - @s18 * 683901
+    @s18 = 0
+
+    # Intermediate carry chain (step 1).
+    @c = (@s6 + (1 << 20)) >> 21
+    @s7 = @s7 + @c
+    @s6 = @s6 - (@c << 21)
+    @c = (@s8 + (1 << 20)) >> 21
+    @s9 = @s9 + @c
+    @s8 = @s8 - (@c << 21)
+    @c = (@s10 + (1 << 20)) >> 21
+    @s11 = @s11 + @c
+    @s10 = @s10 - (@c << 21)
+    @c = (@s12 + (1 << 20)) >> 21
+    @s13 = @s13 + @c
+    @s12 = @s12 - (@c << 21)
+    @c = (@s14 + (1 << 20)) >> 21
+    @s15 = @s15 + @c
+    @s14 = @s14 - (@c << 21)
+    @c = (@s16 + (1 << 20)) >> 21
+    @s17 = @s17 + @c
+    @s16 = @s16 - (@c << 21)
+
+    @c = (@s7 + (1 << 20)) >> 21
+    @s8 = @s8 + @c
+    @s7 = @s7 - (@c << 21)
+    @c = (@s9 + (1 << 20)) >> 21
+    @s10 = @s10 + @c
+    @s9 = @s9 - (@c << 21)
+    @c = (@s11 + (1 << 20)) >> 21
+    @s12 = @s12 + @c
+    @s11 = @s11 - (@c << 21)
+    @c = (@s13 + (1 << 20)) >> 21
+    @s14 = @s14 + @c
+    @s13 = @s13 - (@c << 21)
+    @c = (@s15 + (1 << 20)) >> 21
+    @s16 = @s16 + @c
+    @s15 = @s15 - (@c << 21)
+
+    @s5 = @s5 + @s17 * 666643
+    @s6 = @s6 + @s17 * 470296
+    @s7 = @s7 + @s17 * 654183
+    @s8 = @s8 - @s17 * 997805
+    @s9 = @s9 + @s17 * 136657
+    @s10 = @s10 - @s17 * 683901
+    @s17 = 0
+
+    @s4 = @s4 + @s16 * 666643
+    @s5 = @s5 + @s16 * 470296
+    @s6 = @s6 + @s16 * 654183
+    @s7 = @s7 - @s16 * 997805
+    @s8 = @s8 + @s16 * 136657
+    @s9 = @s9 - @s16 * 683901
+    @s16 = 0
+
+    @s3 = @s3 + @s15 * 666643
+    @s4 = @s4 + @s15 * 470296
+    @s5 = @s5 + @s15 * 654183
+    @s6 = @s6 - @s15 * 997805
+    @s7 = @s7 + @s15 * 136657
+    @s8 = @s8 - @s15 * 683901
+    @s15 = 0
+
+    @s2 = @s2 + @s14 * 666643
+    @s3 = @s3 + @s14 * 470296
+    @s4 = @s4 + @s14 * 654183
+    @s5 = @s5 - @s14 * 997805
+    @s6 = @s6 + @s14 * 136657
+    @s7 = @s7 - @s14 * 683901
+    @s14 = 0
+
+    @s1 = @s1 + @s13 * 666643
+    @s2 = @s2 + @s13 * 470296
+    @s3 = @s3 + @s13 * 654183
+    @s4 = @s4 - @s13 * 997805
+    @s5 = @s5 + @s13 * 136657
+    @s6 = @s6 - @s13 * 683901
+    @s13 = 0
+
+    @s0 = @s0 + @s12 * 666643
+    @s1 = @s1 + @s12 * 470296
+    @s2 = @s2 + @s12 * 654183
+    @s3 = @s3 - @s12 * 997805
+    @s4 = @s4 + @s12 * 136657
+    @s5 = @s5 - @s12 * 683901
+    @s12 = 0
+
+    @c = (@s0 + (1 << 20)) >> 21
+    @s1 = @s1 + @c
+    @s0 = @s0 - (@c << 21)
+    @c = (@s2 + (1 << 20)) >> 21
+    @s3 = @s3 + @c
+    @s2 = @s2 - (@c << 21)
+    @c = (@s4 + (1 << 20)) >> 21
+    @s5 = @s5 + @c
+    @s4 = @s4 - (@c << 21)
+    @c = (@s6 + (1 << 20)) >> 21
+    @s7 = @s7 + @c
+    @s6 = @s6 - (@c << 21)
+    @c = (@s8 + (1 << 20)) >> 21
+    @s9 = @s9 + @c
+    @s8 = @s8 - (@c << 21)
+    @c = (@s10 + (1 << 20)) >> 21
+    @s11 = @s11 + @c
+    @s10 = @s10 - (@c << 21)
+
+    @c = (@s1 + (1 << 20)) >> 21
+    @s2 = @s2 + @c
+    @s1 = @s1 - (@c << 21)
+    @c = (@s3 + (1 << 20)) >> 21
+    @s4 = @s4 + @c
+    @s3 = @s3 - (@c << 21)
+    @c = (@s5 + (1 << 20)) >> 21
+    @s6 = @s6 + @c
+    @s5 = @s5 - (@c << 21)
+    @c = (@s7 + (1 << 20)) >> 21
+    @s8 = @s8 + @c
+    @s7 = @s7 - (@c << 21)
+    @c = (@s9 + (1 << 20)) >> 21
+    @s10 = @s10 + @c
+    @s9 = @s9 - (@c << 21)
+    @c = (@s11 + (1 << 20)) >> 21
+    @s12 = @c
+    @s11 = @s11 - (@c << 21)
+
+    # s12 now contains the "wraparound"; fold it back one more time.
+    @s0 = @s0 + @s12 * 666643
+    @s1 = @s1 + @s12 * 470296
+    @s2 = @s2 + @s12 * 654183
+    @s3 = @s3 - @s12 * 997805
+    @s4 = @s4 + @s12 * 136657
+    @s5 = @s5 - @s12 * 683901
+    @s12 = 0
+
+    @c = @s0 >> 21
+    @s1 = @s1 + @c
+    @s0 = @s0 - (@c << 21)
+    @c = @s1 >> 21
+    @s2 = @s2 + @c
+    @s1 = @s1 - (@c << 21)
+    @c = @s2 >> 21
+    @s3 = @s3 + @c
+    @s2 = @s2 - (@c << 21)
+    @c = @s3 >> 21
+    @s4 = @s4 + @c
+    @s3 = @s3 - (@c << 21)
+    @c = @s4 >> 21
+    @s5 = @s5 + @c
+    @s4 = @s4 - (@c << 21)
+    @c = @s5 >> 21
+    @s6 = @s6 + @c
+    @s5 = @s5 - (@c << 21)
+    @c = @s6 >> 21
+    @s7 = @s7 + @c
+    @s6 = @s6 - (@c << 21)
+    @c = @s7 >> 21
+    @s8 = @s8 + @c
+    @s7 = @s7 - (@c << 21)
+    @c = @s8 >> 21
+    @s9 = @s9 + @c
+    @s8 = @s8 - (@c << 21)
+    @c = @s9 >> 21
+    @s10 = @s10 + @c
+    @s9 = @s9 - (@c << 21)
+    @c = @s10 >> 21
+    @s11 = @s11 + @c
+    @s10 = @s10 - (@c << 21)
+
+    # Serialize to 32 little-endian bytes (12 limbs of 21 bits = 252 bits; the
+    # top nibble is zero in any reduced scalar).
+    @r = array_new(32, 0)
+    @r[0] = @s0 & 0xFF
+    @r[1] = (@s0 >> 8) & 0xFF
+    @r[2] = ((@s0 >> 16) | (@s1 << 5)) & 0xFF
+    @r[3] = (@s1 >> 3) & 0xFF
+    @r[4] = (@s1 >> 11) & 0xFF
+    @r[5] = ((@s1 >> 19) | (@s2 << 2)) & 0xFF
+    @r[6] = (@s2 >> 6) & 0xFF
+    @r[7] = ((@s2 >> 14) | (@s3 << 7)) & 0xFF
+    @r[8] = (@s3 >> 1) & 0xFF
+    @r[9] = (@s3 >> 9) & 0xFF
+    @r[10] = ((@s3 >> 17) | (@s4 << 4)) & 0xFF
+    @r[11] = (@s4 >> 4) & 0xFF
+    @r[12] = (@s4 >> 12) & 0xFF
+    @r[13] = ((@s4 >> 20) | (@s5 << 1)) & 0xFF
+    @r[14] = (@s5 >> 7) & 0xFF
+    @r[15] = ((@s5 >> 15) | (@s6 << 6)) & 0xFF
+    @r[16] = (@s6 >> 2) & 0xFF
+    @r[17] = (@s6 >> 10) & 0xFF
+    @r[18] = ((@s6 >> 18) | (@s7 << 3)) & 0xFF
+    @r[19] = (@s7 >> 5) & 0xFF
+    @r[20] = (@s7 >> 13) & 0xFF
+    @r[21] = @s8 & 0xFF
+    @r[22] = (@s8 >> 8) & 0xFF
+    @r[23] = ((@s8 >> 16) | (@s9 << 5)) & 0xFF
+    @r[24] = (@s9 >> 3) & 0xFF
+    @r[25] = (@s9 >> 11) & 0xFF
+    @r[26] = ((@s9 >> 19) | (@s10 << 2)) & 0xFF
+    @r[27] = (@s10 >> 6) & 0xFF
+    @r[28] = ((@s10 >> 14) | (@s11 << 7)) & 0xFF
+    @r[29] = (@s11 >> 1) & 0xFF
+    @r[30] = (@s11 >> 9) & 0xFF
+    @r[31] = (@s11 >> 17) & 0xFF
+    return @r
+
+fn ed25519_scalar_is_canonical(@s: array) -> int
+    # Returns 1 iff s < ell. ell in little-endian:
+    #   ED ...  ... ... 10
+    # We do a constant-time big-integer compare against the canonical bytes.
+    @ell = array_new(32, 0)
+    @ell[0] = 0xED
+    @ell[1] = 0xD3
+    @ell[2] = 0xF5
+    @ell[3] = 0x5C
+    @ell[4] = 0x1A
+    @ell[5] = 0x63
+    @ell[6] = 0x12
+    @ell[7] = 0x58
+    @ell[8] = 0xD6
+    @ell[9] = 0x9C
+    @ell[10] = 0xF7
+    @ell[11] = 0xA2
+    @ell[12] = 0xDE
+    @ell[13] = 0xF9
+    @ell[14] = 0xDE
+    @ell[15] = 0x14
+    @ell[16] = 0
+    @ell[17] = 0
+    @ell[18] = 0
+    @ell[19] = 0
+    @ell[20] = 0
+    @ell[21] = 0
+    @ell[22] = 0
+    @ell[23] = 0
+    @ell[24] = 0
+    @ell[25] = 0
+    @ell[26] = 0
+    @ell[27] = 0
+    @ell[28] = 0
+    @ell[29] = 0
+    @ell[30] = 0
+    @ell[31] = 0x10
+    # Compare big-endian: walk from MSB down, latch "less" / "greater".
+    @gt = 0
+    @lt = 0
+    orbit @i in range(0, 32)
+        @idx = 31 - @i
+        @a = @s[@idx]
+        @b = @ell[@idx]
+        @is_gt = (@a - @b) >> 31
+        @is_gt = 1 - ((@is_gt + 1) & 1)
+        # Use ct_lt pattern: lt = ((a - b) >> 31) & 1 when a < b and no prior decide.
+        @this_lt = (((@a - @b) >> 31) & 1)
+        @this_gt = (((@b - @a) >> 31) & 1)
+        # Latch only if not yet decided.
+        @undecided = 1 - (@lt | @gt)
+        @lt = @lt | (@undecided & @this_lt)
+        @gt = @gt | (@undecided & @this_gt)
+    return @lt
+
+fn ed25519_verify(@pubkey: array, @msg: array, @sig: array) -> int
+    # RFC 8032 §5.1.7 verification. Returns 1 on valid sig, 0 otherwise.
+    guard array_len(@pubkey) != 32
+        return 0
+    guard array_len(@sig) != 64
+        return 0
+
+    # Step 1: split sig into R_bytes and S_bytes.
+    @R_bytes = array_slice(@sig, 0, 32)
+    @S_bytes = array_slice(@sig, 32, 64)
+
+    # Reject if S is not canonical (>= ell). Non-canonical S is forbidden.
+    guard ed25519_scalar_is_canonical(@S_bytes) == 0
+        return 0
+
+    # Step 2: decode R and A.
+    @R_pt = ed_point_decompress(@R_bytes)
+    guard array_len(@R_pt) != 40
+        return 0
+    @A_pt = ed_point_decompress(@pubkey)
+    guard array_len(@A_pt) != 40
+        return 0
+
+    # Step 3: h = SHA-512(R || A || M) reduced mod ell.
+    @pre = array_concat(@R_bytes, @pubkey)
+    @pre = array_concat(@pre, @msg)
+    @h_full = sha512(@pre)
+    @h = ed25519_sc_reduce(@h_full)
+
+    # Step 4: check [S]B == R + [h]A.
+    @B = ed_basepoint()
+    @sB = ed_scalar_mult(@S_bytes, @B)
+    @hA = ed_scalar_mult(@h, @A_pt)
+    @rhs = ed_point_add(@R_pt, @hA)
+
+    return ed_point_equal(@sB, @rhs)
+
+# =============================================================================
+# SECTION 10b: ECDSA P-256 VERIFY (FIPS 186-4 / SEC 1)
+# =============================================================================
+# Straight bigint arithmetic in 8 limbs of 32 bits. Constant-time is desirable
+# but verification works on public data (signature + pubkey + hash) so we
+# optimize for clarity over side-channel resistance here.
+#
+# Curve: y^2 = x^3 - 3x + b over F_p where:
+#   p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+#   n (order) = FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+#   Gx, Gy: standard NIST P-256 generator
+
+const P256_LIMBS: int = 8
+
+fn p256_p() -> array
+    @p = array_new(8, 0)
+    @p[0] = 0xFFFFFFFF
+    @p[1] = 0xFFFFFFFF
+    @p[2] = 0xFFFFFFFF
+    @p[3] = 0x00000000
+    @p[4] = 0x00000000
+    @p[5] = 0x00000000
+    @p[6] = 0x00000001
+    @p[7] = 0xFFFFFFFF
+    return @p
+
+fn p256_n() -> array
+    @n = array_new(8, 0)
+    @n[0] = 0xFC632551
+    @n[1] = 0xF3B9CAC2
+    @n[2] = 0xA7179E84
+    @n[3] = 0xBCE6FAAD
+    @n[4] = 0xFFFFFFFF
+    @n[5] = 0xFFFFFFFF
+    @n[6] = 0x00000000
+    @n[7] = 0xFFFFFFFF
+    return @n
+
+fn p256_b() -> array
+    @b = array_new(8, 0)
+    @b[0] = 0x27D2604B
+    @b[1] = 0x3BCE3C3E
+    @b[2] = 0xCC53B0F6
+    @b[3] = 0x651D06B0
+    @b[4] = 0x769886BC
+    @b[5] = 0xB3EBBD55
+    @b[6] = 0xAA3A93E7
+    @b[7] = 0x5AC635D8
+    return @b
+
+fn p256_gx() -> array
+    @g = array_new(8, 0)
+    @g[0] = 0xD898C296
+    @g[1] = 0xF4A13945
+    @g[2] = 0x2DEB33A0
+    @g[3] = 0x77037D81
+    @g[4] = 0x63A440F2
+    @g[5] = 0xF8BCE6E5
+    @g[6] = 0xE12C4247
+    @g[7] = 0x6B17D1F2
+    return @g
+
+fn p256_gy() -> array
+    @g = array_new(8, 0)
+    @g[0] = 0x37BF51F5
+    @g[1] = 0xCBB64068
+    @g[2] = 0x6B315ECE
+    @g[3] = 0x2BCE3357
+    @g[4] = 0x7C0F9E16
+    @g[5] = 0x8EE7EB4A
+    @g[6] = 0xFE1A7F9B
+    @g[7] = 0x4FE342E2
+    return @g
+
+fn array_from_limb(@v: int) -> array
+    @r = array_new(8, 0)
+    @r[0] = @v & 0xFFFFFFFF
+    return @r
+
+fn bn_from_bytes_be(@b: array, @off: int, @len: int) -> array
+    # Parse up to 32 big-endian bytes into 8 32-bit little-endian limbs.
+    @r = array_new(8, 0)
+    @end = @off + @len
+    orbit @i in range(0, @len)
+        @byte_idx = @end - 1 - @i
+        @limb_idx = @i / 4
+        @shift = (@i % 4) * 8
+        @r[@limb_idx] = @r[@limb_idx] | (@b[@byte_idx] << @shift)
+    return @r
+
+fn bn_is_zero(@a: array) -> int
+    # Returns 1 iff all limbs are zero. Branch-free.
+    @acc = 0
+    orbit @i in range(0, 8)
+        @acc = @acc | (@a[@i] & 0xFFFFFFFF)
+    @neg = 0 - @acc
+    @bit = ((@acc | @neg) >> 63) & 1
+    return @bit ^ 1
+
+fn bn_cmp(@a: array, @b: array) -> int
+    # Returns 1 if a > b, -1 if a < b, 0 if equal.
+    @gt = 0
+    @lt = 0
+    orbit @i in range(0, 8)
+        @idx = 7 - @i
+        @av = @a[@idx] & 0xFFFFFFFF
+        @bv = @b[@idx] & 0xFFFFFFFF
+        @this_gt = ((@bv - @av) >> 63) & 1
+        @this_lt = ((@av - @bv) >> 63) & 1
+        @undecided = 1 - (@gt | @lt)
+        @gt = @gt | (@undecided & @this_gt)
+        @lt = @lt | (@undecided & @this_lt)
+    guard @gt == 1
+        return 1
+    guard @lt == 1
+        return -1
+    return 0
+
+fn bn_add(@a: array, @b: array) -> array
+    # 9-limb result: low 8 limbs + carry as limb 8.
+    @r = array_new(9, 0)
+    @carry = 0
+    orbit @i in range(0, 8)
+        @sum = (@a[@i] & 0xFFFFFFFF) + (@b[@i] & 0xFFFFFFFF) + @carry
+        @r[@i] = @sum & 0xFFFFFFFF
+        @carry = (@sum >> 32) & 1
+    @r[8] = @carry
+    return @r
+
+fn bn_sub(@a: array, @b: array) -> array
+    # 9-limb result: low 8 limbs + borrow-in-flag as limb 8 (1 => borrow).
+    @r = array_new(9, 0)
+    @borrow = 0
+    orbit @i in range(0, 8)
+        @diff = (@a[@i] & 0xFFFFFFFF) - (@b[@i] & 0xFFFFFFFF) - @borrow
+        @r[@i] = @diff & 0xFFFFFFFF
+        @borrow = (@diff >> 63) & 1
+    @r[8] = @borrow
+    return @r
+
+fn bn_mod_p(@a: array, @m: array) -> array
+    # a is 8 or 9 limbs. If a >= m, subtract m; return low 8 limbs.
+    @lo = array_new(8, 0)
+    orbit @i in range(0, 8)
+        @lo[@i] = @a[@i] & 0xFFFFFFFF
+    # If overflow bit (a[8]) is set, subtract m and return.
+    guard array_len(@a) >= 9 and @a[8] == 1
+        @diff = bn_sub(@lo, @m)
+        @out = array_new(8, 0)
+        orbit @i in range(0, 8)
+            @out[@i] = @diff[@i]
+        return @out
+    guard bn_cmp(@lo, @m) >= 0
+        @diff = bn_sub(@lo, @m)
+        @out = array_new(8, 0)
+        orbit @i in range(0, 8)
+            @out[@i] = @diff[@i]
+        return @out
+    return @lo
+
+fn bn_addmod(@a: array, @b: array, @m: array) -> array
+    return bn_mod_p(bn_add(@a, @b), @m)
+
+fn bn_submod(@a: array, @b: array, @m: array) -> array
+    # (a - b) mod m
+    @diff = bn_sub(@a, @b)
+    guard @diff[8] == 1
+        # Wrapped; add m back.
+        @lo = array_new(8, 0)
+        orbit @i in range(0, 8)
+            @lo[@i] = @diff[@i]
+        @fix = bn_add(@lo, @m)
+        @out = array_new(8, 0)
+        orbit @i in range(0, 8)
+            @out[@i] = @fix[@i]
+        return @out
+    @lo = array_new(8, 0)
+    orbit @i in range(0, 8)
+        @lo[@i] = @diff[@i]
+    return @lo
+
+fn bn_mul_full(@a: array, @b: array) -> array
+    # 8 * 8 -> 16 32-bit limbs. Schoolbook with 64-bit accumulator.
+    @r = array_new(16, 0)
+    orbit @i in range(0, 8)
+        @carry = 0
+        orbit @j in range(0, 8)
+            @prod = (@a[@i] & 0xFFFFFFFF) * (@b[@j] & 0xFFFFFFFF) + (@r[@i + @j] & 0xFFFFFFFF) + @carry
+            @r[@i + @j] = @prod & 0xFFFFFFFF
+            @carry = @prod >> 32
+        @r[@i + 8] = @r[@i + 8] + @carry
+    return @r
+
+fn bn_mod_mul(@a: array, @b: array, @m: array) -> array
+    # Multiply then reduce by repeated big-int subtract. For verification
+    # scale (a handful of multiplies per signature), schoolbook + shift-
+    # reduce is fine; the key insight is that all quantities are public, so
+    # timing isn't secret-critical here. We use a generic reduction that
+    # repeatedly doubles/subtracts. For speed we delegate to Barrett-ish
+    # trick: shift-and-subtract on the 512-bit product.
+    @full = bn_mul_full(@a, @b)
+    # Reduce 16-limb value mod m by bitwise shift-and-subtract.
+    # 16 limbs * 32 bits = 512 bits; m is 256 bits => 256 reduction steps.
+    # For each bit from top to bottom, double remainder, import next bit,
+    # conditionally subtract m.
+    @rem = array_new(8, 0)
+    orbit @bit_i in range(0, 512)
+        @src_bit_idx = 511 - @bit_i
+        @src_limb = @full[@src_bit_idx / 32]
+        @src_bit = (@src_limb >> (@src_bit_idx % 32)) & 1
+        # rem = (rem << 1) | src_bit.
+        @carry = @src_bit
+        orbit @j in range(0, 8)
+            @new_limb = ((@rem[@j] & 0xFFFFFFFF) << 1) | @carry
+            @rem[@j] = @new_limb & 0xFFFFFFFF
+            @carry = (@new_limb >> 32) & 1
+        # If rem >= m (or carry set), subtract m.
+        guard @carry == 1 or bn_cmp(@rem, @m) >= 0
+            @diff = bn_sub(@rem, @m)
+            orbit @j in range(0, 8)
+                @rem[@j] = @diff[@j]
+    return @rem
+
+fn bn_mod_inv(@a: array, @m: array) -> array
+    # Fermat: a^(m-2) mod m  (m must be prime; n is prime).
+    # Square-and-multiply over the bits of m-2.
+    @exp = bn_sub(@m, array_from_limb(2))
+    @result = array_from_limb(1)
+    @base = array_new(8, 0)
+    orbit @i in range(0, 8)
+        @base[@i] = @a[@i]
+    orbit @bit_i in range(0, 256)
+        @limb = @exp[@bit_i / 32]
+        @b = (@limb >> (@bit_i % 32)) & 1
+        guard @b == 1
+            @result = bn_mod_mul(@result, @base, @m)
+        @base = bn_mod_mul(@base, @base, @m)
+    return @result
+
+# ---- P-256 point ops in affine coords ----
+# Affine point is a 16-limb array: [X (8 limbs) | Y (8 limbs)].
+# Identity is represented as 16 zeros with a sentinel: we use the Y=0 check.
+
+fn p256_point_new() -> array
+    return array_new(16, 0)
+
+fn p256_is_identity(@P: array) -> int
+    # Represent identity as X=0, Y=0 (since P-256 has no valid point with Y=0).
+    @all_zero = 1
+    orbit @i in range(0, 16)
+        guard @P[@i] != 0
+            @all_zero = 0
+    return @all_zero
+
+fn p256_point_set(@P: array, @X: array, @Y: array)
+    orbit @i in range(0, 8)
+        @P[@i] = @X[@i]
+        @P[8 + @i] = @Y[@i]
+
+fn p256_point_get_x(@P: array) -> array
+    @x = array_new(8, 0)
+    orbit @i in range(0, 8)
+        @x[@i] = @P[@i]
+    return @x
+
+fn p256_point_get_y(@P: array) -> array
+    @y = array_new(8, 0)
+    orbit @i in range(0, 8)
+        @y[@i] = @P[8 + @i]
+    return @y
+
+fn p256_point_double(@P: array) -> array
+    guard p256_is_identity(@P) == 1
+        return @P
+    @p = p256_p()
+    @X = p256_point_get_x(@P)
+    @Y = p256_point_get_y(@P)
+    # lambda = (3*X^2 - 3) / (2*Y)  — since a = -3 on P-256.
+    @X2 = bn_mod_mul(@X, @X, @p)
+    @three_X2 = bn_addmod(@X2, bn_addmod(@X2, @X2, @p), @p)
+    @three = array_from_limb(3)
+    @num = bn_submod(@three_X2, @three, @p)
+    @two_Y = bn_addmod(@Y, @Y, @p)
+    @inv_2Y = bn_mod_inv(@two_Y, @p)
+    @lam = bn_mod_mul(@num, @inv_2Y, @p)
+    # X3 = lam^2 - 2X
+    @lam2 = bn_mod_mul(@lam, @lam, @p)
+    @two_X = bn_addmod(@X, @X, @p)
+    @X3 = bn_submod(@lam2, @two_X, @p)
+    # Y3 = lam*(X - X3) - Y
+    @dx = bn_submod(@X, @X3, @p)
+    @Y3 = bn_submod(bn_mod_mul(@lam, @dx, @p), @Y, @p)
+    @R = p256_point_new()
+    p256_point_set(@R, @X3, @Y3)
+    return @R
+
+fn p256_point_add(@P: array, @Q: array) -> array
+    guard p256_is_identity(@P) == 1
+        return @Q
+    guard p256_is_identity(@Q) == 1
+        return @P
+    @p = p256_p()
+    @X1 = p256_point_get_x(@P)
+    @Y1 = p256_point_get_y(@P)
+    @X2 = p256_point_get_x(@Q)
+    @Y2 = p256_point_get_y(@Q)
+
+    # If X1 == X2: double or return identity.
+    @dx_sign = bn_cmp(@X1, @X2)
+    guard @dx_sign == 0
+        @y_eq = bn_cmp(@Y1, @Y2)
+        guard @y_eq == 0
+            return p256_point_double(@P)
+        return p256_point_new()   # P + (-P) = O
+
+    @dx = bn_submod(@X2, @X1, @p)
+    @dy = bn_submod(@Y2, @Y1, @p)
+    @inv_dx = bn_mod_inv(@dx, @p)
+    @lam = bn_mod_mul(@dy, @inv_dx, @p)
+    @lam2 = bn_mod_mul(@lam, @lam, @p)
+    @X3 = bn_submod(bn_submod(@lam2, @X1, @p), @X2, @p)
+    @Y3 = bn_submod(bn_mod_mul(@lam, bn_submod(@X1, @X3, @p), @p), @Y1, @p)
+    @R = p256_point_new()
+    p256_point_set(@R, @X3, @Y3)
+    return @R
+
+fn p256_scalar_mult(@k: array, @P: array) -> array
+    # Double-and-add from MSB; k is 8 32-bit limbs little-endian => 256 bits.
+    @R = p256_point_new()
+    orbit @i in range(0, 256)
+        @bit_idx = 255 - @i
+        @limb = @k[@bit_idx / 32]
+        @b = (@limb >> (@bit_idx % 32)) & 1
+        @R = p256_point_double(@R)
+        guard @b == 1
+            @R = p256_point_add(@R, @P)
+    return @R
+
+fn p256_parse_pubkey(@pubkey: array) -> array
+    # Accept uncompressed SEC 1: 0x04 || X(32) || Y(32), total 65 bytes.
+    # Also tolerate subjectPublicKey BIT STRING wrapping by searching for 0x04.
+    @len = array_len(@pubkey)
+    @off = 0
+    guard @len >= 65 and @pubkey[0] == 0x04
+        @off = 0
+    guard @len >= 66 and @pubkey[0] == 0x00 and @pubkey[1] == 0x04
+        @off = 1
+    guard @pubkey[@off] != 0x04
+        return array_from(0)
+    guard @off + 65 > @len
+        return array_from(0)
+    @X = bn_from_bytes_be(@pubkey, @off + 1, 32)
+    @Y = bn_from_bytes_be(@pubkey, @off + 33, 32)
+    @P = p256_point_new()
+    p256_point_set(@P, @X, @Y)
+    return @P
+
+fn ecdsa_p256_parse_sig(@sig_der: array) -> array
+    # DER SEQUENCE { INTEGER r, INTEGER s }. Returns [r_limbs(8), s_limbs(8)]
+    # concatenated (16 limbs total), or array_from(0) on error.
+    @len = array_len(@sig_der)
+    guard @len < 8
+        return array_from(0)
+    guard @sig_der[0] != 0x30
+        return array_from(0)
+    @pos = 2
+    # Handle multi-byte length by skipping past it.
+    guard @sig_der[1] >= 0x80
+        @nbytes = @sig_der[1] - 0x80
+        @pos = 2 + @nbytes
+    guard @sig_der[@pos] != 0x02
+        return array_from(0)
+    @rlen = @sig_der[@pos + 1]
+    @pos = @pos + 2
+    # Skip leading zero byte if present (positive-integer DER form).
+    @r_start = @pos
+    @r_actual_len = @rlen
+    guard @rlen > 0 and @sig_der[@pos] == 0x00
+        @r_start = @pos + 1
+        @r_actual_len = @rlen - 1
+    guard @r_actual_len > 32
+        return array_from(0)
+    @r = bn_from_bytes_be(@sig_der, @r_start, @r_actual_len)
+    @pos = @pos + @rlen
+    guard @sig_der[@pos] != 0x02
+        return array_from(0)
+    @slen = @sig_der[@pos + 1]
+    @pos = @pos + 2
+    @s_start = @pos
+    @s_actual_len = @slen
+    guard @slen > 0 and @sig_der[@pos] == 0x00
+        @s_start = @pos + 1
+        @s_actual_len = @slen - 1
+    guard @s_actual_len > 32
+        return array_from(0)
+    @s = bn_from_bytes_be(@sig_der, @s_start, @s_actual_len)
+    @out = array_new(16, 0)
+    orbit @i in range(0, 8)
+        @out[@i] = @r[@i]
+        @out[8 + @i] = @s[@i]
+    return @out
+
+fn ecdsa_p256_verify(@pubkey: array, @msg_hash: array, @sig_der: array) -> int
+    # FIPS 186-4 §6.4.2 ECDSA verification on P-256.
+    guard array_len(@pubkey) < 33
+        return 0
+    guard array_len(@msg_hash) != 32
+        return 0
+
+    @rs = ecdsa_p256_parse_sig(@sig_der)
+    guard array_len(@rs) != 16
+        return 0
+    @n = p256_n()
+    @r = array_new(8, 0)
+    @s = array_new(8, 0)
+    orbit @i in range(0, 8)
+        @r[@i] = @rs[@i]
+        @s[@i] = @rs[8 + @i]
+
+    # Range-check r, s in [1, n-1].
+    guard bn_is_zero(@r) == 1
+        return 0
+    guard bn_is_zero(@s) == 1
+        return 0
+    guard bn_cmp(@r, @n) >= 0
+        return 0
+    guard bn_cmp(@s, @n) >= 0
+        return 0
+
+    # e = leftmost bits of hash (for P-256, full 32 bytes).
+    @e = bn_from_bytes_be(@msg_hash, 0, 32)
+    # Reduce e mod n if needed.
+    guard bn_cmp(@e, @n) >= 0
+        @diff = bn_sub(@e, @n)
+        orbit @i in range(0, 8)
+            @e[@i] = @diff[@i]
+
+    @w = bn_mod_inv(@s, @n)
+    @u1 = bn_mod_mul(@e, @w, @n)
+    @u2 = bn_mod_mul(@r, @w, @n)
+
+    @Q = p256_parse_pubkey(@pubkey)
+    guard array_len(@Q) != 16
+        return 0
+
+    @G = p256_point_new()
+    p256_point_set(@G, p256_gx(), p256_gy())
+
+    @u1G = p256_scalar_mult(@u1, @G)
+    @u2Q = p256_scalar_mult(@u2, @Q)
+    @R = p256_point_add(@u1G, @u2Q)
+
+    guard p256_is_identity(@R) == 1
+        return 0
+
+    # Compare R.x mod n with r.
+    @Rx = p256_point_get_x(@R)
+    guard bn_cmp(@Rx, @n) >= 0
+        @diff = bn_sub(@Rx, @n)
+        orbit @i in range(0, 8)
+            @Rx[@i] = @diff[@i]
+    guard bn_cmp(@Rx, @r) == 0
+        return 1
+    return 0
+
+# =============================================================================
+# SECTION 11: ChaCha20-Poly1305 AEAD FOR THE RECORD LAYER
+# =============================================================================
+# crypto.luna already gives us chacha20_encrypt and poly1305. We wrap them in
+# the TLS 1.3 record layer shape: per-record nonce = iv XOR big-endian(seq).
+# RFC 8446 Section 5.3.
+
+fn tls13_build_nonce(@iv: array, @seq: int) -> array
+    # nonce = iv XOR pad_left(seq, 12) — RFC 8446 Section 5.3.
+    # Build the padded 64-bit seq in the low 8 bytes of a 12-byte buffer.
+    @seq_bytes = array_new(12, 0)
+    @seq_bytes[4] = (@seq >> 56) % 256
+    @seq_bytes[5] = (@seq >> 48) % 256
+    @seq_bytes[6] = (@seq >> 40) % 256
+    @seq_bytes[7] = (@seq >> 32) % 256
+    @seq_bytes[8] = (@seq >> 24) % 256
+    @seq_bytes[9] = (@seq >> 16) % 256
+    @seq_bytes[10] = (@seq >> 8) % 256
+    @seq_bytes[11] = @seq % 256
+    @out = array_new(12, 0)
+    orbit @i in range(0, 12)
+        @out[@i] = bitxor(@iv[@i], @seq_bytes[@i])
+    return @out
+
+fn chacha20_poly1305_seal(@key: array, @iv: array, @seq: int, @aad: array, @plaintext: array) -> array
+    # Returns ciphertext || tag.
+    @nonce = tls13_build_nonce(@iv, @seq)
+    @enc = aead_encrypt(@key, @nonce, @plaintext, @aad)
+    return array_concat(@enc.ciphertext, @enc.tag)
+
+fn chacha20_poly1305_open(@key: array, @iv: array, @seq: int, @aad: array, @record: array) -> array
+    # Returns plaintext or empty array on MAC failure.
+    @nonce = tls13_build_nonce(@iv, @seq)
+    @n = array_len(@record)
+    guard @n < AEAD_TAG_LEN else return []
+    @ct_len = @n - AEAD_TAG_LEN
+    @ct = array_slice(@record, 0, @ct_len)
+    @tag = array_slice(@record, @ct_len, @n)
+    @res = aead_decrypt(@key, @nonce, @ct, @aad, @tag)
+    guard @res.ok == 1 else return []
+    return @res.plaintext
+
+# =============================================================================
+# SECTION 12: ASN.1 DER PARSER
+# =============================================================================
+# Minimal subset required for X.509 parsing. We expose a cursor struct (by
+# returning `{offset, buf}` maps) and a small family of "take" functions.
+
+fn asn1_parse_length(@buf: array, @off: int) -> array
+    # Returns [length, new_offset].
+    guard @off >= array_len(@buf) else return array_from(-1, @off)
+    @first = @buf[@off]
+    guard @first < 128
+        return array_from(@first, @off + 1)
+    # Long form: lower 7 bits = number of length bytes.
+    @nbytes = @first - 128
+    guard @nbytes == 0 or @nbytes > 4
+        return array_from(-1, @off)
+    @len = 0
+    orbit @i in range(0, @nbytes)
+        @len = (@len << 8) | @buf[@off + 1 + @i]
+    return array_from(@len, @off + 1 + @nbytes)
+
+fn asn1_take_tag(@buf: array, @off: int, @expected_tag: int) -> array
+    # Returns [content_off, content_len, next_off]; negative tag on mismatch.
+    guard @off >= array_len(@buf) else return array_from(-1, 0, @off)
+    @tag = @buf[@off]
+    guard @tag != @expected_tag
+        return array_from(-1, 0, @off)
+    @ll = asn1_parse_length(@buf, @off + 1)
+    @len = @ll[0]
+    @content_off = @ll[1]
+    guard @len < 0 else return array_from(-1, 0, @off)
+    return array_from(@content_off, @len, @content_off + @len)
+
+fn asn1_take_any(@buf: array, @off: int) -> array
+    # Returns [tag, content_off, content_len, next_off].
+    guard @off >= array_len(@buf) else return array_from(-1, 0, 0, @off)
+    @tag = @buf[@off]
+    @ll = asn1_parse_length(@buf, @off + 1)
+    @len = @ll[0]
+    @content_off = @ll[1]
+    guard @len < 0 else return array_from(-1, 0, 0, @off)
+    return array_from(@tag, @content_off, @len, @content_off + @len)
+
+fn asn1_read_int(@buf: array, @off: int) -> array
+    # Returns the integer bytes (big-endian, sign bit stripped if present).
+    @r = asn1_take_tag(@buf, @off, DER_INTEGER)
+    guard @r[0] < 0 else return []
+    return array_slice(@buf, @r[0], @r[0] + @r[1])
+
+fn asn1_read_oid(@buf: array, @off: int) -> array
+    @r = asn1_take_tag(@buf, @off, DER_OID)
+    guard @r[0] < 0 else return []
+    return array_slice(@buf, @r[0], @r[0] + @r[1])
+
+fn asn1_read_octet_string(@buf: array, @off: int) -> array
+    @r = asn1_take_tag(@buf, @off, DER_OCTET_STRING)
+    guard @r[0] < 0 else return []
+    return array_slice(@buf, @r[0], @r[0] + @r[1])
+
+fn asn1_read_bit_string(@buf: array, @off: int) -> array
+    # BIT STRING is [unused_bits, ...bits]; we strip the unused-bits byte.
+    @r = asn1_take_tag(@buf, @off, DER_BIT_STRING)
+    guard @r[0] < 0 else return []
+    guard @r[1] < 1 else return []
+    # Skip the first byte (unused-bit count).
+    return array_slice(@buf, @r[0] + 1, @r[0] + @r[1])
+
+fn asn1_read_utctime(@buf: array, @off: int) -> array
+    # YYMMDDHHMMSSZ — 13 ASCII bytes.
+    @r = asn1_take_tag(@buf, @off, DER_UTC_TIME)
+    guard @r[0] < 0 else return []
+    return array_slice(@buf, @r[0], @r[0] + @r[1])
+
+fn asn1_read_generalized_time(@buf: array, @off: int) -> array
+    # YYYYMMDDHHMMSSZ — 15 ASCII bytes.
+    @r = asn1_take_tag(@buf, @off, DER_GENERALIZED_TIME)
+    guard @r[0] < 0 else return []
+    return array_slice(@buf, @r[0], @r[0] + @r[1])
+
+fn asn1_oid_equal(@a: array, @b: array) -> int
+    @la = array_len(@a)
+    @lb = array_len(@b)
+    guard @la != @lb else return 0
+    orbit @i in range(0, @la)
+        guard @a[@i] != @b[@i] else return 0
+    return 1
+
+# Common OIDs we care about, expressed as DER value bytes (no tag/length).
+fn oid_commonName() -> array
+    # 2.5.4.3
+    return array_from(0x55, 0x04, 0x03)
+
+fn oid_ecPublicKey() -> array
+    # 1.2.840.10045.2.1
+    return array_from(0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01)
+
+fn oid_prime256v1() -> array
+    # 1.2.840.10045.3.1.7
+    return array_from(0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07)
+
+fn oid_ed25519() -> array
+    # 1.3.101.112
+    return array_from(0x2B, 0x65, 0x70)
+
+fn oid_ecdsa_with_sha256() -> array
+    # 1.2.840.10045.4.3.2
+    return array_from(0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02)
+
+# =============================================================================
+# SECTION 13: X.509 CERTIFICATE PARSE
+# =============================================================================
+# We extract exactly what TLS 1.3 needs to verify the handshake:
+#   - issuer CN, subject CN       (diagnostic + SNI match when the SAN list
+#                                  is absent — we don't scan SANs in v1.0)
+#   - NotBefore / NotAfter        (for clock-based validity)
+#   - TBS bytes                   (for signature verify)
+#   - signature algorithm OID
+#   - signature bit string
+#   - subject public key algorithm + bit string
+
+struct ParsedCert
+    tbs_off: int
+    tbs_len: int
+    spki_off: int          # offset of the full SubjectPublicKeyInfo SEQUENCE
+    spki_len: int          # length of the full SPKI SEQUENCE (tag+length+content)
+    subject_cn: array
+    issuer_cn: array
+    not_before: array
+    not_after: array
+    pubkey_alg_oid: array
+    pubkey_bytes: array    # raw BIT STRING minus unused-bits byte
+    sig_alg_oid: array
+    sig_bytes: array       # raw BIT STRING minus unused-bits byte
+    valid: int             # 1 = parsed successfully
+
+fn extract_cn_from_name(@buf: array, @name_off: int, @name_len: int) -> array
+    # A Name is a SEQUENCE OF RelativeDistinguishedName (SET OF AVA).
+    # Each AVA is SEQUENCE { type OID, value ANY }.
+    @off = @name_off
+    @end = @name_off + @name_len
+    orbit @_ in range(0, 64)
+        guard @off >= @end
+            return []
+        @rdn = asn1_take_tag(@buf, @off, DER_SET)
+        guard @rdn[0] < 0
+            return []
+        @rdn_end = @rdn[0] + @rdn[1]
+        @sub = @rdn[0]
+        orbit @_ in range(0, 16)
+            guard @sub >= @rdn_end
+                meow
+            @ava = asn1_take_tag(@buf, @sub, DER_SEQUENCE)
+            guard @ava[0] < 0
+                meow
+            @oid = asn1_read_oid(@buf, @ava[0])
+            guard asn1_oid_equal(@oid, oid_commonName()) == 1
+                # Value follows the OID TLV; compute its start.
+                @oid_tlv = asn1_take_tag(@buf, @ava[0], DER_OID)
+                @val_off = @oid_tlv[2]
+                # Value may be UTF8String, PrintableString, IA5String, ...
+                @val_any = asn1_take_any(@buf, @val_off)
+                guard @val_any[0] < 0
+                    meow
+                return array_slice(@buf, @val_any[1], @val_any[1] + @val_any[2])
+            @sub = @ava[2]
+        @off = @rdn[2]
+    return []
+
+fn x509_parse(@cert: array) -> ParsedCert
+    # Certificate  ::=  SEQUENCE  {
+    #     tbsCertificate       TBSCertificate,
+    #     signatureAlgorithm   AlgorithmIdentifier,
+    #     signatureValue       BIT STRING  }
+    @bad = ParsedCert {
+        tbs_off: 0, tbs_len: 0,
+        spki_off: 0, spki_len: 0,
+        subject_cn: [], issuer_cn: [],
+        not_before: [], not_after: [],
+        pubkey_alg_oid: [], pubkey_bytes: [],
+        sig_alg_oid: [], sig_bytes: [],
+        valid: 0
+    }
+
+    @outer = asn1_take_tag(@cert, 0, DER_SEQUENCE)
+    guard @outer[0] < 0
+        return @bad
+    @outer_off = @outer[0]
+    @outer_end = @outer_off + @outer[1]
+
+    @tbs = asn1_take_tag(@cert, @outer_off, DER_SEQUENCE)
+    guard @tbs[0] < 0
+        return @bad
+    @tbs_content_off = @tbs[0]
+    @tbs_content_end = @tbs_content_off + @tbs[1]
+    # TBS bytes for signature verify include the tag+length prefix.
+    @tbs_full_len = @tbs[2] - @outer_off
+    @tbs_full_off = @outer_off
+
+    # Optional [0] version
+    @walk = @tbs_content_off
+    @peek = @cert[@walk]
+    guard @peek == DER_CONTEXT_0
+        @v = asn1_take_any(@cert, @walk)
+        @walk = @v[3]
+
+    # serialNumber INTEGER
+    @ser = asn1_take_tag(@cert, @walk, DER_INTEGER)
+    guard @ser[0] < 0
+        return @bad
+    @walk = @ser[2]
+
+    # signature AlgorithmIdentifier
+    @sigalg_tbs = asn1_take_tag(@cert, @walk, DER_SEQUENCE)
+    guard @sigalg_tbs[0] < 0
+        return @bad
+    @walk = @sigalg_tbs[2]
+
+    # issuer Name
+    @issuer = asn1_take_tag(@cert, @walk, DER_SEQUENCE)
+    guard @issuer[0] < 0
+        return @bad
+    @issuer_cn_val = extract_cn_from_name(@cert, @issuer[0], @issuer[1])
+    @walk = @issuer[2]
+
+    # validity SEQUENCE { notBefore, notAfter }
+    @validity = asn1_take_tag(@cert, @walk, DER_SEQUENCE)
+    guard @validity[0] < 0
+        return @bad
+    @v_off = @validity[0]
+    @nb_any = asn1_take_any(@cert, @v_off)
+    @not_before_val = array_slice(@cert, @nb_any[1], @nb_any[1] + @nb_any[2])
+    @na_any = asn1_take_any(@cert, @nb_any[3])
+    @not_after_val = array_slice(@cert, @na_any[1], @na_any[1] + @na_any[2])
+    @walk = @validity[2]
+
+    # subject Name
+    @subject = asn1_take_tag(@cert, @walk, DER_SEQUENCE)
+    guard @subject[0] < 0
+        return @bad
+    @subject_cn_val = extract_cn_from_name(@cert, @subject[0], @subject[1])
+    @walk = @subject[2]
+
+    # subjectPublicKeyInfo SEQUENCE { AlgorithmIdentifier, BIT STRING }
+    # Remember the full SPKI bounds — trust-store anchoring hashes this whole
+    # SEQUENCE (outer tag + length + content) per RFC 7469 §2.4.
+    @spki_full_off = @walk
+    @spki = asn1_take_tag(@cert, @walk, DER_SEQUENCE)
+    guard @spki[0] < 0
+        return @bad
+    @spki_full_len = @spki[2] - @walk
+    @spki_off = @spki[0]
+    @alg_id = asn1_take_tag(@cert, @spki_off, DER_SEQUENCE)
+    guard @alg_id[0] < 0
+        return @bad
+    @pubkey_oid = asn1_read_oid(@cert, @alg_id[0])
+    @pubkey_bits_off = @alg_id[2]
+    @pubkey_bits = asn1_read_bit_string(@cert, @pubkey_bits_off)
+
+    # signatureAlgorithm + signatureValue live OUTSIDE the TBS.
+    @outer_walk = @tbs[2]
+    @sigalg_outer = asn1_take_tag(@cert, @outer_walk, DER_SEQUENCE)
+    guard @sigalg_outer[0] < 0
+        return @bad
+    @sigalg_oid = asn1_read_oid(@cert, @sigalg_outer[0])
+    @outer_walk = @sigalg_outer[2]
+    @sig_val = asn1_read_bit_string(@cert, @outer_walk)
+
+    return ParsedCert {
+        tbs_off: @tbs_full_off,
+        tbs_len: @tbs_full_len,
+        spki_off: @spki_full_off,
+        spki_len: @spki_full_len,
+        subject_cn: @subject_cn_val,
+        issuer_cn: @issuer_cn_val,
+        not_before: @not_before_val,
+        not_after: @not_after_val,
+        pubkey_alg_oid: @pubkey_oid,
+        pubkey_bytes: @pubkey_bits,
+        sig_alg_oid: @sigalg_oid,
+        sig_bytes: @sig_val,
+        valid: 1
+    }
+
+fn x509_date_parse_utc(@bytes: array) -> int
+    # Convert YYMMDDHHMMSSZ to a rough unix-epoch day count.
+    # Good enough for "is it between NotBefore and NotAfter?".
+    # TODO: use time.luna SystemTime once available.
+    guard array_len(@bytes) < 12 else return 0
+    @yy = (@bytes[0] - 48) * 10 + (@bytes[1] - 48)
+    @year = @yy
+    guard @yy < 50
+        @year = 2000 + @yy
+    guard @yy >= 50
+        @year = 1900 + @yy
+    @mo = (@bytes[2] - 48) * 10 + (@bytes[3] - 48)
+    @da = (@bytes[4] - 48) * 10 + (@bytes[5] - 48)
+    # Return an integer that monotonically increases with real time —
+    # sufficient for ordering comparisons, not a real unix timestamp.
+    return @year * 10000 + @mo * 100 + @da
+
+fn x509_date_parse_any(@bytes: array) -> int
+    # UTCTime is 13 bytes; GeneralizedTime is 15. Sniff on length.
+    @n = array_len(@bytes)
+    guard @n == 13 or @n == 12
+        return x509_date_parse_utc(@bytes)
+    guard @n == 15 or @n == 14
+        @year = (@bytes[0] - 48) * 1000 + (@bytes[1] - 48) * 100 + (@bytes[2] - 48) * 10 + (@bytes[3] - 48)
+        @mo = (@bytes[4] - 48) * 10 + (@bytes[5] - 48)
+        @da = (@bytes[6] - 48) * 10 + (@bytes[7] - 48)
+        return @year * 10000 + @mo * 100 + @da
+    return 0
+
+fn x509_current_epoch_day() -> int
+    # TODO: wire into time.luna when we stop importing crypto-only.
+    # For now, a roughly-correct constant (2026-04-18) so date checks work.
+    return 20260418
+
+fn x509_verify_dates(@cert: ParsedCert) -> int
+    guard @cert.valid == 0 else return VEIL_BAD_CERT
+    @now = x509_current_epoch_day()
+    @nb = x509_date_parse_any(@cert.not_before)
+    @na = x509_date_parse_any(@cert.not_after)
+    guard @now < @nb
+        return VEIL_BAD_CERT
+    guard @now > @na
+        return VEIL_BAD_CERT
+    return VEIL_OK
+
+fn x509_subject_cn_matches(@cert: ParsedCert, @host: array) -> int
+    @cn = @cert.subject_cn
+    @cl = array_len(@cn)
+    @hl = array_len(@host)
+    guard @cl != @hl else return 0
+    orbit @i in range(0, @cl)
+        guard @cn[@i] != @host[@i]
+            return 0
+    return 1
+
+fn x509_verify_signature(@child: ParsedCert, @parent: ParsedCert, @cert_buf: array) -> int
+    # Dispatch on parent's subjectPublicKey algorithm.
+    guard @child.valid == 0 else return VEIL_BAD_CERT
+    guard @parent.valid == 0 else return VEIL_BAD_CERT
+    @tbs = array_slice(@cert_buf, @child.tbs_off, @child.tbs_off + @child.tbs_len)
+    @tbs_hash = sha256(@tbs)
+
+    guard asn1_oid_equal(@parent.pubkey_alg_oid, oid_ed25519()) == 1
+        @ok = ed25519_verify(@parent.pubkey_bytes, @tbs, @child.sig_bytes)
+        guard @ok == 1
+            return VEIL_OK
+        return VEIL_BAD_CERT
+
+    guard asn1_oid_equal(@parent.pubkey_alg_oid, oid_ecPublicKey()) == 1
+        @ok = ecdsa_p256_verify(@parent.pubkey_bytes, @tbs_hash, @child.sig_bytes)
+        guard @ok == 1
+            return VEIL_OK
+        return VEIL_BAD_CERT
+
+    return VEIL_BAD_CERT
+
+fn x509_extract_spki(@cert_buf: array, @parsed: ParsedCert) -> array
+    # Return the raw SubjectPublicKeyInfo SEQUENCE bytes (tag + length + content)
+    # from the given parsed certificate. These are the bytes SHA-256 hashes to
+    # produce the SPKI fingerprint the trust store indexes by (RFC 7469 §2.4).
+    guard @parsed.valid == 0
+        return []
+    guard @parsed.spki_len <= 0
+        return []
+    return array_slice(@cert_buf, @parsed.spki_off, @parsed.spki_off + @parsed.spki_len)
+
+fn x509_chain_verify(@chain: array) -> int
+    # @chain is an array of raw cert byte-arrays, leaf first.
+    @n = array_len(@chain)
+    guard @n < 1
+        return VEIL_BAD_CERT
+    orbit @i in range(0, @n)
+        @cert = x509_parse(@chain[@i])
+        @dok = x509_verify_dates(@cert)
+        guard @dok != VEIL_OK
+            return @dok
+        guard @i + 1 < @n
+            @parent = x509_parse(@chain[@i + 1])
+            @sok = x509_verify_signature(@cert, @parent, @chain[@i])
+            guard @sok != VEIL_OK
+                return @sok
+    # Anchor the final cert against Luna's trust store. We hash its SPKI
+    # (full SubjectPublicKeyInfo SEQUENCE) and ask x509_roots whether any
+    # root fingerprint matches. No match ⇒ untrusted root ⇒ abort.
+    @top_buf = @chain[@n - 1]
+    @top_cert = x509_parse(@top_buf)
+    guard @top_cert.valid == 0
+        return VEIL_BAD_CERT
+    @spki_bytes = x509_extract_spki(@top_buf, @top_cert)
+    guard array_len(@spki_bytes) == 0
+        return VEIL_BAD_CERT
+    @spki_hash = sha256(@spki_bytes)
+    guard trust_store_contains(@spki_hash) == 0
+        return VEIL_BAD_CERT
+    return VEIL_OK
+
+# =============================================================================
+# SECTION 14: TLS 1.3 RECORD LAYER
+# =============================================================================
+
+fn record_write_header(@buf: array, @ct: int, @version: int, @length: int) -> int
+    @buf[0] = @ct
+    @buf[1] = (@version >> 8) % 256
+    @buf[2] = @version % 256
+    @buf[3] = (@length >> 8) % 256
+    @buf[4] = @length % 256
+    return 5
+
+fn record_send_plain(@h: int, @ct: int, @payload: array) -> int
+    @tcp = @veil_tcp_fds[@h]
+    @n = array_len(@payload)
+    @frame = array_new(5 + @n, 0)
+    record_write_header(@frame, @ct, TLS_V1_2, @n)
+    orbit @i in range(0, @n)
+        @frame[5 + @i] = @payload[@i]
+    return tcp_send(@tcp, __addr(@frame), 5 + @n)
+
+fn record_send_encrypted(@h: int, @inner_type: int, @payload: array, @is_app: int) -> int
+    # Build TLSInnerPlaintext = payload || inner_type || padding(optional).
+    @pt = array_concat(@payload, array_from(@inner_type))
+    # Select key/iv/seq for whichever epoch we're in.
+    @key = []
+    @iv = []
+    @seq = 0
+    guard @is_app == 1
+        @key = slot32_read(__addr(@veil_client_key), @h)
+        @iv = slot12_read(__addr(@veil_client_iv), @h)
+        @seq = @veil_client_seq[@h]
+    guard @is_app == 0
+        # Handshake traffic keys are re-derived on the fly from
+        # client_handshake_traffic_secret (stored in @veil_client_hs_traffic).
+        @hs = slot32_read(__addr(@veil_client_hs_traffic), @h)
+        @key = hkdf_expand_label(@hs, str_to_bytes("key"), [], AEAD_KEY_LEN)
+        @iv = hkdf_expand_label(@hs, str_to_bytes("iv"), [], AEAD_IV_LEN)
+        @seq = @veil_client_seq[@h]
+
+    # AAD for TLS 1.3 record = 5-byte record header of the *ciphertext*.
+    @ct_len = array_len(@pt) + AEAD_TAG_LEN
+    @aad = array_new(5, 0)
+    record_write_header(@aad, TLS_CT_APPLICATION_DATA, TLS_V1_2, @ct_len)
+
+    @sealed = chacha20_poly1305_seal(@key, @iv, @seq, @aad, @pt)
+    @veil_client_seq[@h] = @seq + 1
+
+    @frame = array_new(5 + array_len(@sealed), 0)
+    record_write_header(@frame, TLS_CT_APPLICATION_DATA, TLS_V1_2, array_len(@sealed))
+    bytes_copy(@frame, 5, @sealed, 0, array_len(@sealed))
+    return tcp_send(@veil_tcp_fds[@h], __addr(@frame), array_len(@frame))
+
+fn record_recv(@h: int) -> array
+    # Pulls the next TLS record off the wire. Returns [content_type, payload].
+    # We read a 5-byte header, then exactly that many bytes.
+    @tcp = @veil_tcp_fds[@h]
+    @hdr = array_new(5, 0)
+    @got = 0
+    orbit @_ in range(0, 5)
+        guard @got >= 5
+            meow
+        @r = tcp_recv(@tcp, __addr(@hdr) + @got, 5 - @got)
+        guard @r <= 0
+            return array_from(-1)
+        @got = @got + @r
+    @ct = @hdr[0]
+    @len = (@hdr[3] << 8) | @hdr[4]
+    guard @len > MAX_RECORD_CIPHERTEXT
+        return array_from(-1)
+    @body = array_new(@len, 0)
+    @got = 0
+    orbit @_ in range(0, @len)
+        guard @got >= @len
+            meow
+        @r = tcp_recv(@tcp, __addr(@body) + @got, @len - @got)
+        guard @r <= 0
+            return array_from(-1)
+        @got = @got + @r
+    @out = array_new(1 + @len, 0)
+    @out[0] = @ct
+    orbit @i in range(0, @len)
+        @out[1 + @i] = @body[@i]
+    return @out
+
+fn record_recv_decrypted(@h: int, @is_app: int) -> array
+    # Unwraps one encrypted record into [inner_content_type, plaintext].
+    @raw = record_recv(@h)
+    guard array_len(@raw) == 1 and @raw[0] == -1
+        return array_from(-1)
+    @ct = @raw[0]
+    # Middlebox-compatibility ChangeCipherSpec is silently dropped.
+    guard @ct == TLS_CT_CHANGE_CIPHER_SPEC
+        return record_recv_decrypted(@h, @is_app)
+    guard @ct != TLS_CT_APPLICATION_DATA
+        # Plaintext alert/handshake — pass through untouched.
+        @pt = array_slice(@raw, 1, array_len(@raw))
+        @out = array_new(1 + array_len(@pt), 0)
+        @out[0] = @ct
+        bytes_copy(@out, 1, @pt, 0, array_len(@pt))
+        return @out
+
+    @body = array_slice(@raw, 1, array_len(@raw))
+    @key = []
+    @iv = []
+    @seq = 0
+    guard @is_app == 1
+        @key = slot32_read(__addr(@veil_server_key), @h)
+        @iv = slot12_read(__addr(@veil_server_iv), @h)
+        @seq = @veil_server_seq[@h]
+    guard @is_app == 0
+        @hs = slot32_read(__addr(@veil_server_hs_traffic), @h)
+        @key = hkdf_expand_label(@hs, str_to_bytes("key"), [], AEAD_KEY_LEN)
+        @iv = hkdf_expand_label(@hs, str_to_bytes("iv"), [], AEAD_IV_LEN)
+        @seq = @veil_server_seq[@h]
+
+    @aad = array_new(5, 0)
+    record_write_header(@aad, TLS_CT_APPLICATION_DATA, TLS_V1_2, array_len(@body))
+    @plain = chacha20_poly1305_open(@key, @iv, @seq, @aad, @body)
+    guard array_len(@plain) == 0
+        record_tremor_lit("bad record MAC")
+        return array_from(-1)
+    @veil_server_seq[@h] = @seq + 1
+
+    # Strip trailing zero padding then peel off the inner content type (last byte).
+    @p = array_len(@plain) - 1
+    orbit @_ in range(0, array_len(@plain))
+        guard @p < 0
+            meow
+        guard @plain[@p] != 0
+            meow
+        @p = @p - 1
+    guard @p < 0
+        return array_from(-1)
+    @inner_ct = @plain[@p]
+    @out = array_new(1 + @p, 0)
+    @out[0] = @inner_ct
+    bytes_copy(@out, 1, @plain, 0, @p)
+    return @out
+
+# =============================================================================
+# SECTION 15: KEY SCHEDULE (RFC 8446 Section 7.1)
+# =============================================================================
+# Derivation order:
+#   early_secret = HKDF-Extract(0, PSK or 0)
+#   derived_1    = Derive-Secret(early_secret, "derived", "")
+#   handshake_secret = HKDF-Extract(derived_1, DHE_shared)
+#   client_hs_traffic = Derive-Secret(handshake_secret, "c hs traffic", CH..SH)
+#   server_hs_traffic = Derive-Secret(handshake_secret, "s hs traffic", CH..SH)
+#   derived_2    = Derive-Secret(handshake_secret, "derived", "")
+#   master_secret = HKDF-Extract(derived_2, 0)
+#   client_app_traffic = Derive-Secret(master_secret, "c ap traffic", CH..SF)
+#   server_app_traffic = Derive-Secret(master_secret, "s ap traffic", CH..SF)
+
+fn key_schedule_early(@h: int)
+    @psk = array_new(HASH_LEN, 0)
+    @empty_salt = []
+    @es = hkdf_extract(@empty_salt, @psk)
+    slot32_write(__addr(@veil_early_secret), @h, @es)
+
+fn key_schedule_handshake(@h: int, @ecdh_shared: array)
+    @es = slot32_read(__addr(@veil_early_secret), @h)
+    @empty_hash = sha256([])
+    @derived = derive_secret(@es, str_to_bytes("derived"), @empty_hash)
+    @hs_secret = hkdf_extract(@derived, @ecdh_shared)
+    slot32_write(__addr(@veil_handshake_secret), @h, @hs_secret)
+
+    @th = transcript_snapshot(@h)
+    @c_hs = derive_secret(@hs_secret, str_to_bytes("c hs traffic"), @th)
+    @s_hs = derive_secret(@hs_secret, str_to_bytes("s hs traffic"), @th)
+    slot32_write(__addr(@veil_client_hs_traffic), @h, @c_hs)
+    slot32_write(__addr(@veil_server_hs_traffic), @h, @s_hs)
+
+    # Reset sequence counters — handshake traffic epoch begins.
+    @veil_client_seq[@h] = 0
+    @veil_server_seq[@h] = 0
+
+fn key_schedule_application(@h: int)
+    @hs_secret = slot32_read(__addr(@veil_handshake_secret), @h)
+    @empty_hash = sha256([])
+    @derived = derive_secret(@hs_secret, str_to_bytes("derived"), @empty_hash)
+    @master = hkdf_extract(@derived, array_new(HASH_LEN, 0))
+    slot32_write(__addr(@veil_master_secret), @h, @master)
+
+    @th = transcript_snapshot(@h)
+    @c_ap = derive_secret(@master, str_to_bytes("c ap traffic"), @th)
+    @s_ap = derive_secret(@master, str_to_bytes("s ap traffic"), @th)
+    slot32_write(__addr(@veil_client_ap_traffic), @h, @c_ap)
+    slot32_write(__addr(@veil_server_ap_traffic), @h, @s_ap)
+
+    # Pre-derive AEAD key/iv for the hot path so we don't re-run HKDF per record.
+    @ck = hkdf_expand_label(@c_ap, str_to_bytes("key"), [], AEAD_KEY_LEN)
+    @civ = hkdf_expand_label(@c_ap, str_to_bytes("iv"), [], AEAD_IV_LEN)
+    @sk = hkdf_expand_label(@s_ap, str_to_bytes("key"), [], AEAD_KEY_LEN)
+    @siv = hkdf_expand_label(@s_ap, str_to_bytes("iv"), [], AEAD_IV_LEN)
+    slot32_write(__addr(@veil_client_key), @h, @ck)
+    slot12_write(__addr(@veil_client_iv), @h, @civ)
+    slot32_write(__addr(@veil_server_key), @h, @sk)
+    slot12_write(__addr(@veil_server_iv), @h, @siv)
+
+    @veil_client_seq[@h] = 0
+    @veil_server_seq[@h] = 0
+
+fn compute_finished_mac(@h: int, @traffic_secret: array) -> array
+    # finished_key = HKDF-Expand-Label(traffic_secret, "finished", "", Hash.length)
+    # verify_data  = HMAC(finished_key, Transcript-Hash(up-to-here))
+    @fin_key = hkdf_expand_label(@traffic_secret, str_to_bytes("finished"), [], HASH_LEN)
+    @th = transcript_snapshot(@h)
+    return hmac_sha256(@fin_key, @th)
+
+# =============================================================================
+# SECTION 16: HANDSHAKE MESSAGE BUILDERS
+# =============================================================================
+
+fn build_extension_server_name(@host: array) -> array
+    @hl = array_len(@host)
+    # ServerNameList = uint16 list_len || ( uint8 type=0, uint16 name_len, name )
+    @entry_len = 1 + 2 + @hl
+    @list_len = @entry_len
+    @payload_len = 2 + @entry_len
+    @ext = array_new(4 + @payload_len, 0)
+    write_u16_be(@ext, 0, EXT_SERVER_NAME)
+    write_u16_be(@ext, 2, @payload_len)
+    write_u16_be(@ext, 4, @list_len)
+    @ext[6] = 0   # host_name type
+    write_u16_be(@ext, 7, @hl)
+    bytes_copy(@ext, 9, @host, 0, @hl)
+    return @ext
+
+fn build_extension_supported_versions() -> array
+    # 0x002b, len=3, list_len=2, [0x0304]
+    @ext = array_new(4 + 3, 0)
+    write_u16_be(@ext, 0, EXT_SUPPORTED_VERSIONS)
+    write_u16_be(@ext, 2, 3)
+    @ext[4] = 2
+    write_u16_be(@ext, 5, TLS_V1_3)
+    return @ext
+
+fn build_extension_supported_groups() -> array
+    # list_len=2, [x25519]
+    @ext = array_new(4 + 4, 0)
+    write_u16_be(@ext, 0, EXT_SUPPORTED_GROUPS)
+    write_u16_be(@ext, 2, 4)
+    write_u16_be(@ext, 4, 2)
+    write_u16_be(@ext, 6, GROUP_X25519)
+    return @ext
+
+fn build_extension_signature_algorithms() -> array
+    # list: ecdsa_secp256r1_sha256, ed25519
+    @ext = array_new(4 + 6, 0)
+    write_u16_be(@ext, 0, EXT_SIGNATURE_ALGORITHMS)
+    write_u16_be(@ext, 2, 6)
+    write_u16_be(@ext, 4, 4)
+    write_u16_be(@ext, 6, SIG_ECDSA_SECP256R1_SHA256)
+    write_u16_be(@ext, 8, SIG_ED25519)
+    return @ext
+
+fn build_extension_key_share(@pub: array) -> array
+    # KeyShareClientHello = uint16 list_len || ( group, uint16 key_len, key )
+    @kl = array_len(@pub)
+    @entry_len = 2 + 2 + @kl
+    @payload_len = 2 + @entry_len
+    @ext = array_new(4 + @payload_len, 0)
+    write_u16_be(@ext, 0, EXT_KEY_SHARE)
+    write_u16_be(@ext, 2, @payload_len)
+    write_u16_be(@ext, 4, @entry_len)
+    write_u16_be(@ext, 6, GROUP_X25519)
+    write_u16_be(@ext, 8, @kl)
+    bytes_copy(@ext, 10, @pub, 0, @kl)
+    return @ext
+
+fn build_extension_psk_modes() -> array
+    # RFC 8446 Section 4.2.9: psk_dhe_ke = 1
+    @ext = array_new(4 + 2, 0)
+    write_u16_be(@ext, 0, EXT_PSK_KEY_EXCHANGE_MODES)
+    write_u16_be(@ext, 2, 2)
+    @ext[4] = 1
+    @ext[5] = 1
+    return @ext
+
+fn build_extension_alpn(@protos: array) -> array
+    # @protos = array of byte-arrays (protocol names)
+    @num = array_len(@protos)
+    guard @num == 0 else return []
+    @list_len = 0
+    orbit @i in range(0, @num)
+        @p = @protos[@i]
+        @list_len = @list_len + 1 + array_len(@p)
+    @payload_len = 2 + @list_len
+    @ext = array_new(4 + @payload_len, 0)
+    write_u16_be(@ext, 0, EXT_ALPN)
+    write_u16_be(@ext, 2, @payload_len)
+    write_u16_be(@ext, 4, @list_len)
+    @pos = 6
+    orbit @i in range(0, @num)
+        @p = @protos[@i]
+        @pl = array_len(@p)
+        @ext[@pos] = @pl
+        @pos = @pos + 1
+        bytes_copy(@ext, @pos, @p, 0, @pl)
+        @pos = @pos + @pl
+    return @ext
+
+fn build_client_hello(@h: int, @host: array, @alpn_protos: array) -> array
+    # Generate client random and X25519 keypair.
+    @client_random = csprng_bytes(32)
+    slot32_write(__addr(@veil_client_random), @h, @client_random)
+
+    @priv = array_new(32, 0)
+    @pub = array_new(32, 0)
+    x25519_keypair(@priv, @pub)
+    slot32_write(__addr(@veil_x25519_priv), @h, @priv)
+    slot32_write(__addr(@veil_x25519_pub), @h, @pub)
+
+    # Extensions — order follows common TLS 1.3 libraries.
+    @ext_sni = build_extension_server_name(@host)
+    @ext_sv = build_extension_supported_versions()
+    @ext_sg = build_extension_supported_groups()
+    @ext_sa = build_extension_signature_algorithms()
+    @ext_ks = build_extension_key_share(@pub)
+    @ext_pm = build_extension_psk_modes()
+    @ext_al = build_extension_alpn(@alpn_protos)
+
+    @ext_all = array_concat(@ext_sni, @ext_sv)
+    @ext_all = array_concat(@ext_all, @ext_sg)
+    @ext_all = array_concat(@ext_all, @ext_sa)
+    @ext_all = array_concat(@ext_all, @ext_ks)
+    @ext_all = array_concat(@ext_all, @ext_pm)
+    guard array_len(@ext_al) > 0
+        @ext_all = array_concat(@ext_all, @ext_al)
+
+    # Build the ClientHello body.
+    @ext_len = array_len(@ext_all)
+    @legacy_sid = csprng_bytes(32)  # 32-byte legacy session id for middlebox compat
+    @body_len = 2 + 32 + 1 + 32 + 2 + 2 + 1 + 1 + 2 + @ext_len
+    @body = array_new(@body_len, 0)
+    @pos = 0
+    # legacy_version = TLS 1.2
+    write_u16_be(@body, @pos, TLS_V1_2)
+    @pos = @pos + 2
+    # random
+    bytes_copy(@body, @pos, @client_random, 0, 32)
+    @pos = @pos + 32
+    # legacy_session_id
+    @body[@pos] = 32
+    @pos = @pos + 1
+    bytes_copy(@body, @pos, @legacy_sid, 0, 32)
+    @pos = @pos + 32
+    # cipher_suites: [chacha20_poly1305_sha256]
+    write_u16_be(@body, @pos, 2)
+    @pos = @pos + 2
+    write_u16_be(@body, @pos, TLS_CHACHA20_POLY1305_SHA256)
+    @pos = @pos + 2
+    # legacy_compression_methods: [null]
+    @body[@pos] = 1
+    @pos = @pos + 1
+    @body[@pos] = 0
+    @pos = @pos + 1
+    # extensions
+    write_u16_be(@body, @pos, @ext_len)
+    @pos = @pos + 2
+    bytes_copy(@body, @pos, @ext_all, 0, @ext_len)
+
+    # Wrap in handshake header: type + 24-bit length.
+    @msg = array_new(4 + @body_len, 0)
+    @msg[0] = HS_CLIENT_HELLO
+    write_u24_be(@msg, 1, @body_len)
+    bytes_copy(@msg, 4, @body, 0, @body_len)
+    return @msg
+
+fn build_finished(@h: int) -> array
+    @c_hs = slot32_read(__addr(@veil_client_hs_traffic), @h)
+    @verify = compute_finished_mac(@h, @c_hs)
+    @msg = array_new(4 + HASH_LEN, 0)
+    @msg[0] = HS_FINISHED
+    write_u24_be(@msg, 1, HASH_LEN)
+    bytes_copy(@msg, 4, @verify, 0, HASH_LEN)
+    return @msg
+
+# =============================================================================
+# SECTION 17: HANDSHAKE MESSAGE PARSERS
+# =============================================================================
+
+fn parse_server_hello(@h: int, @msg: array) -> int
+    # msg[0] = HS_SERVER_HELLO, msg[1..4] = 24-bit length, body follows.
+    guard array_len(@msg) < 4
+        return record_tremor_lit("ServerHello truncated")
+    guard @msg[0] != HS_SERVER_HELLO
+        return record_tremor_lit("expected ServerHello")
+    @body_len = u24_be(@msg, 1)
+    guard array_len(@msg) < 4 + @body_len
+        return record_tremor_lit("ServerHello body truncated")
+    @pos = 4
+    # legacy_version (must be TLS 1.2 per RFC 8446 compat mandate)
+    @pos = @pos + 2
+    # server_random
+    @server_random = array_slice(@msg, @pos, @pos + 32)
+    slot32_write(__addr(@veil_server_random), @h, @server_random)
+    @pos = @pos + 32
+    # legacy_session_id_echo
+    @sid_len = @msg[@pos]
+    @pos = @pos + 1 + @sid_len
+    # cipher_suite
+    @suite = u16_be(@msg, @pos)
+    @pos = @pos + 2
+    guard @suite != TLS_CHACHA20_POLY1305_SHA256
+        return record_tremor_lit("unsupported cipher suite in ServerHello")
+    @veil_cipher_suite[@h] = @suite
+    # legacy_compression_method
+    @pos = @pos + 1
+    # extensions
+    @ext_len = u16_be(@msg, @pos)
+    @pos = @pos + 2
+    @ext_end = @pos + @ext_len
+
+    @server_pub = []
+    orbit @_ in range(0, 32)
+        guard @pos >= @ext_end
+            meow
+        @ext_type = u16_be(@msg, @pos)
+        @pos = @pos + 2
+        @elen = u16_be(@msg, @pos)
+        @pos = @pos + 2
+        guard @ext_type == EXT_KEY_SHARE
+            # KeyShareServerHello = { group, key_exchange<1..2^16-1> }
+            @group = u16_be(@msg, @pos)
+            guard @group != GROUP_X25519
+                return record_tremor_lit("ServerHello key_share group mismatch")
+            @klen = u16_be(@msg, @pos + 2)
+            @server_pub = array_slice(@msg, @pos + 4, @pos + 4 + @klen)
+        @pos = @pos + @elen
+
+    guard array_len(@server_pub) != 32
+        return record_tremor_lit("ServerHello key_share missing")
+
+    # ECDH: shared = X25519(priv, server_pub)
+    @priv = slot32_read(__addr(@veil_x25519_priv), @h)
+    @shared = x25519_scalarmult(@priv, @server_pub)
+    slot32_write(__addr(@veil_x25519_shared), @h, @shared)
+    return VEIL_OK
+
+fn parse_encrypted_extensions(@h: int, @msg: array) -> int
+    guard @msg[0] != HS_ENCRYPTED_EXTENSIONS
+        return record_tremor_lit("expected EncryptedExtensions")
+    @body_len = u24_be(@msg, 1)
+    @pos = 4
+    @ext_list_len = u16_be(@msg, @pos)
+    @pos = @pos + 2
+    @end = @pos + @ext_list_len
+    orbit @_ in range(0, 32)
+        guard @pos >= @end
+            meow
+        @ext_type = u16_be(@msg, @pos)
+        @pos = @pos + 2
+        @elen = u16_be(@msg, @pos)
+        @pos = @pos + 2
+        guard @ext_type == EXT_ALPN
+            # ALPN reply: ProtocolNameList = u16 list_len || (u8 len, name)
+            @inner = u16_be(@msg, @pos)
+            @name_len = @msg[@pos + 2]
+            @name = array_slice(@msg, @pos + 3, @pos + 3 + @name_len)
+            # Cap the copy to our buffer.
+            @copy_n = @name_len
+            guard @copy_n > MAX_ALPN_NAME else @copy_n = MAX_ALPN_NAME
+            orbit @i in range(0, @copy_n)
+                __write_int_at(__addr(@veil_alpn_ids), @h * MAX_ALPN_NAME + @i, @name[@i])
+            @veil_alpn_lens[@h] = @copy_n
+        @pos = @pos + @elen
+    return VEIL_OK
+
+fn parse_certificate(@h: int, @msg: array) -> array
+    # Returns array of raw cert byte-arrays (leaf first), or empty on error.
+    guard @msg[0] != HS_CERTIFICATE
+        record_tremor_lit("expected Certificate")
+        return []
+    @pos = 4
+    # certificate_request_context<0..255>
+    @ctx_len = @msg[@pos]
+    @pos = @pos + 1 + @ctx_len
+    # certificate_list<0..2^24-1>
+    @list_len = u24_be(@msg, @pos)
+    @pos = @pos + 3
+    @end = @pos + @list_len
+    @chain = []
+    orbit @_ in range(0, MAX_CHAIN_CERTS)
+        guard @pos >= @end
+            meow
+        @cert_len = u24_be(@msg, @pos)
+        @pos = @pos + 3
+        @cert = array_slice(@msg, @pos, @pos + @cert_len)
+        @pos = @pos + @cert_len
+        # extensions<0..2^16-1>
+        @ext_len = u16_be(@msg, @pos)
+        @pos = @pos + 2 + @ext_len
+        @chain = array_append(@chain, @cert)
+    return @chain
+
+fn parse_certificate_verify(@h: int, @msg: array, @leaf: ParsedCert) -> int
+    guard @msg[0] != HS_CERTIFICATE_VERIFY
+        return record_tremor_lit("expected CertificateVerify")
+    @pos = 4
+    @scheme = u16_be(@msg, @pos)
+    @pos = @pos + 2
+    @sig_len = u16_be(@msg, @pos)
+    @pos = @pos + 2
+    @sig = array_slice(@msg, @pos, @pos + @sig_len)
+
+    # RFC 8446 Section 4.4.3: the signed content is
+    #   0x20 * 64 || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_hash
+    @prefix = array_new(64, 32)  # 64 bytes of 0x20
+    @ctx = str_to_bytes("TLS 1.3, server CertificateVerify")
+    @th = transcript_snapshot(@h)
+    @to_verify = array_concat(@prefix, @ctx)
+    @to_verify = array_concat(@to_verify, array_from(0))
+    @to_verify = array_concat(@to_verify, @th)
+
+    @veil_sig_scheme[@h] = @scheme
+    guard @scheme == SIG_ED25519
+        @ok = ed25519_verify(@leaf.pubkey_bytes, @to_verify, @sig)
+        guard @ok == 1
+            return VEIL_OK
+        return record_tremor_lit("Ed25519 CertificateVerify failed")
+    guard @scheme == SIG_ECDSA_SECP256R1_SHA256
+        @to_verify_hash = sha256(@to_verify)
+        @ok = ecdsa_p256_verify(@leaf.pubkey_bytes, @to_verify_hash, @sig)
+        guard @ok == 1
+            return VEIL_OK
+        return record_tremor_lit("ECDSA CertificateVerify failed")
+    return record_tremor_lit("unsupported CertificateVerify signature scheme")
+
+fn parse_finished(@h: int, @msg: array) -> int
+    guard @msg[0] != HS_FINISHED
+        return record_tremor_lit("expected Finished")
+    @body_len = u24_be(@msg, 1)
+    guard @body_len != HASH_LEN
+        return record_tremor_lit("Finished length mismatch")
+    @peer_verify = array_slice(@msg, 4, 4 + HASH_LEN)
+    @s_hs = slot32_read(__addr(@veil_server_hs_traffic), @h)
+    @expected = compute_finished_mac(@h, @s_hs)
+    @ok = bytes_equal_ct(@peer_verify, @expected, HASH_LEN)
+    guard @ok != 1
+        return record_tremor_lit("server Finished verify_data mismatch")
+    return VEIL_OK
+
+# =============================================================================
+# SECTION 18: HANDSHAKE DRIVER
+# =============================================================================
+# A plain linear FSM — not interruptible. Blocks until success or error.
+# The encrypted-side reader pulls whole handshake messages out of the
+# (decrypted) stream, because TLS 1.3 can split any of them across records.
+
+@veil_hs_buf: array[int, 16777216]  # 256 * 65536 — handshake scratch per link
+@veil_hs_have: array[int, 256]
+@veil_hs_off: array[int, 256]
+
+fn hs_fill_from_record(@h: int, @rec_payload: array) -> int
+    @base = @h * MAX_HANDSHAKE_BYTES
+    @have = @veil_hs_have[@h]
+    @n = array_len(@rec_payload)
+    guard @have + @n > MAX_HANDSHAKE_BYTES
+        return record_tremor_lit("handshake buffer overflow")
+    orbit @i in range(0, @n)
+        __write_int_at(__addr(@veil_hs_buf), @base + @have + @i, @rec_payload[@i])
+    @veil_hs_have[@h] = @have + @n
+    return VEIL_OK
+
+fn hs_take_message(@h: int) -> array
+    # Returns a complete handshake message (header + body) or [] if we need
+    # more bytes.
+    @base = @h * MAX_HANDSHAKE_BYTES
+    @off = @veil_hs_off[@h]
+    @have = @veil_hs_have[@h]
+    guard @have - @off < 4
+        return []
+    @type = __read_int_at(__addr(@veil_hs_buf), @base + @off)
+    @len = (__read_int_at(__addr(@veil_hs_buf), @base + @off + 1) << 16) | (__read_int_at(__addr(@veil_hs_buf), @base + @off + 2) << 8) | __read_int_at(__addr(@veil_hs_buf), @base + @off + 3)
+    guard @have - @off < 4 + @len
+        return []
+    @msg = array_new(4 + @len, 0)
+    orbit @i in range(0, 4 + @len)
+        @msg[@i] = __read_int_at(__addr(@veil_hs_buf), @base + @off + @i)
+    @veil_hs_off[@h] = @off + 4 + @len
+    return @msg
+
+fn hs_next_message(@h: int, @is_app: int) -> array
+    # Pull records until we have at least one full handshake message.
+    orbit @_ in range(0, 64)
+        @msg = hs_take_message(@h)
+        guard array_len(@msg) > 0
+            return @msg
+        @rec = record_recv_decrypted(@h, @is_app)
+        guard array_len(@rec) == 1 and @rec[0] == -1
+            return []
+        @ct = @rec[0]
+        @payload = array_slice(@rec, 1, array_len(@rec))
+        guard @ct == TLS_CT_ALERT
+            record_tremor_lit("server sent alert")
+            return []
+        guard @ct != TLS_CT_HANDSHAKE
+            record_tremor_lit("unexpected content type during handshake")
+            return []
+        @rc = hs_fill_from_record(@h, @payload)
+        guard @rc != VEIL_OK
+            return []
+    return []
+
+fn handshake_drive(@h: int, @host: array, @alpn_protos: array) -> int
+    transcript_init(@h)
+    key_schedule_early(@h)
+
+    # --- Send ClientHello (plaintext) ---
+    @ch = build_client_hello(@h, @host, @alpn_protos)
+    transcript_update(@h, @ch)
+    @sent = record_send_plain(@h, TLS_CT_HANDSHAKE, @ch)
+    guard @sent < 0
+        return record_tremor_lit("TCP send failed during ClientHello")
+    @veil_states[@h] = VEIL_WAIT_SERVER_HELLO
+
+    # --- Wait for ServerHello (plaintext) ---
+    @rec = record_recv(@h)
+    guard array_len(@rec) == 1 and @rec[0] == -1
+        return record_tremor_lit("TCP read failed during ServerHello")
+    guard @rec[0] != TLS_CT_HANDSHAKE
+        return record_tremor_lit("expected handshake record for ServerHello")
+    @sh = array_slice(@rec, 1, array_len(@rec))
+    transcript_update(@h, @sh)
+    @pr = parse_server_hello(@h, @sh)
+    guard @pr != VEIL_OK
+        return @pr
+
+    # --- Derive handshake traffic keys ---
+    @shared = slot32_read(__addr(@veil_x25519_shared), @h)
+    key_schedule_handshake(@h, @shared)
+    @veil_states[@h] = VEIL_WAIT_ENCRYPTED_EXT
+
+    # --- EncryptedExtensions (first encrypted message) ---
+    @ee = hs_next_message(@h, 0)
+    guard array_len(@ee) == 0
+        return VEIL_ERROR
+    transcript_update(@h, @ee)
+    @pr2 = parse_encrypted_extensions(@h, @ee)
+    guard @pr2 != VEIL_OK
+        return @pr2
+    @veil_states[@h] = VEIL_WAIT_CERTIFICATE
+
+    # --- Certificate ---
+    @cert_msg = hs_next_message(@h, 0)
+    guard array_len(@cert_msg) == 0
+        return VEIL_ERROR
+    transcript_update(@h, @cert_msg)
+    @chain = parse_certificate(@h, @cert_msg)
+    guard array_len(@chain) == 0
+        return record_tremor_lit("empty certificate chain")
+
+    # Parse leaf for downstream signature verify + CN exposure.
+    @leaf = x509_parse(@chain[0])
+    guard @leaf.valid == 0
+        return record_tremor_lit("leaf certificate parse failed")
+    # Persist leaf CN for veil_peer_name.
+    @cn_len = array_len(@leaf.subject_cn)
+    guard @cn_len > MAX_PEER_CN else @cn_len = MAX_PEER_CN
+    orbit @i in range(0, @cn_len)
+        __write_int_at(__addr(@veil_peer_cn_ids), @h * MAX_PEER_CN + @i, @leaf.subject_cn[@i])
+    @veil_peer_cn_ids[@h] = @cn_len
+
+    @chain_res = x509_chain_verify(@chain)
+    guard @chain_res != VEIL_OK
+        return @chain_res
+    @veil_states[@h] = VEIL_WAIT_CERT_VERIFY
+
+    # --- CertificateVerify ---
+    @cv_msg = hs_next_message(@h, 0)
+    guard array_len(@cv_msg) == 0
+        return VEIL_ERROR
+    @cv_res = parse_certificate_verify(@h, @cv_msg, @leaf)
+    transcript_update(@h, @cv_msg)
+    guard @cv_res != VEIL_OK
+        return @cv_res
+    @veil_states[@h] = VEIL_WAIT_FINISHED
+
+    # --- Server Finished ---
+    @fin_msg = hs_next_message(@h, 0)
+    guard array_len(@fin_msg) == 0
+        return VEIL_ERROR
+    @fv_res = parse_finished(@h, @fin_msg)
+    guard @fv_res != VEIL_OK
+        return @fv_res
+    transcript_update(@h, @fin_msg)
+
+    # --- Derive application traffic keys ---
+    key_schedule_application(@h)
+
+    # --- Write client Finished ---
+    @client_fin = build_finished(@h)
+    transcript_update(@h, @client_fin)
+    @fs = record_send_encrypted(@h, TLS_CT_HANDSHAKE, @client_fin, 0)
+    guard @fs < 0
+        return record_tremor_lit("TCP send failed during Finished")
+
+    # Handshake complete — future sends/recvs are app-data.
+    @veil_states[@h] = VEIL_READY
+    @veil_client_seq[@h] = 0
+    @veil_server_seq[@h] = 0
+    return VEIL_OK
+
+# =============================================================================
+# SECTION 19: PUBLIC API — veil_link_*
+# =============================================================================
+
+fn veil_link_forge(@host_ptr: int, @host_len: int, @port: int) -> VeilLink
+    # Forge a new veil over the given host:port. Does the full TLS 1.3
+    # handshake before returning. On failure, returns a VeilLink with
+    # state == VEIL_FAILED and tcp_fd == -1.
+    guard @host_ptr == 0
+        record_tremor_lit("veil_link_forge: null host")
+        return VeilLink { handle: -1, tcp_fd: -1, state: VEIL_FAILED }
+    guard @host_len <= 0
+        record_tremor_lit("veil_link_forge: empty host")
+        return VeilLink { handle: -1, tcp_fd: -1, state: VEIL_FAILED }
+    guard @port <= 0 or @port > 65535
+        record_tremor_lit("veil_link_forge: bad port")
+        return VeilLink { handle: -1, tcp_fd: -1, state: VEIL_FAILED }
+
+    @handle = veil_slot_alloc()
+    guard @handle < 0
+        record_tremor_lit("veil_link_forge: out of slots")
+        return VeilLink { handle: -1, tcp_fd: -1, state: VEIL_FAILED }
+
+    # Raw TCP transport — this is the only layer below us.
+    @tcp = tcp_connect(@host_ptr, @host_len, @port)
+    guard @tcp < 0
+        veil_slot_free(@handle)
+        record_tremor_lit("veil_link_forge: tcp_connect failed")
+        return VeilLink { handle: -1, tcp_fd: -1, state: VEIL_FAILED }
+
+    @veil_tcp_fds[@handle] = @tcp
+    @veil_ports[@handle] = @port
+
+    # Copy host bytes into an array for SNI.
+    @host = array_new(@host_len, 0)
+    orbit @i in range(0, @host_len)
+        @host[@i] = __read_byte(@host_ptr + @i)
+
+    # Default ALPN: ["h2", "http/1.1"].
+    @alpn = []
+    @alpn = array_append(@alpn, str_to_bytes("h2"))
+    @alpn = array_append(@alpn, str_to_bytes("http/1.1"))
+
+    @veil_states[@handle] = VEIL_HANDSHAKING
+    @rc = handshake_drive(@handle, @host, @alpn)
+    guard @rc != VEIL_OK
+        tcp_close(@tcp)
+        @veil_states[@handle] = VEIL_FAILED
+        return VeilLink { handle: @handle, tcp_fd: -1, state: VEIL_FAILED }
+
+    return VeilLink { handle: @handle, tcp_fd: @tcp, state: VEIL_READY }
+
+fn veil_link_whisper(@v: VeilLink, @buf: int, @len: int) -> int
+    # Whisper (send) up to @len bytes of plaintext through the veil.
+    # Returns bytes actually sent, or a negative VEIL_* error.
+    guard @v.handle < 0
+        return record_tremor_lit("veil_link_whisper: bad handle")
+    guard @veil_states[@v.handle] != VEIL_READY
+        return record_tremor_lit("veil_link_whisper: not ready")
+    guard @buf == 0
+        return record_tremor_lit("veil_link_whisper: null buf")
+    guard @len <= 0
+        return 0
+
+    # TLS record payload max = 2^14 bytes of plaintext.
+    @sent_total = 0
+    @remaining = @len
+    orbit @_ in range(0, 1024)
+        guard @remaining <= 0
+            return @sent_total
+        @chunk = @remaining
+        guard @chunk > MAX_RECORD_PAYLOAD else @chunk = MAX_RECORD_PAYLOAD
+        @payload = array_new(@chunk, 0)
+        orbit @i in range(0, @chunk)
+            @payload[@i] = __read_byte(@buf + @sent_total + @i)
+        @rc = record_send_encrypted(@v.handle, TLS_CT_APPLICATION_DATA, @payload, 1)
+        guard @rc < 0
+            return VEIL_ERROR
+        @sent_total = @sent_total + @chunk
+        @remaining = @remaining - @chunk
+    return @sent_total
+
+fn veil_link_hear(@v: VeilLink, @buf: int, @len: int) -> int
+    # Hear (receive) up to @len bytes of plaintext.
+    # Returns bytes written to @buf, or a negative VEIL_* error.
+    guard @v.handle < 0
+        return record_tremor_lit("veil_link_hear: bad handle")
+    guard @veil_states[@v.handle] != VEIL_READY
+        return record_tremor_lit("veil_link_hear: not ready")
+    guard @buf == 0
+        return record_tremor_lit("veil_link_hear: null buf")
+    guard @len <= 0
+        return 0
+
+    @rec = record_recv_decrypted(@v.handle, 1)
+    guard array_len(@rec) == 1 and @rec[0] == -1
+        return VEIL_ERROR
+    @ct = @rec[0]
+    guard @ct == TLS_CT_ALERT
+        @veil_states[@v.handle] = VEIL_CLOSED
+        return VEIL_CLOSED_BY_PEER
+    guard @ct != TLS_CT_APPLICATION_DATA
+        return record_tremor_lit("unexpected content type while reading")
+    @payload = array_slice(@rec, 1, array_len(@rec))
+    @plen = array_len(@payload)
+    @take = @plen
+    guard @take > @len else @take = @len
+    orbit @i in range(0, @take)
+        __write_byte(@buf + @i, @payload[@i])
+    return @take
+
+fn veil_link_dissolve(@v: VeilLink) -> int
+    guard @v.handle < 0
+        return VEIL_OK
+    # Send a close_notify alert inside the app-data record layer.
+    guard @veil_states[@v.handle] == VEIL_READY
+        @alert = array_from(ALERT_LEVEL_WARNING, ALERT_CLOSE_NOTIFY)
+        record_send_encrypted(@v.handle, TLS_CT_ALERT, @alert, 1)
+    tcp_close(@veil_tcp_fds[@v.handle])
+    # Wipe all secrets in this slot.
+    orbit @i in range(0, 32)
+        __write_int_at(__addr(@veil_client_key), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_server_key), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_client_hs_traffic), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_server_hs_traffic), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_client_ap_traffic), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_server_ap_traffic), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_early_secret), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_handshake_secret), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_master_secret), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_x25519_priv), @v.handle * 32 + @i, 0)
+        __write_int_at(__addr(@veil_x25519_shared), @v.handle * 32 + @i, 0)
+    veil_slot_free(@v.handle)
+    return VEIL_OK
+
+# =============================================================================
+# SECTION 20: INTROSPECTION
+# =============================================================================
+
+fn veil_peer_name(@v: VeilLink, @out: int, @out_len: int) -> int
+    guard @v.handle < 0
+        return -1
+    @n = @veil_peer_cn_ids[@v.handle]
+    guard @n > @out_len else @n = @out_len
+    orbit @i in range(0, @n)
+        @b = __read_int_at(__addr(@veil_peer_cn_ids), @v.handle * MAX_PEER_CN + @i)
+        __write_byte(@out + @i, @b)
+    return @n
+
+fn veil_alpn(@v: VeilLink, @out: int, @out_len: int) -> int
+    guard @v.handle < 0
+        return -1
+    @n = @veil_alpn_lens[@v.handle]
+    guard @n > @out_len else @n = @out_len
+    orbit @i in range(0, @n)
+        @b = __read_int_at(__addr(@veil_alpn_ids), @v.handle * MAX_ALPN_NAME + @i)
+        __write_byte(@out + @i, @b)
+    return @n
+
+fn veil_last_tremor(@out: int, @out_len: int) -> int
+    @n = @last_tremor_len
+    guard @n > @out_len else @n = @out_len
+    orbit @i in range(0, @n)
+        __write_byte(@out + @i, @last_tremor_bytes[@i])
+    return @n
+
+fn veil_state(@v: VeilLink) -> int
+    guard @v.handle < 0
+        return VEIL_CLOSED
+    return @veil_states[@v.handle]
+
+fn veil_is_ready(@v: VeilLink) -> int
+    return veil_state(@v) == VEIL_READY
+
+fn veil_cipher_name(@v: VeilLink) -> string
+    guard @v.handle < 0
+        return "unknown"
+    @suite = @veil_cipher_suite[@v.handle]
+    phase @suite
+        is TLS_AES_128_GCM_SHA256 -> return "TLS_AES_128_GCM_SHA256"
+        is TLS_AES_256_GCM_SHA384 -> return "TLS_AES_256_GCM_SHA384"
+        is TLS_CHACHA20_POLY1305_SHA256 -> return "TLS_CHACHA20_POLY1305_SHA256"
+    return "unknown"
+
+# =============================================================================
+# SECTION 21: SELF-TESTS
+# =============================================================================
+# RFC 5869 Appendix A test vectors where available; sanity shape checks for
+# primitives whose vectors take too much space for a header file.
+
+fn test_asn1_parse_length() -> int
+    # Short form: 0x05 -> 5, consumed 1 byte.
+    @short = array_from(0x05)
+    @r1 = asn1_parse_length(@short, 0)
+    guard @r1[0] != 5 or @r1[1] != 1
+        return 0
+    # Long form: 0x82 0x01 0x00 -> 256, consumed 3 bytes.
+    @long = array_from(0x82, 0x01, 0x00)
+    @r2 = asn1_parse_length(@long, 0)
+    guard @r2[0] != 256 or @r2[1] != 3
+        return 0
+    # Long form one-byte: 0x81 0x80 -> 128, consumed 2.
+    @long1 = array_from(0x81, 0x80)
+    @r3 = asn1_parse_length(@long1, 0)
+    guard @r3[0] != 128 or @r3[1] != 2
+        return 0
+    return 1
+
+fn test_hkdf_rfc5869_vector() -> int
+    # RFC 5869 Appendix A.1 Basic test case:
+    #   IKM = 0x0b * 22
+    #   salt = 0x00..0x0c (13 bytes)
+    #   info = 0xf0..0xf9 (10 bytes)
+    #   L = 42
+    # PRK first 4 bytes should start 0x07 0x77 0x09 0x36.
+    @ikm = array_new(22, 0x0B)
+    @salt = array_from(0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C)
+    @prk = hkdf_extract(@salt, @ikm)
+    guard array_len(@prk) != 32
+        return 0
+    guard @prk[0] != 0x07 or @prk[1] != 0x77 or @prk[2] != 0x09 or @prk[3] != 0x36
+        return 0
+    @info = array_from(0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9)
+    @okm = hkdf_expand(@prk, @info, 42)
+    guard array_len(@okm) != 42
+        return 0
+    # First byte of OKM = 0x3c per RFC.
+    guard @okm[0] != 0x3C
+        return 0
+    return 1
+
+fn test_tls13_nonce_xor() -> int
+    # iv = 0xaa..aa (12), seq = 0 -> nonce = iv.
+    @iv = array_new(12, 0xAA)
+    @n0 = tls13_build_nonce(@iv, 0)
+    guard @n0[0] != 0xAA or @n0[11] != 0xAA
+        return 0
+    # seq = 1 -> last byte flips.
+    @n1 = tls13_build_nonce(@iv, 1)
+    guard @n1[11] != (0xAA ^ 0x01)
+        return 0
+    return 1
+
+fn test_transcript_basic() -> int
+    # Allocate a slot, seed transcript, hash an empty transcript — should
+    # equal SHA-256("").
+    @h = veil_slot_alloc()
+    guard @h < 0
+        return 0
+    transcript_init(@h)
+    @empty_hash = transcript_snapshot(@h)
+    # SHA-256("") starts with 0xe3 0xb0 0xc4 0x42.
+    @ok = @empty_hash[0] == 0xE3 and @empty_hash[1] == 0xB0 and @empty_hash[2] == 0xC4 and @empty_hash[3] == 0x42
+    veil_slot_free(@h)
+    guard @ok == 0
+        return 0
+    return 1
+
+fn test_x509_parse_shape() -> int
+    # Feed a minimal DER SEQUENCE to x509_parse and verify the "invalid" path
+    # flags gracefully (no crash, valid == 0). Real cert vectors would be too
+    # big to inline; this is shape-only.
+    @fake = array_from(0x30, 0x03, 0x02, 0x01, 0x01)
+    @r = x509_parse(@fake)
+    guard @r.valid != 0
+        return 0
+    return 1
+
+fn test_build_client_hello_shape() -> int
+    @h = veil_slot_alloc()
+    guard @h < 0
+        return 0
+    transcript_init(@h)
+    @host = str_to_bytes("example.com")
+    @alpn = []
+    @alpn = array_append(@alpn, str_to_bytes("h2"))
+    @ch = build_client_hello(@h, @host, @alpn)
+    veil_slot_free(@h)
+    # Must start with HS_CLIENT_HELLO and have a sane length.
+    guard @ch[0] != HS_CLIENT_HELLO
+        return 0
+    @body_len = u24_be(@ch, 1)
+    guard @body_len < 40 or @body_len > MAX_HANDSHAKE_BYTES
+        return 0
+    return 1
+
+fn test_x25519_rfc7748_vector1() -> int
+    # RFC 7748 §6.1 test vector 1:
+    #   scalar = a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4
+    #   u      = e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c
+    #   result = c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552
+    @scalar = array_new(32, 0)
+    @scalar[0] = 0xA5
+    @scalar[1] = 0x46
+    @scalar[2] = 0xE3
+    @scalar[3] = 0x6B
+    @scalar[4] = 0xF0
+    @scalar[5] = 0x52
+    @scalar[6] = 0x7C
+    @scalar[7] = 0x9D
+    @scalar[8] = 0x3B
+    @scalar[9] = 0x16
+    @scalar[10] = 0x15
+    @scalar[11] = 0x4B
+    @scalar[12] = 0x82
+    @scalar[13] = 0x46
+    @scalar[14] = 0x5E
+    @scalar[15] = 0xDD
+    @scalar[16] = 0x62
+    @scalar[17] = 0x14
+    @scalar[18] = 0x4C
+    @scalar[19] = 0x0A
+    @scalar[20] = 0xC1
+    @scalar[21] = 0xFC
+    @scalar[22] = 0x5A
+    @scalar[23] = 0x18
+    @scalar[24] = 0x50
+    @scalar[25] = 0x6A
+    @scalar[26] = 0x22
+    @scalar[27] = 0x44
+    @scalar[28] = 0xBA
+    @scalar[29] = 0x44
+    @scalar[30] = 0x9A
+    @scalar[31] = 0xC4
+
+    @u = array_new(32, 0)
+    @u[0] = 0xE6
+    @u[1] = 0xDB
+    @u[2] = 0x68
+    @u[3] = 0x67
+    @u[4] = 0x58
+    @u[5] = 0x30
+    @u[6] = 0x30
+    @u[7] = 0xDB
+    @u[8] = 0x35
+    @u[9] = 0x94
+    @u[10] = 0xC1
+    @u[11] = 0xA4
+    @u[12] = 0x24
+    @u[13] = 0xB1
+    @u[14] = 0x5F
+    @u[15] = 0x7C
+    @u[16] = 0x72
+    @u[17] = 0x66
+    @u[18] = 0x24
+    @u[19] = 0xEC
+    @u[20] = 0x26
+    @u[21] = 0xB3
+    @u[22] = 0x35
+    @u[23] = 0x3B
+    @u[24] = 0x10
+    @u[25] = 0xA9
+    @u[26] = 0x03
+    @u[27] = 0xA6
+    @u[28] = 0xD0
+    @u[29] = 0xAB
+    @u[30] = 0x1C
+    @u[31] = 0x4C
+
+    @expected = array_new(32, 0)
+    @expected[0] = 0xC3
+    @expected[1] = 0xDA
+    @expected[2] = 0x55
+    @expected[3] = 0x37
+    @expected[4] = 0x9D
+    @expected[5] = 0xE9
+    @expected[6] = 0xC6
+    @expected[7] = 0x90
+    @expected[8] = 0x8E
+    @expected[9] = 0x94
+    @expected[10] = 0xEA
+    @expected[11] = 0x4D
+    @expected[12] = 0xF2
+    @expected[13] = 0x8D
+    @expected[14] = 0x08
+    @expected[15] = 0x4F
+    @expected[16] = 0x32
+    @expected[17] = 0xEC
+    @expected[18] = 0xCF
+    @expected[19] = 0x03
+    @expected[20] = 0x49
+    @expected[21] = 0x1C
+    @expected[22] = 0x71
+    @expected[23] = 0xF7
+    @expected[24] = 0x54
+    @expected[25] = 0xB4
+    @expected[26] = 0x07
+    @expected[27] = 0x55
+    @expected[28] = 0x77
+    @expected[29] = 0xA2
+    @expected[30] = 0x85
+    @expected[31] = 0x52
+
+    @got = x25519_scalarmult(@scalar, @u)
+    guard array_len(@got) != 32
+        return 0
+    @match = 1
+    orbit @i in range(0, 32)
+        guard @got[@i] != @expected[@i]
+            @match = 0
+    return @match
+
+fn test_x25519_base_g1() -> int
+    # Simple shape check: scalar-mult with scalar=1 against base 9 gives
+    # back the base point (clamping sets bit 254; unscrambled result u=9
+    # yields a different point, so we instead test that x25519(base, base)
+    # is non-zero and deterministic).
+    @one = array_new(32, 0)
+    @one[0] = 1
+    @r = x25519_scalarmult(@one, x25519_base())
+    guard array_len(@r) != 32
+        return 0
+    @any_nonzero = 0
+    orbit @i in range(0, 32)
+        guard @r[@i] != 0
+            @any_nonzero = 1
+    return @any_nonzero
+
+fn test_ed25519_rfc8032_empty() -> int
+    # RFC 8032 §7.1 test 1: empty message.
+    # pub = d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+    # sig = e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155
+    #       5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b
+    @pub = array_new(32, 0)
+    @pub[0] = 0xD7
+    @pub[1] = 0x5A
+    @pub[2] = 0x98
+    @pub[3] = 0x01
+    @pub[4] = 0x82
+    @pub[5] = 0xB1
+    @pub[6] = 0x0A
+    @pub[7] = 0xB7
+    @pub[8] = 0xD5
+    @pub[9] = 0x4B
+    @pub[10] = 0xFE
+    @pub[11] = 0xD3
+    @pub[12] = 0xC9
+    @pub[13] = 0x64
+    @pub[14] = 0x07
+    @pub[15] = 0x3A
+    @pub[16] = 0x0E
+    @pub[17] = 0xE1
+    @pub[18] = 0x72
+    @pub[19] = 0xF3
+    @pub[20] = 0xDA
+    @pub[21] = 0xA6
+    @pub[22] = 0x23
+    @pub[23] = 0x25
+    @pub[24] = 0xAF
+    @pub[25] = 0x02
+    @pub[26] = 0x1A
+    @pub[27] = 0x68
+    @pub[28] = 0xF7
+    @pub[29] = 0x07
+    @pub[30] = 0x51
+    @pub[31] = 0x1A
+
+    @sig = array_new(64, 0)
+    @sig[0] = 0xE5
+    @sig[1] = 0x56
+    @sig[2] = 0x43
+    @sig[3] = 0x00
+    @sig[4] = 0xC3
+    @sig[5] = 0x60
+    @sig[6] = 0xAC
+    @sig[7] = 0x72
+    @sig[8] = 0x90
+    @sig[9] = 0x86
+    @sig[10] = 0xE2
+    @sig[11] = 0xCC
+    @sig[12] = 0x80
+    @sig[13] = 0x6E
+    @sig[14] = 0x82
+    @sig[15] = 0x8A
+    @sig[16] = 0x84
+    @sig[17] = 0x87
+    @sig[18] = 0x7F
+    @sig[19] = 0x1E
+    @sig[20] = 0xB8
+    @sig[21] = 0xE5
+    @sig[22] = 0xD9
+    @sig[23] = 0x74
+    @sig[24] = 0xD8
+    @sig[25] = 0x73
+    @sig[26] = 0xE0
+    @sig[27] = 0x65
+    @sig[28] = 0x22
+    @sig[29] = 0x49
+    @sig[30] = 0x01
+    @sig[31] = 0x55
+    @sig[32] = 0x5F
+    @sig[33] = 0xB8
+    @sig[34] = 0x82
+    @sig[35] = 0x15
+    @sig[36] = 0x90
+    @sig[37] = 0xA3
+    @sig[38] = 0x3B
+    @sig[39] = 0xAC
+    @sig[40] = 0xC6
+    @sig[41] = 0x1E
+    @sig[42] = 0x39
+    @sig[43] = 0x70
+    @sig[44] = 0x1C
+    @sig[45] = 0xF9
+    @sig[46] = 0xB4
+    @sig[47] = 0x6B
+    @sig[48] = 0xD2
+    @sig[49] = 0x5B
+    @sig[50] = 0xF5
+    @sig[51] = 0xF0
+    @sig[52] = 0x59
+    @sig[53] = 0x5B
+    @sig[54] = 0xBE
+    @sig[55] = 0x24
+    @sig[56] = 0x65
+    @sig[57] = 0x51
+    @sig[58] = 0x41
+    @sig[59] = 0x43
+    @sig[60] = 0x8E
+    @sig[61] = 0x7A
+    @sig[62] = 0x10
+    @sig[63] = 0x0B
+
+    return ed25519_verify(@pub, [], @sig)
+
+fn run_self_tests()
+    @passed = 0
+    @failed = 0
+
+    shine("  [veil] test 1: ASN.1 length decode...")
+    guard test_asn1_parse_length() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_asn1_parse_length() != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    shine("  [veil] test 2: HKDF RFC 5869 A.1 vector...")
+    guard test_hkdf_rfc5869_vector() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_hkdf_rfc5869_vector() != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    shine("  [veil] test 3: TLS 1.3 per-record nonce XOR...")
+    guard test_tls13_nonce_xor() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_tls13_nonce_xor() != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    shine("  [veil] test 4: transcript hash of empty message set...")
+    guard test_transcript_basic() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_transcript_basic() != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    shine("  [veil] test 5: ClientHello shape...")
+    guard test_build_client_hello_shape() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_build_client_hello_shape() != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    shine("  [veil] test 6: X.509 malformed cert is rejected cleanly...")
+    guard test_x509_parse_shape() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_x509_parse_shape() != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    shine("  [veil] test 7: X25519 RFC 7748 §6.1 vector 1...")
+    guard test_x25519_rfc7748_vector1() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_x25519_rfc7748_vector1() != 1
+        @failed = @failed + 1
+        shine("    FAIL (X25519 field arithmetic produced wrong shared secret)")
+
+    shine("  [veil] test 8: X25519 scalar=1 * base produces non-zero u...")
+    guard test_x25519_base_g1() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_x25519_base_g1() != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    shine("  [veil] test 9: Ed25519 RFC 8032 §7.1 test 1 (empty msg)...")
+    guard test_ed25519_rfc8032_empty() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_ed25519_rfc8032_empty() != 1
+        @failed = @failed + 1
+        shine("    FAIL (Ed25519 point decompression or scalar mult divergent from ref)")
+
+    @total = @passed + @failed
+    shine(str_concat("  [veil] Self-tests: ", int_to_str(@passed), "/", int_to_str(@total), " passed"))
+    guard @failed > 0
+        shine("  [veil] WARNING: some tests failed — check HKDF/ASN.1/transcript paths")
+
+# =============================================================================
+# SECTION 22: EXPORTS
+# =============================================================================
+# Public surface. Cosmic names first (that's what callers consume), then the
+# protocol internals that downstream modules — e.g. http.luna over https — may
+# reach into for debugging.
+
+export {
+    # --- cosmic, user-facing ---
+    VeilLink,
+    veil_link_forge, veil_link_whisper, veil_link_hear, veil_link_dissolve,
+    veil_peer_name, veil_alpn, veil_last_tremor,
+    veil_state, veil_is_ready, veil_cipher_name,
+
+    # --- state constants ---
+    VEIL_INIT, VEIL_HANDSHAKING, VEIL_READY, VEIL_CLOSED, VEIL_FAILED,
+    VEIL_OK, VEIL_ERROR, VEIL_EAGAIN, VEIL_CLOSED_BY_PEER,
+    VEIL_BAD_MAC, VEIL_BAD_CERT, VEIL_PROTOCOL, VEIL_TIMEOUT,
+
+    # --- protocol primitives (for testability + power-user layers) ---
+    hkdf_extract, hkdf_expand, hkdf_expand_label, derive_secret,
+    hkdf_build_label,
+
+    x25519_clamp, x25519_scalarmult, x25519_base, x25519_keypair,
+    ed25519_verify, ecdsa_p256_verify,
+
+    chacha20_poly1305_seal, chacha20_poly1305_open, tls13_build_nonce,
+
+    asn1_parse_length, asn1_take_tag, asn1_take_any,
+    asn1_read_int, asn1_read_oid, asn1_read_octet_string,
+    asn1_read_bit_string, asn1_read_utctime, asn1_read_generalized_time,
+    asn1_oid_equal,
+    oid_commonName, oid_ecPublicKey, oid_prime256v1, oid_ed25519,
+    oid_ecdsa_with_sha256,
+
+    x509_parse, x509_date_parse_any, x509_verify_dates,
+    x509_subject_cn_matches, x509_verify_signature, x509_chain_verify,
+    x509_extract_spki,
+    ParsedCert,
+
+    build_client_hello, build_finished,
+    build_extension_server_name, build_extension_supported_versions,
+    build_extension_supported_groups, build_extension_signature_algorithms,
+    build_extension_key_share, build_extension_psk_modes,
+    build_extension_alpn,
+    parse_server_hello, parse_encrypted_extensions,
+    parse_certificate, parse_certificate_verify, parse_finished,
+
+    key_schedule_early, key_schedule_handshake, key_schedule_application,
+    compute_finished_mac,
+
+    transcript_init, transcript_update, transcript_snapshot,
+
+    record_send_plain, record_send_encrypted, record_recv, record_recv_decrypted,
+
+    handshake_drive,
+
+    run_self_tests
+}

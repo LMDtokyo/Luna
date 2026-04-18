@@ -1,0 +1,910 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Native GUI Module v4.1
+# =============================================================================
+# GUI + Desktop runtime ported from src/stdlib/gui.rs (742 lines)
+# and src/stdlib/desktop.rs (1,927 lines) to pure Luna.
+#
+# Features:
+#   - Handle registry for windows, webviews, menus, trays, hotkeys
+#   - Window management (create, show, hide, resize, position, destroy)
+#   - WebView bridge (create, load HTML/URL, eval JS, IPC)
+#   - Event loop (run, pump, quit, dispatch)
+#   - System features (tray, menu, hotkeys, clipboard, notifications, dialogs)
+#   - NVA5 brain persistence format (encode/decode)
+#   - IPC message routing
+#
+# Platform FFI calls are declared as extern fn.
+# All GUI logic is pure Luna.
+#
+# Build: luna compile --release gui_native.luna -o gui_native.o
+# =============================================================================
+
+import types
+import io
+
+# =============================================================================
+# SECTION 1: CONSTANTS
+# =============================================================================
+
+# Resource kinds
+const RES_WINDOW: int = 0
+const RES_WEBVIEW: int = 1
+const RES_MENU: int = 2
+const RES_TRAY: int = 3
+const RES_HOTKEY: int = 4
+const RES_DIALOG: int = 5
+const RES_NOTIFICATION: int = 6
+
+# Window flags
+const WIN_RESIZABLE: int = 1
+const WIN_FULLSCREEN: int = 2
+const WIN_ALWAYS_ON_TOP: int = 4
+const WIN_BORDERLESS: int = 8
+const WIN_TRANSPARENT: int = 16
+const WIN_MAXIMIZED: int = 32
+const WIN_MINIMIZED: int = 64
+
+# Event types
+const EVT_NONE: int = 0
+const EVT_CLOSE: int = 1
+const EVT_RESIZE: int = 2
+const EVT_MOVE: int = 3
+const EVT_FOCUS: int = 4
+const EVT_BLUR: int = 5
+const EVT_KEY_DOWN: int = 6
+const EVT_KEY_UP: int = 7
+const EVT_MOUSE_DOWN: int = 8
+const EVT_MOUSE_UP: int = 9
+const EVT_MOUSE_MOVE: int = 10
+const EVT_IPC_MESSAGE: int = 11
+const EVT_MENU_CLICK: int = 12
+const EVT_HOTKEY: int = 13
+const EVT_TRAY_CLICK: int = 14
+const EVT_TIMER: int = 15
+const EVT_DROP_FILE: int = 16
+
+# IPC message types
+const IPC_EVAL_RESULT: int = 0
+const IPC_USER_MESSAGE: int = 1
+const IPC_LOAD_BRAIN: int = 2
+const IPC_SAVE_BRAIN: int = 3
+const IPC_DRAG: int = 4
+
+# NVA5 format constants
+const NVA5_MAGIC_0: int = 78    # 'N'
+const NVA5_MAGIC_1: int = 86    # 'V'
+const NVA5_MAGIC_2: int = 65    # 'A'
+const NVA5_MAGIC_3: int = 53    # '5'
+const NVA5_HEADER_SIZE: int = 10
+const NVA5_SYNAPSE_SIZE: int = 7
+const NVA5_FOOTER_SIZE: int = 8
+const NVA5_FLAG_NORMAL: int = 0
+const NVA5_FLAG_CONSOLIDATING: int = 1
+const NVA5_FLAG_IMMUTABLE: int = 2
+
+# Limits
+const MAX_HANDLES: int = 256
+const MAX_EVENTS: int = 64
+const MAX_MENU_ITEMS: int = 64
+const MAX_IPC_MSG_LEN: int = 65536
+const MAX_SYNAPSES: int = 500000
+const MAX_TITLE_LEN: int = 256
+const MAX_URL_LEN: int = 4096
+
+# Result codes
+const GUI_OK: int = 0
+const GUI_ERROR: int = -1
+
+# =============================================================================
+# SECTION 2: PLATFORM FFI DECLARATIONS
+# =============================================================================
+# These extern functions are thin Rust shims that call actual OS/wry/tao APIs.
+
+extern "C" fn platform_window_create(@title: *u8, @t_len: int, @w: int, @h: int, @flags: int) -> int
+extern "C" fn platform_window_show(@handle: int) -> int
+extern "C" fn platform_window_hide(@handle: int) -> int
+extern "C" fn platform_window_close(@handle: int) -> int
+extern "C" fn platform_window_set_title(@handle: int, @title: *u8, @len: int) -> int
+extern "C" fn platform_window_set_size(@handle: int, @w: int, @h: int) -> int
+extern "C" fn platform_window_set_pos(@handle: int, @x: int, @y: int) -> int
+
+extern "C" fn platform_webview_create(@window: int) -> int
+extern "C" fn platform_webview_load_html(@handle: int, @html: *u8, @len: int) -> int
+extern "C" fn platform_webview_load_url(@handle: int, @url: *u8, @len: int) -> int
+extern "C" fn platform_webview_eval(@handle: int, @js: *u8, @len: int) -> int
+
+extern "C" fn platform_event_loop_run() -> int
+extern "C" fn platform_event_loop_pump() -> int
+extern "C" fn platform_event_loop_quit() -> int
+
+extern "C" fn platform_tray_create(@icon: *u8, @len: int) -> int
+extern "C" fn platform_tray_set_tooltip(@handle: int, @text: *u8, @len: int) -> int
+extern "C" fn platform_menu_create() -> int
+extern "C" fn platform_menu_add_item(@handle: int, @label: *u8, @len: int, @id: int) -> int
+extern "C" fn platform_menu_show(@handle: int) -> int
+
+extern "C" fn platform_clipboard_get(@out: *u8, @max: int) -> int
+extern "C" fn platform_clipboard_set(@text: *u8, @len: int) -> int
+extern "C" fn platform_notification_show(@title: *u8, @t_len: int, @body: *u8, @b_len: int) -> int
+extern "C" fn platform_dialog_open_file(@out: *u8, @max: int) -> int
+extern "C" fn platform_dialog_save_file(@out: *u8, @max: int) -> int
+extern "C" fn platform_dialog_message(@title: *u8, @t_len: int, @msg: *u8, @m_len: int) -> int
+extern "C" fn platform_hotkey_register(@key: *u8, @len: int, @id: int) -> int
+extern "C" fn platform_hotkey_unregister(@id: int) -> int
+
+# =============================================================================
+# SECTION 3: HANDLE REGISTRY
+# =============================================================================
+
+meow @handle_kind: [int; 256] = [-1; 256]
+meow @handle_platform_id: [int; 256] = [0; 256]
+meow @handle_parent: [int; 256] = [-1; 256]
+meow @handle_flags: [int; 256] = [0; 256]
+meow @handle_active: [int; 256] = [0; 256]
+meow @handle_x: [int; 256] = [0; 256]
+meow @handle_y: [int; 256] = [0; 256]
+meow @handle_w: [int; 256] = [800; 256]
+meow @handle_h: [int; 256] = [600; 256]
+meow @handle_count: int = 0
+
+# Window titles
+meow @handle_title: [int; 65536] = [0; 65536]    # MAX_HANDLES * MAX_TITLE_LEN
+meow @handle_title_len: [int; 256] = [0; 256]
+
+fn handle_alloc(@kind: int) -> int
+    orbit @i in 0..MAX_HANDLES
+        if @handle_active[@i] == 0
+            @handle_kind[@i] = @kind
+            @handle_platform_id[@i] = 0
+            @handle_parent[@i] = -1
+            @handle_flags[@i] = 0
+            @handle_active[@i] = 1
+            @handle_count = @handle_count + 1
+            return @i
+    return -1
+
+fn handle_free(@idx: int) -> int
+    if @idx < 0
+        return GUI_ERROR
+    if @idx >= MAX_HANDLES
+        return GUI_ERROR
+    if @handle_active[@idx] == 0
+        return GUI_ERROR
+    @handle_active[@idx] = 0
+    @handle_kind[@idx] = -1
+    @handle_count = @handle_count - 1
+    return GUI_OK
+
+fn handle_is_valid(@idx: int) -> int
+    if @idx < 0
+        return 0
+    if @idx >= MAX_HANDLES
+        return 0
+    return @handle_active[@idx]
+
+fn handle_get_kind(@idx: int) -> int
+    if handle_is_valid(@idx) == 0
+        return -1
+    return @handle_kind[@idx]
+
+# =============================================================================
+# SECTION 4: EVENT QUEUE
+# =============================================================================
+
+meow @evt_types: [int; 64] = [0; 64]
+meow @evt_handles: [int; 64] = [-1; 64]
+meow @evt_param1: [int; 64] = [0; 64]
+meow @evt_param2: [int; 64] = [0; 64]
+meow @evt_front: int = 0
+meow @evt_back: int = 0
+meow @evt_count: int = 0
+
+fn event_push(@type_id: int, @handle: int, @p1: int, @p2: int) -> int
+    if @evt_count >= MAX_EVENTS
+        return GUI_ERROR
+    @evt_types[@evt_back] = @type_id
+    @evt_handles[@evt_back] = @handle
+    @evt_param1[@evt_back] = @p1
+    @evt_param2[@evt_back] = @p2
+    @evt_back = (@evt_back + 1) % MAX_EVENTS
+    @evt_count = @evt_count + 1
+    return GUI_OK
+
+fn event_pop_type() -> int
+    if @evt_count <= 0
+        return EVT_NONE
+    @t = @evt_types[@evt_front]
+    return @t
+
+fn event_pop_handle() -> int
+    if @evt_count <= 0
+        return -1
+    return @evt_handles[@evt_front]
+
+fn event_consume()
+    if @evt_count > 0
+        @evt_front = (@evt_front + 1) % MAX_EVENTS
+        @evt_count = @evt_count - 1
+
+fn event_queue_clear()
+    @evt_front = 0
+    @evt_back = 0
+    @evt_count = 0
+
+fn event_queue_count() -> int
+    return @evt_count
+
+# =============================================================================
+# SECTION 5: WINDOW MANAGEMENT
+# =============================================================================
+
+fn window_create(@title: *u8, @t_len: int, @width: int, @height: int, @flags: int) -> int
+    @h = handle_alloc(RES_WINDOW)
+    if @h < 0
+        return GUI_ERROR
+
+    @handle_w[@h] = @width
+    @handle_h[@h] = @height
+    @handle_flags[@h] = @flags
+
+    # Store title
+    @t_off = @h * MAX_TITLE_LEN
+    @copy = @t_len
+    if @copy > MAX_TITLE_LEN
+        @copy = MAX_TITLE_LEN
+    orbit @i in 0..@copy
+        @handle_title[@t_off + @i] = types::ptr_read_byte(@title, @i)
+    @handle_title_len[@h] = @copy
+
+    # Create platform window
+    @pid = platform_window_create(@title, @t_len, @width, @height, @flags)
+    @handle_platform_id[@h] = @pid
+
+    return @h
+
+fn window_show(@handle: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    return platform_window_show(@handle_platform_id[@handle])
+
+fn window_hide(@handle: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    return platform_window_hide(@handle_platform_id[@handle])
+
+fn window_close(@handle: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    @r = platform_window_close(@handle_platform_id[@handle])
+    handle_free(@handle)
+    return @r
+
+fn window_set_title(@handle: int, @title: *u8, @t_len: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    @t_off = @handle * MAX_TITLE_LEN
+    @copy = @t_len
+    if @copy > MAX_TITLE_LEN
+        @copy = MAX_TITLE_LEN
+    orbit @i in 0..@copy
+        @handle_title[@t_off + @i] = types::ptr_read_byte(@title, @i)
+    @handle_title_len[@handle] = @copy
+    return platform_window_set_title(@handle_platform_id[@handle], @title, @t_len)
+
+fn window_set_size(@handle: int, @width: int, @height: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    @handle_w[@handle] = @width
+    @handle_h[@handle] = @height
+    return platform_window_set_size(@handle_platform_id[@handle], @width, @height)
+
+fn window_set_position(@handle: int, @x: int, @y: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    @handle_x[@handle] = @x
+    @handle_y[@handle] = @y
+    return platform_window_set_pos(@handle_platform_id[@handle], @x, @y)
+
+fn window_get_width(@handle: int) -> int
+    if handle_is_valid(@handle) == 0
+        return 0
+    return @handle_w[@handle]
+
+fn window_get_height(@handle: int) -> int
+    if handle_is_valid(@handle) == 0
+        return 0
+    return @handle_h[@handle]
+
+# =============================================================================
+# SECTION 6: WEBVIEW BRIDGE
+# =============================================================================
+
+meow @webview_window: [int; 256] = [-1; 256]
+meow @ipc_msg_buf: [int; 65536] = [0; 65536]
+meow @ipc_msg_len: int = 0
+
+fn webview_create(@window_handle: int) -> int
+    if handle_is_valid(@window_handle) == 0
+        return GUI_ERROR
+    @h = handle_alloc(RES_WEBVIEW)
+    if @h < 0
+        return GUI_ERROR
+    @handle_parent[@h] = @window_handle
+    @webview_window[@h] = @window_handle
+    @pid = platform_webview_create(@handle_platform_id[@window_handle])
+    @handle_platform_id[@h] = @pid
+    return @h
+
+fn webview_load_html(@handle: int, @html: *u8, @html_len: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    return platform_webview_load_html(@handle_platform_id[@handle], @html, @html_len)
+
+fn webview_load_url(@handle: int, @url: *u8, @url_len: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    return platform_webview_load_url(@handle_platform_id[@handle], @url, @url_len)
+
+fn webview_eval_js(@handle: int, @js: *u8, @js_len: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    return platform_webview_eval(@handle_platform_id[@handle], @js, @js_len)
+
+fn ipc_handle_message(@msg: *u8, @msg_len: int) -> int
+    # Route IPC message from webview
+    if @msg_len <= 0
+        return GUI_ERROR
+
+    # Copy to buffer
+    @copy = @msg_len
+    if @copy > MAX_IPC_MSG_LEN
+        @copy = MAX_IPC_MSG_LEN
+    orbit @i in 0..@copy
+        @ipc_msg_buf[@i] = types::ptr_read_byte(@msg, @i)
+    @ipc_msg_len = @copy
+
+    # Detect message type by prefix
+    @first = types::ptr_read_byte(@msg, 0)
+    if @first == 108  # 'l' = load_brain
+        event_push(EVT_IPC_MESSAGE, 0, IPC_LOAD_BRAIN, 0)
+    eclipse
+        if @first == 115  # 's' = save_brain
+            event_push(EVT_IPC_MESSAGE, 0, IPC_SAVE_BRAIN, 0)
+        eclipse
+            if @first == 100  # 'd' = drag
+                event_push(EVT_IPC_MESSAGE, 0, IPC_DRAG, 0)
+            eclipse
+                event_push(EVT_IPC_MESSAGE, 0, IPC_USER_MESSAGE, 0)
+
+    return GUI_OK
+
+# =============================================================================
+# SECTION 7: EVENT LOOP
+# =============================================================================
+
+meow @gui_running: int = 0
+
+fn gui_run() -> int
+    @gui_running = 1
+    return platform_event_loop_run()
+
+fn gui_pump_events() -> int
+    return platform_event_loop_pump()
+
+fn gui_quit() -> int
+    @gui_running = 0
+    return platform_event_loop_quit()
+
+fn gui_is_running() -> int
+    return @gui_running
+
+fn gui_dispatch_event() -> int
+    # Process next event in queue
+    @type_id = event_pop_type()
+    if @type_id == EVT_NONE
+        return 0
+
+    @handle = event_pop_handle()
+    event_consume()
+
+    # Handle close events
+    if @type_id == EVT_CLOSE
+        if handle_is_valid(@handle) == 1
+            window_close(@handle)
+        return 1
+
+    return 1
+
+# =============================================================================
+# SECTION 8: SYSTEM FEATURES
+# =============================================================================
+
+fn tray_create(@icon_path: *u8, @path_len: int) -> int
+    @h = handle_alloc(RES_TRAY)
+    if @h < 0
+        return GUI_ERROR
+    @pid = platform_tray_create(@icon_path, @path_len)
+    @handle_platform_id[@h] = @pid
+    return @h
+
+fn tray_set_tooltip(@handle: int, @text: *u8, @text_len: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    return platform_tray_set_tooltip(@handle_platform_id[@handle], @text, @text_len)
+
+fn menu_create() -> int
+    @h = handle_alloc(RES_MENU)
+    if @h < 0
+        return GUI_ERROR
+    @pid = platform_menu_create()
+    @handle_platform_id[@h] = @pid
+    return @h
+
+fn menu_add_item(@handle: int, @label: *u8, @label_len: int, @item_id: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    return platform_menu_add_item(@handle_platform_id[@handle], @label, @label_len, @item_id)
+
+fn menu_show(@handle: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    return platform_menu_show(@handle_platform_id[@handle])
+
+fn hotkey_register(@key_str: *u8, @key_len: int, @id: int) -> int
+    @h = handle_alloc(RES_HOTKEY)
+    if @h < 0
+        return GUI_ERROR
+    @r = platform_hotkey_register(@key_str, @key_len, @id)
+    @handle_platform_id[@h] = @id
+    return @h
+
+fn hotkey_unregister(@handle: int) -> int
+    if handle_is_valid(@handle) == 0
+        return GUI_ERROR
+    @r = platform_hotkey_unregister(@handle_platform_id[@handle])
+    handle_free(@handle)
+    return @r
+
+fn clipboard_get(@out: *u8, @max: int) -> int
+    return platform_clipboard_get(@out, @max)
+
+fn clipboard_set(@text: *u8, @text_len: int) -> int
+    return platform_clipboard_set(@text, @text_len)
+
+fn notification_show(@title: *u8, @t_len: int, @body: *u8, @b_len: int) -> int
+    return platform_notification_show(@title, @t_len, @body, @b_len)
+
+fn dialog_open_file(@out: *u8, @max: int) -> int
+    return platform_dialog_open_file(@out, @max)
+
+fn dialog_save_file(@out: *u8, @max: int) -> int
+    return platform_dialog_save_file(@out, @max)
+
+fn dialog_message(@title: *u8, @t_len: int, @msg: *u8, @m_len: int) -> int
+    return platform_dialog_message(@title, @t_len, @msg, @m_len)
+
+# =============================================================================
+# SECTION 9: NVA5 BRAIN PERSISTENCE
+# =============================================================================
+# Binary format for Nova AI spiking neural network synapse data.
+# Header(10) + Synapse[](7 each) + Footer(8)
+
+meow @brain_pre: [int; 500000] = [0; 500000]
+meow @brain_post: [int; 500000] = [0; 500000]
+meow @brain_weight: [int; 500000] = [0; 500000]    # float16 as int
+meow @brain_flag: [int; 500000] = [0; 500000]
+meow @brain_synapse_count: int = 0
+meow @brain_version: int = 1
+
+meow @brain_buf: [int; 4194304] = [0; 4194304]   # ~4MB buffer
+
+fn brain_encode(@out: *u8, @max_len: int) -> int
+    # Encode brain to NVA5 binary format
+    # Returns total bytes written
+    @pos = 0
+
+    # Header: magic(4) + version(2) + synapse_count(4) = 10 bytes
+    if @max_len < NVA5_HEADER_SIZE
+        return 0
+
+    types::ptr_write_byte(@out, 0, NVA5_MAGIC_0)
+    types::ptr_write_byte(@out, 1, NVA5_MAGIC_1)
+    types::ptr_write_byte(@out, 2, NVA5_MAGIC_2)
+    types::ptr_write_byte(@out, 3, NVA5_MAGIC_3)
+    types::ptr_write_byte(@out, 4, @brain_version & 255)
+    types::ptr_write_byte(@out, 5, (@brain_version >> 8) & 255)
+    types::ptr_write_byte(@out, 6, @brain_synapse_count & 255)
+    types::ptr_write_byte(@out, 7, (@brain_synapse_count >> 8) & 255)
+    types::ptr_write_byte(@out, 8, (@brain_synapse_count >> 16) & 255)
+    types::ptr_write_byte(@out, 9, (@brain_synapse_count >> 24) & 255)
+    @pos = NVA5_HEADER_SIZE
+
+    # Synapses: pre(2) + post(2) + weight_f16(2) + flag(1) = 7 bytes each
+    orbit @i in 0..@brain_synapse_count
+        if @pos + NVA5_SYNAPSE_SIZE > @max_len
+            nova
+        @pre = @brain_pre[@i]
+        @post = @brain_post[@i]
+        @w = @brain_weight[@i]
+        @f = @brain_flag[@i]
+
+        types::ptr_write_byte(@out, @pos, @pre & 255)
+        types::ptr_write_byte(@out, @pos + 1, (@pre >> 8) & 255)
+        types::ptr_write_byte(@out, @pos + 2, @post & 255)
+        types::ptr_write_byte(@out, @pos + 3, (@post >> 8) & 255)
+        types::ptr_write_byte(@out, @pos + 4, @w & 255)
+        types::ptr_write_byte(@out, @pos + 5, (@w >> 8) & 255)
+        types::ptr_write_byte(@out, @pos + 6, @f)
+        @pos = @pos + NVA5_SYNAPSE_SIZE
+
+    # Footer: timestamp(8)
+    orbit @i in 0..NVA5_FOOTER_SIZE
+        if @pos < @max_len
+            types::ptr_write_byte(@out, @pos, 0)
+            @pos = @pos + 1
+
+    return @pos
+
+fn brain_decode(@data: *u8, @data_len: int) -> int
+    # Decode NVA5 binary format into brain arrays
+    # Returns synapse count or -1 on error
+    if @data_len < NVA5_HEADER_SIZE
+        return -1
+
+    # Verify magic
+    if types::ptr_read_byte(@data, 0) != NVA5_MAGIC_0
+        return -1
+    if types::ptr_read_byte(@data, 1) != NVA5_MAGIC_1
+        return -1
+    if types::ptr_read_byte(@data, 2) != NVA5_MAGIC_2
+        return -1
+    if types::ptr_read_byte(@data, 3) != NVA5_MAGIC_3
+        return -1
+
+    @brain_version = types::ptr_read_byte(@data, 4) | (types::ptr_read_byte(@data, 5) << 8)
+    @count = types::ptr_read_byte(@data, 6) | (types::ptr_read_byte(@data, 7) << 8) | (types::ptr_read_byte(@data, 8) << 16) | (types::ptr_read_byte(@data, 9) << 24)
+
+    if @count > MAX_SYNAPSES
+        @count = MAX_SYNAPSES
+
+    @pos = NVA5_HEADER_SIZE
+    orbit @i in 0..@count
+        if @pos + NVA5_SYNAPSE_SIZE > @data_len
+            nova
+        @brain_pre[@i] = types::ptr_read_byte(@data, @pos) | (types::ptr_read_byte(@data, @pos + 1) << 8)
+        @brain_post[@i] = types::ptr_read_byte(@data, @pos + 2) | (types::ptr_read_byte(@data, @pos + 3) << 8)
+        @brain_weight[@i] = types::ptr_read_byte(@data, @pos + 4) | (types::ptr_read_byte(@data, @pos + 5) << 8)
+        @brain_flag[@i] = types::ptr_read_byte(@data, @pos + 6)
+        @pos = @pos + NVA5_SYNAPSE_SIZE
+
+    @brain_synapse_count = @count
+    return @count
+
+fn brain_get_synapse_count() -> int
+    return @brain_synapse_count
+
+fn brain_get_pre(@idx: int) -> int
+    if @idx < 0
+        return 0
+    if @idx >= @brain_synapse_count
+        return 0
+    return @brain_pre[@idx]
+
+fn brain_get_post(@idx: int) -> int
+    if @idx < 0
+        return 0
+    if @idx >= @brain_synapse_count
+        return 0
+    return @brain_post[@idx]
+
+fn brain_get_weight(@idx: int) -> int
+    if @idx < 0
+        return 0
+    if @idx >= @brain_synapse_count
+        return 0
+    return @brain_weight[@idx]
+
+fn brain_get_flag(@idx: int) -> int
+    if @idx < 0
+        return 0
+    if @idx >= @brain_synapse_count
+        return 0
+    return @brain_flag[@idx]
+
+fn brain_add_synapse(@pre: int, @post: int, @weight: int, @flag: int) -> int
+    if @brain_synapse_count >= MAX_SYNAPSES
+        return -1
+    @idx = @brain_synapse_count
+    @brain_pre[@idx] = @pre
+    @brain_post[@idx] = @post
+    @brain_weight[@idx] = @weight
+    @brain_flag[@idx] = @flag
+    @brain_synapse_count = @brain_synapse_count + 1
+    return @idx
+
+fn brain_clear()
+    @brain_synapse_count = 0
+
+fn brain_save(@path: *u8, @path_len: int) -> int
+    @encoded_len = brain_encode(@brain_buf, 4194304)
+    if @encoded_len <= 0
+        return GUI_ERROR
+    @fd = io::file_open(@path, @path_len, 1)  # MODE_WRITE
+    if @fd < 0
+        return GUI_ERROR
+    io::file_write(@fd, @brain_buf, @encoded_len)
+    io::file_close(@fd)
+    return @encoded_len
+
+fn brain_load(@path: *u8, @path_len: int) -> int
+    @fd = io::file_open(@path, @path_len, 0)  # MODE_READ
+    if @fd < 0
+        return GUI_ERROR
+    @bytes = io::file_read(@fd, @brain_buf, 4194304)
+    io::file_close(@fd)
+    if @bytes <= 0
+        return GUI_ERROR
+    return brain_decode(@brain_buf, @bytes)
+
+# =============================================================================
+# SECTION 10: UTILITY FUNCTIONS
+# =============================================================================
+
+fn gui_get_handle_count() -> int
+    return @handle_count
+
+fn gui_get_active_windows() -> int
+    @count = 0
+    orbit @i in 0..MAX_HANDLES
+        if @handle_active[@i] == 1
+            if @handle_kind[@i] == RES_WINDOW
+                @count = @count + 1
+    return @count
+
+fn gui_reset()
+    orbit @i in 0..MAX_HANDLES
+        @handle_active[@i] = 0
+        @handle_kind[@i] = -1
+    @handle_count = 0
+    event_queue_clear()
+    @gui_running = 0
+    brain_clear()
+
+# =============================================================================
+# SECTION 11: EXTERN C API
+# =============================================================================
+
+extern "C" fn luna_gui_window_create(@title: *u8, @tlen: int, @w: int, @h: int, @flags: int) -> int
+    return window_create(@title, @tlen, @w, @h, @flags)
+
+extern "C" fn luna_gui_window_show(@h: int) -> int
+    return window_show(@h)
+
+extern "C" fn luna_gui_window_hide(@h: int) -> int
+    return window_hide(@h)
+
+extern "C" fn luna_gui_window_close(@h: int) -> int
+    return window_close(@h)
+
+extern "C" fn luna_gui_webview_create(@win: int) -> int
+    return webview_create(@win)
+
+extern "C" fn luna_gui_webview_load_html(@h: int, @html: *u8, @len: int) -> int
+    return webview_load_html(@h, @html, @len)
+
+extern "C" fn luna_gui_webview_eval(@h: int, @js: *u8, @len: int) -> int
+    return webview_eval_js(@h, @js, @len)
+
+extern "C" fn luna_gui_run() -> int
+    return gui_run()
+
+extern "C" fn luna_gui_quit() -> int
+    return gui_quit()
+
+extern "C" fn luna_gui_clipboard_get(@out: *u8, @max: int) -> int
+    return clipboard_get(@out, @max)
+
+extern "C" fn luna_gui_clipboard_set(@text: *u8, @len: int) -> int
+    return clipboard_set(@text, @len)
+
+extern "C" fn luna_gui_notification(@title: *u8, @tlen: int, @body: *u8, @blen: int) -> int
+    return notification_show(@title, @tlen, @body, @blen)
+
+extern "C" fn luna_brain_load(@path: *u8, @len: int) -> int
+    return brain_load(@path, @len)
+
+extern "C" fn luna_brain_save(@path: *u8, @len: int) -> int
+    return brain_save(@path, @len)
+
+extern "C" fn luna_brain_count() -> int
+    return brain_get_synapse_count()
+
+# =============================================================================
+# SECTION 12: SELF-TESTS
+# =============================================================================
+
+fn test_gui_handle_alloc() -> int
+    gui_reset()
+    @h1 = handle_alloc(RES_WINDOW)
+    guard @h1 >= 0, "gui: handle alloc should succeed"
+    guard @handle_active[@h1] == 1, "gui: handle should be active"
+    guard @handle_kind[@h1] == RES_WINDOW, "gui: handle kind should be WINDOW"
+
+    @h2 = handle_alloc(RES_WEBVIEW)
+    guard @h2 >= 0, "gui: second alloc should succeed"
+    guard @h2 != @h1, "gui: handles should be different"
+
+    shine("  [PASS] gui handle alloc")
+    return 1
+
+fn test_gui_handle_free() -> int
+    gui_reset()
+    @h = handle_alloc(RES_WINDOW)
+    @r = handle_free(@h)
+    guard @r == GUI_OK, "gui: handle free should succeed"
+    guard @handle_active[@h] == 0, "gui: handle should be inactive after free"
+
+    # Can reuse freed slot
+    @h2 = handle_alloc(RES_MENU)
+    guard @h2 == @h, "gui: should reuse freed slot"
+
+    shine("  [PASS] gui handle free")
+    return 1
+
+fn test_gui_event_queue() -> int
+    event_queue_clear()
+    event_push(EVT_CLOSE, 5, 0, 0)
+    event_push(EVT_RESIZE, 3, 800, 600)
+
+    guard @evt_count == 2, "gui: should have 2 events"
+
+    @t1 = event_pop_type()
+    guard @t1 == EVT_CLOSE, "gui: first event should be CLOSE"
+    event_consume()
+
+    @t2 = event_pop_type()
+    guard @t2 == EVT_RESIZE, "gui: second event should be RESIZE"
+    event_consume()
+
+    guard @evt_count == 0, "gui: queue should be empty"
+
+    shine("  [PASS] gui event queue")
+    return 1
+
+fn test_gui_brain_encode_decode() -> int
+    brain_clear()
+    # Add some test synapses
+    brain_add_synapse(100, 200, 16384, NVA5_FLAG_NORMAL)
+    brain_add_synapse(300, 400, 32768, NVA5_FLAG_CONSOLIDATING)
+    brain_add_synapse(500, 600, 49152, NVA5_FLAG_IMMUTABLE)
+
+    guard @brain_synapse_count == 3, "gui: should have 3 synapses"
+
+    # Encode
+    meow @enc_buf: [int; 4096] = [0; 4096]
+    @enc_len = brain_encode(@enc_buf, 4096)
+    guard @enc_len > 0, "gui: encode should produce bytes"
+    guard @enc_len == NVA5_HEADER_SIZE + 3 * NVA5_SYNAPSE_SIZE + NVA5_FOOTER_SIZE, "gui: encode length wrong"
+
+    # Decode into fresh state
+    brain_clear()
+    @dec_count = brain_decode(@enc_buf, @enc_len)
+    guard @dec_count == 3, "gui: decode should return 3 synapses"
+
+    guard brain_get_pre(0) == 100, "gui: synapse 0 pre should be 100"
+    guard brain_get_post(0) == 200, "gui: synapse 0 post should be 200"
+    guard brain_get_weight(0) == 16384, "gui: synapse 0 weight should be 16384"
+    guard brain_get_flag(0) == NVA5_FLAG_NORMAL, "gui: synapse 0 flag should be NORMAL"
+
+    guard brain_get_pre(2) == 500, "gui: synapse 2 pre should be 500"
+    guard brain_get_flag(2) == NVA5_FLAG_IMMUTABLE, "gui: synapse 2 flag should be IMMUTABLE"
+
+    shine("  [PASS] gui brain encode/decode")
+    return 1
+
+fn test_gui_ipc_message() -> int
+    event_queue_clear()
+    @r = ipc_handle_message("load_brain", 10)
+    guard @r == GUI_OK, "gui: ipc should return OK"
+
+    @t = event_pop_type()
+    guard @t == EVT_IPC_MESSAGE, "gui: should be IPC event"
+    @p1 = @evt_param1[@evt_front]
+    guard @p1 == IPC_LOAD_BRAIN, "gui: param should be LOAD_BRAIN"
+    event_consume()
+
+    ipc_handle_message("save_brain:{}", 13)
+    @t = event_pop_type()
+    guard @t == EVT_IPC_MESSAGE, "gui: should be IPC event"
+    @p1 = @evt_param1[@evt_front]
+    guard @p1 == IPC_SAVE_BRAIN, "gui: param should be SAVE_BRAIN"
+    event_consume()
+
+    shine("  [PASS] gui ipc message")
+    return 1
+
+fn test_gui_handle_registry() -> int
+    gui_reset()
+    @w1 = handle_alloc(RES_WINDOW)
+    @w2 = handle_alloc(RES_WINDOW)
+    @m1 = handle_alloc(RES_MENU)
+
+    @wc = gui_get_active_windows()
+    guard @wc == 2, "gui: should have 2 active windows"
+
+    @total = gui_get_handle_count()
+    guard @total == 3, "gui: should have 3 total handles"
+
+    handle_free(@w1)
+    @wc = gui_get_active_windows()
+    guard @wc == 1, "gui: should have 1 window after free"
+
+    shine("  [PASS] gui handle registry")
+    return 1
+
+fn test_gui_nva5_magic() -> int
+    brain_clear()
+    brain_add_synapse(1, 2, 100, 0)
+
+    meow @buf: [int; 256] = [0; 256]
+    @len = brain_encode(@buf, 256)
+
+    guard @buf[0] == NVA5_MAGIC_0, "gui: magic[0] should be 'N'"
+    guard @buf[1] == NVA5_MAGIC_1, "gui: magic[1] should be 'V'"
+    guard @buf[2] == NVA5_MAGIC_2, "gui: magic[2] should be 'A'"
+    guard @buf[3] == NVA5_MAGIC_3, "gui: magic[3] should be '5'"
+
+    shine("  [PASS] gui nva5 magic")
+    return 1
+
+fn test_gui_brain_limits() -> int
+    brain_clear()
+    # Add maximum synapses
+    orbit @i in 0..100
+        brain_add_synapse(@i, @i + 1, @i * 100, 0)
+
+    guard @brain_synapse_count == 100, "gui: should have 100 synapses"
+
+    brain_clear()
+    guard @brain_synapse_count == 0, "gui: should have 0 after clear"
+
+    shine("  [PASS] gui brain limits")
+    return 1
+
+fn test_gui_event_overflow() -> int
+    event_queue_clear()
+    # Fill event queue
+    orbit @i in 0..MAX_EVENTS
+        event_push(EVT_TIMER, @i, 0, 0)
+
+    guard @evt_count == MAX_EVENTS, "gui: queue should be full"
+
+    # Overflow should fail gracefully
+    @r = event_push(EVT_CLOSE, 0, 0, 0)
+    guard @r == GUI_ERROR, "gui: overflow push should return error"
+
+    # Drain queue
+    orbit @i in 0..MAX_EVENTS
+        event_consume()
+    guard @evt_count == 0, "gui: queue should be empty after drain"
+
+    shine("  [PASS] gui event overflow")
+    return 1
+
+fn run_gui_native_tests() -> int
+    shine("--- gui_native.luna self-tests ---")
+    @pass_count = 0
+    @pass_count = @pass_count + test_gui_handle_alloc()
+    @pass_count = @pass_count + test_gui_handle_free()
+    @pass_count = @pass_count + test_gui_event_queue()
+    @pass_count = @pass_count + test_gui_brain_encode_decode()
+    @pass_count = @pass_count + test_gui_ipc_message()
+    @pass_count = @pass_count + test_gui_handle_registry()
+    @pass_count = @pass_count + test_gui_nva5_magic()
+    @pass_count = @pass_count + test_gui_brain_limits()
+    @pass_count = @pass_count + test_gui_event_overflow()
+    shine("--- gui_native.luna: " + @pass_count + "/9 tests passed ---")
+    return @pass_count

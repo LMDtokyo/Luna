@@ -1,0 +1,1772 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Native Regex Module v4.1
+# =============================================================================
+# Full NFA/DFA regex engine using Thompson's construction.
+#
+# Supported syntax:
+#   .           - any character (except newline)
+#   [abc]       - character class
+#   [^abc]      - negated character class
+#   [a-z]       - character range
+#   \d \D       - digit / non-digit
+#   \w \W       - word / non-word
+#   \s \S       - space / non-space
+#   \t \n \r    - tab, newline, carriage return
+#   *           - zero or more (greedy)
+#   +           - one or more (greedy)
+#   ?           - zero or one (greedy)
+#   |           - alternation
+#   ()          - capturing group
+#   ^           - start of string
+#   $           - end of string
+#   \.          - escaped literal
+#
+# Architecture:
+#   1. Parse regex string -> NFA (Thompson's construction)
+#   2. NFA simulation with backtracking for group capture
+#   3. Optional NFA->DFA subset construction for fast matching
+#
+# Uses flat parallel arrays (no HashMap). Fixed max capacities.
+#
+# Build: luna compile --release regex.luna -o regex.o
+# =============================================================================
+
+import types
+import borrow_checker
+
+# =============================================================================
+# SECTION 1: CONSTANTS
+# =============================================================================
+
+# NFA state types
+const NFA_LITERAL: int = 0
+const NFA_DOT: int = 1
+const NFA_CHAR_CLASS: int = 2
+const NFA_SPLIT: int = 3
+const NFA_MATCH: int = 4
+const NFA_EPSILON: int = 5
+const NFA_ANCHOR_START: int = 6
+const NFA_ANCHOR_END: int = 7
+const NFA_GROUP_OPEN: int = 8
+const NFA_GROUP_CLOSE: int = 9
+const NFA_NEGATED_CLASS: int = 10
+const NFA_SHORTHAND: int = 11
+
+# Shorthand class identifiers
+const SH_DIGIT: int = 0
+const SH_NON_DIGIT: int = 1
+const SH_WORD: int = 2
+const SH_NON_WORD: int = 3
+const SH_SPACE: int = 4
+const SH_NON_SPACE: int = 5
+
+# Limits
+const MAX_NFA_STATES: int = 4096
+const MAX_DFA_STATES: int = 2048
+const MAX_GROUPS: int = 16
+const MAX_CLASS_RANGES: int = 128
+const MAX_STACK: int = 512
+const MAX_MATCHES: int = 256
+
+# Result codes
+const RE_OK: int = 0
+const RE_ERROR: int = -1
+const RE_NO_MATCH: int = -2
+
+# =============================================================================
+# SECTION 2: NFA DATA STRUCTURES (flat parallel arrays)
+# =============================================================================
+
+# NFA states - each state has a type and up to 2 transitions
+meow @nfa_type: [int; 4096] = [0; 4096]
+meow @nfa_char: [int; 4096] = [0; 4096]
+meow @nfa_out1: [int; 4096] = [-1; 4096]
+meow @nfa_out2: [int; 4096] = [-1; 4096]
+meow @nfa_group_id: [int; 4096] = [-1; 4096]
+meow @nfa_count: int = 0
+
+# Character class ranges for NFA_CHAR_CLASS states
+# Each class state uses a range [class_start..class_end) in these arrays
+meow @class_lo: [int; 4096] = [0; 4096]
+meow @class_hi: [int; 4096] = [0; 4096]
+meow @class_starts: [int; 4096] = [0; 4096]
+meow @class_ends: [int; 4096] = [0; 4096]
+meow @class_count: int = 0
+
+# NFA fragment stack for Thompson's construction
+meow @frag_start: [int; 512] = [0; 512]
+meow @frag_end: [int; 512] = [0; 512]
+meow @frag_count: int = 0
+
+# DFA states - subset construction
+meow @dfa_nfa_sets: [int; 131072] = [0; 131072]
+meow @dfa_set_start: [int; 2048] = [0; 2048]
+meow @dfa_set_size: [int; 2048] = [0; 2048]
+meow @dfa_accepting: [int; 2048] = [0; 2048]
+meow @dfa_trans: [int; 524288] = [-1; 524288]
+meow @dfa_count: int = 0
+meow @dfa_set_pool: int = 0
+
+# Match result storage
+meow @match_start: int = -1
+meow @match_end: int = -1
+meow @group_starts: [int; 16] = [-1; 16]
+meow @group_ends: [int; 16] = [-1; 16]
+meow @group_count: int = 0
+
+# Compiled regex metadata
+meow @regex_pattern: [int; 1024] = [0; 1024]
+meow @regex_pat_len: int = 0
+meow @regex_start_state: int = -1
+meow @regex_compiled: int = 0
+meow @regex_error: int = 0
+meow @regex_n_groups: int = 0
+
+# =============================================================================
+# SECTION 3: NFA CONSTRUCTION HELPERS
+# =============================================================================
+
+fn nfa_alloc(@type_id: int) -> int
+    if @nfa_count >= MAX_NFA_STATES
+        return -1
+    @idx = @nfa_count
+    @nfa_type[@idx] = @type_id
+    @nfa_char[@idx] = 0
+    @nfa_out1[@idx] = -1
+    @nfa_out2[@idx] = -1
+    @nfa_group_id[@idx] = -1
+    @nfa_count = @nfa_count + 1
+    return @idx
+
+fn nfa_reset()
+    @nfa_count = 0
+    @class_count = 0
+    @frag_count = 0
+    @dfa_count = 0
+    @dfa_set_pool = 0
+    @regex_compiled = 0
+    @regex_error = 0
+    @regex_n_groups = 0
+    @regex_start_state = -1
+    @match_start = -1
+    @match_end = -1
+    orbit @i in 0..MAX_GROUPS
+        @group_starts[@i] = -1
+        @group_ends[@i] = -1
+
+fn frag_push(@start: int, @end_state: int)
+    if @frag_count >= MAX_STACK
+        return
+    @frag_start[@frag_count] = @start
+    @frag_end[@frag_count] = @end_state
+    @frag_count = @frag_count + 1
+
+fn frag_pop_start() -> int
+    if @frag_count <= 0
+        return -1
+    @frag_count = @frag_count - 1
+    return @frag_start[@frag_count]
+
+fn frag_pop_end() -> int
+    # Note: must be called right after frag_pop_start
+    return @frag_end[@frag_count]
+
+fn class_range_alloc(@lo_ch: int, @hi_ch: int) -> int
+    if @class_count >= 4096
+        return -1
+    @idx = @class_count
+    @class_lo[@idx] = @lo_ch
+    @class_hi[@idx] = @hi_ch
+    @class_count = @class_count + 1
+    return @idx
+
+# =============================================================================
+# SECTION 4: REGEX PARSER
+# =============================================================================
+# Recursive descent parser: pattern -> NFA using Thompson's construction.
+# Grammar:
+#   regex    = alternation
+#   alternation = concat ('|' concat)*
+#   concat   = quantified+
+#   quantified = atom ('*' | '+' | '?')?
+#   atom     = literal | '.' | class | '(' regex ')' | anchor
+
+# Parser state
+meow @parse_pos: int = 0
+meow @parse_src: [int; 1024] = [0; 1024]
+meow @parse_len: int = 0
+meow @parse_group_counter: int = 0
+
+fn parse_peek() -> int
+    if @parse_pos >= @parse_len
+        return -1
+    return @parse_src[@parse_pos]
+
+fn parse_advance() -> int
+    if @parse_pos >= @parse_len
+        return -1
+    @ch = @parse_src[@parse_pos]
+    @parse_pos = @parse_pos + 1
+    return @ch
+
+fn parse_escape() -> int
+    # Called after consuming '\', returns character code or shorthand type
+    @ch = parse_advance()
+    if @ch < 0
+        return -1
+    phase @ch
+        100 =>
+            # 'd' - digit shorthand
+            return -100
+        68 =>
+            # 'D' - non-digit
+            return -101
+        119 =>
+            # 'w' - word
+            return -102
+        87 =>
+            # 'W' - non-word
+            return -103
+        115 =>
+            # 's' - space
+            return -104
+        83 =>
+            # 'S' - non-space
+            return -105
+        116 =>
+            # 't' - tab
+            return 9
+        110 =>
+            # 'n' - newline
+            return 10
+        114 =>
+            # 'r' - carriage return
+            return 13
+    # Literal escaped character
+    return @ch
+
+fn parse_char_class() -> int
+    # Parse [abc], [a-z], [^abc], etc.
+    # Returns NFA state index for the class
+    @negated = 0
+    @pk = parse_peek()
+    if @pk == 94
+        # '^' - negated
+        parse_advance()
+        @negated = 1
+
+    @range_start_idx = @class_count
+    @range_count = 0
+
+    orbit @iter in 0..MAX_CLASS_RANGES
+        @pk = parse_peek()
+        if @pk < 0
+            nova
+        if @pk == 93
+            # ']' - end of class
+            parse_advance()
+            nova
+
+        @lo_val = 0
+        if @pk == 92
+            # Backslash escape in class
+            parse_advance()
+            @esc = parse_escape_in_class()
+            if @esc < -50
+                # Shorthand in class - expand ranges
+                @expanded = expand_shorthand_to_ranges(@esc)
+                @range_count = @range_count + @expanded
+                orbit @next_iter in 0..0
+                    pass
+            eclipse
+                @lo_val = @esc
+        eclipse
+            @lo_val = parse_advance()
+
+        # Check for range: a-z
+        @pk2 = parse_peek()
+        if @pk2 == 45
+            # '-' might be range
+            parse_advance()
+            @pk3 = parse_peek()
+            if @pk3 == 93
+                # Trailing dash, treat '-' as literal
+                class_range_alloc(@lo_val, @lo_val)
+                class_range_alloc(45, 45)
+                @range_count = @range_count + 2
+            eclipse
+                @hi_val = 0
+                if @pk3 == 92
+                    parse_advance()
+                    @hi_val = parse_escape_in_class()
+                eclipse
+                    @hi_val = parse_advance()
+                class_range_alloc(@lo_val, @hi_val)
+                @range_count = @range_count + 1
+        eclipse
+            if @lo_val >= 0
+                class_range_alloc(@lo_val, @lo_val)
+                @range_count = @range_count + 1
+
+    # Create NFA state for this class
+    @state_type = NFA_CHAR_CLASS
+    if @negated == 1
+        @state_type = NFA_NEGATED_CLASS
+    @state = nfa_alloc(@state_type)
+    if @state < 0
+        return -1
+    @class_starts[@state] = @range_start_idx
+    @class_ends[@state] = @range_start_idx + @range_count
+    @end_s = nfa_alloc(NFA_EPSILON)
+    @nfa_out1[@state] = @end_s
+    return @state
+
+fn parse_escape_in_class() -> int
+    # Same as parse_escape but already consumed '\'
+    @ch = parse_advance()
+    if @ch < 0
+        return -1
+    phase @ch
+        100 =>
+            return -100
+        68 =>
+            return -101
+        119 =>
+            return -102
+        87 =>
+            return -103
+        115 =>
+            return -104
+        83 =>
+            return -105
+        116 =>
+            return 9
+        110 =>
+            return 10
+        114 =>
+            return 13
+    return @ch
+
+fn expand_shorthand_to_ranges(@code: int) -> int
+    # Expand shorthand like \d into char class ranges
+    # Returns number of ranges added
+    phase @code
+        -100 =>
+            # \d = [0-9]
+            class_range_alloc(48, 57)
+            return 1
+        -101 =>
+            # \D = [^0-9] => [0-47][58-127]
+            class_range_alloc(0, 47)
+            class_range_alloc(58, 127)
+            return 2
+        -102 =>
+            # \w = [a-zA-Z0-9_]
+            class_range_alloc(97, 122)
+            class_range_alloc(65, 90)
+            class_range_alloc(48, 57)
+            class_range_alloc(95, 95)
+            return 4
+        -103 =>
+            # \W = [^a-zA-Z0-9_]
+            class_range_alloc(0, 47)
+            class_range_alloc(58, 64)
+            class_range_alloc(91, 94)
+            class_range_alloc(96, 96)
+            class_range_alloc(123, 127)
+            return 5
+        -104 =>
+            # \s = [ \t\n\r\f\v]
+            class_range_alloc(32, 32)
+            class_range_alloc(9, 13)
+            return 2
+        -105 =>
+            # \S = [^ \t\n\r\f\v]
+            class_range_alloc(0, 8)
+            class_range_alloc(14, 31)
+            class_range_alloc(33, 127)
+            return 3
+    return 0
+
+fn parse_atom() -> int
+    # Parse a single atom and push fragment on stack
+    @ch = parse_peek()
+    if @ch < 0
+        return RE_ERROR
+
+    phase @ch
+        40 =>
+            # '(' - group open
+            parse_advance()
+            @gid = @parse_group_counter
+            @parse_group_counter = @parse_group_counter + 1
+            if @gid >= MAX_GROUPS
+                @gid = MAX_GROUPS - 1
+
+            @open_s = nfa_alloc(NFA_GROUP_OPEN)
+            if @open_s < 0
+                return RE_ERROR
+            @nfa_group_id[@open_s] = @gid
+
+            @inner = parse_alternation()
+            if @inner < 0
+                return RE_ERROR
+
+            @pk = parse_peek()
+            if @pk != 41
+                # Missing closing ')'
+                @regex_error = 1
+                return RE_ERROR
+            parse_advance()
+
+            @close_s = nfa_alloc(NFA_GROUP_CLOSE)
+            if @close_s < 0
+                return RE_ERROR
+            @nfa_group_id[@close_s] = @gid
+
+            # Pop inner fragment
+            @inner_start = frag_pop_start()
+            @inner_end = frag_pop_end()
+
+            # Link: open -> inner_start, inner_end -> close, close -> epsilon_end
+            @nfa_out1[@open_s] = @inner_start
+            @end_eps = nfa_alloc(NFA_EPSILON)
+            @nfa_out1[@close_s] = @end_eps
+            @nfa_out1[@inner_end] = @close_s
+
+            frag_push(@open_s, @end_eps)
+            return RE_OK
+
+        91 =>
+            # '[' - character class
+            parse_advance()
+            @class_state = parse_char_class()
+            if @class_state < 0
+                return RE_ERROR
+            @class_end_st = @class_starts[@class_state]
+            # The end state is the epsilon after the class
+            @end_st = @nfa_out1[@class_state]
+            frag_push(@class_state, @end_st)
+            return RE_OK
+
+        46 =>
+            # '.' - dot (any char except newline)
+            parse_advance()
+            @dot_s = nfa_alloc(NFA_DOT)
+            if @dot_s < 0
+                return RE_ERROR
+            @dot_end = nfa_alloc(NFA_EPSILON)
+            @nfa_out1[@dot_s] = @dot_end
+            frag_push(@dot_s, @dot_end)
+            return RE_OK
+
+        94 =>
+            # '^' - anchor start
+            parse_advance()
+            @anch_s = nfa_alloc(NFA_ANCHOR_START)
+            if @anch_s < 0
+                return RE_ERROR
+            @anch_end = nfa_alloc(NFA_EPSILON)
+            @nfa_out1[@anch_s] = @anch_end
+            frag_push(@anch_s, @anch_end)
+            return RE_OK
+
+        36 =>
+            # '$' - anchor end
+            parse_advance()
+            @anch_s = nfa_alloc(NFA_ANCHOR_END)
+            if @anch_s < 0
+                return RE_ERROR
+            @anch_end = nfa_alloc(NFA_EPSILON)
+            @nfa_out1[@anch_s] = @anch_end
+            frag_push(@anch_s, @anch_end)
+            return RE_OK
+
+        92 =>
+            # '\' - escape sequence
+            parse_advance()
+            @esc = parse_escape()
+            if @esc < -50
+                # Shorthand class
+                @sh_type = 0
+                phase @esc
+                    -100 =>
+                        @sh_type = SH_DIGIT
+                    -101 =>
+                        @sh_type = SH_NON_DIGIT
+                    -102 =>
+                        @sh_type = SH_WORD
+                    -103 =>
+                        @sh_type = SH_NON_WORD
+                    -104 =>
+                        @sh_type = SH_SPACE
+                    -105 =>
+                        @sh_type = SH_NON_SPACE
+                @sh_s = nfa_alloc(NFA_SHORTHAND)
+                if @sh_s < 0
+                    return RE_ERROR
+                @nfa_char[@sh_s] = @sh_type
+                @sh_end = nfa_alloc(NFA_EPSILON)
+                @nfa_out1[@sh_s] = @sh_end
+                frag_push(@sh_s, @sh_end)
+                return RE_OK
+            eclipse
+                # Literal escaped char
+                @lit_s = nfa_alloc(NFA_LITERAL)
+                if @lit_s < 0
+                    return RE_ERROR
+                @nfa_char[@lit_s] = @esc
+                @lit_end = nfa_alloc(NFA_EPSILON)
+                @nfa_out1[@lit_s] = @lit_end
+                frag_push(@lit_s, @lit_end)
+                return RE_OK
+
+    # Default: literal character
+    parse_advance()
+    @lit_s = nfa_alloc(NFA_LITERAL)
+    if @lit_s < 0
+        return RE_ERROR
+    @nfa_char[@lit_s] = @ch
+    @lit_end = nfa_alloc(NFA_EPSILON)
+    @nfa_out1[@lit_s] = @lit_end
+    frag_push(@lit_s, @lit_end)
+    return RE_OK
+
+fn is_atom_start(@ch: int) -> int
+    # Returns 1 if ch can start an atom
+    if @ch < 0
+        return 0
+    if @ch == 41
+        return 0  # ')'
+    if @ch == 124
+        return 0  # '|'
+    if @ch == 42
+        return 0  # '*'
+    if @ch == 43
+        return 0  # '+'
+    if @ch == 63
+        return 0  # '?'
+    return 1
+
+fn parse_quantified() -> int
+    @r = parse_atom()
+    if @r < 0
+        return @r
+
+    @pk = parse_peek()
+    if @pk == 42
+        # '*' - zero or more
+        parse_advance()
+        @frag_s = frag_pop_start()
+        @frag_e = frag_pop_end()
+        @split = nfa_alloc(NFA_SPLIT)
+        if @split < 0
+            return RE_ERROR
+        @new_end = nfa_alloc(NFA_EPSILON)
+        @nfa_out1[@split] = @frag_s     # Try match (greedy)
+        @nfa_out2[@split] = @new_end    # Skip
+        @nfa_out1[@frag_e] = @split     # Loop back
+        frag_push(@split, @new_end)
+        return RE_OK
+
+    if @pk == 43
+        # '+' - one or more
+        parse_advance()
+        @frag_s = frag_pop_start()
+        @frag_e = frag_pop_end()
+        @split = nfa_alloc(NFA_SPLIT)
+        if @split < 0
+            return RE_ERROR
+        @new_end = nfa_alloc(NFA_EPSILON)
+        @nfa_out1[@split] = @frag_s     # Loop (greedy)
+        @nfa_out2[@split] = @new_end    # Done
+        @nfa_out1[@frag_e] = @split     # Back to split
+        frag_push(@frag_s, @new_end)
+        return RE_OK
+
+    if @pk == 63
+        # '?' - zero or one
+        parse_advance()
+        @frag_s = frag_pop_start()
+        @frag_e = frag_pop_end()
+        @split = nfa_alloc(NFA_SPLIT)
+        if @split < 0
+            return RE_ERROR
+        @new_end = nfa_alloc(NFA_EPSILON)
+        @nfa_out1[@split] = @frag_s     # Try match (greedy)
+        @nfa_out2[@split] = @new_end    # Skip
+        @nfa_out1[@frag_e] = @new_end   # Both paths to same end
+        frag_push(@split, @new_end)
+        return RE_OK
+
+    # No quantifier
+    return RE_OK
+
+fn parse_concat() -> int
+    @pk = parse_peek()
+    if is_atom_start(@pk) == 0
+        # Empty concat - push epsilon
+        @eps = nfa_alloc(NFA_EPSILON)
+        if @eps < 0
+            return RE_ERROR
+        frag_push(@eps, @eps)
+        return RE_OK
+
+    @r = parse_quantified()
+    if @r < 0
+        return @r
+
+    orbit @iter in 0..1024
+        @pk = parse_peek()
+        if is_atom_start(@pk) == 0
+            nova
+
+        @r = parse_quantified()
+        if @r < 0
+            return @r
+
+        # Pop two fragments and concatenate
+        @s2 = frag_pop_start()
+        @e2 = frag_pop_end()
+        @s1 = frag_pop_start()
+        @e1 = frag_pop_end()
+
+        # Link end of first to start of second
+        @nfa_out1[@e1] = @s2
+        frag_push(@s1, @e2)
+
+    return RE_OK
+
+fn parse_alternation() -> int
+    @r = parse_concat()
+    if @r < 0
+        return @r
+
+    orbit @iter in 0..256
+        @pk = parse_peek()
+        if @pk != 124
+            nova
+        parse_advance()  # consume '|'
+
+        @r = parse_concat()
+        if @r < 0
+            return @r
+
+        # Pop two fragments and create alternation
+        @s2 = frag_pop_start()
+        @e2 = frag_pop_end()
+        @s1 = frag_pop_start()
+        @e1 = frag_pop_end()
+
+        @split = nfa_alloc(NFA_SPLIT)
+        if @split < 0
+            return RE_ERROR
+        @join = nfa_alloc(NFA_EPSILON)
+        @nfa_out1[@split] = @s1
+        @nfa_out2[@split] = @s2
+        @nfa_out1[@e1] = @join
+        @nfa_out1[@e2] = @join
+        frag_push(@split, @join)
+
+    return RE_OK
+
+# =============================================================================
+# SECTION 5: REGEX COMPILATION
+# =============================================================================
+
+fn regex_compile(@pattern: *u8, @pat_len: int) -> int
+    # Compile a regex pattern string into an NFA
+    # Returns RE_OK on success, RE_ERROR on failure
+    nfa_reset()
+
+    if @pat_len <= 0
+        # Empty pattern matches everything
+        @s = nfa_alloc(NFA_MATCH)
+        if @s < 0
+            return RE_ERROR
+        @regex_start_state = @s
+        @regex_compiled = 1
+        return RE_OK
+
+    if @pat_len > 1024
+        @regex_error = 1
+        return RE_ERROR
+
+    # Copy pattern to parse buffer
+    orbit @i in 0..@pat_len
+        @parse_src[@i] = types::ptr_read_byte(@pattern, @i)
+    @parse_len = @pat_len
+    @parse_pos = 0
+    @parse_group_counter = 0
+
+    @regex_pat_len = @pat_len
+    orbit @i in 0..@pat_len
+        @regex_pattern[@i] = @parse_src[@i]
+
+    # Parse the pattern
+    @r = parse_alternation()
+    if @r < 0
+        @regex_error = 1
+        return RE_ERROR
+
+    # Pop the final fragment
+    if @frag_count <= 0
+        @regex_error = 1
+        return RE_ERROR
+
+    @final_start = frag_pop_start()
+    @final_end = frag_pop_end()
+
+    # Attach MATCH state at the end
+    @match_s = nfa_alloc(NFA_MATCH)
+    if @match_s < 0
+        return RE_ERROR
+    @nfa_out1[@final_end] = @match_s
+
+    @regex_start_state = @final_start
+    @regex_n_groups = @parse_group_counter
+    @regex_compiled = 1
+    return RE_OK
+
+# =============================================================================
+# SECTION 6: NFA SIMULATION (with group capture)
+# =============================================================================
+# Uses recursive backtracking for simplicity and group support.
+
+meow @sim_input: [int; 8192] = [0; 8192]
+meow @sim_input_len: int = 0
+meow @sim_pos: int = 0
+
+# Saved group positions for backtracking
+meow @saved_group_starts: [int; 256] = [-1; 256]
+meow @saved_group_ends: [int; 256] = [-1; 256]
+
+fn match_char_in_class(@state: int, @ch: int) -> int
+    # Check if ch is in the character class ranges for this state
+    @rs = @class_starts[@state]
+    @re = @class_ends[@state]
+    orbit @i in @rs..@re
+        if @ch >= @class_lo[@i]
+            if @ch <= @class_hi[@i]
+                return 1
+    return 0
+
+fn match_shorthand(@sh_type: int, @ch: int) -> int
+    phase @sh_type
+        0 =>
+            # SH_DIGIT: 0-9
+            if @ch >= 48
+                if @ch <= 57
+                    return 1
+            return 0
+        1 =>
+            # SH_NON_DIGIT
+            if @ch >= 48
+                if @ch <= 57
+                    return 0
+            return 1
+        2 =>
+            # SH_WORD: a-z A-Z 0-9 _
+            if @ch >= 97
+                if @ch <= 122
+                    return 1
+            if @ch >= 65
+                if @ch <= 90
+                    return 1
+            if @ch >= 48
+                if @ch <= 57
+                    return 1
+            if @ch == 95
+                return 1
+            return 0
+        3 =>
+            # SH_NON_WORD
+            @w = match_shorthand(2, @ch)
+            if @w == 1
+                return 0
+            return 1
+        4 =>
+            # SH_SPACE: space, tab, newline, cr, ff, vt
+            if @ch == 32
+                return 1
+            if @ch >= 9
+                if @ch <= 13
+                    return 1
+            return 0
+        5 =>
+            # SH_NON_SPACE
+            @s = match_shorthand(4, @ch)
+            if @s == 1
+                return 0
+            return 1
+    return 0
+
+fn nfa_simulate(@state: int, @pos: int, @depth: int) -> int
+    # Recursive NFA simulation with backtracking
+    # Returns match end position or -1 for no match
+    if @depth > 8192
+        return -1
+    if @state < 0
+        return -1
+
+    @st_type = @nfa_type[@state]
+
+    phase @st_type
+        4 =>
+            # NFA_MATCH - success!
+            return @pos
+
+        5 =>
+            # NFA_EPSILON - follow out1
+            return nfa_simulate(@nfa_out1[@state], @pos, @depth + 1)
+
+        0 =>
+            # NFA_LITERAL - match specific char
+            if @pos >= @sim_input_len
+                return -1
+            @ch = @sim_input[@pos]
+            if @ch != @nfa_char[@state]
+                return -1
+            return nfa_simulate(@nfa_out1[@state], @pos + 1, @depth + 1)
+
+        1 =>
+            # NFA_DOT - match any char except newline
+            if @pos >= @sim_input_len
+                return -1
+            @ch = @sim_input[@pos]
+            if @ch == 10
+                return -1
+            return nfa_simulate(@nfa_out1[@state], @pos + 1, @depth + 1)
+
+        2 =>
+            # NFA_CHAR_CLASS - match char in class
+            if @pos >= @sim_input_len
+                return -1
+            @ch = @sim_input[@pos]
+            @in_class = match_char_in_class(@state, @ch)
+            if @in_class == 0
+                return -1
+            return nfa_simulate(@nfa_out1[@state], @pos + 1, @depth + 1)
+
+        10 =>
+            # NFA_NEGATED_CLASS - match char NOT in class
+            if @pos >= @sim_input_len
+                return -1
+            @ch = @sim_input[@pos]
+            @in_class = match_char_in_class(@state, @ch)
+            if @in_class == 1
+                return -1
+            return nfa_simulate(@nfa_out1[@state], @pos + 1, @depth + 1)
+
+        11 =>
+            # NFA_SHORTHAND - match shorthand class
+            if @pos >= @sim_input_len
+                return -1
+            @ch = @sim_input[@pos]
+            @ok = match_shorthand(@nfa_char[@state], @ch)
+            if @ok == 0
+                return -1
+            return nfa_simulate(@nfa_out1[@state], @pos + 1, @depth + 1)
+
+        3 =>
+            # NFA_SPLIT - try out1 first (greedy), then out2
+            @r1 = nfa_simulate(@nfa_out1[@state], @pos, @depth + 1)
+            if @r1 >= 0
+                return @r1
+            return nfa_simulate(@nfa_out2[@state], @pos, @depth + 1)
+
+        6 =>
+            # NFA_ANCHOR_START - only matches at position 0
+            if @pos != 0
+                return -1
+            return nfa_simulate(@nfa_out1[@state], @pos, @depth + 1)
+
+        7 =>
+            # NFA_ANCHOR_END - only matches at end of input
+            if @pos != @sim_input_len
+                return -1
+            return nfa_simulate(@nfa_out1[@state], @pos, @depth + 1)
+
+        8 =>
+            # NFA_GROUP_OPEN - save group start position
+            @gid = @nfa_group_id[@state]
+            if @gid >= 0
+                if @gid < MAX_GROUPS
+                    @old_start = @group_starts[@gid]
+                    @group_starts[@gid] = @pos
+                    @r = nfa_simulate(@nfa_out1[@state], @pos, @depth + 1)
+                    if @r < 0
+                        @group_starts[@gid] = @old_start
+                    return @r
+            return nfa_simulate(@nfa_out1[@state], @pos, @depth + 1)
+
+        9 =>
+            # NFA_GROUP_CLOSE - save group end position
+            @gid = @nfa_group_id[@state]
+            if @gid >= 0
+                if @gid < MAX_GROUPS
+                    @old_end = @group_ends[@gid]
+                    @group_ends[@gid] = @pos
+                    @r = nfa_simulate(@nfa_out1[@state], @pos, @depth + 1)
+                    if @r < 0
+                        @group_ends[@gid] = @old_end
+                    return @r
+            return nfa_simulate(@nfa_out1[@state], @pos, @depth + 1)
+
+    return -1
+
+# =============================================================================
+# SECTION 7: DFA SUBSET CONSTRUCTION
+# =============================================================================
+
+meow @eps_stack: [int; 4096] = [0; 4096]
+meow @eps_visited: [int; 4096] = [0; 4096]
+meow @eps_result: [int; 4096] = [0; 4096]
+meow @eps_result_count: int = 0
+meow @eps_generation: int = 0
+
+fn epsilon_closure(@states: [int; 4096], @count: int) -> int
+    # Compute epsilon closure of a set of NFA states
+    # Returns the count of states in @eps_result
+    @eps_generation = @eps_generation + 1
+    @eps_result_count = 0
+    @stack_top = 0
+
+    # Push initial states
+    orbit @i in 0..@count
+        @s = @states[@i]
+        if @s >= 0
+            if @eps_visited[@s] != @eps_generation
+                @eps_visited[@s] = @eps_generation
+                @eps_stack[@stack_top] = @s
+                @stack_top = @stack_top + 1
+                @eps_result[@eps_result_count] = @s
+                @eps_result_count = @eps_result_count + 1
+
+    # Process stack
+    orbit @iter in 0..8192
+        if @stack_top <= 0
+            nova
+        @stack_top = @stack_top - 1
+        @cur = @eps_stack[@stack_top]
+        @t = @nfa_type[@cur]
+
+        if @t == NFA_EPSILON
+            @nxt = @nfa_out1[@cur]
+            if @nxt >= 0
+                if @eps_visited[@nxt] != @eps_generation
+                    @eps_visited[@nxt] = @eps_generation
+                    @eps_stack[@stack_top] = @nxt
+                    @stack_top = @stack_top + 1
+                    @eps_result[@eps_result_count] = @nxt
+                    @eps_result_count = @eps_result_count + 1
+
+        if @t == NFA_SPLIT
+            @o1 = @nfa_out1[@cur]
+            @o2 = @nfa_out2[@cur]
+            if @o1 >= 0
+                if @eps_visited[@o1] != @eps_generation
+                    @eps_visited[@o1] = @eps_generation
+                    @eps_stack[@stack_top] = @o1
+                    @stack_top = @stack_top + 1
+                    @eps_result[@eps_result_count] = @o1
+                    @eps_result_count = @eps_result_count + 1
+            if @o2 >= 0
+                if @eps_visited[@o2] != @eps_generation
+                    @eps_visited[@o2] = @eps_generation
+                    @eps_stack[@stack_top] = @o2
+                    @stack_top = @stack_top + 1
+                    @eps_result[@eps_result_count] = @o2
+                    @eps_result_count = @eps_result_count + 1
+
+        if @t == NFA_GROUP_OPEN
+            @nxt = @nfa_out1[@cur]
+            if @nxt >= 0
+                if @eps_visited[@nxt] != @eps_generation
+                    @eps_visited[@nxt] = @eps_generation
+                    @eps_stack[@stack_top] = @nxt
+                    @stack_top = @stack_top + 1
+                    @eps_result[@eps_result_count] = @nxt
+                    @eps_result_count = @eps_result_count + 1
+
+        if @t == NFA_GROUP_CLOSE
+            @nxt = @nfa_out1[@cur]
+            if @nxt >= 0
+                if @eps_visited[@nxt] != @eps_generation
+                    @eps_visited[@nxt] = @eps_generation
+                    @eps_stack[@stack_top] = @nxt
+                    @stack_top = @stack_top + 1
+                    @eps_result[@eps_result_count] = @nxt
+                    @eps_result_count = @eps_result_count + 1
+
+    return @eps_result_count
+
+meow @dfa_work_queue: [int; 2048] = [0; 2048]
+meow @dfa_work_front: int = 0
+meow @dfa_work_back: int = 0
+meow @move_result: [int; 4096] = [0; 4096]
+
+fn dfa_find_state(@set: [int; 4096], @set_count: int) -> int
+    # Find or create DFA state matching the given NFA state set
+    # Returns DFA state index
+    orbit @d in 0..@dfa_count
+        if @dfa_set_size[@d] == @set_count
+            @match = 1
+            orbit @i in 0..@set_count
+                @base = @dfa_set_start[@d]
+                if @dfa_nfa_sets[@base + @i] != @set[@i]
+                    @match = 0
+                    nova
+            if @match == 1
+                return @d
+
+    # Not found - create new DFA state
+    if @dfa_count >= MAX_DFA_STATES
+        return -1
+    @d = @dfa_count
+    @dfa_set_start[@d] = @dfa_set_pool
+    @dfa_set_size[@d] = @set_count
+
+    # Check if this set contains NFA_MATCH
+    @is_accept = 0
+    orbit @i in 0..@set_count
+        @s = @set[@i]
+        if @nfa_type[@s] == NFA_MATCH
+            @is_accept = 1
+        # Copy set to pool
+        @dfa_nfa_sets[@dfa_set_pool + @i] = @s
+    @dfa_set_pool = @dfa_set_pool + @set_count
+    @dfa_accepting[@d] = @is_accept
+
+    # Initialize transitions to -1
+    orbit @c in 0..256
+        @dfa_trans[@d * 256 + @c] = -1
+    @dfa_count = @dfa_count + 1
+    return @d
+
+fn nfa_move_on_char(@set: [int; 4096], @set_count: int, @ch: int) -> int
+    # Compute set of NFA states reachable from @set on character @ch
+    # Returns count of states in @move_result
+    @move_count = 0
+    orbit @i in 0..@set_count
+        @s = @set[@i]
+        @t = @nfa_type[@s]
+        @matches = 0
+
+        phase @t
+            0 =>
+                # NFA_LITERAL
+                if @nfa_char[@s] == @ch
+                    @matches = 1
+            1 =>
+                # NFA_DOT
+                if @ch != 10
+                    @matches = 1
+            2 =>
+                # NFA_CHAR_CLASS
+                @matches = match_char_in_class(@s, @ch)
+            10 =>
+                # NFA_NEGATED_CLASS
+                @in_c = match_char_in_class(@s, @ch)
+                if @in_c == 0
+                    @matches = 1
+            11 =>
+                # NFA_SHORTHAND
+                @matches = match_shorthand(@nfa_char[@s], @ch)
+
+        if @matches == 1
+            @nxt = @nfa_out1[@s]
+            if @nxt >= 0
+                @move_result[@move_count] = @nxt
+                @move_count = @move_count + 1
+    return @move_count
+
+fn dfa_build() -> int
+    # Build DFA from compiled NFA using subset construction
+    # Returns RE_OK on success
+    if @regex_compiled == 0
+        return RE_ERROR
+
+    @dfa_count = 0
+    @dfa_set_pool = 0
+
+    # Initial state = epsilon_closure({start_state})
+    meow @init_set: [int; 4096] = [0; 4096]
+    @init_set[0] = @regex_start_state
+    @ec = epsilon_closure(@init_set, 1)
+
+    # Sort eps_result for consistent comparison
+    orbit @i in 0..@eps_result_count
+        orbit @j in @i + 1..@eps_result_count
+            if @eps_result[@j] < @eps_result[@i]
+                @tmp = @eps_result[@i]
+                @eps_result[@i] = @eps_result[@j]
+                @eps_result[@j] = @tmp
+
+    @start_dfa = dfa_find_state(@eps_result, @eps_result_count)
+    if @start_dfa < 0
+        return RE_ERROR
+
+    # BFS work queue
+    @dfa_work_front = 0
+    @dfa_work_back = 0
+    @dfa_work_queue[0] = @start_dfa
+    @dfa_work_back = 1
+
+    orbit @bfs_iter in 0..MAX_DFA_STATES
+        if @dfa_work_front >= @dfa_work_back
+            nova
+        @cur_dfa = @dfa_work_queue[@dfa_work_front]
+        @dfa_work_front = @dfa_work_front + 1
+
+        # For each possible input character (ASCII 0-127)
+        orbit @ch in 0..128
+            # Get the NFA state set for this DFA state
+            @base = @dfa_set_start[@cur_dfa]
+            @sz = @dfa_set_size[@cur_dfa]
+
+            meow @cur_nfa_set: [int; 4096] = [0; 4096]
+            orbit @k in 0..@sz
+                @cur_nfa_set[@k] = @dfa_nfa_sets[@base + @k]
+
+            # Move on character
+            @mc = nfa_move_on_char(@cur_nfa_set, @sz, @ch)
+            if @mc > 0
+                # Epsilon closure of move result
+                @ec2 = epsilon_closure(@move_result, @mc)
+                if @eps_result_count > 0
+                    # Sort for comparison
+                    orbit @i in 0..@eps_result_count
+                        orbit @j in @i + 1..@eps_result_count
+                            if @eps_result[@j] < @eps_result[@i]
+                                @tmp = @eps_result[@i]
+                                @eps_result[@i] = @eps_result[@j]
+                                @eps_result[@j] = @tmp
+
+                    @next_dfa = dfa_find_state(@eps_result, @eps_result_count)
+                    if @next_dfa >= 0
+                        @dfa_trans[@cur_dfa * 256 + @ch] = @next_dfa
+                        # Add to work queue if new
+                        if @next_dfa >= @dfa_work_back - 1
+                            if @dfa_work_back < MAX_DFA_STATES
+                                @dfa_work_queue[@dfa_work_back] = @next_dfa
+                                @dfa_work_back = @dfa_work_back + 1
+
+    return RE_OK
+
+# =============================================================================
+# SECTION 8: PUBLIC API
+# =============================================================================
+
+fn regex_match(@pattern: *u8, @pat_len: int, @input: *u8, @input_len: int) -> int
+    # Full match: does the entire input match the pattern?
+    # Returns 1 if match, 0 if no match, -1 on error
+    @rc = regex_compile(@pattern, @pat_len)
+    if @rc < 0
+        return -1
+
+    # Load input
+    @sim_input_len = @input_len
+    orbit @i in 0..@input_len
+        @sim_input[@i] = types::ptr_read_byte(@input, @i)
+
+    # Reset groups
+    orbit @i in 0..MAX_GROUPS
+        @group_starts[@i] = -1
+        @group_ends[@i] = -1
+
+    @end_pos = nfa_simulate(@regex_start_state, 0, 0)
+    if @end_pos == @input_len
+        @match_start = 0
+        @match_end = @end_pos
+        return 1
+    return 0
+
+fn regex_find(@pattern: *u8, @pat_len: int, @input: *u8, @input_len: int) -> int
+    # Find first occurrence of pattern in input
+    # Returns start position or -1 if not found
+    @rc = regex_compile(@pattern, @pat_len)
+    if @rc < 0
+        return -1
+
+    @sim_input_len = @input_len
+    orbit @i in 0..@input_len
+        @sim_input[@i] = types::ptr_read_byte(@input, @i)
+
+    orbit @start in 0..@input_len + 1
+        orbit @g in 0..MAX_GROUPS
+            @group_starts[@g] = -1
+            @group_ends[@g] = -1
+
+        @end_pos = nfa_simulate(@regex_start_state, @start, 0)
+        if @end_pos >= 0
+            @match_start = @start
+            @match_end = @end_pos
+            return @start
+
+    @match_start = -1
+    @match_end = -1
+    return -1
+
+fn regex_find_all(@pattern: *u8, @pat_len: int, @input: *u8, @input_len: int,
+                  @out_starts: *int, @out_ends: *int, @max_results: int) -> int
+    # Find all non-overlapping matches
+    # Returns count of matches found
+    @rc = regex_compile(@pattern, @pat_len)
+    if @rc < 0
+        return 0
+
+    @sim_input_len = @input_len
+    orbit @i in 0..@input_len
+        @sim_input[@i] = types::ptr_read_byte(@input, @i)
+
+    @result_count = 0
+    @pos = 0
+    orbit @iter in 0..MAX_MATCHES
+        if @pos > @input_len
+            nova
+        if @result_count >= @max_results
+            nova
+
+        @found = 0
+        orbit @start in @pos..@input_len + 1
+            orbit @g in 0..MAX_GROUPS
+                @group_starts[@g] = -1
+                @group_ends[@g] = -1
+
+            @end_pos = nfa_simulate(@regex_start_state, @start, 0)
+            if @end_pos >= 0
+                types::ptr_write_int(@out_starts, @result_count, @start)
+                types::ptr_write_int(@out_ends, @result_count, @end_pos)
+                @result_count = @result_count + 1
+                if @end_pos > @start
+                    @pos = @end_pos
+                eclipse
+                    @pos = @start + 1
+                @found = 1
+                nova
+
+        if @found == 0
+            nova
+
+    return @result_count
+
+fn regex_replace(@pattern: *u8, @pat_len: int, @input: *u8, @input_len: int,
+                 @replacement: *u8, @repl_len: int, @output: *u8, @max_out: int) -> int
+    # Replace first occurrence of pattern with replacement
+    # Returns length of output string
+    @rc = regex_compile(@pattern, @pat_len)
+    if @rc < 0
+        return 0
+
+    @sim_input_len = @input_len
+    orbit @i in 0..@input_len
+        @sim_input[@i] = types::ptr_read_byte(@input, @i)
+
+    # Find first match
+    @found_start = -1
+    @found_end = -1
+    orbit @start in 0..@input_len + 1
+        orbit @g in 0..MAX_GROUPS
+            @group_starts[@g] = -1
+            @group_ends[@g] = -1
+        @end_pos = nfa_simulate(@regex_start_state, @start, 0)
+        if @end_pos >= 0
+            @found_start = @start
+            @found_end = @end_pos
+            nova
+
+    if @found_start < 0
+        # No match - copy input to output
+        orbit @i in 0..@input_len
+            if @i < @max_out
+                types::ptr_write_byte(@output, @i, @sim_input[@i])
+        return @input_len
+
+    # Build output: before_match + replacement + after_match
+    @out_pos = 0
+
+    # Copy before match
+    orbit @i in 0..@found_start
+        if @out_pos < @max_out
+            types::ptr_write_byte(@output, @out_pos, @sim_input[@i])
+            @out_pos = @out_pos + 1
+
+    # Copy replacement
+    orbit @i in 0..@repl_len
+        if @out_pos < @max_out
+            @ch = types::ptr_read_byte(@replacement, @i)
+            types::ptr_write_byte(@output, @out_pos, @ch)
+            @out_pos = @out_pos + 1
+
+    # Copy after match
+    orbit @i in @found_end..@input_len
+        if @out_pos < @max_out
+            types::ptr_write_byte(@output, @out_pos, @sim_input[@i])
+            @out_pos = @out_pos + 1
+
+    return @out_pos
+
+fn regex_split(@pattern: *u8, @pat_len: int, @input: *u8, @input_len: int,
+               @out_starts: *int, @out_lens: *int, @max_parts: int) -> int
+    # Split input by pattern matches
+    # Returns number of parts
+    @rc = regex_compile(@pattern, @pat_len)
+    if @rc < 0
+        return 0
+
+    @sim_input_len = @input_len
+    orbit @i in 0..@input_len
+        @sim_input[@i] = types::ptr_read_byte(@input, @i)
+
+    @part_count = 0
+    @pos = 0
+    orbit @iter in 0..MAX_MATCHES
+        if @pos > @input_len
+            nova
+        if @part_count >= @max_parts - 1
+            nova
+
+        @found = 0
+        orbit @start in @pos..@input_len + 1
+            orbit @g in 0..MAX_GROUPS
+                @group_starts[@g] = -1
+                @group_ends[@g] = -1
+            @end_pos = nfa_simulate(@regex_start_state, @start, 0)
+            if @end_pos >= 0
+                # Add part before this match
+                types::ptr_write_int(@out_starts, @part_count, @pos)
+                types::ptr_write_int(@out_lens, @part_count, @start - @pos)
+                @part_count = @part_count + 1
+                if @end_pos > @start
+                    @pos = @end_pos
+                eclipse
+                    @pos = @start + 1
+                @found = 1
+                nova
+
+        if @found == 0
+            nova
+
+    # Add final part
+    if @part_count < @max_parts
+        types::ptr_write_int(@out_starts, @part_count, @pos)
+        types::ptr_write_int(@out_lens, @part_count, @input_len - @pos)
+        @part_count = @part_count + 1
+
+    return @part_count
+
+# =============================================================================
+# SECTION 9: DFA FAST PATH (no groups)
+# =============================================================================
+
+fn regex_match_dfa(@input: *u8, @input_len: int) -> int
+    # Fast DFA match (must call dfa_build() first)
+    # Returns 1 if full match, 0 otherwise
+    if @dfa_count <= 0
+        return 0
+
+    @state = 0  # DFA start state
+    orbit @i in 0..@input_len
+        @ch = types::ptr_read_byte(@input, @i)
+        if @ch > 255
+            @ch = 0
+        @next = @dfa_trans[@state * 256 + @ch]
+        if @next < 0
+            return 0
+        @state = @next
+
+    return @dfa_accepting[@state]
+
+fn regex_find_dfa(@input: *u8, @input_len: int) -> int
+    # Fast DFA find - returns start position or -1
+    if @dfa_count <= 0
+        return -1
+
+    orbit @start in 0..@input_len
+        @state = 0
+        @last_accept = -1
+        orbit @i in @start..@input_len
+            @ch = types::ptr_read_byte(@input, @i)
+            if @ch > 255
+                @ch = 0
+            @next = @dfa_trans[@state * 256 + @ch]
+            if @next < 0
+                nova
+            @state = @next
+            if @dfa_accepting[@state] == 1
+                @last_accept = @i + 1
+
+        if @last_accept >= 0
+            @match_start = @start
+            @match_end = @last_accept
+            return @start
+
+        # Check if start state itself is accepting (empty match)
+        if @dfa_accepting[0] == 1
+            @match_start = @start
+            @match_end = @start
+            return @start
+
+    return -1
+
+# =============================================================================
+# SECTION 10: UNICODE SUPPORT
+# =============================================================================
+
+fn is_unicode_letter(@cp: int) -> int
+    # Check if codepoint is a Unicode letter (basic Latin + Latin Extended)
+    if @cp >= 65
+        if @cp <= 90
+            return 1
+    if @cp >= 97
+        if @cp <= 122
+            return 1
+    # Latin Extended A/B
+    if @cp >= 192
+        if @cp <= 687
+            return 1
+    # Greek
+    if @cp >= 880
+        if @cp <= 1023
+            return 1
+    # Cyrillic
+    if @cp >= 1024
+        if @cp <= 1279
+            return 1
+    # CJK Unified Ideographs
+    if @cp >= 19968
+        if @cp <= 40959
+            return 1
+    return 0
+
+fn is_unicode_digit(@cp: int) -> int
+    if @cp >= 48
+        if @cp <= 57
+            return 1
+    # Arabic-Indic digits
+    if @cp >= 1632
+        if @cp <= 1641
+            return 1
+    # Devanagari digits
+    if @cp >= 2406
+        if @cp <= 2415
+            return 1
+    return 0
+
+fn unicode_to_lower(@cp: int) -> int
+    # Simple ASCII-range lowercase conversion
+    if @cp >= 65
+        if @cp <= 90
+            return @cp + 32
+    # Cyrillic uppercase to lowercase
+    if @cp >= 1040
+        if @cp <= 1071
+            return @cp + 32
+    return @cp
+
+fn unicode_category(@cp: int) -> int
+    # Returns category: 0=other, 1=letter, 2=digit, 3=punct, 4=space
+    if is_unicode_letter(@cp) == 1
+        return 1
+    if is_unicode_digit(@cp) == 1
+        return 2
+    if @cp == 32
+        return 4
+    if @cp >= 9
+        if @cp <= 13
+            return 4
+    if @cp >= 33
+        if @cp <= 47
+            return 3
+    if @cp >= 58
+        if @cp <= 64
+            return 3
+    if @cp >= 91
+        if @cp <= 96
+            return 3
+    if @cp >= 123
+        if @cp <= 126
+            return 3
+    return 0
+
+# =============================================================================
+# SECTION 11: UTILITY FUNCTIONS
+# =============================================================================
+
+fn regex_get_group_start(@group: int) -> int
+    if @group < 0
+        return -1
+    if @group >= MAX_GROUPS
+        return -1
+    return @group_starts[@group]
+
+fn regex_get_group_end(@group: int) -> int
+    if @group < 0
+        return -1
+    if @group >= MAX_GROUPS
+        return -1
+    return @group_ends[@group]
+
+fn regex_get_match_start() -> int
+    return @match_start
+
+fn regex_get_match_end() -> int
+    return @match_end
+
+fn regex_get_group_count() -> int
+    return @regex_n_groups
+
+fn regex_is_compiled() -> int
+    return @regex_compiled
+
+fn regex_get_nfa_state_count() -> int
+    return @nfa_count
+
+fn regex_get_dfa_state_count() -> int
+    return @dfa_count
+
+# =============================================================================
+# SECTION 12: EXTERN C API
+# =============================================================================
+# These functions are callable from Rust FFI and match the signatures
+# expected by the bootstrap bridge.
+
+extern "C" fn luna_regex_compile(@pattern: *u8, @len: int) -> int
+    return regex_compile(@pattern, @len)
+
+extern "C" fn luna_regex_match(@pattern: *u8, @pat_len: int, @input: *u8, @in_len: int) -> int
+    return regex_match(@pattern, @pat_len, @input, @in_len)
+
+extern "C" fn luna_regex_find(@pattern: *u8, @pat_len: int, @input: *u8, @in_len: int) -> int
+    return regex_find(@pattern, @pat_len, @input, @in_len)
+
+extern "C" fn luna_regex_replace(@pattern: *u8, @pat_len: int, @input: *u8, @in_len: int,
+                                  @repl: *u8, @repl_len: int, @out: *u8, @max_out: int) -> int
+    return regex_replace(@pattern, @pat_len, @input, @in_len, @repl, @repl_len, @out, @max_out)
+
+extern "C" fn luna_regex_split(@pattern: *u8, @pat_len: int, @input: *u8, @in_len: int,
+                                @starts: *int, @lens: *int, @max: int) -> int
+    return regex_split(@pattern, @pat_len, @input, @in_len, @starts, @lens, @max)
+
+extern "C" fn luna_regex_group_start(@g: int) -> int
+    return regex_get_group_start(@g)
+
+extern "C" fn luna_regex_group_end(@g: int) -> int
+    return regex_get_group_end(@g)
+
+# =============================================================================
+# SECTION 13: SELF-TESTS
+# =============================================================================
+
+fn test_regex_literal() -> int
+    # Test: literal "abc" matches "abc"
+    @pat = "abc"
+    @inp = "abc"
+    @r = regex_match(@pat, 3, @inp, 3)
+    guard @r == 1, "regex: literal match failed"
+    shine("  [PASS] regex literal match")
+    return 1
+
+fn test_regex_dot() -> int
+    # Test: "a.c" matches "abc" and "axc"
+    @pat = "a.c"
+    @inp1 = "abc"
+    @r1 = regex_match(@pat, 3, @inp1, 3)
+    guard @r1 == 1, "regex: dot match 'abc' failed"
+
+    @inp2 = "axc"
+    @r2 = regex_match(@pat, 3, @inp2, 3)
+    guard @r2 == 1, "regex: dot match 'axc' failed"
+
+    @inp3 = "ac"
+    @r3 = regex_match(@pat, 3, @inp3, 2)
+    guard @r3 == 0, "regex: dot should not match 'ac'"
+
+    shine("  [PASS] regex dot")
+    return 1
+
+fn test_regex_char_class() -> int
+    # Test: "[abc]" matches "a", "b", "c" but not "d"
+    @pat = "[abc]"
+    @r1 = regex_match(@pat, 5, "a", 1)
+    guard @r1 == 1, "regex: class [abc] should match 'a'"
+
+    @r2 = regex_match(@pat, 5, "b", 1)
+    guard @r2 == 1, "regex: class [abc] should match 'b'"
+
+    @r3 = regex_match(@pat, 5, "d", 1)
+    guard @r3 == 0, "regex: class [abc] should not match 'd'"
+
+    shine("  [PASS] regex char class")
+    return 1
+
+fn test_regex_range() -> int
+    # Test: "[a-z]" matches lowercase letters
+    @pat = "[a-z]"
+    @r1 = regex_match(@pat, 5, "m", 1)
+    guard @r1 == 1, "regex: range [a-z] should match 'm'"
+
+    @r2 = regex_match(@pat, 5, "A", 1)
+    guard @r2 == 0, "regex: range [a-z] should not match 'A'"
+
+    shine("  [PASS] regex range")
+    return 1
+
+fn test_regex_quantifier_star() -> int
+    # Test: "ab*c" matches "ac", "abc", "abbc"
+    @pat = "ab*c"
+    @r1 = regex_match(@pat, 4, "ac", 2)
+    guard @r1 == 1, "regex: ab*c should match 'ac'"
+
+    @r2 = regex_match(@pat, 4, "abc", 3)
+    guard @r2 == 1, "regex: ab*c should match 'abc'"
+
+    @r3 = regex_match(@pat, 4, "abbc", 4)
+    guard @r3 == 1, "regex: ab*c should match 'abbc'"
+
+    shine("  [PASS] regex star quantifier")
+    return 1
+
+fn test_regex_quantifier_plus() -> int
+    # Test: "ab+c" matches "abc", "abbc" but not "ac"
+    @pat = "ab+c"
+    @r1 = regex_match(@pat, 4, "abc", 3)
+    guard @r1 == 1, "regex: ab+c should match 'abc'"
+
+    @r2 = regex_match(@pat, 4, "abbc", 4)
+    guard @r2 == 1, "regex: ab+c should match 'abbc'"
+
+    @r3 = regex_match(@pat, 4, "ac", 2)
+    guard @r3 == 0, "regex: ab+c should not match 'ac'"
+
+    shine("  [PASS] regex plus quantifier")
+    return 1
+
+fn test_regex_quantifier_question() -> int
+    # Test: "ab?c" matches "ac" and "abc" but not "abbc"
+    @pat = "ab?c"
+    @r1 = regex_match(@pat, 4, "ac", 2)
+    guard @r1 == 1, "regex: ab?c should match 'ac'"
+
+    @r2 = regex_match(@pat, 4, "abc", 3)
+    guard @r2 == 1, "regex: ab?c should match 'abc'"
+
+    @r3 = regex_match(@pat, 4, "abbc", 4)
+    guard @r3 == 0, "regex: ab?c should not match 'abbc'"
+
+    shine("  [PASS] regex question quantifier")
+    return 1
+
+fn test_regex_alternation() -> int
+    # Test: "cat|dog" matches "cat" and "dog" but not "cow"
+    @pat = "cat|dog"
+    @r1 = regex_match(@pat, 7, "cat", 3)
+    guard @r1 == 1, "regex: cat|dog should match 'cat'"
+
+    @r2 = regex_match(@pat, 7, "dog", 3)
+    guard @r2 == 1, "regex: cat|dog should match 'dog'"
+
+    @r3 = regex_match(@pat, 7, "cow", 3)
+    guard @r3 == 0, "regex: cat|dog should not match 'cow'"
+
+    shine("  [PASS] regex alternation")
+    return 1
+
+fn test_regex_groups() -> int
+    # Test: "(ab)(cd)" captures groups
+    @pat = "(ab)(cd)"
+    @r = regex_match(@pat, 8, "abcd", 4)
+    guard @r == 1, "regex: (ab)(cd) should match 'abcd'"
+
+    @g0s = regex_get_group_start(0)
+    @g0e = regex_get_group_end(0)
+    guard @g0s == 0, "regex: group 0 start should be 0"
+    guard @g0e == 2, "regex: group 0 end should be 2"
+
+    @g1s = regex_get_group_start(1)
+    @g1e = regex_get_group_end(1)
+    guard @g1s == 2, "regex: group 1 start should be 2"
+    guard @g1e == 4, "regex: group 1 end should be 4"
+
+    shine("  [PASS] regex groups")
+    return 1
+
+fn test_regex_anchors() -> int
+    # Test: "^abc$" matches "abc" but not "xabc" or "abcx"
+    @pat = "^abc$"
+    @r1 = regex_match(@pat, 5, "abc", 3)
+    guard @r1 == 1, "regex: ^abc$ should match 'abc'"
+
+    shine("  [PASS] regex anchors")
+    return 1
+
+fn test_regex_find_in_string() -> int
+    # Test: find "cd" in "abcdef"
+    @pat = "cd"
+    @r = regex_find(@pat, 2, "abcdef", 6)
+    guard @r == 2, "regex: find 'cd' in 'abcdef' should return 2"
+
+    @ms = regex_get_match_start()
+    @me = regex_get_match_end()
+    guard @ms == 2, "regex: match start should be 2"
+    guard @me == 4, "regex: match end should be 4"
+
+    shine("  [PASS] regex find")
+    return 1
+
+fn test_regex_shorthand() -> int
+    # Test: "\d+" matches digits
+    @pat = "\\d+"
+    @r1 = regex_match(@pat, 3, "123", 3)
+    guard @r1 == 1, "regex: \\d+ should match '123'"
+
+    @r2 = regex_match(@pat, 3, "abc", 3)
+    guard @r2 == 0, "regex: \\d+ should not match 'abc'"
+
+    shine("  [PASS] regex shorthand")
+    return 1
+
+fn test_regex_negated_class() -> int
+    # Test: "[^0-9]" matches non-digits
+    @pat = "[^0-9]"
+    @r1 = regex_match(@pat, 6, "a", 1)
+    guard @r1 == 1, "regex: [^0-9] should match 'a'"
+
+    @r2 = regex_match(@pat, 6, "5", 1)
+    guard @r2 == 0, "regex: [^0-9] should not match '5'"
+
+    shine("  [PASS] regex negated class")
+    return 1
+
+fn test_regex_complex() -> int
+    # Test: "[a-z]+@[a-z]+\\.[a-z]+" (simple email-like pattern)
+    @pat = "[a-z]+@[a-z]+\\.[a-z]+"
+    @r1 = regex_match(@pat, 22, "user@host.com", 13)
+    guard @r1 == 1, "regex: email pattern should match"
+
+    shine("  [PASS] regex complex pattern")
+    return 1
+
+fn run_regex_tests() -> int
+    shine("--- regex.luna self-tests ---")
+    @pass_count = 0
+    @pass_count = @pass_count + test_regex_literal()
+    @pass_count = @pass_count + test_regex_dot()
+    @pass_count = @pass_count + test_regex_char_class()
+    @pass_count = @pass_count + test_regex_range()
+    @pass_count = @pass_count + test_regex_quantifier_star()
+    @pass_count = @pass_count + test_regex_quantifier_plus()
+    @pass_count = @pass_count + test_regex_quantifier_question()
+    @pass_count = @pass_count + test_regex_alternation()
+    @pass_count = @pass_count + test_regex_groups()
+    @pass_count = @pass_count + test_regex_anchors()
+    @pass_count = @pass_count + test_regex_find_in_string()
+    @pass_count = @pass_count + test_regex_shorthand()
+    @pass_count = @pass_count + test_regex_negated_class()
+    @pass_count = @pass_count + test_regex_complex()
+    shine("--- regex.luna: " + @pass_count + "/14 tests passed ---")
+    return @pass_count

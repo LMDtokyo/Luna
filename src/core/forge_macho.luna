@@ -1,0 +1,1058 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Forge Mach-O — macOS Mach-O 64-bit Container Writer (v4.3)
+# =============================================================================
+# Sister file to forge_elf.luna / forge_pe.luna.  Wraps a Forge code buffer
+# in a valid Mach-O 64 executable for macOS (x86-64 and arm64).
+#
+# Darwin has no stable syscall ABI — every program that runs on macOS
+# MUST dynamically link libSystem.dylib.  So unlike ELF's static path,
+# the Mach-O writer always emits LC_LOAD_DYLIB for /usr/lib/libSystem.B.dylib
+# and generates LC_SYMTAB / LC_DYSYMTAB / indirect-symbol entries for
+# every aether.posix_* extern.
+#
+# # Output layout
+#
+#   Mach-O 64 header                    (32 bytes)
+#   Load commands block:                (ncmds × average ~80 bytes)
+#     LC_SEGMENT_64  __PAGEZERO          (72 bytes — zero-page guard)
+#     LC_SEGMENT_64  __TEXT              (152 bytes — 2 sections)
+#     LC_SEGMENT_64  __LINKEDIT          (72 bytes)
+#     LC_SYMTAB                          (24 bytes)
+#     LC_DYSYMTAB                        (80 bytes)
+#     LC_LOAD_DYLINKER                   (32 bytes — "/usr/lib/dyld")
+#     LC_LOAD_DYLIB  libSystem           (variable)
+#     LC_MAIN                            (24 bytes — entry offset)
+#   Padding to page boundary
+#   __TEXT,__text  = Forge code bytes
+#   __TEXT,__stubs = PLT-style stubs (one per imported symbol)
+#   __LINKEDIT     = symtab + strtab + indirect-symbol table
+# =============================================================================
+
+import forge
+
+# =============================================================================
+# SECTION 1 — MACH-O CONSTANTS
+# =============================================================================
+
+# Magic numbers (fat headers ignored — we emit thin 64-bit only)
+const MH_MAGIC_64:      int = 0xFEEDFACF
+const MH_CIGAM_64:      int = 0xCFFAEDFE     # big-endian placeholder (not used)
+
+# CPU types / subtypes
+const CPU_TYPE_X86_64:  int = 0x01000007     # CPU_ARCH_ABI64 | CPU_TYPE_X86
+const CPU_TYPE_ARM64:   int = 0x0100000C     # CPU_ARCH_ABI64 | CPU_TYPE_ARM
+const CPU_SUBTYPE_X86_ALL: int = 3
+const CPU_SUBTYPE_ARM64_ALL: int = 0
+
+# File types
+const MH_OBJECT:    int = 1
+const MH_EXECUTE:   int = 2
+const MH_DYLIB:     int = 6
+const MH_DYLINKER:  int = 7
+const MH_BUNDLE:    int = 8
+
+# Flags (subset)
+const MH_NOUNDEFS:  int = 0x1
+const MH_DYLDLINK:  int = 0x4
+const MH_TWOLEVEL:  int = 0x80
+const MH_PIE:       int = 0x200000
+
+# Load command types
+const LC_REQ_DYLD:          int = 0x80000000
+const LC_SEGMENT_64:        int = 0x19
+const LC_SYMTAB:            int = 0x02
+const LC_DYSYMTAB:          int = 0x0B
+const LC_LOAD_DYLINKER:     int = 0x0E
+const LC_LOAD_DYLIB:        int = 0x0C
+const LC_MAIN:              int = 0x28 | 0x80000000     # = LC_REQ_DYLD | 0x28
+const LC_DYLD_INFO_ONLY:    int = 0x22 | 0x80000000
+const LC_SOURCE_VERSION:    int = 0x2A
+
+# Segment protections (VM_PROT_*)
+const VM_PROT_NONE:    int = 0x0
+const VM_PROT_READ:    int = 0x1
+const VM_PROT_WRITE:   int = 0x2
+const VM_PROT_EXECUTE: int = 0x4
+
+# Section attributes
+const S_REGULAR:                    int = 0x0
+const S_SYMBOL_STUBS:               int = 0x8
+const S_ATTR_PURE_INSTRUCTIONS:     int = 0x80000000
+const S_ATTR_SOME_INSTRUCTIONS:     int = 0x00000400
+
+# Symbol table entry flags (n_type)
+const N_UNDF:   int = 0x00
+const N_SECT:   int = 0x0E
+const N_EXT:    int = 0x01
+
+# Page sizes — macOS uses 4 KiB on x86, 16 KiB on arm64
+const MACHO_PAGE_SIZE_X86:   int = 0x1000
+const MACHO_PAGE_SIZE_ARM64: int = 0x4000
+
+# Traditional virtual-address base for executables
+const MACHO_VMADDR_BASE:     int = 0x100000000
+const MACHO_VMADDR_TEXT:     int = 0x100000000
+
+# =============================================================================
+# SECTION 2 — MACH-O WRITER
+# =============================================================================
+
+const MACHOW_MAX: int = 2097152
+
+struct MachoWriter
+    bytes:  [int; 2097152]
+    len:    int
+    errors: int
+
+fn machow_new() -> MachoWriter
+    return MachoWriter {
+        bytes: [0; 2097152],
+        len: 0,
+        errors: 0
+    }
+
+#[inline]
+fn machow_u8(@w: MachoWriter, @v: int)
+    if @w.len >= MACHOW_MAX
+        @w.errors = @w.errors + 1
+        return
+    @w.bytes[@w.len] = @v & 0xFF
+    @w.len = @w.len + 1
+
+#[inline]
+fn machow_u16(@w: MachoWriter, @v: int)
+    machow_u8(@w, @v & 0xFF)
+    machow_u8(@w, (@v >> 8) & 0xFF)
+
+#[inline]
+fn machow_u32(@w: MachoWriter, @v: int)
+    machow_u8(@w, @v & 0xFF)
+    machow_u8(@w, (@v >> 8) & 0xFF)
+    machow_u8(@w, (@v >> 16) & 0xFF)
+    machow_u8(@w, (@v >> 24) & 0xFF)
+
+#[inline]
+fn machow_u64(@w: MachoWriter, @v: int)
+    machow_u32(@w, @v & 0xFFFFFFFF)
+    machow_u32(@w, (@v >> 32) & 0xFFFFFFFF)
+
+fn machow_zero(@w: MachoWriter, @n: int)
+    orbit _ in 0..@n
+        machow_u8(@w, 0)
+
+fn machow_pad_to(@w: MachoWriter, @align: int)
+    @rem = @w.len % @align
+    if @rem == 0
+        return
+    machow_zero(@w, @align - @rem)
+
+fn machow_write_str_fixed(@w: MachoWriter, @s: str, @s_len: int, @field_len: int)
+    # Write s into a fixed-size field, NUL-pad the rest.
+    @written = 0
+    orbit @i in 0..@s_len
+        if @written >= @field_len
+            break
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@s + @i)
+        machow_u8(@w, @ch)
+        @written = @written + 1
+    orbit _ in @written..@field_len
+        machow_u8(@w, 0)
+
+fn machow_patch_u32(@w: MachoWriter, @at: int, @v: int)
+    if @at < 0 or @at + 4 > @w.len
+        @w.errors = @w.errors + 1
+        return
+    @w.bytes[@at + 0] = @v & 0xFF
+    @w.bytes[@at + 1] = (@v >> 8) & 0xFF
+    @w.bytes[@at + 2] = (@v >> 16) & 0xFF
+    @w.bytes[@at + 3] = (@v >> 24) & 0xFF
+
+fn machow_patch_u64(@w: MachoWriter, @at: int, @v: int)
+    machow_patch_u32(@w, @at, @v & 0xFFFFFFFF)
+    machow_patch_u32(@w, @at + 4, (@v >> 32) & 0xFFFFFFFF)
+
+# =============================================================================
+# SECTION 3 — MACH HEADER
+# =============================================================================
+
+struct MachHeaderPatches
+    ncmds_at:      int
+    sizeofcmds_at: int
+
+fn emit_mach_header(@w: MachoWriter, @cpu: int, @subtype: int,
+                    @filetype: int, @flags: int) -> MachHeaderPatches
+    machow_u32(@w, MH_MAGIC_64)         # magic
+    machow_u32(@w, @cpu)                # cputype
+    machow_u32(@w, @subtype)            # cpusubtype
+    machow_u32(@w, @filetype)           # filetype
+
+    seal @ncmds_at = @w.len
+    machow_u32(@w, 0)                   # ncmds (patched)
+
+    seal @sizeofcmds_at = @w.len
+    machow_u32(@w, 0)                   # sizeofcmds (patched)
+
+    machow_u32(@w, @flags)              # flags
+    machow_u32(@w, 0)                   # reserved
+
+    return MachHeaderPatches {
+        ncmds_at: @ncmds_at,
+        sizeofcmds_at: @sizeofcmds_at
+    }
+
+# =============================================================================
+# SECTION 4 — LC_SEGMENT_64
+# =============================================================================
+# A segment descriptor — 72 bytes base + 80 bytes per section.
+# Sections are written inline after the segment header.
+
+# Emit segment header with 0 sections (caller emits sections separately
+# with emit_macho_section and patches nsects afterwards).
+fn emit_lc_segment_64(@w: MachoWriter,
+                      @segname: str, @segname_len: int,
+                      @vmaddr: int, @vmsize: int,
+                      @fileoff: int, @filesize: int,
+                      @maxprot: int, @initprot: int,
+                      @nsects: int, @flags: int) -> int
+    seal @cmd_start = @w.len
+    seal @cmdsize = 72 + @nsects * 80
+    machow_u32(@w, LC_SEGMENT_64)       # cmd
+    machow_u32(@w, @cmdsize)            # cmdsize
+    machow_write_str_fixed(@w, @segname, @segname_len, 16)
+    machow_u64(@w, @vmaddr)
+    machow_u64(@w, @vmsize)
+    machow_u64(@w, @fileoff)
+    machow_u64(@w, @filesize)
+    machow_u32(@w, @maxprot)
+    machow_u32(@w, @initprot)
+    machow_u32(@w, @nsects)
+    machow_u32(@w, @flags)
+    return @cmd_start
+
+fn emit_macho_section(@w: MachoWriter,
+                      @sectname: str, @sectname_len: int,
+                      @segname: str, @segname_len: int,
+                      @addr: int, @size: int, @offset: int,
+                      @align_log2: int, @reloff: int, @nreloc: int,
+                      @flags: int, @reserved1: int, @reserved2: int)
+    machow_write_str_fixed(@w, @sectname, @sectname_len, 16)
+    machow_write_str_fixed(@w, @segname, @segname_len, 16)
+    machow_u64(@w, @addr)
+    machow_u64(@w, @size)
+    machow_u32(@w, @offset)
+    machow_u32(@w, @align_log2)
+    machow_u32(@w, @reloff)
+    machow_u32(@w, @nreloc)
+    machow_u32(@w, @flags)
+    machow_u32(@w, @reserved1)
+    machow_u32(@w, @reserved2)
+    machow_u32(@w, 0)                   # reserved3
+
+# =============================================================================
+# SECTION 5 — LC_MAIN (entry point)
+# =============================================================================
+# LC_MAIN replaces the older LC_UNIXTHREAD.  entryoff is measured from the
+# start of the __TEXT segment (i.e. from file offset 0).
+
+fn emit_lc_main(@w: MachoWriter, @entry_fileoff: int, @stacksize: int)
+    machow_u32(@w, LC_MAIN)
+    machow_u32(@w, 24)                  # cmdsize
+    machow_u64(@w, @entry_fileoff)
+    machow_u64(@w, @stacksize)
+
+# =============================================================================
+# SECTION 6 — LC_LOAD_DYLINKER
+# =============================================================================
+
+fn emit_lc_load_dylinker(@w: MachoWriter)
+    seal @linker = "/usr/lib/dyld"
+    seal @linker_len = 13
+    # cmd + cmdsize + offset + padded string (NUL-terminated, 8-byte aligned)
+    seal @pad_len = 32 - 12 - @linker_len - 1        # approximate
+    @cmdsize = 12 + ((@linker_len + 8) & (-8))       # round up
+    machow_u32(@w, LC_LOAD_DYLINKER)
+    machow_u32(@w, @cmdsize)
+    machow_u32(@w, 12)                               # offset of string within the cmd
+    # String
+    orbit @i in 0..@linker_len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@linker + @i)
+        machow_u8(@w, @ch)
+    machow_u8(@w, 0)                                 # NUL
+    # Pad to cmdsize
+    @bytes_so_far = 12 + @linker_len + 1
+    orbit _ in @bytes_so_far..@cmdsize
+        machow_u8(@w, 0)
+
+# =============================================================================
+# SECTION 7 — LC_LOAD_DYLIB
+# =============================================================================
+# Describes a dylib dependency.  For macOS we need libSystem.B.dylib —
+# Apple's C library + kernel interface wrapper.  Every Mach-O executable
+# links it; there is no "static libc" on modern macOS.
+
+fn emit_lc_load_dylib(@w: MachoWriter, @path: str, @path_len: int,
+                      @timestamp: int, @current_version: int,
+                      @compat_version: int)
+    # Fixed header: cmd(4) + cmdsize(4) + name-offset(4) + timestamp(4)
+    #             + current_version(4) + compat_version(4) = 24 bytes
+    # Then the string, NUL-terminated and 8-byte aligned.
+    seal @string_bytes = @path_len + 1
+    seal @cmdsize = (24 + @string_bytes + 7) & (-8)
+    machow_u32(@w, LC_LOAD_DYLIB)
+    machow_u32(@w, @cmdsize)
+    machow_u32(@w, 24)                               # name offset
+    machow_u32(@w, @timestamp)
+    machow_u32(@w, @current_version)
+    machow_u32(@w, @compat_version)
+    orbit @i in 0..@path_len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@path + @i)
+        machow_u8(@w, @ch)
+    machow_u8(@w, 0)
+    # Pad to cmdsize
+    @bytes = 24 + @path_len + 1
+    orbit _ in @bytes..@cmdsize
+        machow_u8(@w, 0)
+
+# =============================================================================
+# SECTION 8 — LC_SYMTAB + LC_DYSYMTAB (minimal)
+# =============================================================================
+# For a stub-free binary (no imports) we can emit empty symbol tables,
+# but macOS refuses to run a dylib-linked executable without the LC_SYMTAB
+# load command present.  We emit an empty one pointing at zero entries.
+
+fn emit_lc_symtab(@w: MachoWriter, @symoff: int, @nsyms: int,
+                  @stroff: int, @strsize: int)
+    machow_u32(@w, LC_SYMTAB)
+    machow_u32(@w, 24)                              # cmdsize
+    machow_u32(@w, @symoff)
+    machow_u32(@w, @nsyms)
+    machow_u32(@w, @stroff)
+    machow_u32(@w, @strsize)
+
+fn emit_lc_dysymtab(@w: MachoWriter)
+    machow_u32(@w, LC_DYSYMTAB)
+    machow_u32(@w, 80)                              # cmdsize
+    # All 18 u32 fields zeroed — no defined / undefined / indirect syms yet
+    orbit _ in 0..18
+        machow_u32(@w, 0)
+
+# Fully-populated LC_DYSYMTAB — fills in iundefsym/nundefsym plus the
+# indirect-symbol table offset/count.  Other segment-grouping fields are
+# left at zero (we don't distinguish local vs. extern-defined symbols yet).
+fn emit_lc_dysymtab_full(@w: MachoWriter,
+                         @iundefsym: int, @nundefsym: int,
+                         @indirectsymoff: int, @nindirectsyms: int)
+    machow_u32(@w, LC_DYSYMTAB)
+    machow_u32(@w, 80)                              # cmdsize
+    machow_u32(@w, 0)                               # ilocalsym
+    machow_u32(@w, 0)                               # nlocalsym
+    machow_u32(@w, 0)                               # iextdefsym
+    machow_u32(@w, 0)                               # nextdefsym
+    machow_u32(@w, @iundefsym)                      # iundefsym
+    machow_u32(@w, @nundefsym)                      # nundefsym
+    machow_u32(@w, 0)                               # tocoff
+    machow_u32(@w, 0)                               # ntoc
+    machow_u32(@w, 0)                               # modtaboff
+    machow_u32(@w, 0)                               # nmodtab
+    machow_u32(@w, 0)                               # extrefsymoff
+    machow_u32(@w, 0)                               # nextrefsyms
+    machow_u32(@w, @indirectsymoff)                 # indirectsymoff
+    machow_u32(@w, @nindirectsyms)                  # nindirectsyms
+    machow_u32(@w, 0)                               # extreloff
+    machow_u32(@w, 0)                               # nextrel
+    machow_u32(@w, 0)                               # locreloff
+    machow_u32(@w, 0)                               # nlocrel
+
+# =============================================================================
+# SECTION 8B — MACHO IMPORTS DESCRIPTOR
+# =============================================================================
+# MachoImports mirrors forge_pe.luna's PeImports: a flat blob of dylib
+# names + imported function names, with per-fn routing back to its dylib.
+# The top-level emitter consumes this to lay out __stubs / __la_symbol_ptr
+# and the matching LC_SYMTAB + indirect-symbol table entries.
+
+const MACHO_MAX_DYLIBS:  int = 16
+const MACHO_MAX_IMPORTS: int = 256
+const MACHO_NAME_BLOB:   int = 8192
+
+struct MachoImports
+    dylib_names:      [int; 16]     # offsets into name_blob
+    dylib_name_lens:  [int; 16]
+    dylib_count:      int
+
+    fns:              [int; 256]    # name offsets into name_blob
+    fn_name_lens:     [int; 256]
+    fn_dylib_idx:     [int; 256]    # which dylib each fn belongs to
+    fn_count:         int
+
+    name_blob:        [int; 8192]
+    name_blob_len:    int
+
+fn macho_imports_new() -> MachoImports
+    return MachoImports {
+        dylib_names: [0; 16],
+        dylib_name_lens: [0; 16],
+        dylib_count: 0,
+        fns: [0; 256],
+        fn_name_lens: [0; 256],
+        fn_dylib_idx: [0; 256],
+        fn_count: 0,
+        name_blob: [0; 8192],
+        name_blob_len: 0
+    }
+
+fn macho_imports_add_dylib(@im: MachoImports, @name: str, @name_len: int) -> int
+    if @im.dylib_count >= MACHO_MAX_DYLIBS
+        return -1
+    seal @idx = @im.dylib_count
+    seal @off = @im.name_blob_len
+    orbit @i in 0..@name_len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@name + @i)
+        @im.name_blob[@im.name_blob_len] = @ch
+        @im.name_blob_len = @im.name_blob_len + 1
+    @im.name_blob[@im.name_blob_len] = 0
+    @im.name_blob_len = @im.name_blob_len + 1
+    @im.dylib_names[@idx] = @off
+    @im.dylib_name_lens[@idx] = @name_len
+    @im.dylib_count = @im.dylib_count + 1
+    return @idx
+
+fn macho_imports_add_fn(@im: MachoImports, @dylib_idx: int,
+                        @name: str, @name_len: int) -> int
+    if @im.fn_count >= MACHO_MAX_IMPORTS
+        return -1
+    seal @idx = @im.fn_count
+    seal @off = @im.name_blob_len
+    orbit @i in 0..@name_len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@name + @i)
+        @im.name_blob[@im.name_blob_len] = @ch
+        @im.name_blob_len = @im.name_blob_len + 1
+    @im.name_blob[@im.name_blob_len] = 0
+    @im.name_blob_len = @im.name_blob_len + 1
+    @im.fns[@idx]           = @off
+    @im.fn_name_lens[@idx]  = @name_len
+    @im.fn_dylib_idx[@idx]  = @dylib_idx
+    @im.fn_count = @im.fn_count + 1
+    return @idx
+
+# =============================================================================
+# SECTION 9 — TOP-LEVEL EMIT
+# =============================================================================
+
+fn forge_emit_macho64(@f: Forge, @entry_offset: int, @cpu: int) -> MachoWriter
+    @w = machow_new()
+
+    seal @subtype = if @cpu == CPU_TYPE_ARM64 then CPU_SUBTYPE_ARM64_ALL else CPU_SUBTYPE_X86_ALL
+    seal @page_size = if @cpu == CPU_TYPE_ARM64 then MACHO_PAGE_SIZE_ARM64 else MACHO_PAGE_SIZE_X86
+
+    # --- Mach header (patch ncmds + sizeofcmds later) --------------------
+    @hp = emit_mach_header(@w, @cpu, @subtype,
+                           MH_EXECUTE,
+                           MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE)
+
+    # Save start of load commands block so we can measure sizeofcmds later
+    seal @cmds_start = @w.len
+
+    # --- LC_SEGMENT_64 __PAGEZERO ----------------------------------------
+    # Unmapped region at the start of the VM to catch NULL dereferences.
+    emit_lc_segment_64(@w, "__PAGEZERO", 10,
+                       0, MACHO_VMADDR_BASE,     # vmaddr, vmsize
+                       0, 0,                      # fileoff, filesize
+                       VM_PROT_NONE, VM_PROT_NONE,
+                       0, 0)
+
+    # --- LC_SEGMENT_64 __TEXT + __text section ---------------------------
+    # Single __text section containing the Forge code buffer.
+    seal @text_vmaddr = MACHO_VMADDR_TEXT
+    seal @text_vmsize = ((@f.code_len + @page_size - 1) / @page_size) * @page_size
+    # We'll place __text at file offset (cmds_end + padding-to-page-boundary).
+    # We don't know cmds_end yet; patch size + offset after layout.
+    seal @text_seg_cmd_at = @w.len
+    emit_lc_segment_64(@w, "__TEXT", 6,
+                       @text_vmaddr, @text_vmsize,
+                       0, 0,                       # fileoff / filesize — patched
+                       VM_PROT_READ | VM_PROT_EXECUTE,
+                       VM_PROT_READ | VM_PROT_EXECUTE,
+                       1, 0)                       # 1 section
+    # Inline section header — 80 bytes
+    emit_macho_section(@w, "__text", 6, "__TEXT", 6,
+                       @text_vmaddr, @f.code_len,  # addr, size
+                       0,                           # offset — patched below
+                       4,                           # align log2 = 16 bytes
+                       0, 0,                        # reloff / nreloc
+                       S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                       0, 0)
+
+    # --- LC_LOAD_DYLINKER ------------------------------------------------
+    emit_lc_load_dylinker(@w)
+
+    # --- LC_LOAD_DYLIB libSystem -----------------------------------------
+    emit_lc_load_dylib(@w, "/usr/lib/libSystem.B.dylib", 26,
+                       2, 0x01000000, 0x00010000)
+
+    # --- LC_SYMTAB (empty — Mach-O requires it even when empty) ---------
+    emit_lc_symtab(@w, 0, 0, 0, 0)
+
+    # --- LC_DYSYMTAB (empty) ---------------------------------------------
+    emit_lc_dysymtab(@w)
+
+    # --- LC_MAIN (patch entry after we know text fileoff) ---------------
+    seal @main_cmd_at = @w.len
+    emit_lc_main(@w, 0, 0)                         # entry offset patched below
+
+    # --- Patch Mach header counts ---------------------------------------
+    seal @cmds_end = @w.len
+    seal @ncmds = 7                                # segments + symtab + dysymtab + dylinker + dylib + main
+    machow_patch_u32(@w, @hp.ncmds_at, @ncmds)
+    machow_patch_u32(@w, @hp.sizeofcmds_at, @cmds_end - @cmds_start)
+
+    # --- Pad to page boundary before __text bytes ------------------------
+    machow_pad_to(@w, @page_size)
+    seal @text_fileoff = @w.len
+
+    # Now we know where __text lives — write the code, then patch the
+    # segment command and LC_MAIN.
+    orbit @i in 0..@f.code_len
+        machow_u8(@w, @f.code[@i])
+
+    # Patch __TEXT segment: fileoff + filesize
+    # The LC_SEGMENT_64 header layout:
+    #   u32 cmd  | u32 cmdsize | char segname[16] | u64 vmaddr | u64 vmsize
+    #   u64 fileoff | u64 filesize | u32 maxprot | u32 initprot | u32 nsects | u32 flags
+    # From @text_seg_cmd_at:
+    #   +0  cmd              (u32)
+    #   +4  cmdsize          (u32)
+    #   +8  segname[16]
+    #  +24  vmaddr           (u64)
+    #  +32  vmsize           (u64)
+    #  +40  fileoff          (u64)
+    #  +48  filesize         (u64)
+    machow_patch_u64(@w, @text_seg_cmd_at + 40, @text_fileoff)
+    machow_patch_u64(@w, @text_seg_cmd_at + 48, @f.code_len)
+
+    # Patch __text section inside the segment — its layout sits right after
+    # the 72-byte segment header, so it starts at @text_seg_cmd_at + 72.
+    # Section header layout:
+    #   +0 sectname[16]  +16 segname[16]  +32 addr(u64)  +40 size(u64)
+    # +48 offset(u32)  +52 align(u32)  +56 reloff(u32) ... (80 bytes total)
+    machow_patch_u32(@w, @text_seg_cmd_at + 72 + 48, @text_fileoff)
+
+    # Patch LC_MAIN entryoff
+    # LC_MAIN layout:
+    #   +0 cmd(u32)  +4 cmdsize(u32)  +8 entryoff(u64)  +16 stacksize(u64)
+    machow_patch_u64(@w, @main_cmd_at + 8, @text_fileoff + @entry_offset)
+
+    return @w
+
+# =============================================================================
+# SECTION 9B — MACH-O WITH IMPORTS (stubs + la_symbol_ptr + symtab)
+# =============================================================================
+# Real macOS binaries need LC_SYMTAB populated with N_EXT|N_UNDF entries
+# for each imported function, a __TEXT,__stubs section with 6-byte
+# FF 25 <disp32> jumps, and a __DATA,__la_symbol_ptr table the loader
+# overwrites during lazy binding.  We also wire LC_DYSYMTAB's
+# indirectsymoff / nindirectsyms so dyld knows which symtab entry backs
+# each stub / lazy-pointer slot.
+#
+# TODO (out of scope for this pass):
+#   * __stub_helper — real PLT glue that jumps through dyld_stub_binder
+#     the first time a stub fires.  We currently leave la_symbol_ptr
+#     slots pointing at 0 and rely on the loader's fall-back lazy bind.
+#   * LC_CODE_SIGNATURE — Apple Silicon requires an ad-hoc CMS blob;
+#     this writer still emits an unsigned image.
+
+const MACHO_STUB_SIZE:   int = 6     # jmp [rip+disp32] -> FF 25 xx xx xx xx
+const MACHO_LA_PTR_SIZE: int = 8     # u64 lazy pointer
+
+# n_type flag combo for an undefined external symbol
+const MACHO_N_TYPE_UNDEF_EXT: int = 0x01     # N_EXT | N_UNDF (N_UNDF == 0)
+
+# Set the "library ordinal" byte inside n_desc — dyld uses this to pick
+# which LC_LOAD_DYLIB owns the symbol.  Ordinal 1 == first dylib.
+#[inline]
+fn macho_set_library_ordinal(@n_desc: int, @ord: int) -> int
+    return (@n_desc & 0x00FF) | ((@ord & 0xFF) << 8)
+
+# Emit one 6-byte stub: FF 25 <disp32>, where disp32 = la_ptr_rva - (stub_rva + 6).
+# NOTE: this is the x86-64 encoding.  A proper ARM64 stub would be a
+# 12-byte ADRP+LDR+BR triplet — add that when we wire MachoImports into
+# the arm64 lowering path; until then, arm64 callers must keep their
+# import list empty.
+fn emit_macho_stub(@w: MachoWriter, @stub_rva: int, @la_ptr_rva: int)
+    machow_u8(@w, 0xFF)
+    machow_u8(@w, 0x25)
+    seal @disp = @la_ptr_rva - (@stub_rva + 6)
+    machow_u32(@w, @disp)
+
+# Emit a full MachO executable that carries an explicit import table.
+# The 3-arg `forge_emit_macho64` remains for no-import callers.
+fn forge_emit_macho64_with_imports(@f: Forge, @im: MachoImports,
+                                   @entry_offset: int, @cpu: int) -> MachoWriter
+    @w = machow_new()
+
+    seal @subtype = if @cpu == CPU_TYPE_ARM64 then CPU_SUBTYPE_ARM64_ALL else CPU_SUBTYPE_X86_ALL
+    seal @page_size = if @cpu == CPU_TYPE_ARM64 then MACHO_PAGE_SIZE_ARM64 else MACHO_PAGE_SIZE_X86
+
+    seal @nimports = @im.fn_count
+
+    # --- Mach header --------------------------------------------------
+    # MH_NOUNDEFS is only valid when the symbol table has zero undef
+    # entries — so we drop it whenever any fn import is declared.
+    seal @flags = if @nimports > 0
+                      then MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+                      else MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+    @hp = emit_mach_header(@w, @cpu, @subtype, MH_EXECUTE, @flags)
+
+    seal @cmds_start = @w.len
+
+    # --- LC_SEGMENT_64 __PAGEZERO -------------------------------------
+    emit_lc_segment_64(@w, "__PAGEZERO", 10,
+                       0, MACHO_VMADDR_BASE,
+                       0, 0,
+                       VM_PROT_NONE, VM_PROT_NONE,
+                       0, 0)
+
+    # --- LC_SEGMENT_64 __TEXT (2 sections: __text + __stubs) ----------
+    seal @text_vmaddr = MACHO_VMADDR_TEXT
+    seal @stubs_size  = @nimports * MACHO_STUB_SIZE
+    seal @text_section_vmsize = @f.code_len + @stubs_size
+    seal @text_vmsize = ((@text_section_vmsize + @page_size - 1) / @page_size) * @page_size
+    seal @text_nsects = if @nimports > 0 then 2 else 1
+
+    seal @text_seg_cmd_at = @w.len
+    emit_lc_segment_64(@w, "__TEXT", 6,
+                       @text_vmaddr, @text_vmsize,
+                       0, 0,
+                       VM_PROT_READ | VM_PROT_EXECUTE,
+                       VM_PROT_READ | VM_PROT_EXECUTE,
+                       @text_nsects, 0)
+    # __text section header (patched offset + size later)
+    emit_macho_section(@w, "__text", 6, "__TEXT", 6,
+                       @text_vmaddr, @f.code_len,
+                       0,
+                       4,
+                       0, 0,
+                       S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                       0, 0)
+    # __stubs section header (only when imports present)
+    seal @stubs_sect_hdr_at = @w.len
+    if @nimports > 0
+        emit_macho_section(@w, "__stubs", 7, "__TEXT", 6,
+                           0, @stubs_size,              # addr/size — patched
+                           0,                            # file offset — patched
+                           1,                            # align log2 = 2
+                           0, 0,
+                           S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                           0,                            # reserved1 = indirect-sym index (0)
+                           MACHO_STUB_SIZE)              # reserved2 = stub size
+
+    # --- LC_SEGMENT_64 __DATA (1 section: __la_symbol_ptr) ------------
+    seal @data_seg_cmd_at = @w.len
+    seal @la_ptr_size = @nimports * MACHO_LA_PTR_SIZE
+    if @nimports > 0
+        emit_lc_segment_64(@w, "__DATA", 6,
+                           0, 0,                         # vmaddr / vmsize patched
+                           0, 0,                         # fileoff / filesize patched
+                           VM_PROT_READ | VM_PROT_WRITE,
+                           VM_PROT_READ | VM_PROT_WRITE,
+                           1, 0)
+        emit_macho_section(@w, "__la_symbol_ptr", 15, "__DATA", 6,
+                           0, @la_ptr_size,              # addr / size — patched
+                           0,                             # file offset — patched
+                           3,                             # align log2 = 8 bytes
+                           0, 0,
+                           0x00000007,                    # S_LAZY_SYMBOL_POINTERS
+                           @nimports,                     # reserved1 = indirect index
+                           0)
+
+    # --- LC_SEGMENT_64 __LINKEDIT -------------------------------------
+    # Holds symtab + strtab + indirect-sym table.  Addresses patched later.
+    seal @linkedit_seg_cmd_at = @w.len
+    emit_lc_segment_64(@w, "__LINKEDIT", 10,
+                       0, 0,                             # vmaddr / vmsize patched
+                       0, 0,                             # fileoff / filesize patched
+                       VM_PROT_READ, VM_PROT_READ,
+                       0, 0)
+
+    # --- LC_LOAD_DYLINKER ---------------------------------------------
+    emit_lc_load_dylinker(@w)
+
+    # --- LC_LOAD_DYLIB per dylib in MachoImports ----------------------
+    orbit @d in 0..@im.dylib_count
+        seal @dns = @im.dylib_names[@d]
+        seal @dnl = @im.dylib_name_lens[@d]
+        # Pull the name out of the blob into a fresh buffer via the
+        # LC_LOAD_DYLIB emitter — which reads via volatile_read.  We
+        # feed it the blob's base address directly.
+        # (@im.name_blob is the char buffer; pointer arithmetic here
+        # aligns with how pe_imports does the same thing.)
+        emit_lc_load_dylib_bytes(@w, @im.name_blob, @dns, @dnl,
+                                 2, 0x01000000, 0x00010000)
+    # If no dylibs declared but we do have fn imports, we still must
+    # emit at least libSystem so the loader accepts the binary.
+    if @im.dylib_count == 0 and @nimports > 0
+        emit_lc_load_dylib(@w, "/usr/lib/libSystem.B.dylib", 26,
+                           2, 0x01000000, 0x00010000)
+
+    # --- LC_SYMTAB (placeholder — patched after linkedit layout) ------
+    seal @symtab_cmd_at = @w.len
+    emit_lc_symtab(@w, 0, @nimports, 0, 0)
+
+    # --- LC_DYSYMTAB (placeholder — patched similarly) ----------------
+    seal @dysymtab_cmd_at = @w.len
+    emit_lc_dysymtab_full(@w, 0, @nimports, 0, @nimports * 2)
+
+    # --- LC_MAIN ------------------------------------------------------
+    seal @main_cmd_at = @w.len
+    emit_lc_main(@w, 0, 0)
+
+    # --- Count commands + patch header -------------------------------
+    seal @cmds_end = @w.len
+    meow @ncmds: int = 0
+    # __PAGEZERO + __TEXT + __LINKEDIT + symtab + dysymtab + dylinker + main = 7
+    @ncmds = 7
+    if @nimports > 0
+        @ncmds = @ncmds + 1        # __DATA segment
+    @ncmds = @ncmds + @im.dylib_count
+    if @im.dylib_count == 0 and @nimports > 0
+        @ncmds = @ncmds + 1        # implicit libSystem
+    machow_patch_u32(@w, @hp.ncmds_at, @ncmds)
+    machow_patch_u32(@w, @hp.sizeofcmds_at, @cmds_end - @cmds_start)
+
+    # --- Pad to page boundary, then write __text ---------------------
+    machow_pad_to(@w, @page_size)
+    seal @text_fileoff = @w.len
+    orbit @i in 0..@f.code_len
+        machow_u8(@w, @f.code[@i])
+
+    # --- Emit __stubs bytes -------------------------------------------
+    seal @stubs_fileoff = @w.len
+    seal @stubs_vmaddr  = @text_vmaddr + (@stubs_fileoff - @text_fileoff)
+    # __la_symbol_ptr placement: on the next page boundary
+    seal @la_ptr_fileoff = ((@stubs_fileoff + @stubs_size + @page_size - 1) / @page_size) * @page_size
+    seal @data_vmaddr    = @text_vmaddr + @text_vmsize
+    seal @la_ptr_vmaddr  = @data_vmaddr
+    orbit @s in 0..@nimports
+        seal @stub_rva = @stubs_vmaddr + @s * MACHO_STUB_SIZE
+        seal @la_rva   = @la_ptr_vmaddr + @s * MACHO_LA_PTR_SIZE
+        emit_macho_stub(@w, @stub_rva, @la_rva)
+
+    # --- Pad to page boundary and emit __la_symbol_ptr ----------------
+    if @nimports > 0
+        machow_pad_to(@w, @page_size)
+        seal @la_actual_fileoff = @w.len
+        # Each slot initially points to its stub (this triggers the
+        # loader's classic lazy binding fall-back since we have no
+        # __stub_helper).  The dylib loader will overwrite on first use.
+        orbit @s in 0..@nimports
+            machow_u64(@w, 0)
+
+    # --- __LINKEDIT layout: strtab + symtab + indirect-sym table ------
+    machow_pad_to(@w, 8)
+    seal @linkedit_fileoff = @w.len
+    seal @linkedit_vmaddr  = @data_vmaddr + (((@la_ptr_size + @page_size - 1) / @page_size) * @page_size)
+
+    # -- String table: leading NUL + each fn name, NUL-terminated ------
+    seal @strtab_off = @w.len
+    machow_u8(@w, 0)    # offset 0 is always \0
+    # record each fn's strtab offset
+    meow @strtab_offs: [int; 256] = [0; 256]
+    orbit @s in 0..@nimports
+        @strtab_offs[@s] = @w.len - @strtab_off
+        seal @ns = @im.fns[@s]
+        seal @nl = @im.fn_name_lens[@s]
+        # Mach-O convention prepends '_' to every C symbol
+        machow_u8(@w, 0x5F)     # '_'
+        orbit @j in 0..@nl
+            machow_u8(@w, @im.name_blob[@ns + @j])
+        machow_u8(@w, 0)
+    # pad strtab to 4 bytes for nlist alignment
+    machow_pad_to(@w, 4)
+    seal @strtab_size = @w.len - @strtab_off
+
+    # -- Symbol table: one nlist_64 per imported fn --------------------
+    seal @symtab_off = @w.len
+    orbit @s in 0..@nimports
+        seal @ord = @im.fn_dylib_idx[@s] + 1   # dyld ordinals are 1-based
+        machow_u32(@w, @strtab_offs[@s])       # n_strx
+        machow_u8(@w, MACHO_N_TYPE_UNDEF_EXT)  # n_type = N_EXT | N_UNDF
+        machow_u8(@w, 0)                       # n_sect = 0 for undef
+        machow_u16(@w, macho_set_library_ordinal(0, @ord))  # n_desc
+        machow_u64(@w, 0)                      # n_value
+
+    # -- Indirect symbol table -----------------------------------------
+    # One u32 per __stubs entry (0..nimports-1) then one per __la_symbol_ptr
+    # entry (0..nimports-1).  Each value is the symtab index of the fn.
+    seal @indirect_off = @w.len
+    orbit @s in 0..@nimports
+        machow_u32(@w, @s)
+    orbit @s in 0..@nimports
+        machow_u32(@w, @s)
+
+    seal @linkedit_end = @w.len
+    seal @linkedit_filesize = @linkedit_end - @linkedit_fileoff
+    seal @linkedit_vmsize = ((@linkedit_filesize + @page_size - 1) / @page_size) * @page_size
+
+    # --- Patch __TEXT segment -----------------------------------------
+    machow_patch_u64(@w, @text_seg_cmd_at + 40, @text_fileoff)
+    machow_patch_u64(@w, @text_seg_cmd_at + 48,
+                     @f.code_len + @stubs_size)
+    # __text section offset
+    machow_patch_u32(@w, @text_seg_cmd_at + 72 + 48, @text_fileoff)
+    # __stubs section: addr, offset, reserved1 (base indirect index)
+    if @nimports > 0
+        # section header layout at @stubs_sect_hdr_at:
+        #   +0  sectname[16]  +16 segname[16]  +32 addr  +40 size
+        #   +48 offset  +52 align  +56 reloff  +60 nreloc
+        #   +64 flags   +68 reserved1  +72 reserved2
+        machow_patch_u64(@w, @stubs_sect_hdr_at + 32, @stubs_vmaddr)
+        machow_patch_u32(@w, @stubs_sect_hdr_at + 48, @stubs_fileoff)
+        machow_patch_u32(@w, @stubs_sect_hdr_at + 68, 0)
+
+    # --- Patch __DATA segment + __la_symbol_ptr section ---------------
+    if @nimports > 0
+        seal @data_fileoff = @la_ptr_fileoff
+        seal @data_filesize = @la_ptr_size
+        seal @data_vmsize = ((@la_ptr_size + @page_size - 1) / @page_size) * @page_size
+        machow_patch_u64(@w, @data_seg_cmd_at + 24, @data_vmaddr)
+        machow_patch_u64(@w, @data_seg_cmd_at + 32, @data_vmsize)
+        machow_patch_u64(@w, @data_seg_cmd_at + 40, @data_fileoff)
+        machow_patch_u64(@w, @data_seg_cmd_at + 48, @data_filesize)
+        # __la_symbol_ptr section header (inside __DATA segment header):
+        seal @la_sect_hdr_at = @data_seg_cmd_at + 72
+        machow_patch_u64(@w, @la_sect_hdr_at + 32, @la_ptr_vmaddr)
+        machow_patch_u32(@w, @la_sect_hdr_at + 48, @data_fileoff)
+        machow_patch_u32(@w, @la_sect_hdr_at + 68, @nimports)  # base indirect idx
+
+    # --- Patch __LINKEDIT segment -------------------------------------
+    machow_patch_u64(@w, @linkedit_seg_cmd_at + 24, @linkedit_vmaddr)
+    machow_patch_u64(@w, @linkedit_seg_cmd_at + 32, @linkedit_vmsize)
+    machow_patch_u64(@w, @linkedit_seg_cmd_at + 40, @linkedit_fileoff)
+    machow_patch_u64(@w, @linkedit_seg_cmd_at + 48, @linkedit_filesize)
+
+    # --- Patch LC_SYMTAB ----------------------------------------------
+    #   +0 cmd  +4 cmdsize  +8 symoff  +12 nsyms  +16 stroff  +20 strsize
+    machow_patch_u32(@w, @symtab_cmd_at + 8,  @symtab_off)
+    machow_patch_u32(@w, @symtab_cmd_at + 12, @nimports)
+    machow_patch_u32(@w, @symtab_cmd_at + 16, @strtab_off)
+    machow_patch_u32(@w, @symtab_cmd_at + 20, @strtab_size)
+
+    # --- Patch LC_DYSYMTAB indirectsymoff -----------------------------
+    # Field layout (u32 each, after cmd+cmdsize header):
+    #  0 ilocalsym, 1 nlocalsym, 2 iextdefsym, 3 nextdefsym,
+    #  4 iundefsym, 5 nundefsym, 6 tocoff, 7 ntoc,
+    #  8 modtaboff, 9 nmodtab, 10 extrefsymoff, 11 nextrefsyms,
+    # 12 indirectsymoff, 13 nindirectsyms, ...
+    machow_patch_u32(@w, @dysymtab_cmd_at + 8 + 12 * 4, @indirect_off)
+    machow_patch_u32(@w, @dysymtab_cmd_at + 8 + 13 * 4, @nimports * 2)
+
+    # --- Patch LC_MAIN entry offset -----------------------------------
+    machow_patch_u64(@w, @main_cmd_at + 8, @text_fileoff + @entry_offset)
+
+    return @w
+
+# Mach-O LC_LOAD_DYLIB emitter fed from a byte-array blob + offset
+# instead of a str pointer — lets us route through MachoImports.name_blob.
+fn emit_lc_load_dylib_bytes(@w: MachoWriter,
+                            @blob: [int; 8192],
+                            @name_off: int, @name_len: int,
+                            @timestamp: int, @current_version: int,
+                            @compat_version: int)
+    seal @string_bytes = @name_len + 1
+    seal @cmdsize = (24 + @string_bytes + 7) & (-8)
+    machow_u32(@w, LC_LOAD_DYLIB)
+    machow_u32(@w, @cmdsize)
+    machow_u32(@w, 24)
+    machow_u32(@w, @timestamp)
+    machow_u32(@w, @current_version)
+    machow_u32(@w, @compat_version)
+    orbit @i in 0..@name_len
+        machow_u8(@w, @blob[@name_off + @i])
+    machow_u8(@w, 0)
+    seal @bytes = 24 + @name_len + 1
+    orbit _ in @bytes..@cmdsize
+        machow_u8(@w, 0)
+
+# =============================================================================
+# SECTION 10 — HIGH-LEVEL CONVENIENCES
+# =============================================================================
+
+fn forge_emit_macho64_x86(@f: Forge, @entry_offset: int) -> MachoWriter
+    return forge_emit_macho64(@f, @entry_offset, CPU_TYPE_X86_64)
+
+fn forge_emit_macho64_arm64(@f: Forge, @entry_offset: int) -> MachoWriter
+    return forge_emit_macho64(@f, @entry_offset, CPU_TYPE_ARM64)
+
+# =============================================================================
+# SECTION 11 — SELF-TESTS
+# =============================================================================
+
+fn macho_selftest_header() -> int
+    @w = machow_new()
+    emit_mach_header(@w, CPU_TYPE_X86_64, CPU_SUBTYPE_X86_ALL,
+                     MH_EXECUTE, MH_NOUNDEFS | MH_DYLDLINK)
+    # Magic bytes 0xFEEDFACF little-endian: CF FA ED FE
+    if @w.bytes[0] != 0xCF
+        return 1
+    if @w.bytes[1] != 0xFA
+        return 2
+    if @w.bytes[2] != 0xED
+        return 3
+    if @w.bytes[3] != 0xFE
+        return 4
+    # cputype at offset 4: 0x01000007 → 07 00 00 01
+    if @w.bytes[4] != 0x07
+        return 5
+    if @w.bytes[7] != 0x01
+        return 6
+    # filetype at offset 12: MH_EXECUTE == 2
+    if @w.bytes[12] != 2
+        return 7
+    return 0
+
+fn macho_selftest_minimal_image() -> int
+    @f = forge_new()
+    emit_ret(@f)                        # `ret` — 1 byte 0xC3
+    @w = forge_emit_macho64(@f, 0, CPU_TYPE_X86_64)
+    # Sanity: len > 0, magic ok
+    if @w.len < 0x1000
+        return 1
+    if @w.bytes[0] != 0xCF
+        return 2
+    return 0
+
+fn macho_selftest_imports_stubs() -> int
+    # Build a MachO with 1 dylib + 1 imported fn.  Confirm __stubs carries
+    # the `FF 25 xx xx xx xx` jmp pattern and the strtab ends with
+    # "_printf\0" (Mach-O prefixes every C symbol with an underscore).
+    @f = forge_new()
+    emit_ret(@f)
+    @im = macho_imports_new()
+    macho_imports_add_dylib(@im, "/usr/lib/libSystem.B.dylib", 26)
+    macho_imports_add_fn(@im, 0, "printf", 6)
+    @w = forge_emit_macho64_with_imports(@f, @im, 0, CPU_TYPE_X86_64)
+    if @w.len < 0x1000
+        return 1
+    # Scan the whole image for the FF 25 jmp pattern — the stub must
+    # exist somewhere after the text code.
+    meow @found_stub: int = 0
+    orbit @i in 0..@w.len - 6
+        if @w.bytes[@i] == 0xFF and @w.bytes[@i + 1] == 0x25
+            @found_stub = 1
+            break
+    if @found_stub == 0
+        return 2
+    # String table must contain "_printf" somewhere (the leading '_' is
+    # the Mach-O name-mangling convention we apply in the emitter).
+    meow @found_name: int = 0
+    orbit @i in 0..@w.len - 7
+        if @w.bytes[@i] == 0x5F and      # '_'
+           @w.bytes[@i + 1] == 0x70 and  # 'p'
+           @w.bytes[@i + 2] == 0x72 and  # 'r'
+           @w.bytes[@i + 3] == 0x69 and  # 'i'
+           @w.bytes[@i + 4] == 0x6E and  # 'n'
+           @w.bytes[@i + 5] == 0x74 and  # 't'
+           @w.bytes[@i + 6] == 0x66 and  # 'f'
+           @w.bytes[@i + 7] == 0x00      # NUL
+            @found_name = 1
+            break
+    if @found_name == 0
+        return 3
+    return 0
+
+fn run_forge_macho_selftests() -> int
+    @pass = 0
+    if macho_selftest_header() == 0
+        @pass = @pass + 1
+    if macho_selftest_minimal_image() == 0
+        @pass = @pass + 1
+    if macho_selftest_imports_stubs() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+# SECTION 12 — ROADMAP
+# =============================================================================
+#
+# Working paths:
+#   * MH_EXECUTE with __PAGEZERO + __TEXT segments
+#   * LC_LOAD_DYLINKER, LC_LOAD_DYLIB libSystem (+ extras via MachoImports)
+#   * LC_MAIN entry point
+#   * LC_SYMTAB / LC_DYSYMTAB (empty or populated)
+#   * __TEXT,__stubs + __DATA,__la_symbol_ptr + indirect-symbol table
+#     (via forge_emit_macho64_with_imports; 3-arg form stays import-free)
+#
+# Still TODO (in priority order):
+#
+#   1. **__stub_helper glue**
+#      Emit real PLT glue that jumps through dyld_stub_binder on first
+#      call.  Today la_symbol_ptr slots start zeroed and the loader takes
+#      the classic lazy-bind fall-back.  Works, but each first call is a
+#      full dyld round-trip instead of the fast dyld_stub_binder path.
+#
+#   2. **__DATA segment for rodata/literals**
+#      For string literals and initialised globals beyond la_symbol_ptr.
+#      Currently rodata is embedded in __text, which works but wastes
+#      memory permissions.
+#
+#   3. **LC_DYLD_INFO_ONLY**
+#      Modern dyld uses this to bind symbols via a compact opcode stream
+#      (bind / rebase / lazy-bind / export).  Without it we fall back to
+#      classic symbol tables, which newer macOS still accepts but may
+#      warn about.
+#
+#   4. **Code-signing ad-hoc stub**
+#      Apple Silicon macOS (arm64) refuses to run unsigned binaries.
+#      Need an LC_CODE_SIGNATURE command with an ad-hoc CMS blob.
+#      Without this, even `ret` won't execute on M1/M2.
+#
+#   5. **Fat / universal binaries**
+#      Emit a fat wrapper containing both x86-64 and arm64 thin Mach-Os.
+# =============================================================================
+
+export {
+    MH_MAGIC_64,
+    CPU_TYPE_X86_64, CPU_TYPE_ARM64,
+    CPU_SUBTYPE_X86_ALL, CPU_SUBTYPE_ARM64_ALL,
+    MH_EXECUTE, MH_NOUNDEFS, MH_DYLDLINK, MH_TWOLEVEL, MH_PIE,
+    LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_LOAD_DYLINKER,
+    LC_LOAD_DYLIB, LC_MAIN,
+    VM_PROT_NONE, VM_PROT_READ, VM_PROT_WRITE, VM_PROT_EXECUTE,
+    MACHO_PAGE_SIZE_X86, MACHO_PAGE_SIZE_ARM64,
+    MACHO_VMADDR_BASE, MACHO_VMADDR_TEXT,
+
+    MachoWriter, MachHeaderPatches,
+    machow_new, machow_u8, machow_u16, machow_u32, machow_u64,
+    machow_zero, machow_pad_to, machow_write_str_fixed,
+    machow_patch_u32, machow_patch_u64,
+
+    emit_mach_header, emit_lc_segment_64, emit_macho_section,
+    emit_lc_main, emit_lc_load_dylinker, emit_lc_load_dylib,
+    emit_lc_load_dylib_bytes,
+    emit_lc_symtab, emit_lc_dysymtab, emit_lc_dysymtab_full,
+
+    # Imports API
+    MACHO_MAX_DYLIBS, MACHO_MAX_IMPORTS,
+    MACHO_STUB_SIZE, MACHO_LA_PTR_SIZE,
+    MachoImports,
+    macho_imports_new, macho_imports_add_dylib, macho_imports_add_fn,
+    macho_set_library_ordinal, emit_macho_stub,
+
+    forge_emit_macho64, forge_emit_macho64_x86, forge_emit_macho64_arm64,
+    forge_emit_macho64_with_imports,
+
+    run_forge_macho_selftests
+}

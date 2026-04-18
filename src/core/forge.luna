@@ -1,0 +1,1353 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Forge — Native Machine-Code Emitter (v4.3, phase L1)
+# =============================================================================
+# "The forge is where Luna hammers raw intent into bytes the CPU will run."
+#
+# Forge replaces LLVM and Cranelift in the Luna compilation pipeline.  Given
+# a Titan-optimised AST + type information, forge emits actual x86-64 (and
+# eventually ARM64) machine code, plus the surrounding PE / ELF / Mach-O
+# container.  Nothing else in the Luna toolchain calls out to a foreign
+# backend — this file is the floor.
+#
+# # Scope of this file
+#
+# forge.luna owns:
+#   1. x86-64 instruction *encoding*  — REX / ModR/M / SIB / immediates
+#   2. A small IR in flat array form (`ForgeInstr`) that the AST lowerer
+#      hands us
+#   3. High-level `emit_*` helpers the lowerer actually calls
+#   4. A relocation table so PE/ELF builders can patch symbol addresses
+#
+# Sister files:
+#   * src/core/forge_pe.luna   — Windows PE64 container + IAT
+#   * src/core/forge_elf.luna  — Linux ELF64 + dynamic section
+#   * src/core/forge_macho.luna — macOS Mach-O (stub)
+#   * src/core/forge_arm64.luna — AArch64 instruction encoding (stub)
+#
+# # What this file is NOT
+#
+# It is not a register allocator (lives in src/core/titan_opt.luna later),
+# not a linker (forge emits already-placed code), not an optimiser.  It
+# takes a pre-lowered instruction stream and turns it into bytes.
+#
+# # Status
+#
+# Version 0.1 — covers roughly 40 instructions needed for "hello world +
+# a function call + a loop + an FFI call".  Enough to bootstrap the rest
+# of Luna.  Each instruction family has a TODO note where the remaining
+# encodings live.
+# =============================================================================
+
+# =============================================================================
+# SECTION 1 — REGISTERS
+# =============================================================================
+# Canonical x86-64 GP register enumeration.  Numbers match the encoding the
+# CPU expects (0..7 for the legacy set, 8..15 for the REX-extended set).
+
+const REG_RAX: int = 0
+const REG_RCX: int = 1
+const REG_RDX: int = 2
+const REG_RBX: int = 3
+const REG_RSP: int = 4
+const REG_RBP: int = 5
+const REG_RSI: int = 6
+const REG_RDI: int = 7
+const REG_R8:  int = 8
+const REG_R9:  int = 9
+const REG_R10: int = 10
+const REG_R11: int = 11
+const REG_R12: int = 12
+const REG_R13: int = 13
+const REG_R14: int = 14
+const REG_R15: int = 15
+
+# =============================================================================
+# SECTION 2 — OPERAND SIZES
+# =============================================================================
+
+const SIZE_8:  int = 1
+const SIZE_16: int = 2
+const SIZE_32: int = 4
+const SIZE_64: int = 8
+
+# =============================================================================
+# SECTION 3 — CONDITION CODES (for Jcc / SETcc)
+# =============================================================================
+
+const CC_O:  int = 0x0    # overflow
+const CC_NO: int = 0x1
+const CC_B:  int = 0x2    # below / unsigned <
+const CC_AE: int = 0x3
+const CC_E:  int = 0x4    # equal
+const CC_NE: int = 0x5
+const CC_BE: int = 0x6    # unsigned <=
+const CC_A:  int = 0x7
+const CC_S:  int = 0x8    # sign
+const CC_NS: int = 0x9
+const CC_P:  int = 0xA    # parity
+const CC_NP: int = 0xB
+const CC_L:  int = 0xC    # signed <
+const CC_GE: int = 0xD
+const CC_LE: int = 0xE
+const CC_G:  int = 0xF    # signed >
+
+# =============================================================================
+# SECTION 4 — FORGE STATE
+# =============================================================================
+# The emitter streams bytes into a monotonically-growing buffer.  We also
+# maintain three side arrays that the linker needs later:
+#   * symbols — name + offset for every function we emit
+#   * relocs  — unresolved references (call to foreign symbol, jmp to label)
+#   * labels  — named anchor points inside the code
+
+const FORGE_MAX_CODE:    int = 1048576     # 1 MiB per object (oversized for now)
+const FORGE_MAX_SYMBOLS: int = 4096
+const FORGE_MAX_RELOCS:  int = 16384
+const FORGE_MAX_LABELS:  int = 16384
+
+# Relocation kinds
+const RELOC_ABS64:       int = 1           # 8-byte absolute address
+const RELOC_PC32:        int = 2           # 4-byte PC-relative (call/jmp)
+const RELOC_PLT32:       int = 3           # PLT entry (ELF)
+const RELOC_IAT32:       int = 4           # PE IAT slot (Windows import)
+const RELOC_GOT32:       int = 5           # GOT entry (ELF shared)
+
+struct ForgeSymbol
+    name_start: int     # offset into source string for the name
+    name_len:   int
+    offset:     int     # byte offset in code buffer
+    is_extern:  int     # 1 = external (lives in another DLL/SO)
+    abi:        int     # 0=C, 1=stdcall, 2=linux_syscall, 3=macho_syscall
+
+struct ForgeReloc
+    at_offset:  int     # byte offset in code buffer where patch goes
+    kind:       int     # RELOC_*
+    symbol_idx: int     # index into symbols[]
+    addend:     int
+
+struct ForgeLabel
+    name_start: int
+    name_len:   int
+    offset:     int     # -1 if unresolved
+
+struct Forge
+    code:         [int; 1048576]
+    code_len:     int
+
+    symbols:      [ForgeSymbol; 4096]
+    symbol_count: int
+
+    relocs:       [ForgeReloc; 16384]
+    reloc_count:  int
+
+    labels:       [ForgeLabel; 16384]
+    label_count:  int
+
+    current_fn:   int     # index into symbols[] of the function being emitted, -1 if none
+    errors:       int     # bumped on any encoding failure
+
+fn forge_new() -> Forge
+    return Forge {
+        code: [0; 1048576],
+        code_len: 0,
+        symbols: [ForgeSymbol { name_start: 0, name_len: 0, offset: 0, is_extern: 0, abi: 0 }; 4096],
+        symbol_count: 0,
+        relocs: [ForgeReloc { at_offset: 0, kind: 0, symbol_idx: 0, addend: 0 }; 16384],
+        reloc_count: 0,
+        labels: [ForgeLabel { name_start: 0, name_len: 0, offset: -1 }; 16384],
+        label_count: 0,
+        current_fn: -1,
+        errors: 0
+    }
+
+# =============================================================================
+# SECTION 5 — BYTE EMITTERS
+# =============================================================================
+# All encoding boils down to putting bytes into the code buffer.
+
+#[inline]
+fn emit_u8(@f: Forge, @b: int)
+    if @f.code_len >= FORGE_MAX_CODE
+        @f.errors = @f.errors + 1
+        return
+    @f.code[@f.code_len] = @b & 0xFF
+    @f.code_len = @f.code_len + 1
+
+#[inline]
+fn emit_u16(@f: Forge, @v: int)
+    emit_u8(@f, @v & 0xFF)
+    emit_u8(@f, (@v >> 8) & 0xFF)
+
+#[inline]
+fn emit_u32(@f: Forge, @v: int)
+    emit_u8(@f, @v & 0xFF)
+    emit_u8(@f, (@v >> 8) & 0xFF)
+    emit_u8(@f, (@v >> 16) & 0xFF)
+    emit_u8(@f, (@v >> 24) & 0xFF)
+
+#[inline]
+fn emit_u64(@f: Forge, @v: int)
+    emit_u32(@f, @v & 0xFFFFFFFF)
+    emit_u32(@f, (@v >> 32) & 0xFFFFFFFF)
+
+# =============================================================================
+# SECTION 6 — REX PREFIX
+# =============================================================================
+# REX = 0100 W R X B
+#   W = operand size 64 when 1
+#   R = extends ModR/M.reg
+#   X = extends SIB.index
+#   B = extends ModR/M.rm / opcode reg
+# Emit only when non-zero — a bare 0x40 prefix is legal but bloats code.
+
+fn rex_for(@w: int, @reg: int, @rm: int, @index: int) -> int
+    @rex = 0x40
+    if @w != 0
+        @rex = @rex | 0x08
+    if @reg >= 8
+        @rex = @rex | 0x04
+    if @index >= 8
+        @rex = @rex | 0x02
+    if @rm >= 8
+        @rex = @rex | 0x01
+    return @rex
+
+fn emit_rex(@f: Forge, @w: int, @reg: int, @rm: int, @index: int)
+    @rex = rex_for(@w, @reg, @rm, @index)
+    # Emit only if any extension bit is set or we need 64-bit operand
+    if @rex != 0x40
+        emit_u8(@f, @rex)
+
+# =============================================================================
+# SECTION 7 — ModR/M and SIB
+# =============================================================================
+# ModR/M = mod(2) reg(3) rm(3)
+#   mod = 00 (indirect, no disp), 01 (indirect +disp8), 10 (indirect +disp32), 11 (register direct)
+# When rm = 100 (RSP/R12 low-3-bits) and mod != 11, a SIB byte follows.
+# When rm = 101 (RBP/R13) and mod = 00, disp32 follows with no base register.
+
+#[inline]
+fn modrm(@mod: int, @reg: int, @rm: int) -> int
+    return ((@mod & 3) << 6) | ((@reg & 7) << 3) | (@rm & 7)
+
+#[inline]
+fn sib(@scale: int, @index: int, @base: int) -> int
+    return ((@scale & 3) << 6) | ((@index & 7) << 3) | (@base & 7)
+
+# =============================================================================
+# SECTION 8 — HIGH-LEVEL INSTRUCTION EMITTERS
+# =============================================================================
+# These are the functions the AST lowerer actually calls.  Each follows
+# the same pattern: emit prefix, opcode, ModR/M, optional SIB+disp+imm.
+
+# mov dst_reg, imm64
+# REX.W + B8+rd io
+fn emit_mov_reg_imm64(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xB8 + (@dst & 7))
+    emit_u64(@f, @imm)
+
+# mov dst_reg, src_reg (both 64-bit)
+# REX.W + 89 /r
+fn emit_mov_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @src, @dst, 0)
+    emit_u8(@f, 0x89)
+    emit_u8(@f, modrm(3, @src, @dst))
+
+# mov [base + disp32], src_reg  (64-bit)
+# REX.W + 89 /r
+fn emit_mov_mem_reg(@f: Forge, @base: int, @disp: int, @src: int)
+    emit_rex(@f, 1, @src, @base, 0)
+    emit_u8(@f, 0x89)
+    @base7 = @base & 7
+    if @base7 == 4  # RSP/R12 — need SIB
+        emit_u8(@f, modrm(2, @src, 4))
+        emit_u8(@f, sib(0, 4, @base7))
+        emit_u32(@f, @disp)
+    else
+        emit_u8(@f, modrm(2, @src, @base7))
+        emit_u32(@f, @disp)
+
+# mov dst_reg, [base + disp32]  (64-bit)
+# REX.W + 8B /r
+fn emit_mov_reg_mem(@f: Forge, @dst: int, @base: int, @disp: int)
+    emit_rex(@f, 1, @dst, @base, 0)
+    emit_u8(@f, 0x8B)
+    @base7 = @base & 7
+    if @base7 == 4
+        emit_u8(@f, modrm(2, @dst, 4))
+        emit_u8(@f, sib(0, 4, @base7))
+        emit_u32(@f, @disp)
+    else
+        emit_u8(@f, modrm(2, @dst, @base7))
+        emit_u32(@f, @disp)
+
+# add dst_reg, src_reg (64-bit)
+# REX.W + 01 /r
+fn emit_add_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @src, @dst, 0)
+    emit_u8(@f, 0x01)
+    emit_u8(@f, modrm(3, @src, @dst))
+
+# add dst_reg, imm32 (sign-extended to 64)
+# REX.W + 81 /0 id
+fn emit_add_reg_imm32(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x81)
+    emit_u8(@f, modrm(3, 0, @dst))
+    emit_u32(@f, @imm)
+
+# sub dst_reg, src_reg
+# REX.W + 29 /r
+fn emit_sub_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @src, @dst, 0)
+    emit_u8(@f, 0x29)
+    emit_u8(@f, modrm(3, @src, @dst))
+
+# sub dst_reg, imm32
+# REX.W + 81 /5 id
+fn emit_sub_reg_imm32(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x81)
+    emit_u8(@f, modrm(3, 5, @dst))
+    emit_u32(@f, @imm)
+
+# imul dst_reg, src_reg   (signed 64x64)
+# REX.W + 0F AF /r
+fn emit_imul_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @dst, @src, 0)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0xAF)
+    emit_u8(@f, modrm(3, @dst, @src))
+
+# cmp dst_reg, src_reg
+# REX.W + 39 /r
+fn emit_cmp_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @src, @dst, 0)
+    emit_u8(@f, 0x39)
+    emit_u8(@f, modrm(3, @src, @dst))
+
+# cmp reg, imm32
+# REX.W + 81 /7 id
+fn emit_cmp_reg_imm32(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x81)
+    emit_u8(@f, modrm(3, 7, @dst))
+    emit_u32(@f, @imm)
+
+# xor dst_reg, src_reg — the idiomatic zero-reg trick
+# REX.W + 31 /r
+fn emit_xor_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @src, @dst, 0)
+    emit_u8(@f, 0x31)
+    emit_u8(@f, modrm(3, @src, @dst))
+
+# push reg64
+# 50+rd (no REX.W needed; REX.B if reg >= 8)
+fn emit_push_reg(@f: Forge, @reg: int)
+    if @reg >= 8
+        emit_u8(@f, 0x41)   # REX.B
+    emit_u8(@f, 0x50 + (@reg & 7))
+
+# pop reg64
+fn emit_pop_reg(@f: Forge, @reg: int)
+    if @reg >= 8
+        emit_u8(@f, 0x41)
+    emit_u8(@f, 0x58 + (@reg & 7))
+
+# ret — near, no immediate
+fn emit_ret(@f: Forge)
+    emit_u8(@f, 0xC3)
+
+# syscall
+fn emit_syscall(@f: Forge)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x05)
+
+# nop
+fn emit_nop(@f: Forge)
+    emit_u8(@f, 0x90)
+
+# int3 — software breakpoint, handy for unresolved placeholders during bring-up
+fn emit_int3(@f: Forge)
+    emit_u8(@f, 0xCC)
+
+# jmp rel32 (near, PC-relative, 32-bit displacement)
+# E9 cd — returns offset of the displacement so callers can back-patch.
+fn emit_jmp_rel32(@f: Forge, @disp: int) -> int
+    emit_u8(@f, 0xE9)
+    @at = @f.code_len
+    emit_u32(@f, @disp)
+    return @at
+
+# jcc rel32 — conditional branch, 6-byte form (0F 8x cd)
+fn emit_jcc_rel32(@f: Forge, @cc: int, @disp: int) -> int
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x80 + (@cc & 0xF))
+    @at = @f.code_len
+    emit_u32(@f, @disp)
+    return @at
+
+# call rel32 — E8 cd, returns displacement offset so the linker can patch it
+fn emit_call_rel32(@f: Forge, @disp: int) -> int
+    emit_u8(@f, 0xE8)
+    @at = @f.code_len
+    emit_u32(@f, @disp)
+    return @at
+
+# call [rip + disp32] — indirect through a pointer (used for PE IAT and ELF GOT)
+# FF 15 cd
+fn emit_call_rip_rel(@f: Forge, @disp: int) -> int
+    emit_u8(@f, 0xFF)
+    emit_u8(@f, 0x15)
+    @at = @f.code_len
+    emit_u32(@f, @disp)
+    return @at
+
+# lea reg, [rip + disp32]  — REX.W + 8D /r with ModR/M = 00 reg 101
+fn emit_lea_reg_rip(@f: Forge, @dst: int, @disp: int) -> int
+    emit_rex(@f, 1, @dst, 0, 0)
+    emit_u8(@f, 0x8D)
+    emit_u8(@f, modrm(0, @dst & 7, 5))
+    @at = @f.code_len
+    emit_u32(@f, @disp)
+    return @at
+
+# =============================================================================
+# SECTION 8.1 — SHORT-FORM IMMEDIATE ENCODINGS (imm8 sign-extended)
+# =============================================================================
+# For any add/sub/cmp/and/or with a constant that fits in a signed byte, the
+# CPU has a 2-byte-shorter encoding (0x83 /op ib) vs. the 7-byte 0x81 /op id
+# form.  The lowerer is expected to pick this form whenever -128 <= imm <= 127.
+
+# add reg, imm8   — REX.W + 83 /0 ib
+fn emit_add_reg_imm8(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x83)
+    emit_u8(@f, modrm(3, 0, @dst))
+    emit_u8(@f, @imm & 0xFF)
+
+# sub reg, imm8   — REX.W + 83 /5 ib
+fn emit_sub_reg_imm8(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x83)
+    emit_u8(@f, modrm(3, 5, @dst))
+    emit_u8(@f, @imm & 0xFF)
+
+# cmp reg, imm8   — REX.W + 83 /7 ib
+fn emit_cmp_reg_imm8(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x83)
+    emit_u8(@f, modrm(3, 7, @dst))
+    emit_u8(@f, @imm & 0xFF)
+
+# and reg, imm8   — REX.W + 83 /4 ib
+fn emit_and_reg_imm8(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x83)
+    emit_u8(@f, modrm(3, 4, @dst))
+    emit_u8(@f, @imm & 0xFF)
+
+# or reg, imm8    — REX.W + 83 /1 ib
+fn emit_or_reg_imm8(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x83)
+    emit_u8(@f, modrm(3, 1, @dst))
+    emit_u8(@f, @imm & 0xFF)
+
+# mov reg, imm32 (sign-extended to 64) — REX.W + C7 /0 id
+# 7 bytes vs. 10 for mov reg,imm64 — the lowerer should use this when the
+# constant fits in a signed 32-bit value.
+fn emit_mov_reg_imm32(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xC7)
+    emit_u8(@f, modrm(3, 0, @dst))
+    emit_u32(@f, @imm)
+
+# =============================================================================
+# SECTION 8.2 — LOGICAL OPERATIONS
+# =============================================================================
+# Full register forms for and/or/test and the unary not/neg.  The imm32 forms
+# mirror the existing add_reg_imm32 / sub_reg_imm32 pattern.
+
+# and dst, src    — REX.W + 21 /r
+fn emit_and_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @src, @dst, 0)
+    emit_u8(@f, 0x21)
+    emit_u8(@f, modrm(3, @src, @dst))
+
+# or dst, src     — REX.W + 09 /r
+fn emit_or_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @src, @dst, 0)
+    emit_u8(@f, 0x09)
+    emit_u8(@f, modrm(3, @src, @dst))
+
+# and reg, imm32  — REX.W + 81 /4 id
+fn emit_and_reg_imm32(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x81)
+    emit_u8(@f, modrm(3, 4, @dst))
+    emit_u32(@f, @imm)
+
+# or reg, imm32   — REX.W + 81 /1 id
+fn emit_or_reg_imm32(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0x81)
+    emit_u8(@f, modrm(3, 1, @dst))
+    emit_u32(@f, @imm)
+
+# test dst, src   — REX.W + 85 /r (sets flags from dst AND src, no write)
+fn emit_test_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @src, @dst, 0)
+    emit_u8(@f, 0x85)
+    emit_u8(@f, modrm(3, @src, @dst))
+
+# not reg         — REX.W + F7 /2
+fn emit_not_reg(@f: Forge, @dst: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xF7)
+    emit_u8(@f, modrm(3, 2, @dst))
+
+# neg reg         — REX.W + F7 /3
+fn emit_neg_reg(@f: Forge, @dst: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xF7)
+    emit_u8(@f, modrm(3, 3, @dst))
+
+# =============================================================================
+# SECTION 8.3 — SHIFT / ROTATE
+# =============================================================================
+# Shift by CL (D3 family) is the most general form — CL supplies the count.
+# Shift by imm8 (C1 family) is used when the count is a constant.  Note that
+# CL is always register REG_RCX; the lowerer must ensure it's free.
+
+# shl reg, cl     — REX.W + D3 /4
+fn emit_shl_reg_cl(@f: Forge, @dst: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xD3)
+    emit_u8(@f, modrm(3, 4, @dst))
+
+# shr reg, cl     — REX.W + D3 /5
+fn emit_shr_reg_cl(@f: Forge, @dst: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xD3)
+    emit_u8(@f, modrm(3, 5, @dst))
+
+# sar reg, cl     — REX.W + D3 /7   (arithmetic: sign-extends)
+fn emit_sar_reg_cl(@f: Forge, @dst: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xD3)
+    emit_u8(@f, modrm(3, 7, @dst))
+
+# shl reg, imm8   — REX.W + C1 /4 ib
+fn emit_shl_reg_imm8(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xC1)
+    emit_u8(@f, modrm(3, 4, @dst))
+    emit_u8(@f, @imm & 0xFF)
+
+# shr reg, imm8   — REX.W + C1 /5 ib
+fn emit_shr_reg_imm8(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xC1)
+    emit_u8(@f, modrm(3, 5, @dst))
+    emit_u8(@f, @imm & 0xFF)
+
+# sar reg, imm8   — REX.W + C1 /7 ib
+fn emit_sar_reg_imm8(@f: Forge, @dst: int, @imm: int)
+    emit_rex(@f, 1, 0, @dst, 0)
+    emit_u8(@f, 0xC1)
+    emit_u8(@f, modrm(3, 7, @dst))
+    emit_u8(@f, @imm & 0xFF)
+
+# =============================================================================
+# SECTION 8.4 — INTEGER DIVIDE / MULTIPLY (RDX:RAX ← RAX / src)
+# =============================================================================
+# DIV / IDIV use the implicit register pair RDX:RAX as the dividend; quotient
+# goes to RAX, remainder to RDX.  For signed IDIV you must first sign-extend
+# RAX into RDX via CQO (REX.W + 99) — NOT CDQ, which only touches EDX:EAX.
+
+# idiv reg        — REX.W + F7 /7   (signed divide)
+fn emit_idiv_reg(@f: Forge, @divisor: int)
+    emit_rex(@f, 1, 0, @divisor, 0)
+    emit_u8(@f, 0xF7)
+    emit_u8(@f, modrm(3, 7, @divisor))
+
+# div reg         — REX.W + F7 /6   (unsigned divide)
+fn emit_div_reg(@f: Forge, @divisor: int)
+    emit_rex(@f, 1, 0, @divisor, 0)
+    emit_u8(@f, 0xF7)
+    emit_u8(@f, modrm(3, 6, @divisor))
+
+# cdq             — 99   (sign-extend EAX into EDX:EAX, 32-bit)
+fn emit_cdq(@f: Forge)
+    emit_u8(@f, 0x99)
+
+# cqo             — REX.W + 99   (sign-extend RAX into RDX:RAX, 64-bit)
+fn emit_cqo(@f: Forge)
+    emit_u8(@f, 0x48)
+    emit_u8(@f, 0x99)
+
+# =============================================================================
+# SECTION 8.5 — SSE2 SCALAR DOUBLES (f64)
+# =============================================================================
+# XMM registers mirror GP numbering: XMM0..XMM7 in the low 3 bits, XMM8..XMM15
+# need REX.R/REX.B just like r8..r15.  Scalar double encodings use F2 as the
+# mandatory prefix, followed by 0F + opcode.  Note: UCOMISD uses 66 (not F2)
+# because it operates on the low packed double of a packed-compare form.
+#
+# All scalar-double ops take dst_xmm, src_xmm.  For memory forms we provide
+# load (10) / store (11) pairs; the rest operate XMM-to-XMM.
+
+const REG_XMM0:  int = 0
+const REG_XMM1:  int = 1
+const REG_XMM2:  int = 2
+const REG_XMM3:  int = 3
+const REG_XMM4:  int = 4
+const REG_XMM5:  int = 5
+const REG_XMM6:  int = 6
+const REG_XMM7:  int = 7
+const REG_XMM8:  int = 8
+const REG_XMM9:  int = 9
+const REG_XMM10: int = 10
+const REG_XMM11: int = 11
+const REG_XMM12: int = 12
+const REG_XMM13: int = 13
+const REG_XMM14: int = 14
+const REG_XMM15: int = 15
+
+# REX prefix for XMM ops — same bit semantics as rex_for but we emit only
+# when any extension bit is needed.  @w=1 forces REX.W (for cvtsi2sd with
+# a 64-bit GP source, for example).
+fn emit_rex_xmm(@f: Forge, @w: int, @reg_xmm: int, @rm_xmm: int)
+    @rex = 0x40
+    if @w != 0
+        @rex = @rex | 0x08
+    if @reg_xmm >= 8
+        @rex = @rex | 0x04
+    if @rm_xmm >= 8
+        @rex = @rex | 0x01
+    if @rex != 0x40
+        emit_u8(@f, @rex)
+
+# movsd xmm_dst, xmm_src   — F2 0F 10 /r   (load form, xmm ← xmm)
+fn emit_movsd_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_u8(@f, 0xF2)
+    emit_rex_xmm(@f, 0, @dst, @src)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x10)
+    emit_u8(@f, modrm(3, @dst, @src))
+
+# movsd xmm_dst, [base + disp32]   — F2 0F 10 /r
+fn emit_movsd_reg_mem(@f: Forge, @dst: int, @base: int, @disp: int)
+    emit_u8(@f, 0xF2)
+    emit_rex_xmm(@f, 0, @dst, @base)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x10)
+    @base7 = @base & 7
+    if @base7 == 4
+        emit_u8(@f, modrm(2, @dst, 4))
+        emit_u8(@f, sib(0, 4, @base7))
+        emit_u32(@f, @disp)
+    else
+        emit_u8(@f, modrm(2, @dst, @base7))
+        emit_u32(@f, @disp)
+
+# movsd [base + disp32], xmm_src   — F2 0F 11 /r
+fn emit_movsd_mem_reg(@f: Forge, @base: int, @disp: int, @src: int)
+    emit_u8(@f, 0xF2)
+    emit_rex_xmm(@f, 0, @src, @base)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x11)
+    @base7 = @base & 7
+    if @base7 == 4
+        emit_u8(@f, modrm(2, @src, 4))
+        emit_u8(@f, sib(0, 4, @base7))
+        emit_u32(@f, @disp)
+    else
+        emit_u8(@f, modrm(2, @src, @base7))
+        emit_u32(@f, @disp)
+
+# addsd xmm_dst, xmm_src   — F2 0F 58 /r
+fn emit_addsd(@f: Forge, @dst: int, @src: int)
+    emit_u8(@f, 0xF2)
+    emit_rex_xmm(@f, 0, @dst, @src)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x58)
+    emit_u8(@f, modrm(3, @dst, @src))
+
+# subsd xmm_dst, xmm_src   — F2 0F 5C /r
+fn emit_subsd(@f: Forge, @dst: int, @src: int)
+    emit_u8(@f, 0xF2)
+    emit_rex_xmm(@f, 0, @dst, @src)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x5C)
+    emit_u8(@f, modrm(3, @dst, @src))
+
+# mulsd xmm_dst, xmm_src   — F2 0F 59 /r
+fn emit_mulsd(@f: Forge, @dst: int, @src: int)
+    emit_u8(@f, 0xF2)
+    emit_rex_xmm(@f, 0, @dst, @src)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x59)
+    emit_u8(@f, modrm(3, @dst, @src))
+
+# divsd xmm_dst, xmm_src   — F2 0F 5E /r
+fn emit_divsd(@f: Forge, @dst: int, @src: int)
+    emit_u8(@f, 0xF2)
+    emit_rex_xmm(@f, 0, @dst, @src)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x5E)
+    emit_u8(@f, modrm(3, @dst, @src))
+
+# ucomisd xmm_dst, xmm_src — 66 0F 2E /r   (sets EFLAGS from comparison)
+fn emit_ucomisd(@f: Forge, @dst: int, @src: int)
+    emit_u8(@f, 0x66)
+    emit_rex_xmm(@f, 0, @dst, @src)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x2E)
+    emit_u8(@f, modrm(3, @dst, @src))
+
+# cvtsi2sd xmm_dst, gp_src — F2 REX.W 0F 2A /r   (int64 → double)
+fn emit_cvtsi2sd(@f: Forge, @dst_xmm: int, @src_reg: int)
+    emit_u8(@f, 0xF2)
+    emit_rex_xmm(@f, 1, @dst_xmm, @src_reg)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x2A)
+    emit_u8(@f, modrm(3, @dst_xmm, @src_reg))
+
+# cvttsd2si gp_dst, xmm_src — F2 REX.W 0F 2C /r   (double → int64, truncation)
+fn emit_cvttsd2si(@f: Forge, @dst_reg: int, @src_xmm: int)
+    emit_u8(@f, 0xF2)
+    emit_rex_xmm(@f, 1, @dst_reg, @src_xmm)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0x2C)
+    emit_u8(@f, modrm(3, @dst_reg, @src_xmm))
+
+# =============================================================================
+# SECTION 8.6 — ATOMICS (LOCK prefix + fences)
+# =============================================================================
+# Needed by src/core/sync.luna for Mutex / Atomic<T> primitives.  The LOCK
+# prefix (F0) is legal only on a specific subset of RMW instructions; we wrap
+# just those here.  XCHG with memory is implicitly locked — no F0 needed —
+# but the reg-reg form is a plain swap with no atomicity.
+#
+# MFENCE / LFENCE / SFENCE / PAUSE are prefix-free standalone opcodes from
+# the 0F AE group (plus F3 90 for PAUSE).
+
+# lock cmpxchg [base + disp32], src   — F0 REX.W 0F B1 /r
+# If RAX == [mem], [mem] = src (ZF=1); else RAX = [mem] (ZF=0).
+fn emit_lock_cmpxchg_mem_reg(@f: Forge, @base: int, @disp: int, @src: int)
+    emit_u8(@f, 0xF0)                    # LOCK prefix
+    emit_rex(@f, 1, @src, @base, 0)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0xB1)
+    @base7 = @base & 7
+    if @base7 == 4
+        emit_u8(@f, modrm(2, @src, 4))
+        emit_u8(@f, sib(0, 4, @base7))
+        emit_u32(@f, @disp)
+    else
+        emit_u8(@f, modrm(2, @src, @base7))
+        emit_u32(@f, @disp)
+
+# lock xadd [base + disp32], src   — F0 REX.W 0F C1 /r
+# Atomic fetch-and-add: TMP = [mem]+src; [mem]=TMP; src=old_mem_value.
+fn emit_lock_xadd_mem_reg(@f: Forge, @base: int, @disp: int, @src: int)
+    emit_u8(@f, 0xF0)
+    emit_rex(@f, 1, @src, @base, 0)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0xC1)
+    @base7 = @base & 7
+    if @base7 == 4
+        emit_u8(@f, modrm(2, @src, 4))
+        emit_u8(@f, sib(0, 4, @base7))
+        emit_u32(@f, @disp)
+    else
+        emit_u8(@f, modrm(2, @src, @base7))
+        emit_u32(@f, @disp)
+
+# xchg dst, src   — REX.W + 87 /r   (reg-reg swap; not atomic w/o memory)
+fn emit_xchg_reg_reg(@f: Forge, @dst: int, @src: int)
+    emit_rex(@f, 1, @src, @dst, 0)
+    emit_u8(@f, 0x87)
+    emit_u8(@f, modrm(3, @src, @dst))
+
+# mfence          — 0F AE F0   (full memory fence)
+fn emit_mfence(@f: Forge)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0xAE)
+    emit_u8(@f, 0xF0)
+
+# lfence          — 0F AE E8   (load fence)
+fn emit_lfence(@f: Forge)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0xAE)
+    emit_u8(@f, 0xE8)
+
+# sfence          — 0F AE F8   (store fence)
+fn emit_sfence(@f: Forge)
+    emit_u8(@f, 0x0F)
+    emit_u8(@f, 0xAE)
+    emit_u8(@f, 0xF8)
+
+# pause           — F3 90   (spin-loop hint; rep-prefix on top of NOP)
+fn emit_pause(@f: Forge)
+    emit_u8(@f, 0xF3)
+    emit_u8(@f, 0x90)
+
+# =============================================================================
+# SECTION 8.7 — INDEXED MEMORY ADDRESSING ([base + index*scale + disp32])
+# =============================================================================
+# Array indexing is the most common addressing form missing from §8.  These
+# emit the full SIB byte so the lowerer can do `table[i]` with one
+# instruction.  `scale` is the encoded log value: 0 → *1, 1 → *2, 2 → *4,
+# 3 → *8.
+#
+# Caveat: when base low-3-bits == 5 (RBP/R13) with mod=00, the CPU would
+# interpret it as "no base, 32-bit absolute disp".  We always use mod=10
+# (disp32) here, sidestepping that edge case.
+
+# mov dst, [base + index*scale + disp32]   — REX.W + 8B /r with SIB
+fn emit_mov_reg_mem_indexed(@f: Forge, @dst: int, @base: int, @index: int, @scale: int, @disp: int)
+    emit_rex(@f, 1, @dst, @base, @index)
+    emit_u8(@f, 0x8B)
+    emit_u8(@f, modrm(2, @dst, 4))       # rm=4 signals "SIB follows"
+    emit_u8(@f, sib(@scale, @index, @base))
+    emit_u32(@f, @disp)
+
+# mov [base + index*scale + disp32], src   — REX.W + 89 /r with SIB
+fn emit_mov_mem_indexed_reg(@f: Forge, @base: int, @index: int, @scale: int, @disp: int, @src: int)
+    emit_rex(@f, 1, @src, @base, @index)
+    emit_u8(@f, 0x89)
+    emit_u8(@f, modrm(2, @src, 4))
+    emit_u8(@f, sib(@scale, @index, @base))
+    emit_u32(@f, @disp)
+
+# =============================================================================
+# SECTION 9 — SYMBOL & RELOCATION HELPERS
+# =============================================================================
+
+# Define a new symbol at the current code offset.  Returns its index.
+fn forge_define_symbol(@f: Forge, @name_start: int, @name_len: int) -> int
+    if @f.symbol_count >= FORGE_MAX_SYMBOLS
+        @f.errors = @f.errors + 1
+        return -1
+    @idx = @f.symbol_count
+    @f.symbols[@idx] = ForgeSymbol {
+        name_start: @name_start,
+        name_len: @name_len,
+        offset: @f.code_len,
+        is_extern: 0,
+        abi: 0
+    }
+    @f.symbol_count = @f.symbol_count + 1
+    return @idx
+
+# Declare an external symbol (to be linked later).  abi is one of the
+# AETHER platform ABIs: 0=C, 1=stdcall, 2=linux_syscall, 3=macho_syscall.
+fn forge_extern_symbol(@f: Forge, @name_start: int, @name_len: int, @abi: int) -> int
+    if @f.symbol_count >= FORGE_MAX_SYMBOLS
+        @f.errors = @f.errors + 1
+        return -1
+    @idx = @f.symbol_count
+    @f.symbols[@idx] = ForgeSymbol {
+        name_start: @name_start,
+        name_len: @name_len,
+        offset: 0,
+        is_extern: 1,
+        abi: @abi
+    }
+    @f.symbol_count = @f.symbol_count + 1
+    return @idx
+
+# Add a relocation at @at_offset pointing to @symbol_idx.
+fn forge_add_reloc(@f: Forge, @at_offset: int, @kind: int, @symbol_idx: int, @addend: int)
+    if @f.reloc_count >= FORGE_MAX_RELOCS
+        @f.errors = @f.errors + 1
+        return
+    @f.relocs[@f.reloc_count] = ForgeReloc {
+        at_offset: @at_offset,
+        kind: @kind,
+        symbol_idx: @symbol_idx,
+        addend: @addend
+    }
+    @f.reloc_count = @f.reloc_count + 1
+
+# Emit a call to an external function.  Generates either a PC-relative call
+# (when the linker can fix up PLT/IAT entries) or an indirect call through
+# a pointer slot for PE-style imports.
+fn emit_call_extern(@f: Forge, @symbol_idx: int)
+    if @symbol_idx < 0
+        @f.errors = @f.errors + 1
+        return
+    @sym = @f.symbols[@symbol_idx]
+    if @sym.abi == 1  # stdcall (Windows) — use indirect call via IAT
+        @at = emit_call_rip_rel(@f, 0)
+        forge_add_reloc(@f, @at, RELOC_IAT32, @symbol_idx, -4)
+    else
+        @at = emit_call_rel32(@f, 0)
+        forge_add_reloc(@f, @at, RELOC_PC32, @symbol_idx, -4)
+
+# Linux syscall marker: the lowerer sets syscall number in rax then calls this.
+fn emit_linux_syscall(@f: Forge)
+    emit_syscall(@f)
+
+# =============================================================================
+# SECTION 10 — LABELS
+# =============================================================================
+
+fn forge_label_new(@f: Forge, @name_start: int, @name_len: int) -> int
+    if @f.label_count >= FORGE_MAX_LABELS
+        @f.errors = @f.errors + 1
+        return -1
+    @idx = @f.label_count
+    @f.labels[@idx] = ForgeLabel {
+        name_start: @name_start,
+        name_len: @name_len,
+        offset: -1
+    }
+    @f.label_count = @f.label_count + 1
+    return @idx
+
+fn forge_label_bind(@f: Forge, @label_idx: int)
+    if @label_idx < 0 or @label_idx >= @f.label_count
+        return
+    @f.labels[@label_idx].offset = @f.code_len
+
+# Back-patch a 32-bit displacement at @patch_at so that it points to
+# @label_idx.  Useful for forward jumps that were emitted with a 0 displacement.
+fn forge_label_resolve(@f: Forge, @patch_at: int, @label_idx: int)
+    if @label_idx < 0 or @label_idx >= @f.label_count
+        return
+    @target = @f.labels[@label_idx].offset
+    if @target < 0
+        @f.errors = @f.errors + 1   # label never bound
+        return
+    @disp = @target - (@patch_at + 4)    # +4 because rel32 is relative to NEXT instruction
+    @f.code[@patch_at + 0] = @disp & 0xFF
+    @f.code[@patch_at + 1] = (@disp >> 8) & 0xFF
+    @f.code[@patch_at + 2] = (@disp >> 16) & 0xFF
+    @f.code[@patch_at + 3] = (@disp >> 24) & 0xFF
+
+# =============================================================================
+# SECTION 11 — FUNCTION PROLOGUE / EPILOGUE HELPERS
+# =============================================================================
+# Standard System V AMD64 and MS x64 function frames.  These wrap the
+# instruction emitters so the lowerer doesn't have to repeat boilerplate.
+
+fn forge_function_begin(@f: Forge, @name_start: int, @name_len: int, @locals_bytes: int) -> int
+    @sym = forge_define_symbol(@f, @name_start, @name_len)
+    @f.current_fn = @sym
+    # push rbp ; mov rbp, rsp
+    emit_push_reg(@f, REG_RBP)
+    emit_mov_reg_reg(@f, REG_RBP, REG_RSP)
+    # sub rsp, N  (stack frame)
+    if @locals_bytes > 0
+        # Align to 16 for SysV ABI
+        @aligned = (@locals_bytes + 15) & (-16)
+        emit_sub_reg_imm32(@f, REG_RSP, @aligned)
+    return @sym
+
+fn forge_function_end(@f: Forge, @locals_bytes: int)
+    if @locals_bytes > 0
+        @aligned = (@locals_bytes + 15) & (-16)
+        emit_add_reg_imm32(@f, REG_RSP, @aligned)
+    emit_pop_reg(@f, REG_RBP)
+    emit_ret(@f)
+    @f.current_fn = -1
+
+# =============================================================================
+# SECTION 12 — SELF-TEST
+# =============================================================================
+# A couple of sanity checks that exercise the encoder end-to-end.  These emit
+# into a temporary Forge, then verify known byte sequences match the Intel
+# manual's canonical encoding.  Run with `luna --test forge`.
+
+fn forge_selftest_mov_imm() -> int
+    @f = forge_new()
+    emit_mov_reg_imm64(@f, REG_RAX, 0x1122334455667788)
+    # Expect: 48 B8 88 77 66 55 44 33 22 11
+    if @f.code_len != 10
+        return 1
+    if @f.code[0] != 0x48
+        return 2
+    if @f.code[1] != 0xB8
+        return 3
+    if @f.code[2] != 0x88
+        return 4
+    return 0
+
+fn forge_selftest_add() -> int
+    @f = forge_new()
+    emit_add_reg_reg(@f, REG_RAX, REG_RCX)   # 48 01 C8
+    if @f.code_len != 3
+        return 1
+    if @f.code[0] != 0x48 or @f.code[1] != 0x01 or @f.code[2] != 0xC8
+        return 2
+    return 0
+
+fn forge_selftest_call_ret() -> int
+    @f = forge_new()
+    emit_call_rel32(@f, 0)    # E8 00 00 00 00
+    emit_ret(@f)              # C3
+    if @f.code_len != 6
+        return 1
+    if @f.code[0] != 0xE8 or @f.code[5] != 0xC3
+        return 2
+    return 0
+
+fn forge_selftest_syscall() -> int
+    @f = forge_new()
+    # write(1, buf, n) on Linux x86-64:
+    #   mov rax, 1          48 C7 C0 01 00 00 00  — but we use mov reg,imm64 form
+    #   syscall             0F 05
+    emit_mov_reg_imm64(@f, REG_RAX, 1)
+    emit_syscall(@f)
+    # 10 bytes for mov imm64 + 2 bytes syscall = 12
+    if @f.code_len != 12
+        return 1
+    return 0
+
+# --- Short-form immediate ---
+# add rax, 10  →  48 83 C0 0A   (REX.W + 83 /0 ib)
+fn forge_selftest_add_imm8() -> int
+    @f = forge_new()
+    emit_add_reg_imm8(@f, REG_RAX, 10)
+    if @f.code_len != 4
+        return 1
+    if @f.code[0] != 0x48
+        return 2
+    if @f.code[1] != 0x83
+        return 3
+    if @f.code[2] != 0xC0
+        return 4
+    if @f.code[3] != 0x0A
+        return 5
+    return 0
+
+# mov rax, 0x12345678  →  48 C7 C0 78 56 34 12   (REX.W + C7 /0 id)
+fn forge_selftest_mov_imm32() -> int
+    @f = forge_new()
+    emit_mov_reg_imm32(@f, REG_RAX, 0x12345678)
+    if @f.code_len != 7
+        return 1
+    if @f.code[0] != 0x48 or @f.code[1] != 0xC7 or @f.code[2] != 0xC0
+        return 2
+    if @f.code[3] != 0x78 or @f.code[6] != 0x12
+        return 3
+    return 0
+
+# --- Logical ops ---
+# and rax, rcx →  48 21 C8     (REX.W + 21 /r, ModR/M = 11 001 000)
+fn forge_selftest_logical() -> int
+    @f = forge_new()
+    emit_and_reg_reg(@f, REG_RAX, REG_RCX)
+    if @f.code_len != 3
+        return 1
+    if @f.code[0] != 0x48 or @f.code[1] != 0x21 or @f.code[2] != 0xC8
+        return 2
+    # test rax, rax → 48 85 C0
+    @g = forge_new()
+    emit_test_reg_reg(@g, REG_RAX, REG_RAX)
+    if @g.code[0] != 0x48 or @g.code[1] != 0x85 or @g.code[2] != 0xC0
+        return 3
+    # not rax → 48 F7 D0
+    @h = forge_new()
+    emit_not_reg(@h, REG_RAX)
+    if @h.code[0] != 0x48 or @h.code[1] != 0xF7 or @h.code[2] != 0xD0
+        return 4
+    return 0
+
+# --- Shift ---
+# shl rax, 4  →  48 C1 E0 04   (REX.W + C1 /4 ib, ModR/M = 11 100 000)
+fn forge_selftest_shift() -> int
+    @f = forge_new()
+    emit_shl_reg_imm8(@f, REG_RAX, 4)
+    if @f.code_len != 4
+        return 1
+    if @f.code[0] != 0x48 or @f.code[1] != 0xC1 or @f.code[2] != 0xE0 or @f.code[3] != 0x04
+        return 2
+    # shr rax, cl → 48 D3 E8
+    @g = forge_new()
+    emit_shr_reg_cl(@g, REG_RAX)
+    if @g.code[0] != 0x48 or @g.code[1] != 0xD3 or @g.code[2] != 0xE8
+        return 3
+    return 0
+
+# --- CQO ---
+# cqo → 48 99
+fn forge_selftest_cqo() -> int
+    @f = forge_new()
+    emit_cqo(@f)
+    if @f.code_len != 2
+        return 1
+    if @f.code[0] != 0x48 or @f.code[1] != 0x99
+        return 2
+    return 0
+
+# --- idiv ---
+# idiv rcx → 48 F7 F9   (REX.W + F7 /7, ModR/M = 11 111 001)
+fn forge_selftest_idiv() -> int
+    @f = forge_new()
+    emit_idiv_reg(@f, REG_RCX)
+    if @f.code_len != 3
+        return 1
+    if @f.code[0] != 0x48 or @f.code[1] != 0xF7 or @f.code[2] != 0xF9
+        return 2
+    return 0
+
+# --- SSE2 scalar double ---
+# addsd xmm0, xmm1 → F2 0F 58 C1   (no REX needed, low regs)
+fn forge_selftest_addsd() -> int
+    @f = forge_new()
+    emit_addsd(@f, REG_XMM0, REG_XMM1)
+    if @f.code_len != 4
+        return 1
+    if @f.code[0] != 0xF2 or @f.code[1] != 0x0F
+        return 2
+    if @f.code[2] != 0x58 or @f.code[3] != 0xC1
+        return 3
+    return 0
+
+# cvtsi2sd xmm0, rax → F2 48 0F 2A C0
+fn forge_selftest_cvtsi2sd() -> int
+    @f = forge_new()
+    emit_cvtsi2sd(@f, REG_XMM0, REG_RAX)
+    if @f.code_len != 5
+        return 1
+    if @f.code[0] != 0xF2 or @f.code[1] != 0x48
+        return 2
+    if @f.code[2] != 0x0F or @f.code[3] != 0x2A or @f.code[4] != 0xC0
+        return 3
+    return 0
+
+# ucomisd xmm0, xmm1 → 66 0F 2E C1
+fn forge_selftest_ucomisd() -> int
+    @f = forge_new()
+    emit_ucomisd(@f, REG_XMM0, REG_XMM1)
+    if @f.code_len != 4
+        return 1
+    if @f.code[0] != 0x66 or @f.code[1] != 0x0F
+        return 2
+    if @f.code[2] != 0x2E or @f.code[3] != 0xC1
+        return 3
+    return 0
+
+# --- Atomics ---
+# lock cmpxchg [rax + 0], rcx → F0 48 0F B1 48 00
+#   F0      LOCK
+#   48      REX.W
+#   0F B1   opcode
+#   48      ModR/M: mod=01 reg=001(rcx) rm=000(rax) → 0x48
+#   00      disp8
+# Note: our emitter always uses disp32 (mod=10), producing:
+#   F0 48 0F B1 88 00 00 00 00  (9 bytes).  We verify that encoding below.
+fn forge_selftest_lock_cmpxchg() -> int
+    @f = forge_new()
+    emit_lock_cmpxchg_mem_reg(@f, REG_RAX, 0, REG_RCX)
+    if @f.code_len != 9
+        return 1
+    if @f.code[0] != 0xF0 or @f.code[1] != 0x48
+        return 2
+    if @f.code[2] != 0x0F or @f.code[3] != 0xB1
+        return 3
+    # ModR/M = mod=10 reg=001(rcx) rm=000(rax) = 10 001 000 = 0x88
+    if @f.code[4] != 0x88
+        return 4
+    if @f.code[5] != 0x00 or @f.code[6] != 0x00 or @f.code[7] != 0x00 or @f.code[8] != 0x00
+        return 5
+    return 0
+
+# mfence → 0F AE F0
+fn forge_selftest_mfence() -> int
+    @f = forge_new()
+    emit_mfence(@f)
+    if @f.code_len != 3
+        return 1
+    if @f.code[0] != 0x0F or @f.code[1] != 0xAE or @f.code[2] != 0xF0
+        return 2
+    return 0
+
+# --- Indexed mem ---
+# mov rax, [rbx + rcx*8 + 0] → 48 8B 84 CB 00 00 00 00
+#   48      REX.W
+#   8B      opcode
+#   84      ModR/M: mod=10 reg=000(rax) rm=100(SIB) = 10 000 100 = 0x84
+#   CB      SIB: scale=11(*8) index=001(rcx) base=011(rbx) = 11 001 011 = 0xCB
+#   00..00  disp32
+fn forge_selftest_mem_indexed() -> int
+    @f = forge_new()
+    emit_mov_reg_mem_indexed(@f, REG_RAX, REG_RBX, REG_RCX, 3, 0)
+    if @f.code_len != 8
+        return 1
+    if @f.code[0] != 0x48 or @f.code[1] != 0x8B
+        return 2
+    if @f.code[2] != 0x84 or @f.code[3] != 0xCB
+        return 3
+    if @f.code[4] != 0x00 or @f.code[7] != 0x00
+        return 4
+    return 0
+
+fn run_forge_selftests() -> int
+    @pass = 0
+    if forge_selftest_mov_imm() == 0
+        @pass = @pass + 1
+    if forge_selftest_add() == 0
+        @pass = @pass + 1
+    if forge_selftest_call_ret() == 0
+        @pass = @pass + 1
+    if forge_selftest_syscall() == 0
+        @pass = @pass + 1
+    if forge_selftest_add_imm8() == 0
+        @pass = @pass + 1
+    if forge_selftest_mov_imm32() == 0
+        @pass = @pass + 1
+    if forge_selftest_logical() == 0
+        @pass = @pass + 1
+    if forge_selftest_shift() == 0
+        @pass = @pass + 1
+    if forge_selftest_cqo() == 0
+        @pass = @pass + 1
+    if forge_selftest_idiv() == 0
+        @pass = @pass + 1
+    if forge_selftest_addsd() == 0
+        @pass = @pass + 1
+    if forge_selftest_cvtsi2sd() == 0
+        @pass = @pass + 1
+    if forge_selftest_ucomisd() == 0
+        @pass = @pass + 1
+    if forge_selftest_lock_cmpxchg() == 0
+        @pass = @pass + 1
+    if forge_selftest_mfence() == 0
+        @pass = @pass + 1
+    if forge_selftest_mem_indexed() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+# SECTION 13 — ROADMAP / TODO
+# =============================================================================
+# v0.1 shipped ~40 instructions (basic int arithmetic + control flow).
+# v0.2 (this file) adds ~40 more across eight families:
+#
+#   * Short-form immediates (83 /op ib)           — add/sub/cmp/and/or imm8
+#   * Compact mov reg,imm32 (C7 /0 id)            — 7-byte vs 10 for imm64
+#   * Logical register ops                         — and, or, test, not, neg
+#   * Shift / rotate (D3 by CL, C1 by imm8)        — shl, shr, sar
+#   * Integer divide                               — div, idiv, cdq, cqo
+#   * SSE2 scalar doubles (F2 0F family)          — movsd, addsd, subsd,
+#                                                    mulsd, divsd, ucomisd,
+#                                                    cvtsi2sd, cvttsd2si
+#   * Atomics                                      — lock cmpxchg, lock xadd,
+#                                                    xchg, mfence, lfence,
+#                                                    sfence, pause
+#   * Indexed memory (SIB)                         — [base + index*scale + disp]
+#
+# Still outstanding for LLVM-parity:
+#
+#   * String ops: movsb, stosq, rep-prefix handling for memcpy/memset
+#   * Bit scans: bt, bts, btc, btr, bsf, bsr, popcnt, tzcnt, lzcnt
+#   * Full SIMD: SSE4.2 / AVX2 packed ops for titan_opt's vector path
+#   * Rotates: rol, ror, rcl, rcr (by CL and by imm8)
+#   * setcc reg8 — emit 0x0F 9x /0 for boolean materialisation
+#   * cmov family (0F 4x /r)
+#
+# A companion `forge_verify.luna` will shell out to `ndisasm` / `objdump`
+# during development to cross-check encodings.  Once that's green for the
+# full instruction set above, LLVM can be ripped out of the pipeline.
+# =============================================================================
+
+export {
+    # registers
+    REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+    REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15,
+
+    # xmm registers
+    REG_XMM0, REG_XMM1, REG_XMM2, REG_XMM3, REG_XMM4, REG_XMM5, REG_XMM6, REG_XMM7,
+    REG_XMM8, REG_XMM9, REG_XMM10, REG_XMM11, REG_XMM12, REG_XMM13, REG_XMM14, REG_XMM15,
+
+    # condition codes
+    CC_O, CC_NO, CC_B, CC_AE, CC_E, CC_NE, CC_BE, CC_A,
+    CC_S, CC_NS, CC_P, CC_NP, CC_L, CC_GE, CC_LE, CC_G,
+
+    # sizes
+    SIZE_8, SIZE_16, SIZE_32, SIZE_64,
+
+    # reloc kinds
+    RELOC_ABS64, RELOC_PC32, RELOC_PLT32, RELOC_IAT32, RELOC_GOT32,
+
+    # state
+    Forge, ForgeSymbol, ForgeReloc, ForgeLabel,
+    forge_new,
+
+    # byte emitters
+    emit_u8, emit_u16, emit_u32, emit_u64,
+    emit_rex_xmm,
+
+    # instruction emitters — v0.1
+    emit_mov_reg_imm64, emit_mov_reg_reg, emit_mov_mem_reg, emit_mov_reg_mem,
+    emit_add_reg_reg, emit_add_reg_imm32,
+    emit_sub_reg_reg, emit_sub_reg_imm32,
+    emit_imul_reg_reg,
+    emit_cmp_reg_reg, emit_cmp_reg_imm32,
+    emit_xor_reg_reg,
+    emit_push_reg, emit_pop_reg,
+    emit_ret, emit_syscall, emit_nop, emit_int3,
+    emit_jmp_rel32, emit_jcc_rel32, emit_call_rel32, emit_call_rip_rel,
+    emit_lea_reg_rip,
+    emit_call_extern, emit_linux_syscall,
+
+    # instruction emitters — v0.2 short-form immediates
+    emit_add_reg_imm8, emit_sub_reg_imm8, emit_cmp_reg_imm8,
+    emit_and_reg_imm8, emit_or_reg_imm8,
+    emit_mov_reg_imm32,
+
+    # instruction emitters — v0.2 logical
+    emit_and_reg_reg, emit_or_reg_reg,
+    emit_and_reg_imm32, emit_or_reg_imm32,
+    emit_test_reg_reg, emit_not_reg, emit_neg_reg,
+
+    # instruction emitters — v0.2 shift/rotate
+    emit_shl_reg_cl, emit_shr_reg_cl, emit_sar_reg_cl,
+    emit_shl_reg_imm8, emit_shr_reg_imm8, emit_sar_reg_imm8,
+
+    # instruction emitters — v0.2 divide/multiply
+    emit_idiv_reg, emit_div_reg, emit_cdq, emit_cqo,
+
+    # instruction emitters — v0.2 SSE2 scalar doubles
+    emit_movsd_reg_reg, emit_movsd_reg_mem, emit_movsd_mem_reg,
+    emit_addsd, emit_subsd, emit_mulsd, emit_divsd,
+    emit_ucomisd, emit_cvtsi2sd, emit_cvttsd2si,
+
+    # instruction emitters — v0.2 atomics
+    emit_lock_cmpxchg_mem_reg, emit_lock_xadd_mem_reg,
+    emit_xchg_reg_reg,
+    emit_mfence, emit_lfence, emit_sfence, emit_pause,
+
+    # instruction emitters — v0.2 indexed memory
+    emit_mov_reg_mem_indexed, emit_mov_mem_indexed_reg,
+
+    # symbols / relocs
+    forge_define_symbol, forge_extern_symbol, forge_add_reloc,
+
+    # labels
+    forge_label_new, forge_label_bind, forge_label_resolve,
+
+    # function frames
+    forge_function_begin, forge_function_end,
+
+    # tests
+    forge_selftest_mov_imm, forge_selftest_add,
+    forge_selftest_call_ret, forge_selftest_syscall,
+    forge_selftest_add_imm8, forge_selftest_mov_imm32,
+    forge_selftest_logical, forge_selftest_shift,
+    forge_selftest_cqo, forge_selftest_idiv,
+    forge_selftest_addsd, forge_selftest_cvtsi2sd, forge_selftest_ucomisd,
+    forge_selftest_lock_cmpxchg, forge_selftest_mfence,
+    forge_selftest_mem_indexed,
+    run_forge_selftests
+}

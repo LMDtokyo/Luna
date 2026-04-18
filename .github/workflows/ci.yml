@@ -1,0 +1,204 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        rust: [stable]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build Release
+        run: cargo build --release
+
+      - name: Run Tests
+        run: cargo test --release
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: luna-${{ matrix.os }}
+          path: |
+            target/release/luna
+            target/release/luna.exe
+
+  self-compile:
+    name: Self-Compile Check
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux Binary
+        uses: actions/download-artifact@v4
+        with:
+          name: luna-ubuntu-latest
+          path: ./bin
+
+      - name: Make Executable
+        run: chmod +x ./bin/luna
+
+      - name: Self-Compile Check
+        run: |
+          echo "Running Luna self-compile verification..."
+          ./bin/luna --self-compile
+          if [ $? -eq 0 ]; then
+            echo "Self-compile successful!"
+          else
+            echo "Self-compile FAILED!"
+            exit 1
+          fi
+
+      - name: Verify Bootstrap Metrics
+        run: |
+          OUTPUT=$(./bin/luna --self-compile 2>&1)
+          echo "$OUTPUT"
+
+          # Check file count
+          if echo "$OUTPUT" | grep -q "25/25 files"; then
+            echo "File count: PASS (25 files)"
+          else
+            echo "File count: FAIL"
+            exit 1
+          fi
+
+          # Check line count (should be > 45000)
+          LINES=$(echo "$OUTPUT" | grep -oP '\d+(?= lines)' | head -1)
+          if [ "$LINES" -ge 45000 ]; then
+            echo "Line count: PASS ($LINES lines)"
+          else
+            echo "Line count: FAIL ($LINES < 45000)"
+            exit 1
+          fi
+
+  borrow-check:
+    name: Borrow Checker Validation
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux Binary
+        uses: actions/download-artifact@v4
+        with:
+          name: luna-ubuntu-latest
+          path: ./bin
+
+      - name: Make Executable
+        run: chmod +x ./bin/luna
+
+      - name: Check All Bootstrap Files
+        run: |
+          echo "Running borrow checker on all bootstrap files..."
+          FAILED=0
+
+          for file in src/core/*.luna src/stdlib/*.luna src/lsp/*.luna; do
+            echo "Checking: $file"
+            if ./bin/luna check "$file" 2>&1 | grep -q "error"; then
+              echo "FAIL: $file has borrow checker errors"
+              FAILED=1
+            else
+              echo "PASS: $file"
+            fi
+          done
+
+          if [ $FAILED -eq 1 ]; then
+            echo "Borrow checker found errors!"
+            exit 1
+          fi
+
+          echo "All files passed borrow checker!"
+
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Audit Dependencies
+        uses: rustsec/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [build, self-compile, borrow-check, lint]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            luna-ubuntu-latest/luna
+            luna-windows-latest/luna.exe
+            luna-macos-latest/luna
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,93 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna cosmos — process environment access (v4.3)
+# =============================================================================
+# The `cosmos` is the ambient world of the program: env vars, locale, the big
+# bag of configuration that lives outside the source tree.  L4_RENAME_MAP does
+# not give env vars their own module in section 4 — instead it folds env into
+# the aether core as `cosmos_peek` / `cosmos_impress`.  This shim is the
+# user-facing surface: the bots call `cosmos.peek("TELEGRAM_BOT_TOKEN")?`.
+#
+# Ideal signature is `peek(name) -> seen<str>` returning Here(v) / Gone, but
+# `seen<T>` codegen is not landed yet.  For v4.3 we expose a byte-buffer form
+# that returns length (>0 = present, AETHER_MISSING = absent).  A higher-level
+# `peek_str` variant copies into a caller-supplied Luna string buffer.
+# =============================================================================
+
+import aether
+
+# --- Constants --------------------------------------------------------------
+
+# Maximum length of a single env value we will copy out.  Values longer than
+# this are truncated (peek returns the number of bytes written, capped).
+const COSMOS_MAX_VALUE: int = 4096
+
+# Sentinel returned by peek when the variable is not set in the environment.
+# Mirrors AETHER_MISSING so downstream callers can compare directly.
+const COSMOS_GONE: int = -1
+
+# --- Core peek / impress ----------------------------------------------------
+
+# Raw peek — writes into a caller-supplied buffer.  Returns either the number
+# of bytes written (>= 0) or COSMOS_GONE when the variable is absent.
+# This is the form the compiler emits for `cosmos.peek(name)?` today, until
+# `seen<T>` codegen lands.
+fn peek(@name_ptr: int, @name_len: int,
+        @out: int, @out_len: int) -> int
+    @n = cosmos_peek(@name_ptr, @name_len, @out, @out_len)
+    if @n <= 0
+        return COSMOS_GONE
+    return @n
+
+# Convenience: peek into a freshly-allocated 4 KiB buffer and return the
+# string.  An empty string is returned when the variable is not set —
+# distinguish from "set-but-empty" via `has(name)`.
+fn peek_str(@name: str, @name_len: int) -> str
+    meow @buf: [int; 4096] = [0; 4096]
+    @n = cosmos_peek(@name, @name_len, @buf, COSMOS_MAX_VALUE)
+    if @n <= 0
+        return ""
+    @out = ""
+    orbit @i in 0..@n
+        @out = @out + char_from_byte(@buf[@i])
+    return @out
+
+# Presence test without copying the value.  Returns 1 if set, 0 otherwise.
+fn has(@name: str, @name_len: int) -> int
+    meow @buf: [int; 4] = [0; 4]
+    @n = cosmos_peek(@name, @name_len, @buf, 4)
+    if @n <= 0
+        return 0
+    return 1
+
+# Write side — set (or unset when value_len == 0) an env var.
+fn impress(@name_ptr: int, @name_len: int,
+           @value_ptr: int, @value_len: int) -> int
+    return cosmos_impress(@name_ptr, @name_len, @value_ptr, @value_len)
+
+# Convenience string-in form for impress.
+fn impress_str(@name: str, @name_len: int,
+               @value: str, @value_len: int) -> int
+    return cosmos_impress(@name, @name_len, @value, @value_len)
+
+# --- Helpers ----------------------------------------------------------------
+
+# Rebuild a single byte into a one-character Luna string — used by peek_str.
+# The runtime already ships a generic `char_from_byte`; we keep this small
+# wrapper local so the shim does not leak unrelated imports.
+fn char_from_byte(@b: int) -> str
+    if @b < 0
+        return ""
+    return __byte_to_char(@b)
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+export {
+    COSMOS_MAX_VALUE, COSMOS_GONE,
+    peek, peek_str, has,
+    impress, impress_str
+}

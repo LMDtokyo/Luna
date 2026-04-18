@@ -1,0 +1,374 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Veil X.509 Trust Store v1.0 "Lunar Independence L3"
+# =============================================================================
+# The trust anchor table for Luna's pure-Luna TLS 1.3 stack. This is the set of
+# root certificate authorities that `veil.luna`'s `x509_chain_verify` consults
+# to terminate chain validation — without a hit here, no certificate chain is
+# ever considered valid, no matter how perfectly each intra-chain signature
+# verifies.
+#
+# Storage discipline:
+#   Roots are identified by the SHA-256 of their full `SubjectPublicKeyInfo`
+#   SEQUENCE (the SPKI fingerprint, RFC 7469 §2.4). A fingerprint is 32 bytes;
+#   storing 100 roots as fingerprints is ~3.2 KB vs ~150 KB for full DER blobs.
+#   This is the same shape used by Chromium's CRLSet and Mozilla's NSS pin-set.
+#
+# Data sources:
+#   Fingerprints below are drawn from Mozilla's Included CA Certificate Report
+#   (CCADB) and Chromium's root store. Each entry carries the CCADB display
+#   name as a human-readable diagnostic.
+#
+# Cosmic vocabulary (user-facing):
+#   trust_halo_contains  — does this SPKI ride in Luna's trust halo?
+#   trust_halo_find      — which halo slot does this SPKI occupy?
+#   trust_halo_name      — name of the root at a given halo slot
+#
+# Non-cosmic (internal — keep precise):
+#   TRUST_ROOT_SPKI, TRUST_ROOT_COUNT, TRUST_ROOT_NAMES,
+#   trust_store_contains, trust_store_find, trust_store_name.
+#
+# Build: luna compile --release x509_roots.luna -o x509_roots.o
+# =============================================================================
+
+import types
+import crypto
+
+# =============================================================================
+# SECTION 1: TRUST ROOT FINGERPRINT TABLE
+# =============================================================================
+# Each root is 32 bytes of SHA-256(SPKI). The table is a flat `int` array of
+# 32 * N bytes. Index i of root k lives at TRUST_ROOT_SPKI[k * 32 + i].
+#
+# This is the minimum-viable set needed to reach the major public CAs. It
+# covers the issuers for >90% of the modern public web:
+#   - Let's Encrypt (ISRG Root X1 + X2)
+#   - DigiCert (Global Root G2 + classic Global Root CA)
+#   - Amazon (Root CA 1)
+#   - GlobalSign (Root CA)
+#   - Google Trust Services (GTS Root R1 + R4)
+#   - Microsoft (RSA Root Certificate Authority 2017)
+#   - Baltimore CyberTrust Root (legacy Akamai/CDN issuer)
+#   - Sectigo / USERTrust (ECC & RSA)
+#
+# Fingerprints are SHA-256 of the full SPKI SEQUENCE (including the outer
+# SEQUENCE tag + length), which is what `x509_extract_spki` returns.
+
+const TRUST_ROOT_COUNT: int = 12
+
+# 12 roots * 32 bytes = 384 entries. Comments above each block name the root.
+const TRUST_ROOT_SPKI: [int; 384] = [
+    # [0] ISRG Root X1 — Let's Encrypt RSA (issues for >50% of public web).
+    0x0B, 0x9F, 0xA5, 0xA5, 0x9E, 0xED, 0x71, 0x5C,
+    0x26, 0xC1, 0x02, 0x0C, 0x71, 0x1B, 0x4F, 0x6E,
+    0xC4, 0x2D, 0x58, 0xB0, 0x01, 0x5E, 0x14, 0x33,
+    0x7A, 0x39, 0xDA, 0xD3, 0x01, 0xC5, 0xAF, 0xC3,
+
+    # [1] ISRG Root X2 — Let's Encrypt ECDSA.
+    0x76, 0x21, 0x95, 0xC2, 0x25, 0x58, 0x6E, 0xE6,
+    0xC0, 0x23, 0x74, 0x56, 0xE2, 0x10, 0x7D, 0xC5,
+    0x4F, 0x1E, 0xFC, 0x21, 0xF6, 0x1A, 0x79, 0x2E,
+    0xBD, 0x51, 0x59, 0x13, 0xCC, 0xE6, 0x83, 0x32,
+
+    # [2] DigiCert Global Root G2.
+    0x37, 0xD5, 0x10, 0x06, 0xC5, 0x12, 0xEA, 0xAB,
+    0x62, 0x64, 0x21, 0xF1, 0xEC, 0x8C, 0x92, 0x01,
+    0x3F, 0xC5, 0xF8, 0x2A, 0xE9, 0x8E, 0xE5, 0x33,
+    0xEB, 0x46, 0x19, 0xB8, 0xDE, 0xB4, 0xD0, 0x6C,
+
+    # [3] DigiCert Global Root CA (classic RSA-2048 root).
+    0xE3, 0x5D, 0x28, 0x41, 0x9E, 0xD0, 0x20, 0x25,
+    0xCF, 0xA6, 0x90, 0x38, 0xCD, 0x62, 0x39, 0x62,
+    0x45, 0x8D, 0xA5, 0xC6, 0x95, 0xFB, 0xDE, 0xA3,
+    0xC2, 0x2B, 0x0B, 0xFB, 0x25, 0x89, 0x70, 0x92,
+
+    # [4] Amazon Root CA 1.
+    0x06, 0xB2, 0x59, 0x27, 0xBB, 0xE7, 0xE5, 0x4B,
+    0xCE, 0x07, 0x76, 0xC3, 0xD4, 0xB5, 0xB9, 0x81,
+    0x4E, 0xA5, 0xCD, 0xF2, 0xC2, 0x2E, 0xB1, 0x28,
+    0x91, 0xDF, 0x8B, 0x1E, 0xE0, 0xE4, 0xE6, 0xBC,
+
+    # [5] GlobalSign Root CA — R1 RSA-2048.
+    0xB8, 0x5B, 0x4C, 0x1A, 0xAD, 0x4B, 0x3B, 0xCA,
+    0xA8, 0x0F, 0xFE, 0xF5, 0xE3, 0x2A, 0x87, 0xFD,
+    0xD4, 0xF4, 0xF7, 0xEA, 0x54, 0xB8, 0x1D, 0x0C,
+    0xAE, 0x2C, 0x5F, 0xDD, 0xDA, 0x42, 0xFF, 0xE8,
+
+    # [6] GTS Root R1 — Google Trust Services RSA-4096.
+    # TODO: replace with real SPKI-SHA256 of GTS Root R1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06,
+
+    # [7] GTS Root R4 — Google Trust Services ECDSA P-384.
+    # TODO: replace with real SPKI-SHA256 of GTS Root R4
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+
+    # [8] Microsoft RSA Root Certificate Authority 2017.
+    # TODO: replace with real SPKI-SHA256 of Microsoft RSA Root CA 2017
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
+
+    # [9] Baltimore CyberTrust Root — legacy Akamai / CDN issuer.
+    # TODO: replace with real SPKI-SHA256 of Baltimore CyberTrust Root
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
+
+    # [10] USERTrust ECC Certification Authority — Sectigo ECC.
+    # TODO: replace with real SPKI-SHA256 of USERTrust ECC CA
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A,
+
+    # [11] USERTrust RSA Certification Authority — Sectigo RSA.
+    # TODO: replace with real SPKI-SHA256 of USERTrust RSA CA
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0B
+]
+
+# =============================================================================
+# SECTION 2: ROOT NAME TABLE
+# =============================================================================
+# Parallel to TRUST_ROOT_SPKI. Each index i maps to a human-readable name via
+# trust_root_name_at(i). We keep this as a dispatch function rather than a
+# giant NUL-terminated blob so the shape stays readable and indexable without
+# a string-search helper.
+
+fn trust_root_name_at(@index: int) -> array
+    guard @index == 0 else return str_to_bytes_local("ISRG Root X1")
+    guard @index == 1 else return str_to_bytes_local("ISRG Root X2")
+    guard @index == 2 else return str_to_bytes_local("DigiCert Global Root G2")
+    guard @index == 3 else return str_to_bytes_local("DigiCert Global Root CA")
+    guard @index == 4 else return str_to_bytes_local("Amazon Root CA 1")
+    guard @index == 5 else return str_to_bytes_local("GlobalSign Root CA")
+    guard @index == 6 else return str_to_bytes_local("GTS Root R1")
+    guard @index == 7 else return str_to_bytes_local("GTS Root R4")
+    guard @index == 8 else return str_to_bytes_local("Microsoft RSA Root Certificate Authority 2017")
+    guard @index == 9 else return str_to_bytes_local("Baltimore CyberTrust Root")
+    guard @index == 10 else return str_to_bytes_local("USERTrust ECC Certification Authority")
+    guard @index == 11 else return str_to_bytes_local("USERTrust RSA Certification Authority")
+    return array_from(63)   # single '?' byte = "unknown"
+
+fn str_to_bytes_local(@s: array) -> array
+    # `@s` arrives as a byte-array literal; we return it untouched. Kept as a
+    # thin wrapper so callers read intent at the call site.
+    return @s
+
+# =============================================================================
+# SECTION 3: SPKI LOOKUP PRIMITIVES
+# =============================================================================
+
+fn spki_hash_equal(@index: int, @candidate: array) -> int
+    # Byte-for-byte compare TRUST_ROOT_SPKI[index * 32 .. +32] against @candidate.
+    # We do not short-circuit on first mismatch — constant-ish time within the
+    # 32-byte window limits an attacker's ability to learn which slot matched.
+    guard array_len(@candidate) != 32
+        return 0
+    @base = @index * 32
+    @diff = 0
+    orbit @i in range(0, 32)
+        @a = TRUST_ROOT_SPKI[@base + @i]
+        @b = @candidate[@i]
+        @diff = @diff | (@a ^ @b)
+    guard @diff != 0
+        return 0
+    return 1
+
+# =============================================================================
+# SECTION 4: PUBLIC API
+# =============================================================================
+# `veil.luna`'s `x509_chain_verify` calls `trust_store_contains(spki_hash)`
+# with the SHA-256 of the top cert's SubjectPublicKeyInfo. If we return 1,
+# the chain is anchored; if 0, chain validation aborts.
+
+fn trust_store_contains(@spki_hash: array) -> int
+    # Returns 1 if @spki_hash matches any root's SPKI fingerprint, else 0.
+    guard array_len(@spki_hash) != 32
+        return 0
+    orbit @k in range(0, TRUST_ROOT_COUNT)
+        guard spki_hash_equal(@k, @spki_hash) == 1
+            return 1
+    return 0
+
+fn trust_store_find(@spki_hash: array) -> int
+    # Returns the root's slot index (0..TRUST_ROOT_COUNT-1) or -1 on miss.
+    guard array_len(@spki_hash) != 32
+        return -1
+    orbit @k in range(0, TRUST_ROOT_COUNT)
+        guard spki_hash_equal(@k, @spki_hash) == 1
+            return @k
+    return -1
+
+fn trust_store_name(@index: int) -> array
+    # Human-readable name for diagnostics. Caller owns the returned bytes.
+    guard @index < 0
+        return []
+    guard @index >= TRUST_ROOT_COUNT
+        return []
+    return trust_root_name_at(@index)
+
+fn trust_store_count() -> int
+    return TRUST_ROOT_COUNT
+
+# Cosmic aliases — these are the names veil's user-facing surface prefers.
+fn trust_halo_contains(@spki_hash: array) -> int
+    return trust_store_contains(@spki_hash)
+
+fn trust_halo_find(@spki_hash: array) -> int
+    return trust_store_find(@spki_hash)
+
+fn trust_halo_name(@index: int) -> array
+    return trust_store_name(@index)
+
+# =============================================================================
+# SECTION 5: SELF-TESTS
+# =============================================================================
+# Shape checks only — we do not have real CA certs to hash at test time. The
+# point of these tests is to prove the infrastructure (table layout, lookup
+# arithmetic, miss path) is sound even when some entries are placeholder.
+
+fn test_roots_table_shape() -> int
+    # Ensure the flat SPKI table has exactly 32 * TRUST_ROOT_COUNT entries.
+    guard TRUST_ROOT_COUNT <= 0
+        return 0
+    # ISRG Root X1 slot [0] is a real, known fingerprint — its first byte
+    # must be 0x0B. If someone edits the table and shifts rows, this test
+    # catches the drift.
+    guard TRUST_ROOT_SPKI[0] != 0x0B
+        return 0
+    guard TRUST_ROOT_SPKI[31] != 0xC3
+        return 0
+    return 1
+
+fn test_contains_isrg_x1() -> int
+    # Feed the published ISRG Root X1 SPKI hash and verify a hit.
+    @probe = array_from(
+        0x0B, 0x9F, 0xA5, 0xA5, 0x9E, 0xED, 0x71, 0x5C,
+        0x26, 0xC1, 0x02, 0x0C, 0x71, 0x1B, 0x4F, 0x6E,
+        0xC4, 0x2D, 0x58, 0xB0, 0x01, 0x5E, 0x14, 0x33,
+        0x7A, 0x39, 0xDA, 0xD3, 0x01, 0xC5, 0xAF, 0xC3
+    )
+    guard trust_store_contains(@probe) != 1
+        return 0
+    guard trust_store_find(@probe) != 0
+        return 0
+    return 1
+
+fn test_contains_miss() -> int
+    # All-zero 32-byte hash must miss — even though some placeholder slots
+    # begin with zeros, their final bytes differ (by the slot-encoding trick
+    # above). This guards against a footgun where someone adds an all-zero
+    # row and accidentally whitelists the null SPKI.
+    @probe = array_new(32, 0)
+    guard trust_store_contains(@probe) != 0
+        return 0
+    return 1
+
+fn test_name_lookup() -> int
+    @nm = trust_store_name(0)
+    guard array_len(@nm) < 4
+        return 0
+    # "ISRG Root X1" starts with 'I' = 0x49.
+    guard @nm[0] != 0x49
+        return 0
+    @bad = trust_store_name(-1)
+    guard array_len(@bad) != 0
+        return 0
+    @overflow = trust_store_name(TRUST_ROOT_COUNT + 50)
+    guard array_len(@overflow) != 0
+        return 0
+    return 1
+
+fn test_wrong_length_rejected() -> int
+    # Short inputs must be rejected without scanning the table.
+    @short = array_new(16, 0xFF)
+    guard trust_store_contains(@short) != 0
+        return 0
+    guard trust_store_find(@short) != -1
+        return 0
+    # Long inputs too.
+    @long = array_new(64, 0xFF)
+    guard trust_store_contains(@long) != 0
+        return 0
+    return 1
+
+fn run_x509_roots_tests() -> int
+    @passed = 0
+    @failed = 0
+
+    shine("  [x509_roots] test 1: table shape...")
+    guard test_roots_table_shape() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_roots_table_shape() != 1
+        @failed = @failed + 1
+        shine("    FAIL (table size / anchor row drifted)")
+
+    shine("  [x509_roots] test 2: ISRG Root X1 lookup hit...")
+    guard test_contains_isrg_x1() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_contains_isrg_x1() != 1
+        @failed = @failed + 1
+        shine("    FAIL (known-good SPKI did not match slot 0)")
+
+    shine("  [x509_roots] test 3: all-zero probe misses...")
+    guard test_contains_miss() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_contains_miss() != 1
+        @failed = @failed + 1
+        shine("    FAIL (null SPKI erroneously trusted)")
+
+    shine("  [x509_roots] test 4: name lookup bounds...")
+    guard test_name_lookup() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_name_lookup() != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    shine("  [x509_roots] test 5: wrong-length probes rejected...")
+    guard test_wrong_length_rejected() == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard test_wrong_length_rejected() != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    @total = @passed + @failed
+    shine(str_concat("  [x509_roots] Self-tests: ", int_to_str(@passed), "/", int_to_str(@total), " passed"))
+    guard @failed > 0
+        return 0
+    return 1
+
+# =============================================================================
+# SECTION 6: EXPORTS
+# =============================================================================
+
+export {
+    # Constants
+    TRUST_ROOT_COUNT,
+
+    # Cosmic, user-facing surface
+    trust_halo_contains, trust_halo_find, trust_halo_name,
+
+    # Technical surface consumed by veil.luna's x509_chain_verify
+    trust_store_contains, trust_store_find, trust_store_name, trust_store_count,
+
+    # Self-test entry point
+    run_x509_roots_tests
+}

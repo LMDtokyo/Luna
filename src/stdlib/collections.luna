@@ -1,0 +1,2765 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Self-Hosting Collections v1.0
+# =============================================================================
+# Complete port of src/stdlib/collections.rs (986 lines) to Pure Luna.
+#
+# Data structures implemented:
+#   1. LinkedList   - Doubly-linked list with node pool recycling
+#   2. RBTree       - Red-Black balanced BST (flat array-based node pool)
+#   3. HashMap      - Robin Hood open-addressing hash map
+#   4. Vec          - Dynamic array with introsort
+#   5. Deque        - Double-ended queue (circular buffer)
+#   6. StringInterner - Deduplicated string storage
+#   7. StringBuilder  - Efficient string concatenation buffer
+#
+# Design:
+# - All collections use flat array-based storage (i64 values)
+# - Node pools with free-list recycling (no GC, no fragmentation)
+# - BoxAlloc semantics for heap nodes
+# - RcAlloc for shared ownership where needed
+# - FNV-1a hash for strings and integers
+# - Robin Hood hashing with backward-shift deletion
+# - Introsort (quicksort + heapsort fallback) for Vec.sort
+#
+# Build: luna compile collections.luna
+# =============================================================================
+
+import types
+import borrow_checker
+
+# =============================================================================
+# CAPACITY CONSTANTS
+# =============================================================================
+
+const MAX_LIST_NODES: int = 8192
+const MAX_TREE_NODES: int = 4096
+const HASHMAP_INITIAL_CAP: int = 16
+const HASHMAP_LOAD_FACTOR_NUM: int = 3       # 3/4 = 75%
+const HASHMAP_LOAD_FACTOR_DEN: int = 4
+const MAX_VEC_CAPACITY: int = 65536
+const MAX_DEQUE_CAPACITY: int = 8192
+const MAX_INTERNER_STRINGS: int = 16384
+const NODE_COLOR_RED: int = 0
+const NODE_COLOR_BLACK: int = 1
+const NODE_NIL: int = -1                     # null pointer sentinel
+
+# =============================================================================
+# FNV-1a HASH FUNCTION
+# =============================================================================
+# Fowler-Noll-Vo hash (FNV-1a variant) for strings and integers.
+# Produces a 64-bit hash with excellent distribution and avalanche.
+
+const FNV_OFFSET_BASIS: int = 0xCBF29CE484222325
+const FNV_PRIME: int = 0x100000001B3
+
+# Hash an integer value using FNV-1a over its 8 bytes
+fn fnv1a_int(@value: int) -> int
+    @hash = FNV_OFFSET_BASIS
+    # Process 8 bytes of the integer (little-endian)
+    @v = @value
+    orbit @i in 0..8
+        @byte = @v & 0xFF
+        @hash = @hash ^ @byte
+        @hash = @hash * FNV_PRIME
+        @v = @v >> 8
+    return @hash
+
+# Hash a string using FNV-1a over its characters
+fn fnv1a_str(@s: str) -> int
+    @hash = FNV_OFFSET_BASIS
+    @slen = len(@s)
+    orbit @i in 0..@slen
+        @byte = char_code(@s, @i)
+        @hash = @hash ^ @byte
+        @hash = @hash * FNV_PRIME
+    return @hash
+
+# Generic hash: dispatch based on type tag
+# For collections that store i64 values, we just use fnv1a_int
+fn hash_value(@val: int) -> int
+    return fnv1a_int(@val)
+
+# =============================================================================
+# SECTION 1: LINKED LIST (Doubly-Linked)
+# =============================================================================
+# Flat node pool with free-list recycling.
+# Each node stores: value, prev index, next index, active flag.
+# O(1) push/pop at both ends. O(n) iteration.
+#
+# Memory: BoxAlloc semantics — each node is a heap slot in the pool.
+# Free nodes are tracked via a singly-linked free list (next pointer).
+
+# --- LinkedList Node (flat, array-stored) ---
+struct LLNode
+    value: int          # Stored i64 value
+    prev: int           # Index of previous node (NODE_NIL if none)
+    next: int           # Index of next node (NODE_NIL if none)
+    active: int         # 1 = in use, 0 = on free list
+
+# --- LinkedList ---
+struct LinkedList
+    nodes: [LLNode; 8192]       # Pre-allocated node pool
+    head: int                    # Index of first node (NODE_NIL if empty)
+    tail: int                    # Index of last node (NODE_NIL if empty)
+    length: int                  # Number of active elements
+    free_head: int               # Head of free list (NODE_NIL if none)
+    pool_used: int               # Number of pool slots ever allocated
+
+# Create a new empty linked list with initialized free pool
+fn ll_new() -> LinkedList
+    @list = LinkedList {
+        nodes: [LLNode { value: 0, prev: NODE_NIL, next: NODE_NIL, active: 0 }; 8192],
+        head: NODE_NIL,
+        tail: NODE_NIL,
+        length: 0,
+        free_head: NODE_NIL,
+        pool_used: 0
+    }
+    return @list
+
+# Allocate a node from the pool (free list first, then bump)
+fn ll_alloc_node(@list: LinkedList) -> int
+    # Try free list first
+    if @list.free_head != NODE_NIL
+        @idx = @list.free_head
+        @list.free_head = @list.nodes[@idx].next
+        @list.nodes[@idx].prev = NODE_NIL
+        @list.nodes[@idx].next = NODE_NIL
+        @list.nodes[@idx].active = 1
+        return @idx
+    # Bump allocate from pool
+    if @list.pool_used >= MAX_LIST_NODES
+        return NODE_NIL   # Pool exhausted
+    @idx = @list.pool_used
+    @list.pool_used = @list.pool_used + 1
+    @list.nodes[@idx].prev = NODE_NIL
+    @list.nodes[@idx].next = NODE_NIL
+    @list.nodes[@idx].active = 1
+    return @idx
+
+# Return a node to the free list
+fn ll_free_node(@list: LinkedList, @idx: int)
+    @list.nodes[@idx].active = 0
+    @list.nodes[@idx].value = 0
+    @list.nodes[@idx].prev = NODE_NIL
+    @list.nodes[@idx].next = @list.free_head
+    @list.free_head = @idx
+
+# Push a value to the front of the list — O(1)
+fn ll_push_front(@list: LinkedList, @value: int)
+    @idx = ll_alloc_node(@list)
+    if @idx == NODE_NIL
+        return
+    @list.nodes[@idx].value = @value
+    @list.nodes[@idx].prev = NODE_NIL
+    @list.nodes[@idx].next = @list.head
+    if @list.head != NODE_NIL
+        @list.nodes[@list.head].prev = @idx
+    @list.head = @idx
+    if @list.tail == NODE_NIL
+        @list.tail = @idx
+    @list.length = @list.length + 1
+
+# Push a value to the back of the list — O(1)
+fn ll_push_back(@list: LinkedList, @value: int)
+    @idx = ll_alloc_node(@list)
+    if @idx == NODE_NIL
+        return
+    @list.nodes[@idx].value = @value
+    @list.nodes[@idx].prev = @list.tail
+    @list.nodes[@idx].next = NODE_NIL
+    if @list.tail != NODE_NIL
+        @list.nodes[@list.tail].next = @idx
+    @list.tail = @idx
+    if @list.head == NODE_NIL
+        @list.head = @idx
+    @list.length = @list.length + 1
+
+# Pop a value from the front — O(1). Returns NODE_NIL if empty.
+fn ll_pop_front(@list: LinkedList) -> int
+    if @list.head == NODE_NIL
+        return NODE_NIL
+    @idx = @list.head
+    @value = @list.nodes[@idx].value
+    @list.head = @list.nodes[@idx].next
+    if @list.head != NODE_NIL
+        @list.nodes[@list.head].prev = NODE_NIL
+    else
+        @list.tail = NODE_NIL
+    @list.length = @list.length - 1
+    ll_free_node(@list, @idx)
+    return @value
+
+# Pop a value from the back — O(1). Returns NODE_NIL if empty.
+fn ll_pop_back(@list: LinkedList) -> int
+    if @list.tail == NODE_NIL
+        return NODE_NIL
+    @idx = @list.tail
+    @value = @list.nodes[@idx].value
+    @list.tail = @list.nodes[@idx].prev
+    if @list.tail != NODE_NIL
+        @list.nodes[@list.tail].next = NODE_NIL
+    else
+        @list.head = NODE_NIL
+    @list.length = @list.length - 1
+    ll_free_node(@list, @idx)
+    return @value
+
+# Peek at the front value — O(1). Returns NODE_NIL if empty.
+fn ll_front(@list: LinkedList) -> int
+    if @list.head == NODE_NIL
+        return NODE_NIL
+    return @list.nodes[@list.head].value
+
+# Peek at the back value — O(1). Returns NODE_NIL if empty.
+fn ll_back(@list: LinkedList) -> int
+    if @list.tail == NODE_NIL
+        return NODE_NIL
+    return @list.nodes[@list.tail].value
+
+# Get the length of the list — O(1)
+fn ll_len(@list: LinkedList) -> int
+    return @list.length
+
+# Check if the list is empty — O(1)
+fn ll_is_empty(@list: LinkedList) -> int
+    if @list.length == 0
+        return 1
+    return 0
+
+# Clear all elements from the list — O(n)
+fn ll_clear(@list: LinkedList)
+    orbit @i in 0..@list.pool_used
+        if @list.nodes[@i].active == 1
+            @list.nodes[@i].active = 0
+            @list.nodes[@i].value = 0
+            @list.nodes[@i].prev = NODE_NIL
+            @list.nodes[@i].next = NODE_NIL
+    @list.head = NODE_NIL
+    @list.tail = NODE_NIL
+    @list.length = 0
+    # Rebuild free list from all used pool slots
+    @list.free_head = NODE_NIL
+    orbit @i in 0..@list.pool_used
+        @list.nodes[@i].next = @list.free_head
+        @list.free_head = @i
+
+# Iterate the list from head to tail, collecting values into a flat array.
+# Returns the number of elements written to @out.
+# Caller must provide @out with sufficient capacity.
+fn ll_iter(@list: LinkedList, @out: [int; 8192]) -> int
+    @count = 0
+    @cur = @list.head
+    orbit @safety in 0..MAX_LIST_NODES
+        if @cur == NODE_NIL
+            return @count
+        @out[@count] = @list.nodes[@cur].value
+        @count = @count + 1
+        @cur = @list.nodes[@cur].next
+    return @count
+
+# =============================================================================
+# SECTION 2: RED-BLACK TREE (Flat Array-Based Node Pool)
+# =============================================================================
+# Self-balancing BST for ordered key-value storage.
+# Uses integer keys and integer values (i64).
+# All nodes stored in a flat array with index-based pointers.
+#
+# Properties maintained:
+# 1. Every node is red or black
+# 2. Root is always black
+# 3. Red nodes have black children
+# 4. Every path from root to NIL has the same black depth
+#
+# Operations: insert O(log n), get O(log n), contains_key O(log n)
+
+# --- RBTree Node (flat, array-stored) ---
+struct RBNode
+    key: int            # Key (i64)
+    value: int          # Value (i64)
+    color: int          # NODE_COLOR_RED or NODE_COLOR_BLACK
+    left: int           # Index of left child (NODE_NIL if none)
+    right: int          # Index of right child (NODE_NIL if none)
+    parent: int         # Index of parent (NODE_NIL if root)
+    active: int         # 1 = in use, 0 = on free list
+
+# --- RBTree ---
+struct RBTree
+    nodes: [RBNode; 4096]       # Pre-allocated node pool
+    root: int                    # Index of root node (NODE_NIL if empty)
+    length: int                  # Number of active elements
+    free_head: int               # Head of free list
+    pool_used: int               # Bump pointer into pool
+
+# Create a new empty red-black tree
+fn rb_new() -> RBTree
+    @tree = RBTree {
+        nodes: [RBNode { key: 0, value: 0, color: NODE_COLOR_BLACK, left: NODE_NIL, right: NODE_NIL, parent: NODE_NIL, active: 0 }; 4096],
+        root: NODE_NIL,
+        length: 0,
+        free_head: NODE_NIL,
+        pool_used: 0
+    }
+    return @tree
+
+# Allocate a node from the tree pool
+fn rb_alloc_node(@tree: RBTree) -> int
+    if @tree.free_head != NODE_NIL
+        @idx = @tree.free_head
+        @tree.free_head = @tree.nodes[@idx].right   # free list uses right pointer
+        @tree.nodes[@idx].left = NODE_NIL
+        @tree.nodes[@idx].right = NODE_NIL
+        @tree.nodes[@idx].parent = NODE_NIL
+        @tree.nodes[@idx].color = NODE_COLOR_RED
+        @tree.nodes[@idx].active = 1
+        return @idx
+    if @tree.pool_used >= MAX_TREE_NODES
+        return NODE_NIL
+    @idx = @tree.pool_used
+    @tree.pool_used = @tree.pool_used + 1
+    @tree.nodes[@idx].left = NODE_NIL
+    @tree.nodes[@idx].right = NODE_NIL
+    @tree.nodes[@idx].parent = NODE_NIL
+    @tree.nodes[@idx].color = NODE_COLOR_RED
+    @tree.nodes[@idx].active = 1
+    return @idx
+
+# Return a node to the free list
+fn rb_free_node(@tree: RBTree, @idx: int)
+    @tree.nodes[@idx].active = 0
+    @tree.nodes[@idx].left = NODE_NIL
+    @tree.nodes[@idx].right = @tree.free_head
+    @tree.nodes[@idx].parent = NODE_NIL
+    @tree.free_head = @idx
+
+# --- Left rotation around node @x ---
+#       x              y
+#      / \            / \
+#     a   y    =>    x   c
+#        / \        / \
+#       b   c      a   b
+fn rb_rotate_left(@tree: RBTree, @x: int)
+    @y = @tree.nodes[@x].right
+    if @y == NODE_NIL
+        return
+
+    # Move y's left subtree to x's right
+    @tree.nodes[@x].right = @tree.nodes[@y].left
+    if @tree.nodes[@y].left != NODE_NIL
+        @tree.nodes[@tree.nodes[@y].left].parent = @x
+
+    # Link y to x's parent
+    @tree.nodes[@y].parent = @tree.nodes[@x].parent
+    if @tree.nodes[@x].parent == NODE_NIL
+        @tree.root = @y
+    else
+        @p = @tree.nodes[@x].parent
+        if @tree.nodes[@p].left == @x
+            @tree.nodes[@p].left = @y
+        else
+            @tree.nodes[@p].right = @y
+
+    # Put x on y's left
+    @tree.nodes[@y].left = @x
+    @tree.nodes[@x].parent = @y
+
+# --- Right rotation around node @x ---
+#         x            y
+#        / \          / \
+#       y   c  =>   a   x
+#      / \              / \
+#     a   b            b   c
+fn rb_rotate_right(@tree: RBTree, @x: int)
+    @y = @tree.nodes[@x].left
+    if @y == NODE_NIL
+        return
+
+    # Move y's right subtree to x's left
+    @tree.nodes[@x].left = @tree.nodes[@y].right
+    if @tree.nodes[@y].right != NODE_NIL
+        @tree.nodes[@tree.nodes[@y].right].parent = @x
+
+    # Link y to x's parent
+    @tree.nodes[@y].parent = @tree.nodes[@x].parent
+    if @tree.nodes[@x].parent == NODE_NIL
+        @tree.root = @y
+    else
+        @p = @tree.nodes[@x].parent
+        if @tree.nodes[@p].right == @x
+            @tree.nodes[@p].right = @y
+        else
+            @tree.nodes[@p].left = @y
+
+    # Put x on y's right
+    @tree.nodes[@y].right = @x
+    @tree.nodes[@x].parent = @y
+
+# --- Fix red-black properties after insertion ---
+# Iterative fix-up: recolor and rotate to restore RB invariants.
+fn rb_fix_insert(@tree: RBTree, @node: int)
+    @z = @node
+    orbit @safety in 0..MAX_TREE_NODES
+        # If z is root or parent is black, we are done
+        @parent = @tree.nodes[@z].parent
+        if @parent == NODE_NIL
+            # z is root — color it black
+            @tree.nodes[@z].color = NODE_COLOR_BLACK
+            return
+        if @tree.nodes[@parent].color == NODE_COLOR_BLACK
+            return
+
+        # Parent is red — need fix-up
+        @grandparent = @tree.nodes[@parent].parent
+        if @grandparent == NODE_NIL
+            # Parent is root and red — just color it black
+            @tree.nodes[@parent].color = NODE_COLOR_BLACK
+            return
+
+        @parent_is_left = 0
+        if @tree.nodes[@grandparent].left == @parent
+            @parent_is_left = 1
+
+        # Determine uncle
+        @uncle = NODE_NIL
+        if @parent_is_left == 1
+            @uncle = @tree.nodes[@grandparent].right
+        else
+            @uncle = @tree.nodes[@grandparent].left
+
+        # Check uncle color
+        @uncle_is_red = 0
+        if @uncle != NODE_NIL
+            if @tree.nodes[@uncle].color == NODE_COLOR_RED
+                @uncle_is_red = 1
+
+        if @uncle_is_red == 1
+            # Case 1: Uncle is red — recolor
+            @tree.nodes[@parent].color = NODE_COLOR_BLACK
+            @tree.nodes[@uncle].color = NODE_COLOR_BLACK
+            @tree.nodes[@grandparent].color = NODE_COLOR_RED
+            @z = @grandparent
+            # Continue loop to fix grandparent
+        else
+            # Cases 2-3: Uncle is black — rotate
+            if @parent_is_left == 1
+                if @tree.nodes[@parent].right == @z
+                    # Case 2: z is right child — left rotate parent
+                    @z = @parent
+                    rb_rotate_left(@tree, @z)
+                    @parent = @tree.nodes[@z].parent
+                    @grandparent = @tree.nodes[@parent].parent
+                # Case 3: z is left child — right rotate grandparent
+                @tree.nodes[@parent].color = NODE_COLOR_BLACK
+                @tree.nodes[@grandparent].color = NODE_COLOR_RED
+                rb_rotate_right(@tree, @grandparent)
+                return
+            else
+                if @tree.nodes[@parent].left == @z
+                    # Case 2 mirror: z is left child — right rotate parent
+                    @z = @parent
+                    rb_rotate_right(@tree, @z)
+                    @parent = @tree.nodes[@z].parent
+                    @grandparent = @tree.nodes[@parent].parent
+                # Case 3 mirror: z is right child — left rotate grandparent
+                @tree.nodes[@parent].color = NODE_COLOR_BLACK
+                @tree.nodes[@grandparent].color = NODE_COLOR_RED
+                rb_rotate_left(@tree, @grandparent)
+                return
+    # Ensure root is black
+    if @tree.root != NODE_NIL
+        @tree.nodes[@tree.root].color = NODE_COLOR_BLACK
+
+# Insert a key-value pair into the tree — O(log n)
+# Returns the previous value if the key already existed, or NODE_NIL.
+fn rb_insert(@tree: RBTree, @key: int, @value: int) -> int
+    # Standard BST insert
+    @parent = NODE_NIL
+    @current = @tree.root
+    orbit @safety in 0..MAX_TREE_NODES
+        if @current == NODE_NIL
+            # Found insertion point
+            @new_node = rb_alloc_node(@tree)
+            if @new_node == NODE_NIL
+                return NODE_NIL   # Pool exhausted
+            @tree.nodes[@new_node].key = @key
+            @tree.nodes[@new_node].value = @value
+            @tree.nodes[@new_node].parent = @parent
+
+            if @parent == NODE_NIL
+                @tree.root = @new_node
+            else
+                if @key < @tree.nodes[@parent].key
+                    @tree.nodes[@parent].left = @new_node
+                else
+                    @tree.nodes[@parent].right = @new_node
+
+            @tree.length = @tree.length + 1
+            rb_fix_insert(@tree, @new_node)
+            return NODE_NIL   # No previous value
+
+        # Compare keys
+        if @key < @tree.nodes[@current].key
+            @parent = @current
+            @current = @tree.nodes[@current].left
+        else
+            if @key > @tree.nodes[@current].key
+                @parent = @current
+                @current = @tree.nodes[@current].right
+            else
+                # Key already exists — replace value
+                @old_value = @tree.nodes[@current].value
+                @tree.nodes[@current].value = @value
+                return @old_value
+    return NODE_NIL
+
+# Get value by key — O(log n). Returns NODE_NIL if not found.
+fn rb_get(@tree: RBTree, @key: int) -> int
+    @current = @tree.root
+    orbit @safety in 0..MAX_TREE_NODES
+        if @current == NODE_NIL
+            return NODE_NIL
+        if @key < @tree.nodes[@current].key
+            @current = @tree.nodes[@current].left
+        else
+            if @key > @tree.nodes[@current].key
+                @current = @tree.nodes[@current].right
+            else
+                return @tree.nodes[@current].value
+    return NODE_NIL
+
+# Check if key exists — O(log n). Returns 1 if found, 0 otherwise.
+fn rb_contains_key(@tree: RBTree, @key: int) -> int
+    @current = @tree.root
+    orbit @safety in 0..MAX_TREE_NODES
+        if @current == NODE_NIL
+            return 0
+        if @key < @tree.nodes[@current].key
+            @current = @tree.nodes[@current].left
+        else
+            if @key > @tree.nodes[@current].key
+                @current = @tree.nodes[@current].right
+            else
+                return 1
+    return 0
+
+# Get the number of elements in the tree — O(1)
+fn rb_len(@tree: RBTree) -> int
+    return @tree.length
+
+# In-order traversal: collect keys into @out_keys and values into @out_vals.
+# Uses an explicit stack (iterative, no recursion needed).
+# Returns number of elements written.
+fn rb_inorder(@tree: RBTree, @out_keys: [int; 4096], @out_vals: [int; 4096]) -> int
+    @count = 0
+    # Explicit stack for iterative in-order traversal
+    @stack: [int; 4096] = [NODE_NIL; 4096]
+    @stack_top = 0
+    @current = @tree.root
+
+    orbit @safety in 0..8192
+        # Push all left children
+        orbit @inner in 0..MAX_TREE_NODES
+            if @current == NODE_NIL
+                # Break inner loop (go to pop)
+                @inner = MAX_TREE_NODES
+            else
+                @stack[@stack_top] = @current
+                @stack_top = @stack_top + 1
+                @current = @tree.nodes[@current].left
+
+        if @stack_top == 0
+            return @count
+
+        # Pop from stack
+        @stack_top = @stack_top - 1
+        @node = @stack[@stack_top]
+        @out_keys[@count] = @tree.nodes[@node].key
+        @out_vals[@count] = @tree.nodes[@node].value
+        @count = @count + 1
+        @current = @tree.nodes[@node].right
+    return @count
+
+# =============================================================================
+# SECTION 3: HASHMAP (Robin Hood Open Addressing)
+# =============================================================================
+# High-performance hash map with Robin Hood hashing.
+# Uses FNV-1a hash, linear probing, and backward-shift deletion.
+#
+# Key features:
+# - Robin Hood: on collision, the "richer" entry (closer to home) yields
+#   its slot to the "poorer" entry (farther from home), reducing variance
+# - Backward-shift deletion: no tombstones needed
+# - Load factor 75% with power-of-two capacity for fast modulo (bitmask)
+
+# Entry state constants
+const ENTRY_EMPTY: int = 0
+const ENTRY_OCCUPIED: int = 1
+
+# --- HashMap Entry (flat, array-stored) ---
+struct HMEntry
+    key: int            # Key (i64)
+    value: int          # Value (i64)
+    hash: int           # Cached FNV-1a hash
+    state: int          # ENTRY_EMPTY or ENTRY_OCCUPIED
+
+# --- HashMap ---
+# Uses a flat array of entries. Capacity is always a power of 2.
+# Maximum capacity is bounded by MAX_VEC_CAPACITY for the entry array.
+struct HashMap
+    entries: [HMEntry; 65536]    # Entry array (power-of-2 sized)
+    length: int                   # Number of occupied entries
+    capacity: int                 # Current capacity (power of 2)
+    mask: int                     # capacity - 1 (for fast modulo)
+
+# Create a new empty hash map with default initial capacity
+fn hm_new() -> HashMap
+    @map = HashMap {
+        entries: [HMEntry { key: 0, value: 0, hash: 0, state: ENTRY_EMPTY }; 65536],
+        length: 0,
+        capacity: HASHMAP_INITIAL_CAP,
+        mask: HASHMAP_INITIAL_CAP - 1
+    }
+    return @map
+
+# Create a hash map with specified minimum capacity (rounded up to power of 2)
+fn hm_with_capacity(@min_cap: int) -> HashMap
+    # Round up to next power of 2
+    @cap = HASHMAP_INITIAL_CAP
+    orbit @i in 0..20
+        if @cap >= @min_cap
+            @i = 20   # break
+        else
+            @cap = @cap * 2
+    if @cap > MAX_VEC_CAPACITY
+        @cap = MAX_VEC_CAPACITY
+    @map = HashMap {
+        entries: [HMEntry { key: 0, value: 0, hash: 0, state: ENTRY_EMPTY }; 65536],
+        length: 0,
+        capacity: @cap,
+        mask: @cap - 1
+    }
+    return @map
+
+# Compute the displacement (probe distance) for an entry at @index
+# with hash @hash in a map with mask @mask.
+#[inline]
+fn hm_displacement(@index: int, @hash: int, @mask: int) -> int
+    return (@index - (@hash & @mask) + @mask + 1) & @mask
+
+# Check if the map needs to grow (load factor exceeded)
+#[inline]
+fn hm_should_grow(@length: int, @capacity: int) -> int
+    # Check: (length + 1) * DEN > capacity * NUM  =>  load > 75%
+    if (@length + 1) * HASHMAP_LOAD_FACTOR_DEN > @capacity * HASHMAP_LOAD_FACTOR_NUM
+        return 1
+    return 0
+
+# Resize the hash map to double its capacity
+fn hm_resize(@map: HashMap)
+    @old_cap = @map.capacity
+    @new_cap = @old_cap * 2
+    if @new_cap > MAX_VEC_CAPACITY
+        return   # Cannot grow further
+    @new_mask = @new_cap - 1
+
+    # Save old entries
+    @old_entries: [HMEntry; 65536] = [HMEntry { key: 0, value: 0, hash: 0, state: ENTRY_EMPTY }; 65536]
+    orbit @i in 0..@old_cap
+        @old_entries[@i] = @map.entries[@i]
+
+    # Clear the map's entry array
+    orbit @i in 0..@new_cap
+        @map.entries[@i].state = ENTRY_EMPTY
+        @map.entries[@i].key = 0
+        @map.entries[@i].value = 0
+        @map.entries[@i].hash = 0
+
+    @map.capacity = @new_cap
+    @map.mask = @new_mask
+    @map.length = 0
+
+    # Re-insert all occupied entries
+    orbit @i in 0..@old_cap
+        if @old_entries[@i].state == ENTRY_OCCUPIED
+            hm_insert_entry(@map, @old_entries[@i].key, @old_entries[@i].value, @old_entries[@i].hash)
+
+# Insert an entry with a pre-computed hash (used during resize)
+fn hm_insert_entry(@map: HashMap, @key: int, @value: int, @hash: int)
+    @index = @hash & @map.mask
+    @dist = 0
+    @ins_key = @key
+    @ins_val = @value
+    @ins_hash = @hash
+
+    orbit @probe in 0..@map.capacity
+        if @map.entries[@index].state == ENTRY_EMPTY
+            # Found empty slot — place entry
+            @map.entries[@index].key = @ins_key
+            @map.entries[@index].value = @ins_val
+            @map.entries[@index].hash = @ins_hash
+            @map.entries[@index].state = ENTRY_OCCUPIED
+            @map.length = @map.length + 1
+            return
+        # Slot is occupied — check displacement (Robin Hood)
+        @existing_dist = hm_displacement(@index, @map.entries[@index].hash, @map.mask)
+        if @existing_dist < @dist
+            # Robin Hood: steal this slot, displace existing entry
+            @tmp_key = @map.entries[@index].key
+            @tmp_val = @map.entries[@index].value
+            @tmp_hash = @map.entries[@index].hash
+            @map.entries[@index].key = @ins_key
+            @map.entries[@index].value = @ins_val
+            @map.entries[@index].hash = @ins_hash
+            @ins_key = @tmp_key
+            @ins_val = @tmp_val
+            @ins_hash = @tmp_hash
+            @dist = @existing_dist
+        @index = (@index + 1) & @map.mask
+        @dist = @dist + 1
+
+# Insert a key-value pair — O(1) amortized.
+# Returns the previous value if the key already existed, or NODE_NIL.
+fn hm_insert(@map: HashMap, @key: int, @value: int) -> int
+    # Check load factor
+    if hm_should_grow(@map.length, @map.capacity) == 1
+        hm_resize(@map)
+
+    @hash = fnv1a_int(@key)
+    @index = @hash & @map.mask
+    @dist = 0
+
+    orbit @probe in 0..@map.capacity
+        if @map.entries[@index].state == ENTRY_EMPTY
+            # Empty slot — insert here
+            @map.entries[@index].key = @key
+            @map.entries[@index].value = @value
+            @map.entries[@index].hash = @hash
+            @map.entries[@index].state = ENTRY_OCCUPIED
+            @map.length = @map.length + 1
+            return NODE_NIL
+        # Check if key already exists
+        if @map.entries[@index].hash == @hash
+            if @map.entries[@index].key == @key
+                # Replace existing value
+                @old_val = @map.entries[@index].value
+                @map.entries[@index].value = @value
+                return @old_val
+        # Robin Hood: check displacement
+        @existing_dist = hm_displacement(@index, @map.entries[@index].hash, @map.mask)
+        if @existing_dist < @dist
+            # Steal this slot and push existing entry forward
+            @tmp_key = @map.entries[@index].key
+            @tmp_val = @map.entries[@index].value
+            @tmp_hash = @map.entries[@index].hash
+            @map.entries[@index].key = @key
+            @map.entries[@index].value = @value
+            @map.entries[@index].hash = @hash
+            # Continue inserting the displaced entry
+            hm_insert_entry(@map, @tmp_key, @tmp_val, @tmp_hash)
+            return NODE_NIL
+        @index = (@index + 1) & @map.mask
+        @dist = @dist + 1
+    return NODE_NIL
+
+# Get value by key — O(1) average. Returns NODE_NIL if not found.
+fn hm_get(@map: HashMap, @key: int) -> int
+    @hash = fnv1a_int(@key)
+    @index = @hash & @map.mask
+    @dist = 0
+
+    orbit @probe in 0..@map.capacity
+        if @map.entries[@index].state == ENTRY_EMPTY
+            return NODE_NIL
+        if @map.entries[@index].hash == @hash
+            if @map.entries[@index].key == @key
+                return @map.entries[@index].value
+        # Robin Hood early termination
+        @existing_dist = hm_displacement(@index, @map.entries[@index].hash, @map.mask)
+        if @existing_dist < @dist
+            return NODE_NIL   # Would have been here with Robin Hood
+        @index = (@index + 1) & @map.mask
+        @dist = @dist + 1
+    return NODE_NIL
+
+# Check if key exists — O(1) average. Returns 1 if found, 0 otherwise.
+fn hm_contains_key(@map: HashMap, @key: int) -> int
+    @result = hm_get(@map, @key)
+    if @result != NODE_NIL
+        return 1
+    return 0
+
+# Remove a key — O(1) average with backward-shift deletion.
+# Returns the removed value, or NODE_NIL if key not found.
+fn hm_remove(@map: HashMap, @key: int) -> int
+    @hash = fnv1a_int(@key)
+    @index = @hash & @map.mask
+
+    # Find the entry
+    orbit @probe in 0..@map.capacity
+        if @map.entries[@index].state == ENTRY_EMPTY
+            return NODE_NIL
+        if @map.entries[@index].hash == @hash
+            if @map.entries[@index].key == @key
+                # Found it — remove
+                @removed_val = @map.entries[@index].value
+                @map.entries[@index].state = ENTRY_EMPTY
+                @map.entries[@index].key = 0
+                @map.entries[@index].value = 0
+                @map.entries[@index].hash = 0
+                @map.length = @map.length - 1
+
+                # Backward-shift deletion: shift subsequent entries back
+                @curr = @index
+                orbit @shift in 0..@map.capacity
+                    @next = (@curr + 1) & @map.mask
+                    if @map.entries[@next].state == ENTRY_EMPTY
+                        return @removed_val
+                    # Check if next entry is at its home position
+                    @next_home = @map.entries[@next].hash & @map.mask
+                    if @next_home == @next
+                        return @removed_val   # Entry is at home, stop shifting
+                    # Shift entry back
+                    @map.entries[@curr].key = @map.entries[@next].key
+                    @map.entries[@curr].value = @map.entries[@next].value
+                    @map.entries[@curr].hash = @map.entries[@next].hash
+                    @map.entries[@curr].state = ENTRY_OCCUPIED
+                    @map.entries[@next].state = ENTRY_EMPTY
+                    @map.entries[@next].key = 0
+                    @map.entries[@next].value = 0
+                    @map.entries[@next].hash = 0
+                    @curr = @next
+                return @removed_val
+        @index = (@index + 1) & @map.mask
+    return NODE_NIL
+
+# Get the number of entries — O(1)
+fn hm_len(@map: HashMap) -> int
+    return @map.length
+
+# Collect all keys into @out. Returns number of keys.
+fn hm_keys(@map: HashMap, @out: [int; 65536]) -> int
+    @count = 0
+    orbit @i in 0..@map.capacity
+        if @map.entries[@i].state == ENTRY_OCCUPIED
+            @out[@count] = @map.entries[@i].key
+            @count = @count + 1
+    return @count
+
+# Collect all values into @out. Returns number of values.
+fn hm_values(@map: HashMap, @out: [int; 65536]) -> int
+    @count = 0
+    orbit @i in 0..@map.capacity
+        if @map.entries[@i].state == ENTRY_OCCUPIED
+            @out[@count] = @map.entries[@i].value
+            @count = @count + 1
+    return @count
+
+# Clear all entries — O(capacity)
+fn hm_clear(@map: HashMap)
+    orbit @i in 0..@map.capacity
+        @map.entries[@i].state = ENTRY_EMPTY
+        @map.entries[@i].key = 0
+        @map.entries[@i].value = 0
+        @map.entries[@i].hash = 0
+    @map.length = 0
+
+# =============================================================================
+# SECTION 4: VEC (Dynamic Array)
+# =============================================================================
+# Growable array with amortized O(1) push, O(1) random access.
+# Growth factor 2x. Includes introsort for sorting.
+#
+# Stores i64 values in a flat pre-allocated array.
+# Capacity grows by doubling up to MAX_VEC_CAPACITY.
+
+# --- Vec ---
+struct Vec
+    data: [int; 65536]      # Pre-allocated storage
+    length: int              # Number of active elements
+    cap: int                 # Current logical capacity
+
+# Create a new empty vec with default capacity
+fn vec_new() -> Vec
+    @v = Vec {
+        data: [0; 65536],
+        length: 0,
+        cap: 16
+    }
+    return @v
+
+# Create a vec with specified initial capacity
+fn vec_with_capacity(@initial_cap: int) -> Vec
+    @cap = @initial_cap
+    if @cap < 1
+        @cap = 1
+    if @cap > MAX_VEC_CAPACITY
+        @cap = MAX_VEC_CAPACITY
+    @v = Vec {
+        data: [0; 65536],
+        length: 0,
+        cap: @cap
+    }
+    return @v
+
+# Ensure the vec has room for at least one more element.
+# Doubles capacity if full.
+fn vec_grow(@v: Vec)
+    if @v.length >= @v.cap
+        @new_cap = @v.cap * 2
+        if @new_cap > MAX_VEC_CAPACITY
+            @new_cap = MAX_VEC_CAPACITY
+        @v.cap = @new_cap
+
+# Push a value to the end — amortized O(1)
+fn vec_push(@v: Vec, @value: int)
+    vec_grow(@v)
+    if @v.length >= MAX_VEC_CAPACITY
+        return   # Cannot grow further
+    @v.data[@v.length] = @value
+    @v.length = @v.length + 1
+
+# Pop a value from the end — O(1). Returns NODE_NIL if empty.
+fn vec_pop(@v: Vec) -> int
+    if @v.length == 0
+        return NODE_NIL
+    @v.length = @v.length - 1
+    return @v.data[@v.length]
+
+# Get value at index — O(1). Returns NODE_NIL if out of bounds.
+fn vec_get(@v: Vec, @index: int) -> int
+    if @index < 0 or @index >= @v.length
+        return NODE_NIL
+    return @v.data[@index]
+
+# Set value at index — O(1). No-op if out of bounds.
+fn vec_set(@v: Vec, @index: int, @value: int)
+    if @index < 0 or @index >= @v.length
+        return
+    @v.data[@index] = @value
+
+# Get current length — O(1)
+fn vec_len(@v: Vec) -> int
+    return @v.length
+
+# Get current capacity — O(1)
+fn vec_capacity(@v: Vec) -> int
+    return @v.cap
+
+# Check if empty — O(1)
+fn vec_is_empty(@v: Vec) -> int
+    if @v.length == 0
+        return 1
+    return 0
+
+# Clear all elements — O(1) (just resets length)
+fn vec_clear(@v: Vec)
+    @v.length = 0
+
+# Remove element at index, shifting subsequent elements left — O(n)
+fn vec_remove(@v: Vec, @index: int) -> int
+    if @index < 0 or @index >= @v.length
+        return NODE_NIL
+    @removed = @v.data[@index]
+    orbit @i in @index..(@v.length - 1)
+        @v.data[@i] = @v.data[@i + 1]
+    @v.length = @v.length - 1
+    return @removed
+
+# Insert element at index, shifting subsequent elements right — O(n)
+fn vec_insert_at(@v: Vec, @index: int, @value: int)
+    if @index < 0 or @index > @v.length
+        return
+    vec_grow(@v)
+    if @v.length >= MAX_VEC_CAPACITY
+        return
+    # Shift elements right
+    @i = @v.length
+    orbit @safety in 0..MAX_VEC_CAPACITY
+        if @i <= @index
+            @safety = MAX_VEC_CAPACITY   # break
+        else
+            @v.data[@i] = @v.data[@i - 1]
+            @i = @i - 1
+    @v.data[@index] = @value
+    @v.length = @v.length + 1
+
+# Swap two elements — O(1)
+fn vec_swap(@v: Vec, @i: int, @j: int)
+    if @i < 0 or @i >= @v.length
+        return
+    if @j < 0 or @j >= @v.length
+        return
+    @tmp = @v.data[@i]
+    @v.data[@i] = @v.data[@j]
+    @v.data[@j] = @tmp
+
+# Reverse the vec in-place — O(n)
+fn vec_reverse(@v: Vec)
+    @left = 0
+    @right = @v.length - 1
+    orbit @safety in 0..MAX_VEC_CAPACITY
+        if @left >= @right
+            return
+        @tmp = @v.data[@left]
+        @v.data[@left] = @v.data[@right]
+        @v.data[@right] = @tmp
+        @left = @left + 1
+        @right = @right - 1
+
+# Extend vec with elements from another vec — O(n)
+fn vec_extend(@dst: Vec, @src: Vec)
+    orbit @i in 0..@src.length
+        vec_push(@dst, @src.data[@i])
+
+# Filter: create new vec with elements passing a predicate.
+# @pred_fn is not directly callable in Luna's i64 model, so we
+# provide filter_gt (greater than) and filter_lt (less than) as
+# common concrete filters.
+fn vec_filter_gt(@v: Vec, @threshold: int) -> Vec
+    @result = vec_new()
+    orbit @i in 0..@v.length
+        if @v.data[@i] > @threshold
+            vec_push(@result, @v.data[@i])
+    return @result
+
+fn vec_filter_lt(@v: Vec, @threshold: int) -> Vec
+    @result = vec_new()
+    orbit @i in 0..@v.length
+        if @v.data[@i] < @threshold
+            vec_push(@result, @v.data[@i])
+    return @result
+
+fn vec_filter_eq(@v: Vec, @target: int) -> Vec
+    @result = vec_new()
+    orbit @i in 0..@v.length
+        if @v.data[@i] == @target
+            vec_push(@result, @v.data[@i])
+    return @result
+
+# Map: create new vec by applying a transformation.
+# Like filter, we provide concrete map operations.
+fn vec_map_add(@v: Vec, @addend: int) -> Vec
+    @result = vec_new()
+    orbit @i in 0..@v.length
+        vec_push(@result, @v.data[@i] + @addend)
+    return @result
+
+fn vec_map_mul(@v: Vec, @factor: int) -> Vec
+    @result = vec_new()
+    orbit @i in 0..@v.length
+        vec_push(@result, @v.data[@i] * @factor)
+    return @result
+
+fn vec_map_neg(@v: Vec) -> Vec
+    @result = vec_new()
+    orbit @i in 0..@v.length
+        vec_push(@result, 0 - @v.data[@i])
+    return @result
+
+# --- Introsort for Vec ---
+# Hybrid sort: quicksort with heapsort fallback when recursion depth exceeds
+# 2 * floor(log2(n)). This guarantees O(n log n) worst case.
+
+# Compute floor(log2(n)) for depth limit
+fn floor_log2(@n: int) -> int
+    @result = 0
+    @val = @n
+    orbit @i in 0..64
+        if @val <= 1
+            return @result
+        @val = @val >> 1
+        @result = @result + 1
+    return @result
+
+# Heapsort: sift-down based, operates on @v.data[@lo..@hi)
+fn heapsort_range(@v: Vec, @lo: int, @hi: int)
+    @n = @hi - @lo
+    if @n <= 1
+        return
+
+    # Build max-heap (sift down from last parent)
+    @start = (@n / 2) - 1
+    orbit @s in 0..(@start + 1)
+        @idx = @start - @s
+        # Sift down @idx within [0, n)
+        @root = @idx
+        orbit @sift in 0..@n
+            @child = 2 * @root + 1
+            if @child >= @n
+                @sift = @n   # break
+            else
+                # Pick larger child
+                if @child + 1 < @n
+                    if @v.data[@lo + @child + 1] > @v.data[@lo + @child]
+                        @child = @child + 1
+                if @v.data[@lo + @child] > @v.data[@lo + @root]
+                    # Swap root and child
+                    @tmp = @v.data[@lo + @root]
+                    @v.data[@lo + @root] = @v.data[@lo + @child]
+                    @v.data[@lo + @child] = @tmp
+                    @root = @child
+                else
+                    @sift = @n   # break
+
+    # Extract max elements
+    @end = @n - 1
+    orbit @e in 0..(@n - 1)
+        # Swap root (max) with end
+        @tmp = @v.data[@lo]
+        @v.data[@lo] = @v.data[@lo + @end]
+        @v.data[@lo + @end] = @tmp
+        # Sift down root within [0, end)
+        @root = 0
+        orbit @sift in 0..@end
+            @child = 2 * @root + 1
+            if @child >= @end
+                @sift = @end   # break
+            else
+                if @child + 1 < @end
+                    if @v.data[@lo + @child + 1] > @v.data[@lo + @child]
+                        @child = @child + 1
+                if @v.data[@lo + @child] > @v.data[@lo + @root]
+                    @tmp2 = @v.data[@lo + @root]
+                    @v.data[@lo + @root] = @v.data[@lo + @child]
+                    @v.data[@lo + @child] = @tmp2
+                    @root = @child
+                else
+                    @sift = @end   # break
+        @end = @end - 1
+
+# Median of three: return the index of the median element
+fn median_of_three(@v: Vec, @a: int, @b: int, @c: int) -> int
+    @va = @v.data[@a]
+    @vb = @v.data[@b]
+    @vc = @v.data[@c]
+    if @va <= @vb
+        if @vb <= @vc
+            return @b
+        else
+            if @va <= @vc
+                return @c
+            else
+                return @a
+    else
+        if @va <= @vc
+            return @a
+        else
+            if @vb <= @vc
+                return @c
+            else
+                return @b
+
+# Insertion sort for small ranges — O(n^2) but fast for n < 16
+fn insertion_sort_range(@v: Vec, @lo: int, @hi: int)
+    orbit @i in (@lo + 1)..@hi
+        @key = @v.data[@i]
+        @j = @i - 1
+        orbit @shift in 0..MAX_VEC_CAPACITY
+            if @j < @lo
+                @shift = MAX_VEC_CAPACITY   # break
+            else
+                if @v.data[@j] <= @key
+                    @shift = MAX_VEC_CAPACITY   # break
+                else
+                    @v.data[@j + 1] = @v.data[@j]
+                    @j = @j - 1
+        @v.data[@j + 1] = @key
+
+# Introsort implementation using an explicit stack (no recursion)
+# Stack entries are (lo, hi, depth_remaining) packed as 3 values
+const SORT_STACK_SIZE: int = 192      # 64 levels * 3 ints = 192
+const SORT_INSERTION_THRESHOLD: int = 16
+
+fn vec_sort(@v: Vec)
+    if @v.length <= 1
+        return
+    if @v.length <= SORT_INSERTION_THRESHOLD
+        insertion_sort_range(@v, 0, @v.length)
+        return
+
+    @max_depth = 2 * floor_log2(@v.length)
+
+    # Explicit stack: each frame is (lo, hi, depth)
+    @stack: [int; 192] = [0; 192]
+    @sp = 0   # stack pointer (index into @stack, increments by 3)
+
+    # Push initial frame
+    @stack[0] = 0
+    @stack[1] = @v.length
+    @stack[2] = @max_depth
+    @sp = 3
+
+    orbit @iter in 0..MAX_VEC_CAPACITY
+        if @sp == 0
+            return
+
+        # Pop frame
+        @sp = @sp - 3
+        @lo = @stack[@sp]
+        @hi = @stack[@sp + 1]
+        @depth = @stack[@sp + 2]
+
+        @size = @hi - @lo
+        if @size <= SORT_INSERTION_THRESHOLD
+            insertion_sort_range(@v, @lo, @hi)
+        else
+            if @depth == 0
+                # Depth limit reached — fall back to heapsort
+                heapsort_range(@v, @lo, @hi)
+            else
+                # Quicksort partition
+                @mid = @lo + @size / 2
+                @pivot_idx = median_of_three(@v, @lo, @mid, @hi - 1)
+                # Move pivot to end
+                @tmp = @v.data[@pivot_idx]
+                @v.data[@pivot_idx] = @v.data[@hi - 1]
+                @v.data[@hi - 1] = @tmp
+                @pivot = @v.data[@hi - 1]
+
+                # Lomuto partition scheme
+                @store = @lo
+                orbit @k in @lo..(@hi - 1)
+                    if @v.data[@k] < @pivot
+                        @tmp2 = @v.data[@k]
+                        @v.data[@k] = @v.data[@store]
+                        @v.data[@store] = @tmp2
+                        @store = @store + 1
+                # Place pivot in final position
+                @tmp3 = @v.data[@store]
+                @v.data[@store] = @v.data[@hi - 1]
+                @v.data[@hi - 1] = @tmp3
+
+                # Push sub-ranges onto stack (smaller first for stack efficiency)
+                @left_size = @store - @lo
+                @right_size = @hi - @store - 1
+
+                if @left_size > 1
+                    if @right_size > 1
+                        # Push both — larger range first (so smaller is processed first)
+                        if @left_size >= @right_size
+                            @stack[@sp] = @lo
+                            @stack[@sp + 1] = @store
+                            @stack[@sp + 2] = @depth - 1
+                            @sp = @sp + 3
+                            @stack[@sp] = @store + 1
+                            @stack[@sp + 1] = @hi
+                            @stack[@sp + 2] = @depth - 1
+                            @sp = @sp + 3
+                        else
+                            @stack[@sp] = @store + 1
+                            @stack[@sp + 1] = @hi
+                            @stack[@sp + 2] = @depth - 1
+                            @sp = @sp + 3
+                            @stack[@sp] = @lo
+                            @stack[@sp + 1] = @store
+                            @stack[@sp + 2] = @depth - 1
+                            @sp = @sp + 3
+                    else
+                        # Only left partition
+                        @stack[@sp] = @lo
+                        @stack[@sp + 1] = @store
+                        @stack[@sp + 2] = @depth - 1
+                        @sp = @sp + 3
+                else
+                    if @right_size > 1
+                        # Only right partition
+                        @stack[@sp] = @store + 1
+                        @stack[@sp + 1] = @hi
+                        @stack[@sp + 2] = @depth - 1
+                        @sp = @sp + 3
+
+# =============================================================================
+# SECTION 5: DEQUE (Double-Ended Queue)
+# =============================================================================
+# Circular buffer implementation. O(1) push/pop at both ends.
+# Uses a flat array with head/tail indices that wrap around.
+
+# --- Deque ---
+struct Deque
+    data: [int; 8192]        # Circular buffer storage
+    head: int                 # Index of first element
+    tail: int                 # Index one past last element
+    length: int               # Number of active elements
+    cap: int                  # Current logical capacity
+
+# Create a new empty deque
+fn deque_new() -> Deque
+    @d = Deque {
+        data: [0; 8192],
+        head: 0,
+        tail: 0,
+        length: 0,
+        cap: MAX_DEQUE_CAPACITY
+    }
+    return @d
+
+# Push value to the front — O(1)
+fn deque_push_front(@d: Deque, @value: int)
+    if @d.length >= @d.cap
+        return   # Full
+    @d.head = (@d.head - 1 + @d.cap) % @d.cap
+    @d.data[@d.head] = @value
+    @d.length = @d.length + 1
+
+# Push value to the back — O(1)
+fn deque_push_back(@d: Deque, @value: int)
+    if @d.length >= @d.cap
+        return   # Full
+    @d.data[@d.tail] = @value
+    @d.tail = (@d.tail + 1) % @d.cap
+    @d.length = @d.length + 1
+
+# Pop value from the front — O(1). Returns NODE_NIL if empty.
+fn deque_pop_front(@d: Deque) -> int
+    if @d.length == 0
+        return NODE_NIL
+    @value = @d.data[@d.head]
+    @d.head = (@d.head + 1) % @d.cap
+    @d.length = @d.length - 1
+    return @value
+
+# Pop value from the back — O(1). Returns NODE_NIL if empty.
+fn deque_pop_back(@d: Deque) -> int
+    if @d.length == 0
+        return NODE_NIL
+    @d.tail = (@d.tail - 1 + @d.cap) % @d.cap
+    @value = @d.data[@d.tail]
+    @d.length = @d.length - 1
+    return @value
+
+# Peek at front — O(1). Returns NODE_NIL if empty.
+fn deque_front(@d: Deque) -> int
+    if @d.length == 0
+        return NODE_NIL
+    return @d.data[@d.head]
+
+# Peek at back — O(1). Returns NODE_NIL if empty.
+fn deque_back(@d: Deque) -> int
+    if @d.length == 0
+        return NODE_NIL
+    @back_idx = (@d.tail - 1 + @d.cap) % @d.cap
+    return @d.data[@back_idx]
+
+# Get the length — O(1)
+fn deque_len(@d: Deque) -> int
+    return @d.length
+
+# Check if empty — O(1)
+fn deque_is_empty(@d: Deque) -> int
+    if @d.length == 0
+        return 1
+    return 0
+
+# Clear the deque — O(1)
+fn deque_clear(@d: Deque)
+    @d.head = 0
+    @d.tail = 0
+    @d.length = 0
+
+# =============================================================================
+# SECTION 6: STRING INTERNER
+# =============================================================================
+# Deduplicated string storage for efficient identifier handling.
+# Each unique string is stored once and mapped to a unique integer ID.
+# Uses a parallel-array hash map for fast lookup.
+#
+# The interner stores strings in a flat array and uses a separate
+# hash map (key = FNV-1a hash of string, value = string index) for
+# deduplication. String comparison uses the stored string data.
+
+const INTERNER_HASH_CAP: int = 32768        # Hash table capacity
+const INTERNER_HASH_MASK: int = 32767       # INTERNER_HASH_CAP - 1
+
+# Hash bucket for the interner's internal hash map
+struct InternerBucket
+    hash: int           # FNV-1a hash of the string
+    str_idx: int        # Index into the strings array
+    occupied: int       # 1 if occupied, 0 if empty
+
+# --- StringInterner ---
+struct StringInterner
+    strings: [str; 16384]               # Stored strings
+    string_count: int                    # Number of interned strings
+    buckets: [InternerBucket; 32768]     # Hash table for deduplication
+    bucket_count: int                    # Number of occupied buckets
+
+# Create a new empty string interner
+fn interner_new() -> StringInterner
+    @si = StringInterner {
+        strings: [""; 16384],
+        string_count: 0,
+        buckets: [InternerBucket { hash: 0, str_idx: 0, occupied: 0 }; 32768],
+        bucket_count: 0
+    }
+    return @si
+
+# Intern a string, returning its unique ID.
+# If the string was already interned, returns the existing ID.
+fn interner_intern(@si: StringInterner, @s: str) -> int
+    if @si.string_count >= MAX_INTERNER_STRINGS
+        return NODE_NIL   # Interner full
+
+    @hash = fnv1a_str(@s)
+    @index = @hash & INTERNER_HASH_MASK
+
+    # Linear probe to find existing or empty slot
+    orbit @probe in 0..INTERNER_HASH_CAP
+        if @si.buckets[@index].occupied == 0
+            # Empty slot — intern new string
+            @str_idx = @si.string_count
+            @si.strings[@str_idx] = @s
+            @si.string_count = @si.string_count + 1
+            @si.buckets[@index].hash = @hash
+            @si.buckets[@index].str_idx = @str_idx
+            @si.buckets[@index].occupied = 1
+            @si.bucket_count = @si.bucket_count + 1
+            return @str_idx
+        # Check if this bucket holds the same string
+        if @si.buckets[@index].hash == @hash
+            @existing_idx = @si.buckets[@index].str_idx
+            if @si.strings[@existing_idx] == @s
+                return @existing_idx   # Already interned
+        @index = (@index + 1) & INTERNER_HASH_MASK
+    return NODE_NIL   # Hash table full (should not happen if cap > max strings)
+
+# Resolve a string ID back to the string. Returns "" if invalid.
+fn interner_resolve(@si: StringInterner, @id: int) -> str
+    if @id < 0 or @id >= @si.string_count
+        return ""
+    return @si.strings[@id]
+
+# Get the number of interned strings — O(1)
+fn interner_len(@si: StringInterner) -> int
+    return @si.string_count
+
+# Check if a string is already interned — O(1) average.
+# Returns 1 if interned, 0 otherwise.
+fn interner_contains(@si: StringInterner, @s: str) -> int
+    @hash = fnv1a_str(@s)
+    @index = @hash & INTERNER_HASH_MASK
+
+    orbit @probe in 0..INTERNER_HASH_CAP
+        if @si.buckets[@index].occupied == 0
+            return 0
+        if @si.buckets[@index].hash == @hash
+            @existing_idx = @si.buckets[@index].str_idx
+            if @si.strings[@existing_idx] == @s
+                return 1
+        @index = (@index + 1) & INTERNER_HASH_MASK
+    return 0
+
+# =============================================================================
+# SECTION 7: STRING BUILDER
+# =============================================================================
+# Efficient string concatenation buffer.
+# Collects string fragments and builds the final string at the end.
+# Avoids quadratic concatenation overhead.
+
+const MAX_BUILDER_PARTS: int = 4096
+const MAX_BUILDER_CHARS: int = 65536
+
+# --- StringBuilder ---
+struct StringBuilder
+    parts: [str; 4096]          # Collected string fragments
+    part_count: int             # Number of fragments
+    total_len: int              # Total character count across all parts
+
+# Create a new empty string builder
+fn sb_new() -> StringBuilder
+    @sb = StringBuilder {
+        parts: [""; 4096],
+        part_count: 0,
+        total_len: 0
+    }
+    return @sb
+
+# Append a string fragment
+fn sb_append(@sb: StringBuilder, @s: str)
+    if @sb.part_count >= MAX_BUILDER_PARTS
+        return   # Buffer full
+    @slen = len(@s)
+    @sb.parts[@sb.part_count] = @s
+    @sb.part_count = @sb.part_count + 1
+    @sb.total_len = @sb.total_len + @slen
+
+# Append a single character (as a 1-char string)
+fn sb_append_char(@sb: StringBuilder, @ch: str)
+    sb_append(@sb, @ch)
+
+# Get the total length of all appended content — O(1)
+fn sb_len(@sb: StringBuilder) -> int
+    return @sb.total_len
+
+# Build the final concatenated string — O(n)
+# Returns the concatenation of all appended fragments.
+fn sb_build(@sb: StringBuilder) -> str
+    @result = ""
+    orbit @i in 0..@sb.part_count
+        @result = @result + @sb.parts[@i]
+    return @result
+
+# Clear the builder for reuse — O(1)
+fn sb_clear(@sb: StringBuilder)
+    @sb.part_count = 0
+    @sb.total_len = 0
+
+# =============================================================================
+# SECTION 8: SELF-TESTS
+# =============================================================================
+# Comprehensive test suite for all collections.
+
+# --- LinkedList Tests ---
+fn test_linkedlist_basic()
+    shine("  [test] LinkedList basic operations...")
+    @list = ll_new()
+
+    # Test empty state
+    guard ll_is_empty(@list) == 1 else
+        shine("    FAIL: new list should be empty")
+        return
+    guard ll_len(@list) == 0 else
+        shine("    FAIL: new list length should be 0")
+        return
+
+    # Push back
+    ll_push_back(@list, 10)
+    ll_push_back(@list, 20)
+    ll_push_back(@list, 30)
+    guard ll_len(@list) == 3 else
+        shine("    FAIL: length should be 3 after 3 pushes")
+        return
+    guard ll_front(@list) == 10 else
+        shine("    FAIL: front should be 10")
+        return
+    guard ll_back(@list) == 30 else
+        shine("    FAIL: back should be 30")
+        return
+
+    # Push front
+    ll_push_front(@list, 5)
+    guard ll_front(@list) == 5 else
+        shine("    FAIL: front should be 5 after push_front")
+        return
+    guard ll_len(@list) == 4 else
+        shine("    FAIL: length should be 4")
+        return
+
+    # Pop front
+    @val = ll_pop_front(@list)
+    guard @val == 5 else
+        shine("    FAIL: pop_front should return 5")
+        return
+    guard ll_front(@list) == 10 else
+        shine("    FAIL: front should be 10 after pop")
+        return
+
+    # Pop back
+    @val2 = ll_pop_back(@list)
+    guard @val2 == 30 else
+        shine("    FAIL: pop_back should return 30")
+        return
+    guard ll_back(@list) == 20 else
+        shine("    FAIL: back should be 20 after pop")
+        return
+
+    guard ll_len(@list) == 2 else
+        shine("    FAIL: length should be 2")
+        return
+
+    shine("    PASS")
+
+fn test_linkedlist_clear()
+    shine("  [test] LinkedList clear...")
+    @list = ll_new()
+    ll_push_back(@list, 1)
+    ll_push_back(@list, 2)
+    ll_push_back(@list, 3)
+    ll_clear(@list)
+    guard ll_is_empty(@list) == 1 else
+        shine("    FAIL: list should be empty after clear")
+        return
+    guard ll_len(@list) == 0 else
+        shine("    FAIL: length should be 0 after clear")
+        return
+    # Ensure we can still push after clear
+    ll_push_back(@list, 42)
+    guard ll_front(@list) == 42 else
+        shine("    FAIL: should be able to push after clear")
+        return
+    shine("    PASS")
+
+fn test_linkedlist_iter()
+    shine("  [test] LinkedList iteration...")
+    @list = ll_new()
+    ll_push_back(@list, 100)
+    ll_push_back(@list, 200)
+    ll_push_back(@list, 300)
+    @out: [int; 8192] = [0; 8192]
+    @count = ll_iter(@list, @out)
+    guard @count == 3 else
+        shine("    FAIL: iter should return 3 elements")
+        return
+    guard @out[0] == 100 else
+        shine("    FAIL: first element should be 100")
+        return
+    guard @out[1] == 200 else
+        shine("    FAIL: second element should be 200")
+        return
+    guard @out[2] == 300 else
+        shine("    FAIL: third element should be 300")
+        return
+    shine("    PASS")
+
+fn test_linkedlist_empty_pops()
+    shine("  [test] LinkedList empty pops...")
+    @list = ll_new()
+    guard ll_pop_front(@list) == NODE_NIL else
+        shine("    FAIL: pop_front on empty should return NODE_NIL")
+        return
+    guard ll_pop_back(@list) == NODE_NIL else
+        shine("    FAIL: pop_back on empty should return NODE_NIL")
+        return
+    guard ll_front(@list) == NODE_NIL else
+        shine("    FAIL: front on empty should return NODE_NIL")
+        return
+    guard ll_back(@list) == NODE_NIL else
+        shine("    FAIL: back on empty should return NODE_NIL")
+        return
+    shine("    PASS")
+
+# --- RBTree Tests ---
+fn test_rbtree_basic()
+    shine("  [test] RBTree basic operations...")
+    @tree = rb_new()
+
+    # Insert some values
+    rb_insert(@tree, 50, 500)
+    rb_insert(@tree, 30, 300)
+    rb_insert(@tree, 70, 700)
+    rb_insert(@tree, 20, 200)
+    rb_insert(@tree, 40, 400)
+
+    guard rb_len(@tree) == 5 else
+        shine("    FAIL: length should be 5")
+        return
+
+    # Lookup
+    guard rb_get(@tree, 50) == 500 else
+        shine("    FAIL: get(50) should return 500")
+        return
+    guard rb_get(@tree, 30) == 300 else
+        shine("    FAIL: get(30) should return 300")
+        return
+    guard rb_get(@tree, 99) == NODE_NIL else
+        shine("    FAIL: get(99) should return NODE_NIL")
+        return
+
+    # Contains
+    guard rb_contains_key(@tree, 70) == 1 else
+        shine("    FAIL: should contain key 70")
+        return
+    guard rb_contains_key(@tree, 99) == 0 else
+        shine("    FAIL: should not contain key 99")
+        return
+
+    shine("    PASS")
+
+fn test_rbtree_replace()
+    shine("  [test] RBTree value replacement...")
+    @tree = rb_new()
+    rb_insert(@tree, 10, 100)
+    @old = rb_insert(@tree, 10, 999)
+    guard @old == 100 else
+        shine("    FAIL: insert should return old value 100")
+        return
+    guard rb_get(@tree, 10) == 999 else
+        shine("    FAIL: get(10) should return new value 999")
+        return
+    guard rb_len(@tree) == 1 else
+        shine("    FAIL: length should still be 1 after replace")
+        return
+    shine("    PASS")
+
+fn test_rbtree_inorder()
+    shine("  [test] RBTree in-order traversal...")
+    @tree = rb_new()
+    rb_insert(@tree, 5, 50)
+    rb_insert(@tree, 3, 30)
+    rb_insert(@tree, 7, 70)
+    rb_insert(@tree, 1, 10)
+    rb_insert(@tree, 4, 40)
+    rb_insert(@tree, 6, 60)
+    rb_insert(@tree, 8, 80)
+
+    @keys: [int; 4096] = [0; 4096]
+    @vals: [int; 4096] = [0; 4096]
+    @count = rb_inorder(@tree, @keys, @vals)
+    guard @count == 7 else
+        shine("    FAIL: should have 7 elements")
+        return
+    # Verify sorted order
+    guard @keys[0] == 1 else
+        shine("    FAIL: first key should be 1")
+        return
+    guard @keys[1] == 3 else
+        shine("    FAIL: second key should be 3")
+        return
+    guard @keys[2] == 4 else
+        shine("    FAIL: third key should be 4")
+        return
+    guard @keys[3] == 5 else
+        shine("    FAIL: fourth key should be 5")
+        return
+    guard @keys[6] == 8 else
+        shine("    FAIL: last key should be 8")
+        return
+    shine("    PASS")
+
+fn test_rbtree_many_inserts()
+    shine("  [test] RBTree many inserts (stress)...")
+    @tree = rb_new()
+    # Insert 100 elements in reverse order (worst case for naive BST)
+    orbit @i in 0..100
+        @key = 100 - @i
+        rb_insert(@tree, @key, @key * 10)
+    guard rb_len(@tree) == 100 else
+        shine("    FAIL: length should be 100")
+        return
+    # Verify all keys exist
+    @all_found = 1
+    orbit @i in 1..101
+        if rb_contains_key(@tree, @i) == 0
+            @all_found = 0
+    guard @all_found == 1 else
+        shine("    FAIL: not all keys found")
+        return
+    # Verify in-order traversal is sorted
+    @keys: [int; 4096] = [0; 4096]
+    @vals: [int; 4096] = [0; 4096]
+    @count = rb_inorder(@tree, @keys, @vals)
+    @sorted = 1
+    orbit @i in 1..@count
+        if @keys[@i] <= @keys[@i - 1]
+            @sorted = 0
+    guard @sorted == 1 else
+        shine("    FAIL: in-order traversal not sorted")
+        return
+    shine("    PASS")
+
+# --- HashMap Tests ---
+fn test_hashmap_basic()
+    shine("  [test] HashMap basic operations...")
+    @map = hm_new()
+
+    hm_insert(@map, 100, 1000)
+    hm_insert(@map, 200, 2000)
+    hm_insert(@map, 300, 3000)
+
+    guard hm_len(@map) == 3 else
+        shine("    FAIL: length should be 3")
+        return
+    guard hm_get(@map, 100) == 1000 else
+        shine("    FAIL: get(100) should return 1000")
+        return
+    guard hm_get(@map, 200) == 2000 else
+        shine("    FAIL: get(200) should return 2000")
+        return
+    guard hm_get(@map, 999) == NODE_NIL else
+        shine("    FAIL: get(999) should return NODE_NIL")
+        return
+    guard hm_contains_key(@map, 300) == 1 else
+        shine("    FAIL: should contain key 300")
+        return
+    guard hm_contains_key(@map, 999) == 0 else
+        shine("    FAIL: should not contain key 999")
+        return
+    shine("    PASS")
+
+fn test_hashmap_replace()
+    shine("  [test] HashMap value replacement...")
+    @map = hm_new()
+    hm_insert(@map, 42, 100)
+    @old = hm_insert(@map, 42, 999)
+    guard @old == 100 else
+        shine("    FAIL: insert should return old value 100")
+        return
+    guard hm_get(@map, 42) == 999 else
+        shine("    FAIL: get(42) should return 999")
+        return
+    guard hm_len(@map) == 1 else
+        shine("    FAIL: length should still be 1")
+        return
+    shine("    PASS")
+
+fn test_hashmap_remove()
+    shine("  [test] HashMap remove with backward-shift...")
+    @map = hm_new()
+    hm_insert(@map, 10, 100)
+    hm_insert(@map, 20, 200)
+    hm_insert(@map, 30, 300)
+
+    @removed = hm_remove(@map, 20)
+    guard @removed == 200 else
+        shine("    FAIL: removed value should be 200")
+        return
+    guard hm_len(@map) == 2 else
+        shine("    FAIL: length should be 2 after remove")
+        return
+    guard hm_contains_key(@map, 20) == 0 else
+        shine("    FAIL: should not contain key 20 after remove")
+        return
+    # Verify remaining keys still accessible
+    guard hm_get(@map, 10) == 100 else
+        shine("    FAIL: get(10) should still return 100")
+        return
+    guard hm_get(@map, 30) == 300 else
+        shine("    FAIL: get(30) should still return 300")
+        return
+
+    # Remove non-existent key
+    @missing = hm_remove(@map, 999)
+    guard @missing == NODE_NIL else
+        shine("    FAIL: removing non-existent key should return NODE_NIL")
+        return
+    shine("    PASS")
+
+fn test_hashmap_resize()
+    shine("  [test] HashMap resize (load factor)...")
+    @map = hm_new()
+    # Insert enough entries to trigger multiple resizes
+    # Initial cap is 16, load factor 75% => resize at 12+
+    orbit @i in 0..50
+        hm_insert(@map, @i, @i * 100)
+    guard hm_len(@map) == 50 else
+        shine("    FAIL: length should be 50")
+        return
+    # Verify all entries survived resize
+    @all_ok = 1
+    orbit @i in 0..50
+        if hm_get(@map, @i) != @i * 100
+            @all_ok = 0
+    guard @all_ok == 1 else
+        shine("    FAIL: not all entries survived resize")
+        return
+    shine("    PASS")
+
+fn test_hashmap_keys_values()
+    shine("  [test] HashMap keys/values collection...")
+    @map = hm_new()
+    hm_insert(@map, 1, 10)
+    hm_insert(@map, 2, 20)
+    hm_insert(@map, 3, 30)
+
+    @keys: [int; 65536] = [0; 65536]
+    @key_count = hm_keys(@map, @keys)
+    guard @key_count == 3 else
+        shine("    FAIL: should have 3 keys")
+        return
+
+    @vals: [int; 65536] = [0; 65536]
+    @val_count = hm_values(@map, @vals)
+    guard @val_count == 3 else
+        shine("    FAIL: should have 3 values")
+        return
+    shine("    PASS")
+
+fn test_hashmap_clear()
+    shine("  [test] HashMap clear...")
+    @map = hm_new()
+    hm_insert(@map, 1, 10)
+    hm_insert(@map, 2, 20)
+    hm_clear(@map)
+    guard hm_len(@map) == 0 else
+        shine("    FAIL: length should be 0 after clear")
+        return
+    guard hm_get(@map, 1) == NODE_NIL else
+        shine("    FAIL: get(1) should return NODE_NIL after clear")
+        return
+    # Can still insert after clear
+    hm_insert(@map, 99, 990)
+    guard hm_get(@map, 99) == 990 else
+        shine("    FAIL: should be able to insert after clear")
+        return
+    shine("    PASS")
+
+# --- Vec Tests ---
+fn test_vec_basic()
+    shine("  [test] Vec basic operations...")
+    @v = vec_new()
+
+    guard vec_is_empty(@v) == 1 else
+        shine("    FAIL: new vec should be empty")
+        return
+
+    vec_push(@v, 10)
+    vec_push(@v, 20)
+    vec_push(@v, 30)
+
+    guard vec_len(@v) == 3 else
+        shine("    FAIL: length should be 3")
+        return
+    guard vec_get(@v, 0) == 10 else
+        shine("    FAIL: get(0) should be 10")
+        return
+    guard vec_get(@v, 1) == 20 else
+        shine("    FAIL: get(1) should be 20")
+        return
+    guard vec_get(@v, 2) == 30 else
+        shine("    FAIL: get(2) should be 30")
+        return
+    guard vec_is_empty(@v) == 0 else
+        shine("    FAIL: vec with 3 elements should not be empty")
+        return
+
+    # Pop
+    @val = vec_pop(@v)
+    guard @val == 30 else
+        shine("    FAIL: pop should return 30")
+        return
+    guard vec_len(@v) == 2 else
+        shine("    FAIL: length should be 2 after pop")
+        return
+
+    # Set
+    vec_set(@v, 0, 99)
+    guard vec_get(@v, 0) == 99 else
+        shine("    FAIL: get(0) should be 99 after set")
+        return
+
+    shine("    PASS")
+
+fn test_vec_remove_insert()
+    shine("  [test] Vec remove and insert_at...")
+    @v = vec_new()
+    vec_push(@v, 10)
+    vec_push(@v, 20)
+    vec_push(@v, 30)
+    vec_push(@v, 40)
+
+    # Remove middle element
+    @removed = vec_remove(@v, 1)
+    guard @removed == 20 else
+        shine("    FAIL: removed element should be 20")
+        return
+    guard vec_len(@v) == 3 else
+        shine("    FAIL: length should be 3 after remove")
+        return
+    guard vec_get(@v, 1) == 30 else
+        shine("    FAIL: element at 1 should now be 30")
+        return
+
+    # Insert at position 1
+    vec_insert_at(@v, 1, 25)
+    guard vec_len(@v) == 4 else
+        shine("    FAIL: length should be 4 after insert")
+        return
+    guard vec_get(@v, 1) == 25 else
+        shine("    FAIL: element at 1 should be 25")
+        return
+    guard vec_get(@v, 2) == 30 else
+        shine("    FAIL: element at 2 should be 30")
+        return
+    shine("    PASS")
+
+fn test_vec_swap_reverse()
+    shine("  [test] Vec swap and reverse...")
+    @v = vec_new()
+    vec_push(@v, 1)
+    vec_push(@v, 2)
+    vec_push(@v, 3)
+    vec_push(@v, 4)
+
+    vec_swap(@v, 0, 3)
+    guard vec_get(@v, 0) == 4 else
+        shine("    FAIL: after swap, get(0) should be 4")
+        return
+    guard vec_get(@v, 3) == 1 else
+        shine("    FAIL: after swap, get(3) should be 1")
+        return
+
+    # Reset and test reverse
+    vec_clear(@v)
+    vec_push(@v, 10)
+    vec_push(@v, 20)
+    vec_push(@v, 30)
+    vec_push(@v, 40)
+    vec_push(@v, 50)
+    vec_reverse(@v)
+    guard vec_get(@v, 0) == 50 else
+        shine("    FAIL: after reverse, get(0) should be 50")
+        return
+    guard vec_get(@v, 4) == 10 else
+        shine("    FAIL: after reverse, get(4) should be 10")
+        return
+    shine("    PASS")
+
+fn test_vec_extend()
+    shine("  [test] Vec extend...")
+    @v1 = vec_new()
+    vec_push(@v1, 1)
+    vec_push(@v1, 2)
+    @v2 = vec_new()
+    vec_push(@v2, 3)
+    vec_push(@v2, 4)
+    vec_push(@v2, 5)
+    vec_extend(@v1, @v2)
+    guard vec_len(@v1) == 5 else
+        shine("    FAIL: length should be 5 after extend")
+        return
+    guard vec_get(@v1, 2) == 3 else
+        shine("    FAIL: get(2) should be 3")
+        return
+    guard vec_get(@v1, 4) == 5 else
+        shine("    FAIL: get(4) should be 5")
+        return
+    shine("    PASS")
+
+fn test_vec_filter_map()
+    shine("  [test] Vec filter and map...")
+    @v = vec_new()
+    vec_push(@v, 1)
+    vec_push(@v, 5)
+    vec_push(@v, 10)
+    vec_push(@v, 15)
+    vec_push(@v, 20)
+
+    # Filter greater than 8
+    @filtered = vec_filter_gt(@v, 8)
+    guard vec_len(@filtered) == 3 else
+        shine("    FAIL: filter_gt(8) should yield 3 elements")
+        return
+    guard vec_get(@filtered, 0) == 10 else
+        shine("    FAIL: first filtered element should be 10")
+        return
+
+    # Map: multiply by 2
+    @mapped = vec_map_mul(@v, 2)
+    guard vec_len(@mapped) == 5 else
+        shine("    FAIL: map_mul should preserve length")
+        return
+    guard vec_get(@mapped, 0) == 2 else
+        shine("    FAIL: first mapped element should be 2")
+        return
+    guard vec_get(@mapped, 4) == 40 else
+        shine("    FAIL: last mapped element should be 40")
+        return
+    shine("    PASS")
+
+fn test_vec_sort()
+    shine("  [test] Vec introsort...")
+    @v = vec_new()
+    # Unsorted data
+    vec_push(@v, 38)
+    vec_push(@v, 27)
+    vec_push(@v, 43)
+    vec_push(@v, 3)
+    vec_push(@v, 9)
+    vec_push(@v, 82)
+    vec_push(@v, 10)
+    vec_push(@v, 1)
+    vec_push(@v, 55)
+    vec_push(@v, 17)
+    vec_push(@v, 64)
+    vec_push(@v, 29)
+    vec_push(@v, 71)
+    vec_push(@v, 5)
+    vec_push(@v, 44)
+    vec_push(@v, 12)
+    vec_push(@v, 88)
+    vec_push(@v, 36)
+    vec_push(@v, 21)
+    vec_push(@v, 7)
+
+    vec_sort(@v)
+
+    # Verify sorted
+    @sorted = 1
+    orbit @i in 1..vec_len(@v)
+        if vec_get(@v, @i) < vec_get(@v, @i - 1)
+            @sorted = 0
+    guard @sorted == 1 else
+        shine("    FAIL: vec not sorted after introsort")
+        return
+
+    guard vec_get(@v, 0) == 1 else
+        shine("    FAIL: first element should be 1")
+        return
+    guard vec_get(@v, vec_len(@v) - 1) == 88 else
+        shine("    FAIL: last element should be 88")
+        return
+    shine("    PASS")
+
+fn test_vec_sort_large()
+    shine("  [test] Vec introsort large (reverse-sorted)...")
+    @v = vec_new()
+    # Insert 200 elements in reverse order (triggers heapsort fallback)
+    orbit @i in 0..200
+        vec_push(@v, 200 - @i)
+    vec_sort(@v)
+    @sorted = 1
+    orbit @i in 1..vec_len(@v)
+        if vec_get(@v, @i) < vec_get(@v, @i - 1)
+            @sorted = 0
+    guard @sorted == 1 else
+        shine("    FAIL: large reverse-sorted vec not sorted")
+        return
+    guard vec_get(@v, 0) == 1 else
+        shine("    FAIL: first should be 1")
+        return
+    guard vec_get(@v, 199) == 200 else
+        shine("    FAIL: last should be 200")
+        return
+    shine("    PASS")
+
+fn test_vec_sort_already_sorted()
+    shine("  [test] Vec introsort already sorted...")
+    @v = vec_new()
+    orbit @i in 0..50
+        vec_push(@v, @i + 1)
+    vec_sort(@v)
+    @sorted = 1
+    orbit @i in 1..vec_len(@v)
+        if vec_get(@v, @i) < vec_get(@v, @i - 1)
+            @sorted = 0
+    guard @sorted == 1 else
+        shine("    FAIL: already-sorted vec should remain sorted")
+        return
+    shine("    PASS")
+
+fn test_vec_sort_duplicates()
+    shine("  [test] Vec introsort with duplicates...")
+    @v = vec_new()
+    vec_push(@v, 5)
+    vec_push(@v, 3)
+    vec_push(@v, 5)
+    vec_push(@v, 1)
+    vec_push(@v, 3)
+    vec_push(@v, 1)
+    vec_push(@v, 5)
+    vec_sort(@v)
+    guard vec_get(@v, 0) == 1 else
+        shine("    FAIL: first should be 1")
+        return
+    guard vec_get(@v, 1) == 1 else
+        shine("    FAIL: second should be 1")
+        return
+    guard vec_get(@v, 2) == 3 else
+        shine("    FAIL: third should be 3")
+        return
+    guard vec_get(@v, 6) == 5 else
+        shine("    FAIL: last should be 5")
+        return
+    shine("    PASS")
+
+fn test_vec_boundary()
+    shine("  [test] Vec boundary conditions...")
+    @v = vec_new()
+    # Pop from empty
+    guard vec_pop(@v) == NODE_NIL else
+        shine("    FAIL: pop on empty should return NODE_NIL")
+        return
+    # Get out of bounds
+    guard vec_get(@v, 0) == NODE_NIL else
+        shine("    FAIL: get on empty should return NODE_NIL")
+        return
+    guard vec_get(@v, -1) == NODE_NIL else
+        shine("    FAIL: get(-1) should return NODE_NIL")
+        return
+    # Sort empty
+    vec_sort(@v)
+    guard vec_len(@v) == 0 else
+        shine("    FAIL: sort on empty should leave empty")
+        return
+    # Sort single element
+    vec_push(@v, 42)
+    vec_sort(@v)
+    guard vec_get(@v, 0) == 42 else
+        shine("    FAIL: sort single element")
+        return
+    shine("    PASS")
+
+# --- Deque Tests ---
+fn test_deque_basic()
+    shine("  [test] Deque basic operations...")
+    @d = deque_new()
+
+    guard deque_is_empty(@d) == 1 else
+        shine("    FAIL: new deque should be empty")
+        return
+
+    deque_push_back(@d, 10)
+    deque_push_back(@d, 20)
+    deque_push_front(@d, 5)
+
+    guard deque_len(@d) == 3 else
+        shine("    FAIL: length should be 3")
+        return
+    guard deque_front(@d) == 5 else
+        shine("    FAIL: front should be 5")
+        return
+    guard deque_back(@d) == 20 else
+        shine("    FAIL: back should be 20")
+        return
+
+    @val = deque_pop_front(@d)
+    guard @val == 5 else
+        shine("    FAIL: pop_front should return 5")
+        return
+
+    @val2 = deque_pop_back(@d)
+    guard @val2 == 20 else
+        shine("    FAIL: pop_back should return 20")
+        return
+
+    guard deque_len(@d) == 1 else
+        shine("    FAIL: length should be 1")
+        return
+    guard deque_front(@d) == 10 else
+        shine("    FAIL: remaining element should be 10")
+        return
+    shine("    PASS")
+
+fn test_deque_wrap_around()
+    shine("  [test] Deque circular wrap-around...")
+    @d = deque_new()
+    # Push and pop to force wrap-around
+    orbit @i in 0..100
+        deque_push_back(@d, @i)
+    orbit @i in 0..90
+        deque_pop_front(@d)
+    # Now head is at index 90, push more to wrap
+    orbit @i in 100..200
+        deque_push_back(@d, @i)
+    guard deque_len(@d) == 110 else
+        shine("    FAIL: length should be 110")
+        return
+    guard deque_front(@d) == 90 else
+        shine("    FAIL: front should be 90")
+        return
+    guard deque_back(@d) == 199 else
+        shine("    FAIL: back should be 199")
+        return
+    shine("    PASS")
+
+fn test_deque_empty_pops()
+    shine("  [test] Deque empty pops...")
+    @d = deque_new()
+    guard deque_pop_front(@d) == NODE_NIL else
+        shine("    FAIL: pop_front on empty should return NODE_NIL")
+        return
+    guard deque_pop_back(@d) == NODE_NIL else
+        shine("    FAIL: pop_back on empty should return NODE_NIL")
+        return
+    guard deque_front(@d) == NODE_NIL else
+        shine("    FAIL: front on empty should return NODE_NIL")
+        return
+    guard deque_back(@d) == NODE_NIL else
+        shine("    FAIL: back on empty should return NODE_NIL")
+        return
+    shine("    PASS")
+
+fn test_deque_clear()
+    shine("  [test] Deque clear...")
+    @d = deque_new()
+    deque_push_back(@d, 1)
+    deque_push_back(@d, 2)
+    deque_push_back(@d, 3)
+    deque_clear(@d)
+    guard deque_is_empty(@d) == 1 else
+        shine("    FAIL: should be empty after clear")
+        return
+    deque_push_back(@d, 99)
+    guard deque_front(@d) == 99 else
+        shine("    FAIL: should work after clear")
+        return
+    shine("    PASS")
+
+# --- StringInterner Tests ---
+fn test_interner_basic()
+    shine("  [test] StringInterner basic operations...")
+    @si = interner_new()
+
+    @id1 = interner_intern(@si, "hello")
+    @id2 = interner_intern(@si, "world")
+    @id3 = interner_intern(@si, "hello")   # duplicate
+
+    guard @id1 == @id3 else
+        shine("    FAIL: same string should get same ID")
+        return
+    guard @id1 != @id2 else
+        shine("    FAIL: different strings should get different IDs")
+        return
+    guard interner_resolve(@si, @id1) == "hello" else
+        shine("    FAIL: resolve(id1) should be 'hello'")
+        return
+    guard interner_resolve(@si, @id2) == "world" else
+        shine("    FAIL: resolve(id2) should be 'world'")
+        return
+    guard interner_len(@si) == 2 else
+        shine("    FAIL: length should be 2")
+        return
+    shine("    PASS")
+
+fn test_interner_contains()
+    shine("  [test] StringInterner contains...")
+    @si = interner_new()
+    interner_intern(@si, "foo")
+    interner_intern(@si, "bar")
+    guard interner_contains(@si, "foo") == 1 else
+        shine("    FAIL: should contain 'foo'")
+        return
+    guard interner_contains(@si, "bar") == 1 else
+        shine("    FAIL: should contain 'bar'")
+        return
+    guard interner_contains(@si, "baz") == 0 else
+        shine("    FAIL: should not contain 'baz'")
+        return
+    shine("    PASS")
+
+fn test_interner_many()
+    shine("  [test] StringInterner many strings...")
+    @si = interner_new()
+    # Intern 100 different strings
+    orbit @i in 0..100
+        @s = "str_" + str(@i)
+        interner_intern(@si, @s)
+    guard interner_len(@si) == 100 else
+        shine("    FAIL: should have 100 interned strings")
+        return
+    # Verify some lookups
+    guard interner_contains(@si, "str_0") == 1 else
+        shine("    FAIL: should contain 'str_0'")
+        return
+    guard interner_contains(@si, "str_99") == 1 else
+        shine("    FAIL: should contain 'str_99'")
+        return
+    guard interner_contains(@si, "str_100") == 0 else
+        shine("    FAIL: should not contain 'str_100'")
+        return
+    shine("    PASS")
+
+fn test_interner_resolve_invalid()
+    shine("  [test] StringInterner resolve invalid ID...")
+    @si = interner_new()
+    interner_intern(@si, "test")
+    guard interner_resolve(@si, -1) == "" else
+        shine("    FAIL: resolve(-1) should be empty")
+        return
+    guard interner_resolve(@si, 999) == "" else
+        shine("    FAIL: resolve(999) should be empty")
+        return
+    shine("    PASS")
+
+# --- StringBuilder Tests ---
+fn test_stringbuilder_basic()
+    shine("  [test] StringBuilder basic operations...")
+    @sb = sb_new()
+    guard sb_len(@sb) == 0 else
+        shine("    FAIL: new builder should have length 0")
+        return
+    sb_append(@sb, "Hello")
+    sb_append(@sb, " ")
+    sb_append(@sb, "World")
+    guard sb_len(@sb) == 11 else
+        shine("    FAIL: length should be 11")
+        return
+    @result = sb_build(@sb)
+    guard @result == "Hello World" else
+        shine("    FAIL: build should produce 'Hello World'")
+        return
+    shine("    PASS")
+
+fn test_stringbuilder_clear()
+    shine("  [test] StringBuilder clear...")
+    @sb = sb_new()
+    sb_append(@sb, "abc")
+    sb_append(@sb, "def")
+    sb_clear(@sb)
+    guard sb_len(@sb) == 0 else
+        shine("    FAIL: length should be 0 after clear")
+        return
+    @result = sb_build(@sb)
+    guard @result == "" else
+        shine("    FAIL: build after clear should be empty")
+        return
+    # Can still append after clear
+    sb_append(@sb, "new")
+    guard sb_build(@sb) == "new" else
+        shine("    FAIL: should work after clear")
+        return
+    shine("    PASS")
+
+fn test_stringbuilder_append_char()
+    shine("  [test] StringBuilder append_char...")
+    @sb = sb_new()
+    sb_append_char(@sb, "A")
+    sb_append_char(@sb, "B")
+    sb_append_char(@sb, "C")
+    guard sb_len(@sb) == 3 else
+        shine("    FAIL: length should be 3")
+        return
+    guard sb_build(@sb) == "ABC" else
+        shine("    FAIL: build should be 'ABC'")
+        return
+    shine("    PASS")
+
+fn test_stringbuilder_many_appends()
+    shine("  [test] StringBuilder many appends...")
+    @sb = sb_new()
+    orbit @i in 0..100
+        sb_append(@sb, "x")
+    guard sb_len(@sb) == 100 else
+        shine("    FAIL: length should be 100")
+        return
+    @result = sb_build(@sb)
+    guard len(@result) == 100 else
+        shine("    FAIL: built string length should be 100")
+        return
+    shine("    PASS")
+
+# --- FNV-1a Hash Tests ---
+fn test_fnv1a_hash()
+    shine("  [test] FNV-1a hash function...")
+    # Same input should always produce same hash
+    @h1 = fnv1a_int(42)
+    @h2 = fnv1a_int(42)
+    guard @h1 == @h2 else
+        shine("    FAIL: same input should produce same hash")
+        return
+
+    # Different inputs should (very likely) produce different hashes
+    @h3 = fnv1a_int(43)
+    guard @h1 != @h3 else
+        shine("    FAIL: different inputs should produce different hashes")
+        return
+
+    # String hash consistency
+    @hs1 = fnv1a_str("hello")
+    @hs2 = fnv1a_str("hello")
+    guard @hs1 == @hs2 else
+        shine("    FAIL: same string should produce same hash")
+        return
+
+    @hs3 = fnv1a_str("world")
+    guard @hs1 != @hs3 else
+        shine("    FAIL: different strings should produce different hashes")
+        return
+    shine("    PASS")
+
+# --- Cross-Collection Integration Tests ---
+fn test_integration_vec_sort_and_hashmap()
+    shine("  [test] Integration: Vec sort + HashMap lookup...")
+    # Build a vec of keys, sort them, verify in a hashmap
+    @map = hm_new()
+    @v = vec_new()
+    orbit @i in 0..20
+        @key = (20 - @i) * 3   # reverse order, multiples of 3
+        vec_push(@v, @key)
+        hm_insert(@map, @key, @key * 10)
+    vec_sort(@v)
+    # Verify sorted and all lookups succeed
+    @ok = 1
+    orbit @i in 0..vec_len(@v)
+        @key = vec_get(@v, @i)
+        @val = hm_get(@map, @key)
+        if @val != @key * 10
+            @ok = 0
+        if @i > 0
+            if @key < vec_get(@v, @i - 1)
+                @ok = 0
+    guard @ok == 1 else
+        shine("    FAIL: sorted vec keys should all be in hashmap")
+        return
+    shine("    PASS")
+
+fn test_integration_deque_as_queue()
+    shine("  [test] Integration: Deque as FIFO queue...")
+    @q = deque_new()
+    orbit @i in 0..50
+        deque_push_back(@q, @i)
+    @ok = 1
+    orbit @i in 0..50
+        @val = deque_pop_front(@q)
+        if @val != @i
+            @ok = 0
+    guard @ok == 1 else
+        shine("    FAIL: FIFO order not maintained")
+        return
+    guard deque_is_empty(@q) == 1 else
+        shine("    FAIL: deque should be empty after draining")
+        return
+    shine("    PASS")
+
+fn test_integration_interner_and_builder()
+    shine("  [test] Integration: StringInterner + StringBuilder...")
+    @si = interner_new()
+    @sb = sb_new()
+    # Intern some tokens and build a string from them
+    @id_fn = interner_intern(@si, "fn")
+    @id_main = interner_intern(@si, "main")
+    @id_lparen = interner_intern(@si, "(")
+    @id_rparen = interner_intern(@si, ")")
+
+    sb_append(@sb, interner_resolve(@si, @id_fn))
+    sb_append(@sb, " ")
+    sb_append(@sb, interner_resolve(@si, @id_main))
+    sb_append(@sb, interner_resolve(@si, @id_lparen))
+    sb_append(@sb, interner_resolve(@si, @id_rparen))
+
+    @result = sb_build(@sb)
+    guard @result == "fn main()" else
+        shine("    FAIL: built string should be 'fn main()'")
+        return
+    shine("    PASS")
+
+fn test_integration_rbtree_ordered_keys()
+    shine("  [test] Integration: RBTree ordered keys in Vec...")
+    @tree = rb_new()
+    # Insert keys in random-ish order
+    rb_insert(@tree, 42, 1)
+    rb_insert(@tree, 17, 2)
+    rb_insert(@tree, 89, 3)
+    rb_insert(@tree, 5, 4)
+    rb_insert(@tree, 33, 5)
+    rb_insert(@tree, 71, 6)
+    rb_insert(@tree, 3, 7)
+    rb_insert(@tree, 55, 8)
+
+    @keys: [int; 4096] = [0; 4096]
+    @vals: [int; 4096] = [0; 4096]
+    @count = rb_inorder(@tree, @keys, @vals)
+
+    # Put keys into a vec and verify it equals the tree's in-order output
+    @v = vec_new()
+    orbit @i in 0..@count
+        vec_push(@v, @keys[@i])
+
+    # The tree's in-order should already be sorted
+    @sorted = 1
+    orbit @i in 1..vec_len(@v)
+        if vec_get(@v, @i) <= vec_get(@v, @i - 1)
+            @sorted = 0
+    guard @sorted == 1 else
+        shine("    FAIL: RBTree in-order keys should be sorted")
+        return
+    guard vec_len(@v) == 8 else
+        shine("    FAIL: should have 8 keys")
+        return
+    shine("    PASS")
+
+# =============================================================================
+# TEST RUNNER
+# =============================================================================
+
+fn run_self_tests()
+    shine("=== Luna Collections Self-Test Suite ===")
+    shine("")
+
+    shine("--- LinkedList ---")
+    test_linkedlist_basic()
+    test_linkedlist_clear()
+    test_linkedlist_iter()
+    test_linkedlist_empty_pops()
+    shine("")
+
+    shine("--- RBTree ---")
+    test_rbtree_basic()
+    test_rbtree_replace()
+    test_rbtree_inorder()
+    test_rbtree_many_inserts()
+    shine("")
+
+    shine("--- HashMap ---")
+    test_hashmap_basic()
+    test_hashmap_replace()
+    test_hashmap_remove()
+    test_hashmap_resize()
+    test_hashmap_keys_values()
+    test_hashmap_clear()
+    shine("")
+
+    shine("--- Vec ---")
+    test_vec_basic()
+    test_vec_remove_insert()
+    test_vec_swap_reverse()
+    test_vec_extend()
+    test_vec_filter_map()
+    test_vec_sort()
+    test_vec_sort_large()
+    test_vec_sort_already_sorted()
+    test_vec_sort_duplicates()
+    test_vec_boundary()
+    shine("")
+
+    shine("--- Deque ---")
+    test_deque_basic()
+    test_deque_wrap_around()
+    test_deque_empty_pops()
+    test_deque_clear()
+    shine("")
+
+    shine("--- StringInterner ---")
+    test_interner_basic()
+    test_interner_contains()
+    test_interner_many()
+    test_interner_resolve_invalid()
+    shine("")
+
+    shine("--- StringBuilder ---")
+    test_stringbuilder_basic()
+    test_stringbuilder_clear()
+    test_stringbuilder_append_char()
+    test_stringbuilder_many_appends()
+    shine("")
+
+    shine("--- Hash Function ---")
+    test_fnv1a_hash()
+    shine("")
+
+    shine("--- Integration ---")
+    test_integration_vec_sort_and_hashmap()
+    test_integration_deque_as_queue()
+    test_integration_interner_and_builder()
+    test_integration_rbtree_ordered_keys()
+    shine("")
+
+    shine("=== All Collections Tests Done ===")
+
+# Run self-tests when executed directly
+run_self_tests()
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+export {
+    # Constants
+    MAX_LIST_NODES,
+    MAX_TREE_NODES,
+    HASHMAP_INITIAL_CAP,
+    HASHMAP_LOAD_FACTOR_NUM,
+    HASHMAP_LOAD_FACTOR_DEN,
+    MAX_VEC_CAPACITY,
+    MAX_DEQUE_CAPACITY,
+    MAX_INTERNER_STRINGS,
+    NODE_COLOR_RED,
+    NODE_COLOR_BLACK,
+    NODE_NIL,
+    FNV_OFFSET_BASIS,
+    FNV_PRIME,
+
+    # Hash functions
+    fnv1a_int,
+    fnv1a_str,
+    hash_value,
+
+    # LinkedList types and functions
+    LLNode,
+    LinkedList,
+    ll_new,
+    ll_push_front,
+    ll_push_back,
+    ll_pop_front,
+    ll_pop_back,
+    ll_front,
+    ll_back,
+    ll_len,
+    ll_is_empty,
+    ll_clear,
+    ll_iter,
+
+    # RBTree types and functions
+    RBNode,
+    RBTree,
+    rb_new,
+    rb_insert,
+    rb_get,
+    rb_contains_key,
+    rb_len,
+    rb_inorder,
+    rb_rotate_left,
+    rb_rotate_right,
+
+    # HashMap types and functions
+    HMEntry,
+    HashMap,
+    hm_new,
+    hm_with_capacity,
+    hm_insert,
+    hm_get,
+    hm_contains_key,
+    hm_remove,
+    hm_len,
+    hm_keys,
+    hm_values,
+    hm_clear,
+    hm_resize,
+
+    # Vec types and functions
+    Vec,
+    vec_new,
+    vec_with_capacity,
+    vec_push,
+    vec_pop,
+    vec_get,
+    vec_set,
+    vec_len,
+    vec_capacity,
+    vec_is_empty,
+    vec_clear,
+    vec_remove,
+    vec_insert_at,
+    vec_swap,
+    vec_reverse,
+    vec_extend,
+    vec_filter_gt,
+    vec_filter_lt,
+    vec_filter_eq,
+    vec_map_add,
+    vec_map_mul,
+    vec_map_neg,
+    vec_sort,
+
+    # Deque types and functions
+    Deque,
+    deque_new,
+    deque_push_front,
+    deque_push_back,
+    deque_pop_front,
+    deque_pop_back,
+    deque_front,
+    deque_back,
+    deque_len,
+    deque_is_empty,
+    deque_clear,
+
+    # StringInterner types and functions
+    InternerBucket,
+    StringInterner,
+    interner_new,
+    interner_intern,
+    interner_resolve,
+    interner_len,
+    interner_contains,
+
+    # StringBuilder types and functions
+    StringBuilder,
+    sb_new,
+    sb_append,
+    sb_append_char,
+    sb_len,
+    sb_build,
+    sb_clear,
+
+    # Sort utilities
+    floor_log2,
+    heapsort_range,
+    insertion_sort_range,
+    median_of_three,
+
+    # Test runner
+    run_self_tests
+}

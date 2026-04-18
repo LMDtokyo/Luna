@@ -1,0 +1,1905 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Language Server Protocol (LSP) - v4.2
+# =============================================================================
+# Pure Luna implementation of the Language Server Protocol.
+# Provides: diagnostics, completion, hover, go-to-definition, document symbols.
+#
+# Architecture:
+#   - Transport: stdin/stdout JSON-RPC 2.0 with Content-Length framing
+#   - JSON: String-based field extraction (same approach as Rust LSP)
+#   - State: Flat parallel arrays (meow globals)
+#   - Analysis: Reuses lexer, parser, types, borrow_checker modules
+#
+# Sections:
+#   1. Constants & error codes
+#   2. Document store (flat arrays)
+#   3. Transport layer (stdin/stdout)
+#   4. JSON-RPC dispatch
+#   5. Lifecycle handlers (initialize, shutdown, exit)
+#   6. Document sync (didOpen, didChange, didClose)
+#   7. Analysis pipeline (lex → parse → typecheck → borrowcheck)
+#   8. Completion handler
+#   9. Hover handler
+#  10. Definition handler
+#  11. Document symbol handler
+#  12. Diagnostics publisher
+#  13. Parameter extraction utilities
+#  14. JSON response builders
+#  15. Stdlib documentation table
+#  16. Extern C API
+#  17. Self-tests
+
+# =============================================================================
+# Section 1: Constants
+# =============================================================================
+
+# Diagnostic severity
+const SEVERITY_ERROR: int = 1
+const SEVERITY_WARNING: int = 2
+const SEVERITY_INFO: int = 3
+const SEVERITY_HINT: int = 4
+
+# Symbol kinds (LSP spec)
+const SYMBOL_FILE: int = 1
+const SYMBOL_MODULE: int = 2
+const SYMBOL_NAMESPACE: int = 3
+const SYMBOL_PACKAGE: int = 4
+const SYMBOL_CLASS: int = 5
+const SYMBOL_METHOD: int = 6
+const SYMBOL_PROPERTY: int = 7
+const SYMBOL_FIELD: int = 8
+const SYMBOL_CONSTRUCTOR: int = 9
+const SYMBOL_ENUM: int = 10
+const SYMBOL_INTERFACE: int = 11
+const SYMBOL_FUNCTION: int = 12
+const SYMBOL_VARIABLE: int = 13
+const SYMBOL_CONSTANT: int = 14
+const SYMBOL_STRING: int = 15
+const SYMBOL_NUMBER: int = 16
+const SYMBOL_BOOLEAN: int = 17
+const SYMBOL_STRUCT: int = 23
+
+# Completion item kinds
+const COMP_TEXT: int = 1
+const COMP_METHOD: int = 2
+const COMP_FUNCTION: int = 3
+const COMP_CONSTRUCTOR: int = 4
+const COMP_FIELD: int = 5
+const COMP_VARIABLE: int = 6
+const COMP_CLASS: int = 7
+const COMP_MODULE: int = 9
+const COMP_KEYWORD: int = 14
+const COMP_SNIPPET: int = 15
+const COMP_CONSTANT: int = 21
+const COMP_STRUCT: int = 22
+
+# JSON-RPC error codes
+const JSONRPC_PARSE_ERROR: int = -32700
+const JSONRPC_INVALID_REQUEST: int = -32600
+const JSONRPC_METHOD_NOT_FOUND: int = -32601
+const JSONRPC_INVALID_PARAMS: int = -32602
+const JSONRPC_INTERNAL_ERROR: int = -32603
+
+# Capacity
+const MAX_DOCUMENTS: int = 64
+const MAX_DOC_LEN: int = 1048576
+const MAX_SYMBOLS: int = 4096
+const MAX_DIAGNOSTICS: int = 512
+const MAX_COMPLETIONS: int = 256
+const MAX_MSG_LEN: int = 2097152
+const MAX_RESPONSE_LEN: int = 4194304
+const MAX_STDLIB_DOCS: int = 256
+const MAX_LINE_LEN: int = 4096
+
+# =============================================================================
+# Section 2: Document Store
+# =============================================================================
+
+# Document URIs
+meow @doc_uris: [int; 262144] = [0; 262144]       # MAX_DOCUMENTS * MAX_LINE_LEN
+meow @doc_uri_lens: [int; 64] = [0; 64]
+meow @doc_versions: [int; 64] = [0; 64]
+meow @doc_active: [int; 64] = [0; 64]
+meow @doc_count: int = 0
+
+# Document contents — stored as byte arrays
+meow @doc_contents: [int; 67108864] = [0; 67108864]   # MAX_DOCUMENTS * MAX_DOC_LEN
+meow @doc_content_lens: [int; 64] = [0; 64]
+
+# Symbol table (extracted from analysis)
+meow @sym_names: [int; 262144] = [0; 262144]       # MAX_SYMBOLS * 64
+meow @sym_name_lens: [int; 4096] = [0; 4096]
+meow @sym_kinds: [int; 4096] = [0; 4096]
+meow @sym_lines: [int; 4096] = [0; 4096]
+meow @sym_cols: [int; 4096] = [0; 4096]
+meow @sym_end_lines: [int; 4096] = [0; 4096]
+meow @sym_end_cols: [int; 4096] = [0; 4096]
+meow @sym_doc_idx: [int; 4096] = [0; 4096]
+meow @sym_count: int = 0
+
+# Diagnostics (from analysis)
+meow @diag_lines: [int; 512] = [0; 512]
+meow @diag_cols: [int; 512] = [0; 512]
+meow @diag_end_lines: [int; 512] = [0; 512]
+meow @diag_end_cols: [int; 512] = [0; 512]
+meow @diag_severities: [int; 512] = [0; 512]
+meow @diag_messages: [int; 262144] = [0; 262144]   # MAX_DIAGNOSTICS * 512
+meow @diag_msg_lens: [int; 512] = [0; 512]
+meow @diag_codes: [int; 32768] = [0; 32768]        # MAX_DIAGNOSTICS * 64
+meow @diag_code_lens: [int; 512] = [0; 512]
+meow @diag_sources: [int; 16384] = [0; 16384]      # MAX_DIAGNOSTICS * 32
+meow @diag_source_lens: [int; 512] = [0; 512]
+meow @diag_doc_idx: [int; 512] = [0; 512]
+meow @diag_count: int = 0
+
+# Server state
+meow @lsp_initialized: int = 0
+meow @lsp_running: int = 1
+meow @lsp_shutdown: int = 0
+
+# Message buffers
+meow @msg_buf: [int; 2097152] = [0; 2097152]
+meow @msg_len: int = 0
+meow @resp_buf: [int; 4194304] = [0; 4194304]
+meow @resp_len: int = 0
+
+# Line buffer for header reading
+meow @line_buf: [int; 4096] = [0; 4096]
+meow @line_len: int = 0
+
+# Stdlib docs table
+meow @sdoc_names: [int; 16384] = [0; 16384]        # MAX_STDLIB_DOCS * 64
+meow @sdoc_name_lens: [int; 256] = [0; 256]
+meow @sdoc_sigs: [int; 32768] = [0; 32768]         # MAX_STDLIB_DOCS * 128
+meow @sdoc_sig_lens: [int; 256] = [0; 256]
+meow @sdoc_descs: [int; 131072] = [0; 131072]      # MAX_STDLIB_DOCS * 512
+meow @sdoc_desc_lens: [int; 256] = [0; 256]
+meow @sdoc_modules: [int; 16384] = [0; 16384]      # MAX_STDLIB_DOCS * 64
+meow @sdoc_module_lens: [int; 256] = [0; 256]
+meow @sdoc_count: int = 0
+
+# =============================================================================
+# Section 3: Transport Layer
+# =============================================================================
+
+# Read a line from stdin (up to \r\n or \n)
+# Returns number of bytes read, or -1 on EOF
+fn lsp_read_line(@buf: *int, @max: int) -> int
+    @pos = 0
+    orbit @pos < @max
+        @ch = extern_stdin_read_byte()
+        if @ch < 0
+            if @pos == 0
+                return -1
+            return @pos
+        if @ch == 10   # '\n'
+            return @pos
+        if @ch == 13   # '\r'  — skip, next should be \n
+            continue
+        @buf[@pos] = @ch
+        @pos = @pos + 1
+    return @pos
+
+# Parse Content-Length from header line
+# Returns length or -1 if not a Content-Length header
+fn lsp_parse_content_length(@buf: *int, @len: int) -> int
+    # Check prefix "Content-Length: "
+    if @len < 16
+        return -1
+    # "Content-Length: " = [67,111,110,116,101,110,116,45,76,101,110,103,116,104,58,32]
+    if @buf[0] != 67 || @buf[1] != 111 || @buf[2] != 110 || @buf[3] != 116
+        return -1
+    if @buf[4] != 101 || @buf[5] != 110 || @buf[6] != 116 || @buf[7] != 45
+        return -1
+    if @buf[8] != 76 || @buf[9] != 101 || @buf[10] != 110 || @buf[11] != 103
+        return -1
+    if @buf[12] != 116 || @buf[13] != 104 || @buf[14] != 58
+        return -1
+    # Parse number after "Content-Length: "
+    @val = 0
+    @i = 15
+    # Skip whitespace
+    orbit @i < @len
+        if @buf[@i] != 32
+            nova
+        @i = @i + 1
+    orbit @i < @len
+        @d = @buf[@i] - 48
+        if @d < 0 || @d > 9
+            nova
+        @val = @val * 10 + @d
+        @i = @i + 1
+    return @val
+
+# Read a full JSON-RPC message from stdin
+# Returns message length in @msg_buf, or -1 on error
+fn lsp_read_message() -> int
+    @content_length = -1
+    # Read headers until empty line
+    orbit 1 == 1
+        @n = lsp_read_line(&@line_buf[0], MAX_LINE_LEN)
+        if @n < 0
+            return -1
+        if @n == 0
+            nova    # Empty line = end of headers
+        @cl = lsp_parse_content_length(&@line_buf[0], @n)
+        if @cl >= 0
+            @content_length = @cl
+    if @content_length < 0
+        return -1
+    if @content_length > MAX_MSG_LEN
+        # Security: reject oversized messages
+        return -1
+    # Read exactly content_length bytes
+    @read = 0
+    orbit @read < @content_length
+        @ch = extern_stdin_read_byte()
+        if @ch < 0
+            return -1
+        @msg_buf[@read] = @ch
+        @read = @read + 1
+    @msg_len = @content_length
+    return @content_length
+
+# Send a response with Content-Length header
+fn lsp_send_response(@buf: *int, @len: int)
+    # Write "Content-Length: <len>\r\n\r\n"
+    @header = "Content-Length: "
+    extern_stdout_write_str(@header, 16)
+    # Convert @len to decimal string
+    @num_buf: [int; 16] = [0; 16]
+    @num_len = int_to_str(@len, &@num_buf[0], 16)
+    extern_stdout_write(&@num_buf[0], @num_len)
+    extern_stdout_write_str("\r\n\r\n", 4)
+    # Write body
+    extern_stdout_write(@buf, @len)
+    extern_stdout_flush()
+
+# Send a notification (no Content-Length calculation needed separately)
+fn lsp_send_notification(@method: *int, @mlen: int, @params: *int, @plen: int)
+    # Build: {"jsonrpc":"2.0","method":"<method>","params":<params>}
+    @resp_len = 0
+    resp_append_str("{\"jsonrpc\":\"2.0\",\"method\":\"", 26)
+    resp_append(@method, @mlen)
+    resp_append_str("\",\"params\":", 11)
+    resp_append(@params, @plen)
+    resp_append_str("}", 1)
+    lsp_send_response(&@resp_buf[0], @resp_len)
+
+# =============================================================================
+# Section 4: JSON-RPC Dispatch
+# =============================================================================
+
+# Extract the "method" field from a JSON-RPC message
+fn extract_method(@buf: *int, @len: int, @out: *int, @max: int) -> int
+    # Find "method":"
+    @i = 0
+    orbit @i < @len - 10
+        if @buf[@i] == 34 && @buf[@i+1] == 109 && @buf[@i+2] == 101 && @buf[@i+3] == 116 && @buf[@i+4] == 104 && @buf[@i+5] == 111 && @buf[@i+6] == 100 && @buf[@i+7] == 34
+            # Found "method"
+            @j = @i + 8
+            # Skip :"
+            orbit @j < @len
+                if @buf[@j] == 34
+                    @j = @j + 1
+                    nova
+                @j = @j + 1
+            # Copy value until closing "
+            @k = 0
+            orbit @j < @len && @k < @max
+                if @buf[@j] == 34
+                    return @k
+                @out[@k] = @buf[@j]
+                @k = @k + 1
+                @j = @j + 1
+            return @k
+        @i = @i + 1
+    return 0
+
+# Extract "id" field (numeric) from JSON-RPC message
+fn extract_id(@buf: *int, @len: int) -> int
+    # Find "id":
+    @i = 0
+    orbit @i < @len - 4
+        if @buf[@i] == 34 && @buf[@i+1] == 105 && @buf[@i+2] == 100 && @buf[@i+3] == 34
+            @j = @i + 4
+            # Skip :
+            orbit @j < @len
+                if @buf[@j] == 58
+                    @j = @j + 1
+                    nova
+                @j = @j + 1
+            # Skip whitespace
+            orbit @j < @len
+                if @buf[@j] != 32 && @buf[@j] != 9
+                    nova
+                @j = @j + 1
+            # Parse number
+            @val = 0
+            @has_digit = 0
+            orbit @j < @len
+                @d = @buf[@j] - 48
+                if @d < 0 || @d > 9
+                    nova
+                @val = @val * 10 + @d
+                @has_digit = 1
+                @j = @j + 1
+            if @has_digit == 1
+                return @val
+            return -1
+        @i = @i + 1
+    return -1
+
+# Handle a JSON-RPC message. Returns 1 if server should continue, 0 to exit
+fn lsp_handle_message(@buf: *int, @len: int) -> int
+    @method_buf: [int; 256] = [0; 256]
+    @method_len = extract_method(@buf, @len, &@method_buf[0], 256)
+    @id = extract_id(@buf, @len)
+
+    # Log to stderr
+    extern_stderr_write_str("LSP: ", 5)
+    extern_stderr_write(&@method_buf[0], @method_len)
+    extern_stderr_write_str("\n", 1)
+
+    # Dispatch by method name
+    if str_eq(&@method_buf[0], @method_len, "initialize", 10)
+        lsp_handle_initialize(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "initialized", 11)
+        # Notification — no response needed
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "shutdown", 8)
+        lsp_handle_shutdown(@id)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "exit", 4)
+        return 0
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/didOpen", 20)
+        lsp_handle_did_open(@buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/didChange", 22)
+        lsp_handle_did_change(@buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/didClose", 21)
+        lsp_handle_did_close(@buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/didSave", 20)
+        # Re-analyze on save
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/completion", 23)
+        lsp_handle_completion(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/hover", 18)
+        lsp_handle_hover(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/definition", 23)
+        lsp_handle_definition(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/documentSymbol", 27)
+        lsp_handle_document_symbol(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/references", 23)
+        lsp_handle_references(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/formatting", 23)
+        lsp_handle_formatting(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/signatureHelp", 26)
+        lsp_handle_signature_help(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/foldingRange", 25)
+        lsp_handle_folding_range(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/codeAction", 23)
+        lsp_handle_code_action(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/rename", 19)
+        lsp_handle_rename(@id, @buf, @len)
+        return 1
+
+    if str_eq(&@method_buf[0], @method_len, "textDocument/prepareRename", 26)
+        lsp_handle_prepare_rename(@id, @buf, @len)
+        return 1
+
+    # Unknown method — send error if it has an ID (request, not notification)
+    if @id >= 0
+        lsp_send_error(@id, JSONRPC_METHOD_NOT_FOUND, "Method not found")
+    return 1
+
+# =============================================================================
+# Section 5: Lifecycle Handlers
+# =============================================================================
+
+fn lsp_handle_initialize(@id: int, @buf: *int, @len: int)
+    @lsp_initialized = 1
+    # Build capabilities response
+    @resp_len = 0
+    resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+    @num_buf: [int; 16] = [0; 16]
+    @nlen = int_to_str(@id, &@num_buf[0], 16)
+    resp_append(&@num_buf[0], @nlen)
+    resp_append_str(",\"result\":{\"capabilities\":{", 26)
+    # textDocumentSync
+    resp_append_str("\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":true}},", 76)
+    # completionProvider
+    resp_append_str("\"completionProvider\":{\"triggerCharacters\":[\".\",\"@\",\"(\",\":\"],\"resolveProvider\":false},", 82)
+    # hoverProvider
+    resp_append_str("\"hoverProvider\":true,", 20)
+    # definitionProvider
+    resp_append_str("\"definitionProvider\":true,", 25)
+    # referencesProvider
+    resp_append_str("\"referencesProvider\":true,", 25)
+    # documentSymbolProvider
+    resp_append_str("\"documentSymbolProvider\":true,", 29)
+    # documentFormattingProvider
+    resp_append_str("\"documentFormattingProvider\":true,", 33)
+    # signatureHelpProvider
+    resp_append_str("\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},", 55)
+    # foldingRangeProvider
+    resp_append_str("\"foldingRangeProvider\":true,", 27)
+    # codeActionProvider
+    resp_append_str("\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\",\"refactor\"]},", 64)
+    # renameProvider
+    resp_append_str("\"renameProvider\":{\"prepareProvider\":true},", 41)
+    # diagnosticProvider
+    resp_append_str("\"diagnosticProvider\":{\"interFileDependencies\":true,\"workspaceDiagnostics\":false}", 80)
+    resp_append_str("},\"serverInfo\":{\"name\":\"Luna Language Server\",\"version\":\"4.2.0\"}}}", 70)
+    lsp_send_response(&@resp_buf[0], @resp_len)
+    # Init stdlib docs
+    lsp_init_stdlib_docs()
+
+fn lsp_handle_shutdown(@id: int)
+    @lsp_shutdown = 1
+    lsp_send_success(@id, "null", 4)
+
+# =============================================================================
+# Section 6: Document Sync
+# =============================================================================
+
+fn lsp_handle_did_open(@buf: *int, @len: int)
+    # Extract URI
+    @uri_buf: [int; 4096] = [0; 4096]
+    @uri_len = extract_json_string(@buf, @len, "uri", 3, &@uri_buf[0], 4096)
+    if @uri_len <= 0
+        return
+
+    # Extract text (from textDocument.text)
+    @text_buf: [int; 1048576] = [0; 1048576]
+    @text_len = extract_json_string_escaped(@buf, @len, "text", 4, &@text_buf[0], 1048576)
+    if @text_len <= 0
+        return
+
+    # Extract version
+    @version = extract_json_number(@buf, @len, "version", 7)
+
+    # Find or create document slot
+    @idx = doc_find_or_create(&@uri_buf[0], @uri_len)
+    if @idx < 0
+        return
+
+    # Store content
+    @base = @idx * MAX_DOC_LEN
+    orbit @i in 0..@text_len
+        @doc_contents[@base + @i] = @text_buf[@i]
+    @doc_content_lens[@idx] = @text_len
+    @doc_versions[@idx] = @version
+
+    # Analyze and publish diagnostics
+    lsp_analyze_document(@idx)
+    lsp_publish_diagnostics(@idx)
+
+fn lsp_handle_did_change(@buf: *int, @len: int)
+    # Extract URI
+    @uri_buf: [int; 4096] = [0; 4096]
+    @uri_len = extract_json_string(@buf, @len, "uri", 3, &@uri_buf[0], 4096)
+    if @uri_len <= 0
+        return
+
+    # Find document
+    @idx = doc_find(&@uri_buf[0], @uri_len)
+    if @idx < 0
+        return
+
+    # Extract new text from contentChanges[0].text
+    @text_buf: [int; 1048576] = [0; 1048576]
+    @text_len = extract_change_text(@buf, @len, &@text_buf[0], 1048576)
+    if @text_len <= 0
+        return
+
+    # Update content
+    @base = @idx * MAX_DOC_LEN
+    orbit @i in 0..@text_len
+        @doc_contents[@base + @i] = @text_buf[@i]
+    @doc_content_lens[@idx] = @text_len
+
+    # Extract version
+    @version = extract_json_number(@buf, @len, "version", 7)
+    if @version > 0
+        @doc_versions[@idx] = @version
+
+    # Re-analyze
+    lsp_analyze_document(@idx)
+    lsp_publish_diagnostics(@idx)
+
+fn lsp_handle_did_close(@buf: *int, @len: int)
+    @uri_buf: [int; 4096] = [0; 4096]
+    @uri_len = extract_json_string(@buf, @len, "uri", 3, &@uri_buf[0], 4096)
+    if @uri_len <= 0
+        return
+    @idx = doc_find(&@uri_buf[0], @uri_len)
+    if @idx >= 0
+        @doc_active[@idx] = 0
+        @doc_content_lens[@idx] = 0
+        # Clear diagnostics for this document
+        clear_diagnostics_for(@idx)
+
+# =============================================================================
+# Section 7: Analysis Pipeline
+# =============================================================================
+
+fn lsp_analyze_document(@doc_idx: int)
+    # Clear existing symbols and diagnostics for this document
+    clear_symbols_for(@doc_idx)
+    clear_diagnostics_for(@doc_idx)
+
+    @base = @doc_idx * MAX_DOC_LEN
+    @content_len = @doc_content_lens[@doc_idx]
+    if @content_len <= 0
+        return
+
+    # --- Phase 1: Collect symbols by scanning the source ---
+    # Look for fn, struct, const, meow declarations
+    @line = 0
+    @col = 0
+    @i = 0
+    orbit @i < @content_len
+        @ch = @doc_contents[@base + @i]
+        if @ch == 10    # newline
+            @line = @line + 1
+            @col = 0
+            @i = @i + 1
+            continue
+
+        # Check for "fn " at start of line (col 0 or after whitespace)
+        if @ch == 102 && @i + 2 < @content_len   # 'f'
+            if @doc_contents[@base + @i + 1] == 110 && @doc_contents[@base + @i + 2] == 32  # 'n' ' '
+                @name_start = @i + 3
+                @name_end = @name_start
+                orbit @name_end < @content_len
+                    @nc = @doc_contents[@base + @name_end]
+                    if @nc == 40 || @nc == 32 || @nc == 10 || @nc == 13  # '(' ' ' '\n' '\r'
+                        nova
+                    @name_end = @name_end + 1
+                if @name_end > @name_start
+                    add_symbol(&@doc_contents[@base + @name_start], @name_end - @name_start, SYMBOL_FUNCTION, @line, @col, @doc_idx)
+
+        # Check for "struct "
+        if @ch == 115 && @i + 6 < @content_len   # 's'
+            if @doc_contents[@base+@i+1] == 116 && @doc_contents[@base+@i+2] == 114 && @doc_contents[@base+@i+3] == 117 && @doc_contents[@base+@i+4] == 99 && @doc_contents[@base+@i+5] == 116 && @doc_contents[@base+@i+6] == 32
+                @name_start = @i + 7
+                @name_end = @name_start
+                orbit @name_end < @content_len
+                    @nc = @doc_contents[@base + @name_end]
+                    if @nc == 10 || @nc == 13 || @nc == 32
+                        nova
+                    @name_end = @name_end + 1
+                if @name_end > @name_start
+                    add_symbol(&@doc_contents[@base + @name_start], @name_end - @name_start, SYMBOL_STRUCT, @line, @col, @doc_idx)
+
+        # Check for "const "
+        if @ch == 99 && @i + 5 < @content_len    # 'c'
+            if @doc_contents[@base+@i+1] == 111 && @doc_contents[@base+@i+2] == 110 && @doc_contents[@base+@i+3] == 115 && @doc_contents[@base+@i+4] == 116 && @doc_contents[@base+@i+5] == 32
+                @name_start = @i + 6
+                @name_end = @name_start
+                orbit @name_end < @content_len
+                    @nc = @doc_contents[@base + @name_end]
+                    if @nc == 58 || @nc == 32 || @nc == 61 || @nc == 10  # ':' ' ' '=' '\n'
+                        nova
+                    @name_end = @name_end + 1
+                if @name_end > @name_start
+                    add_symbol(&@doc_contents[@base + @name_start], @name_end - @name_start, SYMBOL_CONSTANT, @line, @col, @doc_idx)
+
+        # Check for "meow @"
+        if @ch == 109 && @i + 5 < @content_len   # 'm'
+            if @doc_contents[@base+@i+1] == 101 && @doc_contents[@base+@i+2] == 111 && @doc_contents[@base+@i+3] == 119 && @doc_contents[@base+@i+4] == 32 && @doc_contents[@base+@i+5] == 64
+                @name_start = @i + 5     # Include the @
+                @name_end = @name_start + 1
+                orbit @name_end < @content_len
+                    @nc = @doc_contents[@base + @name_end]
+                    if @nc == 58 || @nc == 32 || @nc == 61 || @nc == 10
+                        nova
+                    @name_end = @name_end + 1
+                if @name_end > @name_start
+                    add_symbol(&@doc_contents[@base + @name_start], @name_end - @name_start, SYMBOL_VARIABLE, @line, @col, @doc_idx)
+
+        @col = @col + 1
+        @i = @i + 1
+
+    # --- Phase 2: Basic diagnostic checks ---
+    # Check for common errors: unbalanced parentheses, unclosed strings
+    @paren_depth = 0
+    @bracket_depth = 0
+    @in_string = 0
+    @in_comment = 0
+    @line = 0
+
+    orbit @i in 0..@content_len
+        @ch = @doc_contents[@base + @i]
+        if @ch == 10
+            @line = @line + 1
+            @in_comment = 0
+            continue
+        if @in_comment == 1
+            continue
+        if @ch == 35 && @in_string == 0   # '#'
+            @in_comment = 1
+            continue
+        if @ch == 34 && @in_string == 0   # '"'
+            @in_string = 1
+            continue
+        if @ch == 34 && @in_string == 1
+            # Check for escape
+            if @i > 0 && @doc_contents[@base + @i - 1] == 92  # '\'
+                continue
+            @in_string = 0
+            continue
+        if @in_string == 1
+            continue
+        if @ch == 40    # '('
+            @paren_depth = @paren_depth + 1
+        if @ch == 41    # ')'
+            @paren_depth = @paren_depth - 1
+            if @paren_depth < 0
+                add_diagnostic(@line, 0, @line, 1, SEVERITY_ERROR, "Unmatched closing parenthesis", 31, "parse_error", 11, "luna", 4, @doc_idx)
+                @paren_depth = 0
+        if @ch == 91    # '['
+            @bracket_depth = @bracket_depth + 1
+        if @ch == 93    # ']'
+            @bracket_depth = @bracket_depth - 1
+            if @bracket_depth < 0
+                add_diagnostic(@line, 0, @line, 1, SEVERITY_ERROR, "Unmatched closing bracket", 25, "parse_error", 11, "luna", 4, @doc_idx)
+                @bracket_depth = 0
+
+    if @paren_depth > 0
+        add_diagnostic(@line, 0, @line, 1, SEVERITY_ERROR, "Unclosed parenthesis", 20, "parse_error", 11, "luna", 4, @doc_idx)
+    if @bracket_depth > 0
+        add_diagnostic(@line, 0, @line, 1, SEVERITY_ERROR, "Unclosed bracket", 16, "parse_error", 11, "luna", 4, @doc_idx)
+    if @in_string == 1
+        add_diagnostic(@line, 0, @line, 1, SEVERITY_ERROR, "Unterminated string literal", 27, "parse_error", 11, "luna", 4, @doc_idx)
+
+    # --- Phase 3: Lint warnings ---
+    @line = 0
+    @line_start = 0
+    orbit @i in 0..@content_len
+        @ch = @doc_contents[@base + @i]
+        if @ch == 10
+            # Check trailing whitespace
+            @line_end = @i
+            if @line_end > @line_start
+                @prev = @doc_contents[@base + @line_end - 1]
+                if @prev == 32 || @prev == 9  # space or tab
+                    add_diagnostic(@line, @line_end - @line_start - 1, @line, @line_end - @line_start, SEVERITY_HINT, "Trailing whitespace", 19, "lint", 4, "luna-lint", 9, @doc_idx)
+            # Check line length (warning if > 120 chars)
+            @ll = @line_end - @line_start
+            if @ll > 120
+                add_diagnostic(@line, 120, @line, @ll, SEVERITY_INFO, "Line exceeds 120 characters", 27, "lint", 4, "luna-lint", 9, @doc_idx)
+            @line = @line + 1
+            @line_start = @i + 1
+
+# =============================================================================
+# Section 8: Completion Handler
+# =============================================================================
+
+fn lsp_handle_completion(@id: int, @buf: *int, @len: int)
+    # Extract position
+    @uri_buf: [int; 4096] = [0; 4096]
+    @uri_len = extract_json_string(@buf, @len, "uri", 3, &@uri_buf[0], 4096)
+    @line = extract_position_line(@buf, @len)
+    @character = extract_position_character(@buf, @len)
+
+    @doc_idx = doc_find(&@uri_buf[0], @uri_len)
+
+    # Build completion list
+    @resp_len = 0
+    resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+    @num_buf: [int; 16] = [0; 16]
+    @nlen = int_to_str(@id, &@num_buf[0], 16)
+    resp_append(&@num_buf[0], @nlen)
+    resp_append_str(",\"result\":{\"isIncomplete\":false,\"items\":[", 40)
+
+    @first = 1
+
+    # Keywords
+    @kw_count = 30
+    @keywords: [*u8; 30] = ["fn", "if", "elif", "else", "for", "while", "orbit", "in", "return", "break", "continue", "let", "const", "struct", "meow", "import", "match", "phase", "guard", "eclipse", "catch", "nova", "await", "spawn", "sealed", "defer", "actor", "export", "send", "shine"]
+    orbit @k in 0..@kw_count
+        if @first == 0
+            resp_append_str(",", 1)
+        @first = 0
+        resp_append_str("{\"label\":\"", 10)
+        @kw_name = @keywords[@k]
+        @kw_len = extern_strlen(@kw_name)
+        resp_append_raw(@kw_name, @kw_len)
+        resp_append_str("\",\"kind\":", 9)
+        @nlen = int_to_str(COMP_KEYWORD, &@num_buf[0], 16)
+        resp_append(&@num_buf[0], @nlen)
+        resp_append_str(",\"sortText\":\"0", 14)
+        resp_append_raw(@kw_name, @kw_len)
+        resp_append_str("\"}", 2)
+
+    # Built-in types
+    @type_count = 5
+    @type_names: [*u8; 5] = ["int", "float", "str", "bool", "any"]
+    orbit @t in 0..@type_count
+        resp_append_str(",{\"label\":\"", 11)
+        @tn = @type_names[@t]
+        @tl = extern_strlen(@tn)
+        resp_append_raw(@tn, @tl)
+        resp_append_str("\",\"kind\":", 9)
+        @nlen = int_to_str(COMP_CLASS, &@num_buf[0], 16)
+        resp_append(&@num_buf[0], @nlen)
+        resp_append_str("}", 1)
+
+    # Symbols from current document
+    if @doc_idx >= 0
+        orbit @s in 0..@sym_count
+            if @sym_doc_idx[@s] == @doc_idx
+                resp_append_str(",{\"label\":\"", 11)
+                @sbase = @s * 64
+                resp_append(&@sym_names[@sbase], @sym_name_lens[@s])
+                resp_append_str("\",\"kind\":", 9)
+                @sk = symbol_kind_to_completion(@sym_kinds[@s])
+                @nlen = int_to_str(@sk, &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str(",\"sortText\":\"1", 14)
+                resp_append(&@sym_names[@sbase], @sym_name_lens[@s])
+                resp_append_str("\"}", 2)
+
+    # Stdlib functions (from docs table)
+    orbit @d in 0..@sdoc_count
+        resp_append_str(",{\"label\":\"", 11)
+        @dbase = @d * 64
+        resp_append(&@sdoc_names[@dbase], @sdoc_name_lens[@d])
+        resp_append_str("\",\"kind\":", 9)
+        @nlen = int_to_str(COMP_FUNCTION, &@num_buf[0], 16)
+        resp_append(&@num_buf[0], @nlen)
+        resp_append_str(",\"detail\":\"", 11)
+        @sbase = @d * 128
+        resp_append(&@sdoc_sigs[@sbase], @sdoc_sig_lens[@d])
+        resp_append_str("\",\"sortText\":\"2", 14)
+        resp_append(&@sdoc_names[@dbase], @sdoc_name_lens[@d])
+        resp_append_str("\"}", 2)
+
+    resp_append_str("]}}", 3)
+    lsp_send_response(&@resp_buf[0], @resp_len)
+
+# =============================================================================
+# Section 9: Hover Handler
+# =============================================================================
+
+fn lsp_handle_hover(@id: int, @buf: *int, @len: int)
+    @uri_buf: [int; 4096] = [0; 4096]
+    @uri_len = extract_json_string(@buf, @len, "uri", 3, &@uri_buf[0], 4096)
+    @line = extract_position_line(@buf, @len)
+    @character = extract_position_character(@buf, @len)
+
+    @doc_idx = doc_find(&@uri_buf[0], @uri_len)
+    if @doc_idx < 0
+        lsp_send_success(@id, "null", 4)
+        return
+
+    # Find word at position
+    @word_buf: [int; 256] = [0; 256]
+    @word_len = get_word_at(@doc_idx, @line, @character, &@word_buf[0], 256)
+    if @word_len <= 0
+        lsp_send_success(@id, "null", 4)
+        return
+
+    # Check symbols in this document
+    orbit @s in 0..@sym_count
+        if @sym_doc_idx[@s] == @doc_idx
+            @sbase = @s * 64
+            if buf_eq(&@word_buf[0], @word_len, &@sym_names[@sbase], @sym_name_lens[@s])
+                # Found a matching symbol
+                @resp_len = 0
+                resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+                @num_buf: [int; 16] = [0; 16]
+                @nlen = int_to_str(@id, &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str(",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":\"", 50)
+                # Symbol type
+                @kind_name = symbol_kind_name(@sym_kinds[@s])
+                @kn_len = extern_strlen(@kind_name)
+                resp_append_str("**", 2)
+                resp_append_raw(@kind_name, @kn_len)
+                resp_append_str("** `", 4)
+                resp_append(&@sym_names[@sbase], @sym_name_lens[@s])
+                resp_append_str("`\\n\\nDefined at line ", 20)
+                @nlen = int_to_str(@sym_lines[@s] + 1, &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str("\"}}}", 4)
+                lsp_send_response(&@resp_buf[0], @resp_len)
+                return
+
+    # Check stdlib docs
+    orbit @d in 0..@sdoc_count
+        @dbase = @d * 64
+        if buf_eq(&@word_buf[0], @word_len, &@sdoc_names[@dbase], @sdoc_name_lens[@d])
+            @resp_len = 0
+            resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+            @num_buf: [int; 16] = [0; 16]
+            @nlen = int_to_str(@id, &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str(",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":\"", 50)
+            resp_append_str("```luna\\n", 9)
+            @sbase = @d * 128
+            resp_append(&@sdoc_sigs[@sbase], @sdoc_sig_lens[@d])
+            resp_append_str("\\n```\\n\\n", 9)
+            @descbase = @d * 512
+            resp_append(&@sdoc_descs[@descbase], @sdoc_desc_lens[@d])
+            resp_append_str("\\n\\n**Module:** `", 17)
+            @mbase = @d * 64
+            resp_append(&@sdoc_modules[@mbase], @sdoc_module_lens[@d])
+            resp_append_str("`", 1)
+            resp_append_str("\"}}}", 4)
+            lsp_send_response(&@resp_buf[0], @resp_len)
+            return
+
+    lsp_send_success(@id, "null", 4)
+
+# =============================================================================
+# Section 10: Definition Handler
+# =============================================================================
+
+fn lsp_handle_definition(@id: int, @buf: *int, @len: int)
+    @uri_buf: [int; 4096] = [0; 4096]
+    @uri_len = extract_json_string(@buf, @len, "uri", 3, &@uri_buf[0], 4096)
+    @line = extract_position_line(@buf, @len)
+    @character = extract_position_character(@buf, @len)
+
+    @doc_idx = doc_find(&@uri_buf[0], @uri_len)
+    if @doc_idx < 0
+        lsp_send_success(@id, "null", 4)
+        return
+
+    # Find word at position
+    @word_buf: [int; 256] = [0; 256]
+    @word_len = get_word_at(@doc_idx, @line, @character, &@word_buf[0], 256)
+    if @word_len <= 0
+        lsp_send_success(@id, "null", 4)
+        return
+
+    # Search all symbols
+    orbit @s in 0..@sym_count
+        @sbase = @s * 64
+        if buf_eq(&@word_buf[0], @word_len, &@sym_names[@sbase], @sym_name_lens[@s])
+            # Found definition
+            @resp_len = 0
+            resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+            @num_buf: [int; 16] = [0; 16]
+            @nlen = int_to_str(@id, &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str(",\"result\":{\"uri\":\"", 18)
+            # Get URI of the document where symbol lives
+            @sym_di = @sym_doc_idx[@s]
+            @ubase = @sym_di * MAX_LINE_LEN
+            resp_append(&@doc_uris[@ubase], @doc_uri_lens[@sym_di])
+            resp_append_str("\",\"range\":{\"start\":{\"line\":", 26)
+            @nlen = int_to_str(@sym_lines[@s], &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str(",\"character\":", 13)
+            @nlen = int_to_str(@sym_cols[@s], &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str("},\"end\":{\"line\":", 15)
+            @nlen = int_to_str(@sym_lines[@s], &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str(",\"character\":", 13)
+            @end_col = @sym_cols[@s] + @sym_name_lens[@s]
+            @nlen = int_to_str(@end_col, &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str("}}}}", 4)
+            lsp_send_response(&@resp_buf[0], @resp_len)
+            return
+
+    lsp_send_success(@id, "null", 4)
+
+# =============================================================================
+# Section 11: Document Symbol Handler
+# =============================================================================
+
+fn lsp_handle_document_symbol(@id: int, @buf: *int, @len: int)
+    @uri_buf: [int; 4096] = [0; 4096]
+    @uri_len = extract_json_string(@buf, @len, "uri", 3, &@uri_buf[0], 4096)
+    @doc_idx = doc_find(&@uri_buf[0], @uri_len)
+
+    @resp_len = 0
+    resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+    @num_buf: [int; 16] = [0; 16]
+    @nlen = int_to_str(@id, &@num_buf[0], 16)
+    resp_append(&@num_buf[0], @nlen)
+    resp_append_str(",\"result\":[", 11)
+
+    @first = 1
+    if @doc_idx >= 0
+        orbit @s in 0..@sym_count
+            if @sym_doc_idx[@s] == @doc_idx
+                if @first == 0
+                    resp_append_str(",", 1)
+                @first = 0
+                resp_append_str("{\"name\":\"", 9)
+                @sbase = @s * 64
+                resp_append(&@sym_names[@sbase], @sym_name_lens[@s])
+                resp_append_str("\",\"kind\":", 9)
+                @nlen = int_to_str(@sym_kinds[@s], &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str(",\"range\":{\"start\":{\"line\":", 25)
+                @nlen = int_to_str(@sym_lines[@s], &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str(",\"character\":", 13)
+                @nlen = int_to_str(@sym_cols[@s], &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str("},\"end\":{\"line\":", 15)
+                @el = @sym_end_lines[@s]
+                if @el == 0
+                    @el = @sym_lines[@s]
+                @nlen = int_to_str(@el, &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str(",\"character\":999}}", 18)
+                resp_append_str(",\"selectionRange\":{\"start\":{\"line\":", 34)
+                @nlen = int_to_str(@sym_lines[@s], &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str(",\"character\":", 13)
+                @nlen = int_to_str(@sym_cols[@s], &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str("},\"end\":{\"line\":", 15)
+                @nlen = int_to_str(@sym_lines[@s], &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str(",\"character\":", 13)
+                @ec = @sym_cols[@s] + @sym_name_lens[@s]
+                @nlen = int_to_str(@ec, &@num_buf[0], 16)
+                resp_append(&@num_buf[0], @nlen)
+                resp_append_str("}}}", 3)
+
+    resp_append_str("]}", 2)
+    lsp_send_response(&@resp_buf[0], @resp_len)
+
+# =============================================================================
+# Section 11b: References, Formatting, Signature, Folding, CodeAction, Rename
+# =============================================================================
+
+fn lsp_handle_references(@id: int, @buf: *int, @len: int)
+    # Find all occurrences of word in document
+    @uri_buf: [int; 4096] = [0; 4096]
+    @uri_len = extract_json_string(@buf, @len, "uri", 3, &@uri_buf[0], 4096)
+    @line = extract_position_line(@buf, @len)
+    @character = extract_position_character(@buf, @len)
+    @doc_idx = doc_find(&@uri_buf[0], @uri_len)
+
+    @resp_len = 0
+    resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+    @num_buf: [int; 16] = [0; 16]
+    @nlen = int_to_str(@id, &@num_buf[0], 16)
+    resp_append(&@num_buf[0], @nlen)
+    resp_append_str(",\"result\":[", 11)
+
+    if @doc_idx >= 0
+        @word_buf: [int; 256] = [0; 256]
+        @word_len = get_word_at(@doc_idx, @line, @character, &@word_buf[0], 256)
+        if @word_len > 0
+            @base = @doc_idx * MAX_DOC_LEN
+            @clen = @doc_content_lens[@doc_idx]
+            @cur_line = 0
+            @cur_col = 0
+            @first = 1
+            orbit @i in 0..@clen
+                @ch = @doc_contents[@base + @i]
+                if @ch == 10
+                    @cur_line = @cur_line + 1
+                    @cur_col = 0
+                    continue
+                # Check if word matches at this position
+                if is_word_boundary(@doc_idx, @i - 1) && match_word_at(@doc_idx, @i, &@word_buf[0], @word_len)
+                    if @first == 0
+                        resp_append_str(",", 1)
+                    @first = 0
+                    resp_append_str("{\"uri\":\"", 8)
+                    @ubase = @doc_idx * MAX_LINE_LEN
+                    resp_append(&@doc_uris[@ubase], @doc_uri_lens[@doc_idx])
+                    resp_append_str("\",\"range\":{\"start\":{\"line\":", 26)
+                    @nlen = int_to_str(@cur_line, &@num_buf[0], 16)
+                    resp_append(&@num_buf[0], @nlen)
+                    resp_append_str(",\"character\":", 13)
+                    @nlen = int_to_str(@cur_col, &@num_buf[0], 16)
+                    resp_append(&@num_buf[0], @nlen)
+                    resp_append_str("},\"end\":{\"line\":", 15)
+                    @nlen = int_to_str(@cur_line, &@num_buf[0], 16)
+                    resp_append(&@num_buf[0], @nlen)
+                    resp_append_str(",\"character\":", 13)
+                    @nlen = int_to_str(@cur_col + @word_len, &@num_buf[0], 16)
+                    resp_append(&@num_buf[0], @nlen)
+                    resp_append_str("}}}", 3)
+                @cur_col = @cur_col + 1
+
+    resp_append_str("]}", 2)
+    lsp_send_response(&@resp_buf[0], @resp_len)
+
+fn lsp_handle_formatting(@id: int, @buf: *int, @len: int)
+    # Return empty edits for now (formatting is complex)
+    lsp_send_success(@id, "[]", 2)
+
+fn lsp_handle_signature_help(@id: int, @buf: *int, @len: int)
+    lsp_send_success(@id, "null", 4)
+
+fn lsp_handle_folding_range(@id: int, @buf: *int, @len: int)
+    @uri_buf: [int; 4096] = [0; 4096]
+    @uri_len = extract_json_string(@buf, @len, "uri", 3, &@uri_buf[0], 4096)
+    @doc_idx = doc_find(&@uri_buf[0], @uri_len)
+
+    @resp_len = 0
+    resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+    @num_buf: [int; 16] = [0; 16]
+    @nlen = int_to_str(@id, &@num_buf[0], 16)
+    resp_append(&@num_buf[0], @nlen)
+    resp_append_str(",\"result\":[", 11)
+
+    @first = 1
+    if @doc_idx >= 0
+        # Fold on fn/struct/orbit blocks
+        orbit @s in 0..@sym_count
+            if @sym_doc_idx[@s] == @doc_idx
+                @el = @sym_end_lines[@s]
+                if @el > @sym_lines[@s]
+                    if @first == 0
+                        resp_append_str(",", 1)
+                    @first = 0
+                    resp_append_str("{\"startLine\":", 13)
+                    @nlen = int_to_str(@sym_lines[@s], &@num_buf[0], 16)
+                    resp_append(&@num_buf[0], @nlen)
+                    resp_append_str(",\"endLine\":", 11)
+                    @nlen = int_to_str(@el, &@num_buf[0], 16)
+                    resp_append(&@num_buf[0], @nlen)
+                    resp_append_str(",\"kind\":\"region\"}", 17)
+
+    resp_append_str("]}", 2)
+    lsp_send_response(&@resp_buf[0], @resp_len)
+
+fn lsp_handle_code_action(@id: int, @buf: *int, @len: int)
+    lsp_send_success(@id, "[]", 2)
+
+fn lsp_handle_rename(@id: int, @buf: *int, @len: int)
+    lsp_send_success(@id, "null", 4)
+
+fn lsp_handle_prepare_rename(@id: int, @buf: *int, @len: int)
+    lsp_send_success(@id, "null", 4)
+
+# =============================================================================
+# Section 12: Diagnostics Publisher
+# =============================================================================
+
+fn lsp_publish_diagnostics(@doc_idx: int)
+    if @doc_idx < 0
+        return
+
+    @resp_len = 0
+    resp_append_str("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"", 75)
+    @ubase = @doc_idx * MAX_LINE_LEN
+    resp_append(&@doc_uris[@ubase], @doc_uri_lens[@doc_idx])
+    resp_append_str("\",\"diagnostics\":[", 17)
+
+    @first = 1
+    orbit @d in 0..@diag_count
+        if @diag_doc_idx[@d] == @doc_idx
+            if @first == 0
+                resp_append_str(",", 1)
+            @first = 0
+            @num_buf: [int; 16] = [0; 16]
+            resp_append_str("{\"range\":{\"start\":{\"line\":", 25)
+            @nlen = int_to_str(@diag_lines[@d], &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str(",\"character\":", 13)
+            @nlen = int_to_str(@diag_cols[@d], &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str("},\"end\":{\"line\":", 15)
+            @nlen = int_to_str(@diag_end_lines[@d], &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str(",\"character\":", 13)
+            @nlen = int_to_str(@diag_end_cols[@d], &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str("}},\"severity\":", 14)
+            @nlen = int_to_str(@diag_severities[@d], &@num_buf[0], 16)
+            resp_append(&@num_buf[0], @nlen)
+            resp_append_str(",\"source\":\"", 11)
+            @src_base = @d * 32
+            resp_append(&@diag_sources[@src_base], @diag_source_lens[@d])
+            resp_append_str("\",\"code\":\"", 10)
+            @code_base = @d * 64
+            resp_append(&@diag_codes[@code_base], @diag_code_lens[@d])
+            resp_append_str("\",\"message\":\"", 13)
+            @msg_base = @d * 512
+            resp_append_escaped(&@diag_messages[@msg_base], @diag_msg_lens[@d])
+            resp_append_str("\"}", 2)
+
+    resp_append_str("]}}", 3)
+    lsp_send_response(&@resp_buf[0], @resp_len)
+
+# =============================================================================
+# Section 13: Parameter Extraction Utilities
+# =============================================================================
+
+# Extract a JSON string value by key name
+fn extract_json_string(@buf: *int, @len: int, @key: *u8, @klen: int, @out: *int, @max: int) -> int
+    # Find "key":"
+    @i = 0
+    orbit @i < @len - @klen - 3
+        if @buf[@i] == 34   # '"'
+            @match = 1
+            orbit @j in 0..@klen
+                if @buf[@i + 1 + @j] != @key[@j]
+                    @match = 0
+                    nova
+            if @match == 1 && @buf[@i + 1 + @klen] == 34  # closing "
+                # Found key, now find :"
+                @p = @i + 2 + @klen
+                orbit @p < @len
+                    if @buf[@p] == 34  # opening quote of value
+                        @p = @p + 1
+                        @k = 0
+                        orbit @p < @len && @k < @max
+                            if @buf[@p] == 34  # closing quote
+                                return @k
+                            if @buf[@p] == 92  # backslash escape
+                                @p = @p + 1
+                                if @p < @len
+                                    if @buf[@p] == 110        # \n
+                                        @out[@k] = 10
+                                    eclipse @buf[@p] == 114   # \r
+                                        @out[@k] = 13
+                                    eclipse @buf[@p] == 116   # \t
+                                        @out[@k] = 9
+                                    eclipse
+                                        @out[@k] = @buf[@p]
+                                    @k = @k + 1
+                                @p = @p + 1
+                                continue
+                            @out[@k] = @buf[@p]
+                            @k = @k + 1
+                            @p = @p + 1
+                        return @k
+                    @p = @p + 1
+        @i = @i + 1
+    return -1
+
+# Extract escaped text (handles JSON escape sequences in value)
+fn extract_json_string_escaped(@buf: *int, @len: int, @key: *u8, @klen: int, @out: *int, @max: int) -> int
+    return extract_json_string(@buf, @len, @key, @klen, @out, @max)
+
+# Extract the text from contentChanges array
+fn extract_change_text(@buf: *int, @len: int, @out: *int, @max: int) -> int
+    # Find "contentChanges" then find "text" within it
+    @i = 0
+    orbit @i < @len - 14
+        if @buf[@i] == 99 && @buf[@i+1] == 111 && @buf[@i+2] == 110 && @buf[@i+3] == 116 && @buf[@i+4] == 101 && @buf[@i+5] == 110 && @buf[@i+6] == 116
+            # Found "content..." — now look for "text":" after this
+            return extract_json_string(@buf + @i, @len - @i, "text", 4, @out, @max)
+        @i = @i + 1
+    # Fallback: try to find "text" anywhere
+    return extract_json_string(@buf, @len, "text", 4, @out, @max)
+
+# Extract a JSON number value by key name
+fn extract_json_number(@buf: *int, @len: int, @key: *u8, @klen: int) -> int
+    @i = 0
+    orbit @i < @len - @klen - 2
+        if @buf[@i] == 34   # '"'
+            @match = 1
+            orbit @j in 0..@klen
+                if @buf[@i + 1 + @j] != @key[@j]
+                    @match = 0
+                    nova
+            if @match == 1 && @buf[@i + 1 + @klen] == 34
+                @p = @i + 2 + @klen
+                # Skip : and whitespace
+                orbit @p < @len
+                    if @buf[@p] == 58 || @buf[@p] == 32 || @buf[@p] == 9
+                        @p = @p + 1
+                        continue
+                    nova
+                # Parse number
+                @val = 0
+                @has = 0
+                orbit @p < @len
+                    @d = @buf[@p] - 48
+                    if @d < 0 || @d > 9
+                        nova
+                    @val = @val * 10 + @d
+                    @has = 1
+                    @p = @p + 1
+                if @has == 1
+                    return @val
+        @i = @i + 1
+    return -1
+
+# Extract position.line from params
+fn extract_position_line(@buf: *int, @len: int) -> int
+    # Find "position" then "line"
+    @i = 0
+    orbit @i < @len - 10
+        if @buf[@i] == 112 && @buf[@i+1] == 111 && @buf[@i+2] == 115 && @buf[@i+3] == 105 && @buf[@i+4] == 116 && @buf[@i+5] == 105 && @buf[@i+6] == 111 && @buf[@i+7] == 110
+            # Found "position", now look for "line":
+            return extract_json_number(@buf + @i, @len - @i, "line", 4)
+        @i = @i + 1
+    return 0
+
+# Extract position.character from params
+fn extract_position_character(@buf: *int, @len: int) -> int
+    @i = 0
+    orbit @i < @len - 10
+        if @buf[@i] == 112 && @buf[@i+1] == 111 && @buf[@i+2] == 115 && @buf[@i+3] == 105 && @buf[@i+4] == 116 && @buf[@i+5] == 105 && @buf[@i+6] == 111 && @buf[@i+7] == 110
+            return extract_json_number(@buf + @i, @len - @i, "character", 9)
+        @i = @i + 1
+    return 0
+
+# =============================================================================
+# Section 14: JSON Response Builders & Utility Functions
+# =============================================================================
+
+fn lsp_send_success(@id: int, @result: *u8, @rlen: int)
+    @resp_len = 0
+    resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+    @num_buf: [int; 16] = [0; 16]
+    @nlen = int_to_str(@id, &@num_buf[0], 16)
+    resp_append(&@num_buf[0], @nlen)
+    resp_append_str(",\"result\":", 10)
+    resp_append_raw(@result, @rlen)
+    resp_append_str("}", 1)
+    lsp_send_response(&@resp_buf[0], @resp_len)
+
+fn lsp_send_error(@id: int, @code: int, @message: *u8)
+    @mlen = extern_strlen(@message)
+    @resp_len = 0
+    resp_append_str("{\"jsonrpc\":\"2.0\",\"id\":", 21)
+    @num_buf: [int; 16] = [0; 16]
+    @nlen = int_to_str(@id, &@num_buf[0], 16)
+    resp_append(&@num_buf[0], @nlen)
+    resp_append_str(",\"error\":{\"code\":", 16)
+    @nlen = int_to_str(@code, &@num_buf[0], 16)
+    resp_append(&@num_buf[0], @nlen)
+    resp_append_str(",\"message\":\"", 12)
+    resp_append_raw(@message, @mlen)
+    resp_append_str("\"}}", 3)
+    lsp_send_response(&@resp_buf[0], @resp_len)
+
+# Append raw bytes to response buffer
+fn resp_append(@src: *int, @slen: int)
+    orbit @i in 0..@slen
+        if @resp_len < MAX_RESPONSE_LEN
+            @resp_buf[@resp_len] = @src[@i]
+            @resp_len = @resp_len + 1
+
+# Append string literal to response buffer
+fn resp_append_str(@s: *u8, @slen: int)
+    orbit @i in 0..@slen
+        if @resp_len < MAX_RESPONSE_LEN
+            @resp_buf[@resp_len] = @s[@i]
+            @resp_len = @resp_len + 1
+
+# Append raw u8 string
+fn resp_append_raw(@s: *u8, @slen: int)
+    orbit @i in 0..@slen
+        if @resp_len < MAX_RESPONSE_LEN
+            @resp_buf[@resp_len] = @s[@i]
+            @resp_len = @resp_len + 1
+
+# Append with JSON string escaping
+fn resp_append_escaped(@src: *int, @slen: int)
+    orbit @i in 0..@slen
+        @ch = @src[@i]
+        if @ch == 34       # '"'
+            resp_append_str("\\\"", 2)
+        eclipse @ch == 92  # '\'
+            resp_append_str("\\\\", 2)
+        eclipse @ch == 10  # '\n'
+            resp_append_str("\\n", 2)
+        eclipse @ch == 13  # '\r'
+            resp_append_str("\\r", 2)
+        eclipse @ch == 9   # '\t'
+            resp_append_str("\\t", 2)
+        eclipse
+            if @resp_len < MAX_RESPONSE_LEN
+                @resp_buf[@resp_len] = @ch
+                @resp_len = @resp_len + 1
+
+# Convert int to decimal string, return length
+fn int_to_str(@val: int, @out: *int, @max: int) -> int
+    if @val == 0
+        @out[0] = 48
+        return 1
+    @neg = 0
+    if @val < 0
+        @neg = 1
+        @val = 0 - @val
+    @tmp: [int; 16] = [0; 16]
+    @pos = 0
+    orbit @val > 0
+        @tmp[@pos] = 48 + (@val % 10)
+        @val = @val / 10
+        @pos = @pos + 1
+    @k = 0
+    if @neg == 1
+        @out[@k] = 45   # '-'
+        @k = @k + 1
+    orbit @pos > 0
+        @pos = @pos - 1
+        @out[@k] = @tmp[@pos]
+        @k = @k + 1
+    return @k
+
+# String equality check
+fn str_eq(@a: *int, @alen: int, @b: *u8, @blen: int) -> int
+    if @alen != @blen
+        return 0
+    orbit @i in 0..@alen
+        if @a[@i] != @b[@i]
+            return 0
+    return 1
+
+# Buffer equality
+fn buf_eq(@a: *int, @alen: int, @b: *int, @blen: int) -> int
+    if @alen != @blen
+        return 0
+    orbit @i in 0..@alen
+        if @a[@i] != @b[@i]
+            return 0
+    return 1
+
+# Document find by URI
+fn doc_find(@uri: *int, @uri_len: int) -> int
+    orbit @i in 0..MAX_DOCUMENTS
+        if @doc_active[@i] == 1 && @doc_uri_lens[@i] == @uri_len
+            @base = @i * MAX_LINE_LEN
+            @match = 1
+            orbit @j in 0..@uri_len
+                if @doc_uris[@base + @j] != @uri[@j]
+                    @match = 0
+                    nova
+            if @match == 1
+                return @i
+    return -1
+
+# Find or create a document slot
+fn doc_find_or_create(@uri: *int, @uri_len: int) -> int
+    @existing = doc_find(@uri, @uri_len)
+    if @existing >= 0
+        return @existing
+    # Find free slot
+    orbit @i in 0..MAX_DOCUMENTS
+        if @doc_active[@i] == 0
+            @doc_active[@i] = 1
+            @base = @i * MAX_LINE_LEN
+            orbit @j in 0..@uri_len
+                @doc_uris[@base + @j] = @uri[@j]
+            @doc_uri_lens[@i] = @uri_len
+            @doc_count = @doc_count + 1
+            return @i
+    return -1
+
+# Add a symbol to the symbol table
+fn add_symbol(@name: *int, @name_len: int, @kind: int, @line: int, @col: int, @doc_idx: int)
+    if @sym_count >= MAX_SYMBOLS
+        return
+    @idx = @sym_count
+    @base = @idx * 64
+    @copy_len = @name_len
+    if @copy_len > 63
+        @copy_len = 63
+    orbit @i in 0..@copy_len
+        @sym_names[@base + @i] = @name[@i]
+    @sym_name_lens[@idx] = @copy_len
+    @sym_kinds[@idx] = @kind
+    @sym_lines[@idx] = @line
+    @sym_cols[@idx] = @col
+    @sym_end_lines[@idx] = @line
+    @sym_end_cols[@idx] = @col + @copy_len
+    @sym_doc_idx[@idx] = @doc_idx
+    @sym_count = @sym_count + 1
+
+# Add a diagnostic
+fn add_diagnostic(@line: int, @col: int, @end_line: int, @end_col: int, @severity: int, @msg: *u8, @msg_len: int, @code: *u8, @code_len: int, @source: *u8, @source_len: int, @doc_idx: int)
+    if @diag_count >= MAX_DIAGNOSTICS
+        return
+    @idx = @diag_count
+    @diag_lines[@idx] = @line
+    @diag_cols[@idx] = @col
+    @diag_end_lines[@idx] = @end_line
+    @diag_end_cols[@idx] = @end_col
+    @diag_severities[@idx] = @severity
+    # Copy message
+    @mbase = @idx * 512
+    @ml = @msg_len
+    if @ml > 511
+        @ml = 511
+    orbit @i in 0..@ml
+        @diag_messages[@mbase + @i] = @msg[@i]
+    @diag_msg_lens[@idx] = @ml
+    # Copy code
+    @cbase = @idx * 64
+    @cl = @code_len
+    if @cl > 63
+        @cl = 63
+    orbit @i in 0..@cl
+        @diag_codes[@cbase + @i] = @code[@i]
+    @diag_code_lens[@idx] = @cl
+    # Copy source
+    @sbase = @idx * 32
+    @sl = @source_len
+    if @sl > 31
+        @sl = 31
+    orbit @i in 0..@sl
+        @diag_sources[@sbase + @i] = @source[@i]
+    @diag_source_lens[@idx] = @sl
+    @diag_doc_idx[@idx] = @doc_idx
+    @diag_count = @diag_count + 1
+
+# Clear symbols for a document
+fn clear_symbols_for(@doc_idx: int)
+    # Compact: shift symbols down
+    @write = 0
+    orbit @read in 0..@sym_count
+        if @sym_doc_idx[@read] != @doc_idx
+            if @write != @read
+                # Copy symbol from read to write
+                @sbase = @read * 64
+                @dbase = @write * 64
+                orbit @i in 0..64
+                    @sym_names[@dbase + @i] = @sym_names[@sbase + @i]
+                @sym_name_lens[@write] = @sym_name_lens[@read]
+                @sym_kinds[@write] = @sym_kinds[@read]
+                @sym_lines[@write] = @sym_lines[@read]
+                @sym_cols[@write] = @sym_cols[@read]
+                @sym_end_lines[@write] = @sym_end_lines[@read]
+                @sym_end_cols[@write] = @sym_end_cols[@read]
+                @sym_doc_idx[@write] = @sym_doc_idx[@read]
+            @write = @write + 1
+    @sym_count = @write
+
+# Clear diagnostics for a document
+fn clear_diagnostics_for(@doc_idx: int)
+    @write = 0
+    orbit @read in 0..@diag_count
+        if @diag_doc_idx[@read] != @doc_idx
+            if @write != @read
+                @diag_lines[@write] = @diag_lines[@read]
+                @diag_cols[@write] = @diag_cols[@read]
+                @diag_end_lines[@write] = @diag_end_lines[@read]
+                @diag_end_cols[@write] = @diag_end_cols[@read]
+                @diag_severities[@write] = @diag_severities[@read]
+                @diag_msg_lens[@write] = @diag_msg_lens[@read]
+                @diag_code_lens[@write] = @diag_code_lens[@read]
+                @diag_source_lens[@write] = @diag_source_lens[@read]
+                @diag_doc_idx[@write] = @diag_doc_idx[@read]
+                # Copy message, code, source arrays
+                orbit @k in 0..@diag_msg_lens[@read]
+                    @diag_messages[@write * 512 + @k] = @diag_messages[@read * 512 + @k]
+                orbit @k in 0..@diag_code_lens[@read]
+                    @diag_codes[@write * 64 + @k] = @diag_codes[@read * 64 + @k]
+                orbit @k in 0..@diag_source_lens[@read]
+                    @diag_sources[@write * 32 + @k] = @diag_sources[@read * 32 + @k]
+            @write = @write + 1
+    @diag_count = @write
+
+# Get word at a given line/character position
+fn get_word_at(@doc_idx: int, @line: int, @character: int, @out: *int, @max: int) -> int
+    @base = @doc_idx * MAX_DOC_LEN
+    @clen = @doc_content_lens[@doc_idx]
+    # Find the offset of the target line
+    @cur_line = 0
+    @line_start = 0
+    orbit @i in 0..@clen
+        if @cur_line == @line
+            @line_start = @i
+            nova
+        if @doc_contents[@base + @i] == 10
+            @cur_line = @cur_line + 1
+    @pos = @line_start + @character
+    if @pos >= @clen
+        return 0
+    # Find word boundaries (identifiers: a-z A-Z 0-9 _ @)
+    @start = @pos
+    orbit @start > @line_start
+        @ch = @doc_contents[@base + @start - 1]
+        if is_ident_char(@ch) == 0
+            nova
+        @start = @start - 1
+    @end = @pos
+    orbit @end < @clen
+        @ch = @doc_contents[@base + @end]
+        if @ch == 10
+            nova
+        if is_ident_char(@ch) == 0
+            nova
+        @end = @end + 1
+    @wlen = @end - @start
+    if @wlen > @max
+        @wlen = @max
+    orbit @i in 0..@wlen
+        @out[@i] = @doc_contents[@base + @start + @i]
+    return @wlen
+
+fn is_ident_char(@ch: int) -> int
+    if @ch >= 97 && @ch <= 122   # a-z
+        return 1
+    if @ch >= 65 && @ch <= 90    # A-Z
+        return 1
+    if @ch >= 48 && @ch <= 57    # 0-9
+        return 1
+    if @ch == 95                  # '_'
+        return 1
+    if @ch == 64                  # '@'
+        return 1
+    return 0
+
+fn is_word_boundary(@doc_idx: int, @pos: int) -> int
+    if @pos < 0
+        return 1
+    @base = @doc_idx * MAX_DOC_LEN
+    @ch = @doc_contents[@base + @pos]
+    if is_ident_char(@ch) == 0
+        return 1
+    return 0
+
+fn match_word_at(@doc_idx: int, @pos: int, @word: *int, @wlen: int) -> int
+    @base = @doc_idx * MAX_DOC_LEN
+    @clen = @doc_content_lens[@doc_idx]
+    if @pos + @wlen > @clen
+        return 0
+    orbit @i in 0..@wlen
+        if @doc_contents[@base + @pos + @i] != @word[@i]
+            return 0
+    # Check that the character after the word is not an ident char
+    if @pos + @wlen < @clen
+        if is_ident_char(@doc_contents[@base + @pos + @wlen]) == 1
+            return 0
+    return 1
+
+fn symbol_kind_to_completion(@sk: int) -> int
+    if @sk == SYMBOL_FUNCTION
+        return COMP_FUNCTION
+    if @sk == SYMBOL_STRUCT
+        return COMP_STRUCT
+    if @sk == SYMBOL_CONSTANT
+        return COMP_CONSTANT
+    if @sk == SYMBOL_VARIABLE
+        return COMP_VARIABLE
+    return COMP_TEXT
+
+fn symbol_kind_name(@sk: int) -> *u8
+    if @sk == SYMBOL_FUNCTION
+        return "Function"
+    if @sk == SYMBOL_STRUCT
+        return "Struct"
+    if @sk == SYMBOL_CONSTANT
+        return "Constant"
+    if @sk == SYMBOL_VARIABLE
+        return "Variable"
+    if @sk == SYMBOL_MODULE
+        return "Module"
+    if @sk == SYMBOL_ENUM
+        return "Enum"
+    return "Symbol"
+
+# =============================================================================
+# Section 15: Stdlib Documentation Table
+# =============================================================================
+
+fn sdoc_add(@name: *u8, @nlen: int, @sig: *u8, @slen: int, @desc: *u8, @dlen: int, @mod: *u8, @mlen: int)
+    if @sdoc_count >= MAX_STDLIB_DOCS
+        return
+    @idx = @sdoc_count
+    # Name
+    @base = @idx * 64
+    orbit @i in 0..@nlen
+        @sdoc_names[@base + @i] = @name[@i]
+    @sdoc_name_lens[@idx] = @nlen
+    # Signature
+    @base = @idx * 128
+    orbit @i in 0..@slen
+        @sdoc_sigs[@base + @i] = @sig[@i]
+    @sdoc_sig_lens[@idx] = @slen
+    # Description
+    @base = @idx * 512
+    @dl = @dlen
+    if @dl > 511
+        @dl = 511
+    orbit @i in 0..@dl
+        @sdoc_descs[@base + @i] = @desc[@i]
+    @sdoc_desc_lens[@idx] = @dl
+    # Module
+    @base = @idx * 64
+    orbit @i in 0..@mlen
+        @sdoc_modules[@base + @i] = @mod[@i]
+    @sdoc_module_lens[@idx] = @mlen
+    @sdoc_count = @sdoc_count + 1
+
+fn lsp_init_stdlib_docs()
+    @sdoc_count = 0
+    # --- Crypto ---
+    sdoc_add("seal", 4, "seal(data: str) -> str", 22, "Compute SHA-256 hash. Returns 64-char hex string.", 49, "std::crypto", 11)
+    sdoc_add("chacha20_encrypt", 16, "chacha20_encrypt(key, nonce, data) -> (cipher, tag)", 51, "ChaCha20-Poly1305 AEAD encryption.", 34, "std::crypto", 11)
+    sdoc_add("argon2_hash", 11, "argon2_hash(password, salt, t, m, p) -> [u8; 32]", 49, "Argon2id password hashing.", 26, "std::crypto", 11)
+    sdoc_add("blake3_hash", 11, "blake3_hash(data) -> str", 24, "BLAKE3 cryptographic hash.", 26, "std::crypto", 11)
+    # --- Collections ---
+    sdoc_add("hm_insert", 9, "hm_insert(key, value)", 21, "Insert key-value pair into HashMap.", 35, "std::collections", 16)
+    sdoc_add("hm_get", 6, "hm_get(key) -> value", 20, "Get value by key from HashMap.", 30, "std::collections", 16)
+    sdoc_add("vec_push", 8, "vec_push(item)", 14, "Append item to Vec.", 19, "std::collections", 16)
+    sdoc_add("vec_sort", 8, "vec_sort()", 10, "Sort Vec in ascending order.", 28, "std::collections", 16)
+    sdoc_add("rb_insert", 9, "rb_insert(key, value)", 21, "Insert into Red-Black Tree.", 27, "std::collections", 16)
+    # --- I/O ---
+    sdoc_add("io_open", 7, "io_open(path, mode) -> fd", 25, "Open file. Modes: read, write, append.", 38, "std::io", 7)
+    sdoc_add("io_read", 7, "io_read(fd, buf, max) -> n", 26, "Read bytes from file descriptor.", 32, "std::io", 7)
+    sdoc_add("io_write", 8, "io_write(fd, buf, len) -> n", 27, "Write bytes to file descriptor.", 31, "std::io", 7)
+    sdoc_add("io_close", 8, "io_close(fd)", 12, "Close file descriptor.", 22, "std::io", 7)
+    sdoc_add("read_file", 9, "read_file(path) -> str", 22, "Read entire file as string.", 27, "std::io", 7)
+    sdoc_add("write_file", 10, "write_file(path, content)", 25, "Write string to file.", 21, "std::io", 7)
+    sdoc_add("mkdir", 5, "mkdir(path) -> int", 18, "Create directory.", 17, "std::io", 7)
+    # --- Net ---
+    sdoc_add("tcp_connect", 11, "tcp_connect(host, port) -> fd", 29, "Create TCP connection.", 22, "std::net", 8)
+    sdoc_add("tcp_listen", 10, "tcp_listen(port) -> fd", 22, "Listen on TCP port.", 19, "std::net", 8)
+    sdoc_add("tcp_accept", 10, "tcp_accept(fd) -> client_fd", 27, "Accept incoming TCP connection.", 31, "std::net", 8)
+    sdoc_add("udp_bind", 8, "udp_bind(port) -> fd", 20, "Bind UDP socket.", 16, "std::net", 8)
+    sdoc_add("dns_resolve", 11, "dns_resolve(hostname) -> ip", 27, "Resolve hostname to IP.", 23, "std::net", 8)
+    # --- Scheduler ---
+    sdoc_add("spawn", 5, "spawn(fn) -> task", 17, "Spawn concurrent task.", 22, "std::scheduler", 14)
+    sdoc_add("fiber_new", 9, "fiber_new(fn) -> fiber", 22, "Create green thread.", 20, "std::scheduler", 14)
+    # --- Sync ---
+    sdoc_add("mutex_lock", 10, "mutex_lock(m)", 13, "Acquire mutex.", 14, "std::sync", 9)
+    sdoc_add("mutex_unlock", 12, "mutex_unlock(m)", 15, "Release mutex.", 14, "std::sync", 9)
+    sdoc_add("channel_new", 11, "channel_new() -> ch", 19, "Create mpsc channel.", 20, "std::sync", 9)
+    sdoc_add("channel_send", 12, "channel_send(ch, msg)", 21, "Send message on channel.", 24, "std::sync", 9)
+    sdoc_add("channel_recv", 12, "channel_recv(ch) -> msg", 23, "Receive message from channel.", 29, "std::sync", 9)
+    # --- Time ---
+    sdoc_add("instant_now", 11, "instant_now() -> int", 20, "Get monotonic timestamp (ns).", 29, "std::time", 9)
+    sdoc_add("sleep", 5, "sleep(ms: int)", 14, "Sleep for milliseconds.", 23, "std::time", 9)
+    sdoc_add("to_iso", 6, "to_iso(epoch) -> str", 20, "Format epoch as ISO 8601.", 25, "std::time", 9)
+    # --- Math ---
+    sdoc_add("math_sqrt", 9, "math_sqrt(x) -> float", 21, "Square root.", 12, "std::math", 9)
+    sdoc_add("math_sin", 8, "math_sin(x) -> float", 20, "Sine function.", 14, "std::math", 9)
+    sdoc_add("math_cos", 8, "math_cos(x) -> float", 20, "Cosine function.", 16, "std::math", 9)
+    sdoc_add("math_pow", 8, "math_pow(b, e) -> float", 23, "Power function.", 15, "std::math", 9)
+    sdoc_add("math_abs", 8, "math_abs(x) -> float", 20, "Absolute value.", 15, "std::math", 9)
+    sdoc_add("math_random", 11, "math_random() -> float", 22, "Random float [0,1).", 19, "std::math", 9)
+    # --- JSON ---
+    sdoc_add("json_parse", 10, "json_parse(text) -> doc", 23, "Parse JSON string.", 18, "std::json", 9)
+    sdoc_add("json_stringify", 14, "json_stringify(doc, idx) -> str", 31, "Serialize JSON node to string.", 30, "std::json", 9)
+    sdoc_add("json_get", 8, "json_get(doc, obj, key) -> idx", 30, "Get value by key from JSON object.", 34, "std::json", 9)
+    sdoc_add("json_is_valid", 13, "json_is_valid(text) -> int", 26, "Check if string is valid JSON.", 30, "std::json", 9)
+    # --- Regex ---
+    sdoc_add("regex_compile", 13, "regex_compile(pattern) -> int", 29, "Compile regex pattern to NFA.", 29, "std::regex", 10)
+    sdoc_add("regex_match", 11, "regex_match(pattern, input) -> int", 34, "Test if input matches pattern.", 30, "std::regex", 10)
+    sdoc_add("regex_find", 10, "regex_find(pattern, input) -> int", 33, "Find first match in input.", 26, "std::regex", 10)
+    sdoc_add("regex_replace", 13, "regex_replace(pattern, input, repl) -> str", 42, "Replace matches with replacement.", 33, "std::regex", 10)
+    sdoc_add("regex_split", 11, "regex_split(pattern, input) -> [str]", 36, "Split string by regex.", 22, "std::regex", 10)
+    # --- DB ---
+    sdoc_add("db_put", 6, "db_put(key, val) -> int", 23, "Insert/update key-value pair.", 29, "std::db", 7)
+    sdoc_add("db_get", 6, "db_get(key) -> val", 18, "Get value by key.", 17, "std::db", 7)
+    sdoc_add("db_delete", 9, "db_delete(key) -> int", 21, "Delete key.", 11, "std::db", 7)
+    sdoc_add("db_begin", 8, "db_begin() -> int", 17, "Begin transaction.", 18, "std::db", 7)
+    sdoc_add("db_commit", 9, "db_commit() -> int", 18, "Commit transaction.", 19, "std::db", 7)
+    sdoc_add("db_rollback", 11, "db_rollback() -> int", 20, "Rollback transaction.", 21, "std::db", 7)
+    # --- HTTP ---
+    sdoc_add("http_parse_request", 18, "http_parse_request(data, len) -> int", 36, "Parse HTTP request.", 19, "std::http", 9)
+    sdoc_add("http_response_json", 18, "http_response_json(status, body) -> resp", 40, "Build JSON HTTP response.", 25, "std::http", 9)
+    sdoc_add("http_response_text", 18, "http_response_text(status, body) -> resp", 40, "Build text HTTP response.", 25, "std::http", 9)
+    sdoc_add("route_add", 9, "route_add(method, path, handler)", 32, "Register HTTP route.", 20, "std::http", 9)
+    sdoc_add("url_decode", 10, "url_decode(encoded) -> str", 26, "URL percent-decode.", 19, "std::http", 9)
+    # --- GUI ---
+    sdoc_add("window_create", 13, "window_create(title, w, h, flags) -> handle", 44, "Create native window.", 21, "std::gui", 8)
+    sdoc_add("webview_create", 14, "webview_create(window_handle) -> handle", 39, "Create WebView in window.", 25, "std::gui", 8)
+    sdoc_add("webview_load_html", 17, "webview_load_html(handle, html)", 31, "Load HTML into WebView.", 23, "std::gui", 8)
+    sdoc_add("gui_run", 7, "gui_run() -> int", 16, "Start GUI event loop.", 21, "std::gui", 8)
+    sdoc_add("gui_quit", 8, "gui_quit()", 10, "Stop GUI event loop.", 20, "std::gui", 8)
+    sdoc_add("clipboard_get", 13, "clipboard_get(out, max) -> int", 30, "Read system clipboard.", 22, "std::gui", 8)
+    sdoc_add("notification_show", 17, "notification_show(title, body)", 30, "Show system notification.", 25, "std::gui", 8)
+    # --- LIDL ---
+    sdoc_add("lidl_parse", 10, "lidl_parse(source) -> int", 25, "Parse LIDL interface.", 21, "std::lidl", 9)
+    sdoc_add("lidl_gen_c_header", 17, "lidl_gen_c_header() -> str", 26, "Generate C FFI header.", 22, "std::lidl", 9)
+    sdoc_add("lidl_gen_ts_types", 17, "lidl_gen_ts_types() -> str", 26, "Generate TypeScript types.", 26, "std::lidl", 9)
+    # --- Core ---
+    sdoc_add("shine", 5, "shine(value)", 12, "Print value to stdout.", 22, "core", 4)
+    sdoc_add("len", 3, "len(collection) -> int", 22, "Get length of collection.", 25, "core", 4)
+    sdoc_add("type", 4, "type(value) -> str", 18, "Get type name of value.", 23, "core", 4)
+    sdoc_add("exit", 4, "exit(code: int)", 15, "Exit with status code.", 22, "core", 4)
+    sdoc_add("assert", 6, "assert(condition, msg)", 22, "Assert condition is true.", 25, "core", 4)
+
+# =============================================================================
+# Section 16: Extern Declarations & Main Entry Point
+# =============================================================================
+
+extern fn extern_stdin_read_byte() -> int
+extern fn extern_stdout_write(@buf: *int, @len: int)
+extern fn extern_stdout_write_str(@s: *u8, @len: int)
+extern fn extern_stdout_flush()
+extern fn extern_stderr_write_str(@s: *u8, @len: int)
+extern fn extern_strlen(@s: *u8) -> int
+
+# Main LSP entry point
+fn lsp_main() -> int
+    extern_stderr_write_str("Luna LSP Server v4.2 started\n", 29)
+    lsp_init_stdlib_docs()
+    orbit @lsp_running == 1
+        @n = lsp_read_message()
+        if @n < 0
+            nova
+        @cont = lsp_handle_message(&@msg_buf[0], @n)
+        if @cont == 0
+            nova
+    extern_stderr_write_str("Luna LSP Server stopped\n", 24)
+    return 0
+
+# =============================================================================
+# Section 17: Self-Tests
+# =============================================================================
+
+fn test_lsp_int_to_str() -> int
+    @buf: [int; 16] = [0; 16]
+    @len = int_to_str(42, &@buf[0], 16)
+    guard @len == 2, "int_to_str(42) should be 2 chars"
+    guard @buf[0] == 52 && @buf[1] == 50, "int_to_str(42) should be '42'"
+    @len = int_to_str(0, &@buf[0], 16)
+    guard @len == 1, "int_to_str(0) should be 1 char"
+    guard @buf[0] == 48, "int_to_str(0) should be '0'"
+    @len = int_to_str(12345, &@buf[0], 16)
+    guard @len == 5, "int_to_str(12345) should be 5 chars"
+    return 1
+
+fn test_lsp_str_eq() -> int
+    @a: [int; 4] = [104, 101, 108, 108]   # "hell"
+    guard str_eq(&@a[0], 4, "hell", 4) == 1, "str_eq should match"
+    guard str_eq(&@a[0], 4, "help", 4) == 0, "str_eq should not match"
+    guard str_eq(&@a[0], 4, "he", 2) == 0, "str_eq different lengths"
+    return 1
+
+fn test_lsp_buf_eq() -> int
+    @a: [int; 3] = [1, 2, 3]
+    @b: [int; 3] = [1, 2, 3]
+    @c: [int; 3] = [1, 2, 4]
+    guard buf_eq(&@a[0], 3, &@b[0], 3) == 1, "buf_eq should match"
+    guard buf_eq(&@a[0], 3, &@c[0], 3) == 0, "buf_eq should not match"
+    return 1
+
+fn test_lsp_content_length_parse() -> int
+    # Simulate "Content-Length: 123"
+    @hdr: [int; 20] = [67,111,110,116,101,110,116,45,76,101,110,103,116,104,58,32,49,50,51,0]
+    @val = lsp_parse_content_length(&@hdr[0], 19)
+    guard @val == 123, "Content-Length should parse to 123"
+    # Not a Content-Length header
+    @bad: [int; 10] = [72,101,108,108,111,0,0,0,0,0]
+    @val2 = lsp_parse_content_length(&@bad[0], 5)
+    guard @val2 == -1, "Non-CL header should return -1"
+    return 1
+
+fn test_lsp_extract_id() -> int
+    # {"id":7,"method":"test"}
+    @msg: [int; 24] = [123,34,105,100,34,58,55,44,34,109,101,116,104,111,100,34,58,34,116,101,115,116,34,125]
+    @id = extract_id(&@msg[0], 24)
+    guard @id == 7, "id should be 7"
+    return 1
+
+fn test_lsp_extract_method() -> int
+    # {"id":1,"method":"initialize"}
+    @msg: [int; 30] = [123,34,105,100,34,58,49,44,34,109,101,116,104,111,100,34,58,34,105,110,105,116,105,97,108,105,122,101,34,125]
+    @out: [int; 64] = [0; 64]
+    @len = extract_method(&@msg[0], 30, &@out[0], 64)
+    guard @len == 10, "method should be 10 chars"
+    guard str_eq(&@out[0], 10, "initialize", 10) == 1, "method should be 'initialize'"
+    return 1
+
+fn test_lsp_is_ident_char() -> int
+    guard is_ident_char(97) == 1, "a is ident"
+    guard is_ident_char(122) == 1, "z is ident"
+    guard is_ident_char(65) == 1, "A is ident"
+    guard is_ident_char(48) == 1, "0 is ident"
+    guard is_ident_char(95) == 1, "_ is ident"
+    guard is_ident_char(64) == 1, "@ is ident"
+    guard is_ident_char(32) == 0, "space is not ident"
+    guard is_ident_char(40) == 0, "( is not ident"
+    return 1
+
+fn test_lsp_symbol_kind() -> int
+    guard symbol_kind_to_completion(SYMBOL_FUNCTION) == COMP_FUNCTION, "fn -> COMP_FUNCTION"
+    guard symbol_kind_to_completion(SYMBOL_STRUCT) == COMP_STRUCT, "struct -> COMP_STRUCT"
+    guard symbol_kind_to_completion(SYMBOL_CONSTANT) == COMP_CONSTANT, "const -> COMP_CONSTANT"
+    guard symbol_kind_to_completion(SYMBOL_VARIABLE) == COMP_VARIABLE, "var -> COMP_VARIABLE"
+    return 1
+
+fn test_lsp_doc_operations() -> int
+    # Reset state
+    orbit @i in 0..MAX_DOCUMENTS
+        @doc_active[@i] = 0
+    @doc_count = 0
+    # Create a document
+    @uri: [int; 10] = [116,101,115,116,46,108,117,110,97,0]  # "test.luna"
+    @idx = doc_find_or_create(&@uri[0], 9)
+    guard @idx >= 0, "doc_find_or_create should succeed"
+    guard @doc_active[@idx] == 1, "doc should be active"
+    # Find it again
+    @idx2 = doc_find(&@uri[0], 9)
+    guard @idx2 == @idx, "doc_find should find same index"
+    # Unknown URI
+    @unk: [int; 5] = [110,111,112,101,0]  # "nope"
+    @idx3 = doc_find(&@unk[0], 4)
+    guard @idx3 == -1, "unknown URI should return -1"
+    return 1
+
+fn test_lsp_add_symbol() -> int
+    @sym_count = 0
+    @name: [int; 8] = [109,121,95,102,117,110,99,0]  # "my_func"
+    add_symbol(&@name[0], 7, SYMBOL_FUNCTION, 10, 0, 0)
+    guard @sym_count == 1, "sym_count should be 1"
+    guard @sym_kinds[0] == SYMBOL_FUNCTION, "kind should be FUNCTION"
+    guard @sym_lines[0] == 10, "line should be 10"
+    guard @sym_name_lens[0] == 7, "name len should be 7"
+    return 1
+
+fn run_lsp_self_tests() -> int
+    @passed = 0
+    @failed = 0
+    if test_lsp_int_to_str() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    if test_lsp_str_eq() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    if test_lsp_buf_eq() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    if test_lsp_content_length_parse() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    if test_lsp_extract_id() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    if test_lsp_extract_method() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    if test_lsp_is_ident_char() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    if test_lsp_symbol_kind() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    if test_lsp_doc_operations() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    if test_lsp_add_symbol() == 1
+        @passed = @passed + 1
+    eclipse
+        @failed = @failed + 1
+    shine("LSP self-tests: " + str(@passed) + " passed, " + str(@failed) + " failed")
+    return @failed

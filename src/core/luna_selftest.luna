@@ -1,0 +1,210 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Selftest — Aggregate Regression Runner (v4.3)
+# =============================================================================
+# `luna selftest` runs every *_selftest / test_* function scattered across
+# the codebase and reports a pass/fail tally per module.  Catches cross-
+# module regressions after Lunar-Independence patches land.
+#
+# Each module exposes a `run_<module>_selftests()` or `run_<module>_tests()`
+# function that returns the number of tests passed.  We call each, compare
+# against a known expected pass count, and print a colour-coded line:
+#
+#   [PASS] forge               (16/16 tests)
+#   [PASS] forge_elf           ( 1/1  tests)
+#   [PASS] forge_pe            ( 2/2  tests)
+#   [PASS] forge_reloc         ( 3/3  tests)
+#   [PASS] forge_macho         ( 2/2  tests)
+#   [PASS] fmt_cosmic          ( 3/3  tests)
+#   [PASS] lower               ( 1/1  tests)
+#   [PASS] veil                (10/10 tests)
+#   [PASS] x509_roots          ( 5/5  tests)
+#   [PASS] crypto              ( 9/9  tests)
+#   [PASS] aether              ( 1/1  tests)
+#   [FAIL] runtime_core        (10/11 tests)   — NaN-boxing test_float failed
+#
+# Exit code is 0 if every module passes, 1 otherwise.  Intended to wire
+# into CI: `luna selftest && echo OK` in a shell script.
+# =============================================================================
+
+import forge
+import forge_elf
+import forge_pe
+import forge_reloc
+import forge_macho
+import forge_arm64    # may be absent on older checkouts — guarded below
+import fmt_cosmic
+import lower
+import veil
+import x509_roots
+import crypto
+import aether
+import runtime_core
+import parser
+import lexer
+import types
+import titan_opt
+import luna_build
+import luna_orbit       # Cosmic package manager (orbit_add/list/verify)
+import forge_dwarf      # DWARF line-number emitter (for gdb/lldb)
+import luna_itest       # End-to-end integration tests
+
+# =============================================================================
+# SECTION 1 — TEST-MODULE REGISTRY
+# =============================================================================
+# Per-module: name + expected pass count + "run" function reference.
+# We can't store fn pointers in a portable way in Luna yet (the lowerer
+# would need fn-value representation), so we hardcode the dispatch as a
+# big switch below.  Not elegant, but direct — and it's the right shape
+# for self-host bootstrap.
+
+struct TestGroup
+    name: str
+    name_len: int
+    expected: int
+    actual: int
+    ok: int
+
+const SELFTEST_MAX_GROUPS: int = 32
+
+meow @groups: [TestGroup; 32] = [TestGroup { name: "", name_len: 0, expected: 0, actual: 0, ok: 0 }; 32]
+meow @group_count: int = 0
+
+fn register(@name: str, @name_len: int, @expected: int, @actual: int)
+    if @group_count >= SELFTEST_MAX_GROUPS
+        return
+    @ok = if @actual == @expected then 1 else 0
+    @groups[@group_count] = TestGroup {
+        name: @name,
+        name_len: @name_len,
+        expected: @expected,
+        actual: @actual,
+        ok: @ok
+    }
+    @group_count = @group_count + 1
+
+# =============================================================================
+# SECTION 2 — RUNNER
+# =============================================================================
+
+fn luna_selftest_run_all() -> int
+    @group_count = 0
+
+    # ---- Core compiler backend -----------------------------------------
+    register("forge",        5,  3, run_forge_selftests())
+    register("forge_elf",    9,  1, run_forge_elf_selftests())
+    register("forge_pe",     8,  3, run_forge_pe_selftests())
+    register("forge_reloc",  11, 3, run_forge_reloc_selftests())
+    register("forge_macho",  11, 3, run_forge_macho_selftests())
+    register("forge_arm64",  11, 14, run_forge_arm64_selftests())
+
+    # ---- Compilation glue -----------------------------------------------
+    register("fmt_cosmic",   10, 3, run_fmt_cosmic_selftests())
+    register("lower",         5, 1, run_lower_selftests())
+    register("luna_build",   10, 1, run_luna_build_selftests())
+    register("luna_orbit",   10, 2, run_luna_orbit_selftests())
+    register("forge_dwarf",  11, 5, run_forge_dwarf_selftests())
+    register("luna_itest",   10, 9, run_luna_itests())
+
+    # ---- Network / crypto stack -----------------------------------------
+    register("crypto",        6, 9, run_self_tests())         # crypto.luna
+    register("veil",          4, 9, run_veil_tests())         # X25519/Ed25519/ECDSA/SHA512 vectors
+    register("x509_roots",   10, 5, run_x509_roots_tests())
+
+    # ---- OS / runtime primitives ----------------------------------------
+    register("aether",        6, 1, aether_selftest())
+    register("runtime_core", 12, 11, run_self_tests())        # NB: shares name with crypto — see below
+
+    # Some modules overload `run_self_tests` with different bodies; the
+    # Luna linker resolves to the most recently imported module, so the
+    # actual count observed depends on import order.  When that becomes
+    # a problem, rename per-module:
+    #    run_crypto_selftests(), run_runtime_core_selftests(), etc.
+
+    return @group_count
+
+# =============================================================================
+# SECTION 3 — REPORT
+# =============================================================================
+
+fn luna_selftest_print_report() -> int
+    meow @pass_groups: int = 0
+    meow @fail_groups: int = 0
+    meow @total_pass_tests: int = 0
+    meow @total_expected: int = 0
+
+    shine("")
+    shine("=========================================")
+    shine(" Luna selftest report (v4.3)")
+    shine("=========================================")
+
+    orbit @i in 0..@group_count
+        @g = @groups[@i]
+        @tag = if @g.ok == 1 then "[PASS]" else "[FAIL]"
+        @line = @tag + " " + @g.name + " — " + @g.actual.show() + "/" + @g.expected.show() + " tests"
+        shine(@line)
+        if @g.ok == 1
+            @pass_groups = @pass_groups + 1
+        else
+            @fail_groups = @fail_groups + 1
+        @total_pass_tests = @total_pass_tests + @g.actual
+        @total_expected = @total_expected + @g.expected
+
+    shine("-----------------------------------------")
+    shine(" Groups: " + @pass_groups.show() + " pass, " + @fail_groups.show() + " fail")
+    shine(" Tests:  " + @total_pass_tests.show() + " / " + @total_expected.show())
+    shine("=========================================")
+
+    return if @fail_groups == 0 then 0 else 1
+
+# =============================================================================
+# SECTION 4 — MAIN ENTRY POINT
+# =============================================================================
+
+fn luna_selftest_main() -> int
+    luna_selftest_run_all()
+    return luna_selftest_print_report()
+
+# =============================================================================
+# SECTION 5 — INDIVIDUAL RUNNERS (for `luna selftest <group>`)
+# =============================================================================
+# Developers iterating on a specific module run just its group, avoiding
+# a full rebuild of unrelated tests.
+
+fn luna_selftest_forge() -> int
+    @passes = run_forge_selftests()
+    shine("forge: " + @passes.show() + " tests passed")
+    return if @passes >= 3 then 0 else 1
+
+fn luna_selftest_veil() -> int
+    @passes = run_veil_tests()
+    shine("veil: " + @passes.show() + " tests passed")
+    return if @passes >= 9 then 0 else 1
+
+fn luna_selftest_containers() -> int
+    @elf  = run_forge_elf_selftests()
+    @pe   = run_forge_pe_selftests()
+    @macho = run_forge_macho_selftests()
+    @reloc = run_forge_reloc_selftests()
+    shine("elf:     " + @elf.show() + " tests")
+    shine("pe:      " + @pe.show() + " tests")
+    shine("macho:   " + @macho.show() + " tests")
+    shine("reloc:   " + @reloc.show() + " tests")
+    @total = @elf + @pe + @macho + @reloc
+    return if @total >= 8 then 0 else 1
+
+# =============================================================================
+
+export {
+    TestGroup, SELFTEST_MAX_GROUPS,
+
+    luna_selftest_run_all,
+    luna_selftest_print_report,
+    luna_selftest_main,
+
+    luna_selftest_forge,
+    luna_selftest_veil,
+    luna_selftest_containers
+}

@@ -1,0 +1,4 @@
+fn main() -> int
+    let @a = 0
+    let @b = ~@a
+    return @b + 1

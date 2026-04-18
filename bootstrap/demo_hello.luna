@@ -1,0 +1,6 @@
+extern "linux_syscall" fn sys_write(@fd: int, @buf: int, @n: int) -> int
+
+fn main() -> int
+    let @msg = "Indent-style Luna works!\n"
+    sys_write(1, @msg, 25)
+    return 0

@@ -1,0 +1,970 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Forge PE — Windows PE64 Container Writer (v4.3, phase L1)
+# =============================================================================
+# Sister file to forge.luna / forge_elf.luna.  Wraps a Forge code buffer
+# in a valid PE32+ (PE64) executable for Windows x86-64.  Emits the
+# import table pointing at kernel32.dll / ws2_32.dll so the `extern
+# "stdcall" lib "kernel32" fn ...` declarations in aether.luna actually
+# resolve at load time without touching the C runtime.
+#
+# # What we output
+#
+#   +0x0000  DOS header                (64 bytes) + DOS stub (64 bytes)
+#   +0x0080  PE signature "PE\0\0"     (4 bytes)
+#   +0x0084  COFF file header          (20 bytes)
+#   +0x0098  Optional header (PE32+)   (240 bytes)
+#   +0x0188  Section headers           (40 bytes each × N)
+#   +0x0200  (padding to file-alignment 0x200)
+#
+#   +0x0200  .text — Forge code
+#   +??????  .idata — IDT + ILT + IAT + hint/name table
+#   +??????  .rdata / .data (optional)
+#
+# Virtual layout (RVAs from image base 0x140000000):
+#   +0x1000  .text
+#   +0x?000  .idata
+# Each section is aligned to 0x1000 in memory (SectionAlignment) and 0x200
+# on disk (FileAlignment).
+#
+# # Imports: the only complex part
+#
+# To call `WriteFile` from kernel32.dll we need:
+#
+#   1. An Import Directory Table entry for kernel32.dll
+#   2. An Import Lookup Table: array of 64-bit values, each pointing to a
+#      Hint/Name entry (or a 0x8000_0000_0000_0000-tagged ordinal)
+#   3. A Hint/Name Table: 2-byte hint + null-terminated ASCII name
+#   4. An Import Address Table: initially identical to the ILT; the
+#      Windows loader overwrites each entry with the actual function
+#      address at load time.  CALLS go through this table
+#      (`call [rip + IAT_slot_rva]`), so once it's patched, the code
+#      dispatches to kernel32 directly.
+#
+# forge.luna already emits `call [rip + disp32]` via `emit_call_rip_rel`
+# for stdcall externs (see forge.emit_call_extern).  Our job here is to
+# fill each relocation's disp32 with (IAT_slot_vaddr - (call_end_vaddr)).
+# =============================================================================
+
+import forge
+
+# =============================================================================
+# SECTION 1 — PE CONSTANTS
+# =============================================================================
+
+const PE_IMAGE_BASE:        int = 0x140000000
+const PE_SECTION_ALIGN:     int = 0x1000
+const PE_FILE_ALIGN:        int = 0x200
+const PE_DOS_STUB_END:      int = 0x80   # where PE signature starts
+
+# COFF / PE characteristics
+const IMAGE_FILE_EXECUTABLE_IMAGE: int = 0x0002
+const IMAGE_FILE_LARGE_ADDRESS_AWARE: int = 0x0020
+const IMAGE_FILE_MACHINE_AMD64: int = 0x8664
+
+# Subsystem
+const IMAGE_SUBSYSTEM_WINDOWS_CUI: int = 3    # console
+
+# Section characteristics
+const IMAGE_SCN_CNT_CODE:                int = 0x00000020
+const IMAGE_SCN_CNT_INITIALIZED_DATA:    int = 0x00000040
+const IMAGE_SCN_CNT_UNINITIALIZED_DATA:  int = 0x00000080
+const IMAGE_SCN_MEM_READ:                int = 0x40000000
+const IMAGE_SCN_MEM_WRITE:               int = 0x80000000
+const IMAGE_SCN_MEM_EXECUTE:             int = 0x20000000
+
+# Data directory indices (OptionalHeader.DataDirectory[N])
+const DIR_EXPORT:         int = 0
+const DIR_IMPORT:         int = 1
+const DIR_RESOURCE:       int = 2
+const DIR_EXCEPTION:      int = 3
+const DIR_SECURITY:       int = 4
+const DIR_BASERELOC:      int = 5
+const DIR_DEBUG:          int = 6
+const DIR_IAT:            int = 12
+
+# DllCharacteristics bits — tell the loader this image is ASLR-friendly.
+const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: int = 0x0040
+const IMAGE_DLLCHARACTERISTICS_NX_COMPAT:    int = 0x0100
+
+# Base-relocation type codes (stored in the high 4 bits of each 16-bit
+# TypeOffset entry).  We only emit DIR64 fix-ups for ABS64 relocs — every
+# other RELOC_* kind is PC-relative and needs no rebase.
+const IMAGE_REL_BASED_ABSOLUTE: int = 0
+const IMAGE_REL_BASED_DIR64:    int = 10
+
+# Section flag for .reloc: readable, discardable, initialised data.
+const IMAGE_SCN_MEM_DISCARDABLE: int = 0x02000000
+
+# =============================================================================
+# SECTION 2 — PE WRITER
+# =============================================================================
+# Same shape as ElfWriter.
+
+const PEW_MAX: int = 2097152
+
+struct PeWriter
+    bytes:  [int; 2097152]
+    len:    int
+    errors: int
+
+fn pew_new() -> PeWriter
+    return PeWriter {
+        bytes: [0; 2097152],
+        len: 0,
+        errors: 0
+    }
+
+#[inline]
+fn pew_u8(@w: PeWriter, @v: int)
+    if @w.len >= PEW_MAX
+        @w.errors = @w.errors + 1
+        return
+    @w.bytes[@w.len] = @v & 0xFF
+    @w.len = @w.len + 1
+
+#[inline]
+fn pew_u16(@w: PeWriter, @v: int)
+    pew_u8(@w, @v & 0xFF)
+    pew_u8(@w, (@v >> 8) & 0xFF)
+
+#[inline]
+fn pew_u32(@w: PeWriter, @v: int)
+    pew_u8(@w, @v & 0xFF)
+    pew_u8(@w, (@v >> 8) & 0xFF)
+    pew_u8(@w, (@v >> 16) & 0xFF)
+    pew_u8(@w, (@v >> 24) & 0xFF)
+
+#[inline]
+fn pew_u64(@w: PeWriter, @v: int)
+    pew_u32(@w, @v & 0xFFFFFFFF)
+    pew_u32(@w, (@v >> 32) & 0xFFFFFFFF)
+
+fn pew_zero(@w: PeWriter, @n: int)
+    orbit _ in 0..@n
+        pew_u8(@w, 0)
+
+fn pew_pad_to(@w: PeWriter, @align: int)
+    @rem = @w.len % @align
+    if @rem == 0
+        return
+    pew_zero(@w, @align - @rem)
+
+fn pew_patch_u32(@w: PeWriter, @at: int, @v: int)
+    if @at < 0 or @at + 4 > @w.len
+        @w.errors = @w.errors + 1
+        return
+    @w.bytes[@at + 0] = @v & 0xFF
+    @w.bytes[@at + 1] = (@v >> 8) & 0xFF
+    @w.bytes[@at + 2] = (@v >> 16) & 0xFF
+    @w.bytes[@at + 3] = (@v >> 24) & 0xFF
+
+fn pew_patch_u64(@w: PeWriter, @at: int, @v: int)
+    pew_patch_u32(@w, @at, @v & 0xFFFFFFFF)
+    pew_patch_u32(@w, @at + 4, (@v >> 32) & 0xFFFFFFFF)
+
+fn pew_write_ascii(@w: PeWriter, @s: str, @s_len: int)
+    orbit @i in 0..@s_len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@s + @i)
+        pew_u8(@w, @ch)
+    pew_u8(@w, 0)    # NUL terminator
+
+# =============================================================================
+# SECTION 3 — IMPORT DESCRIPTORS
+# =============================================================================
+# The import table is the only non-trivial part of PE.  We build a flat
+# in-memory description of "which DLLs, which functions from each", then
+# the emitter lays out:
+#   IDT[]     — one entry per DLL, terminated by all-zeros
+#   ILT[]     — per DLL, one 64-bit value per fn, terminated by 0
+#   IAT[]     — per DLL, identical copy of ILT (patched by loader)
+#   HNT[]     — Hint/Name entries: 2B hint + ASCIIZ name, 2B-aligned
+#   DLL names — ASCIIZ strings
+
+const PE_MAX_DLLS:    int = 32
+const PE_MAX_IMPORTS: int = 1024    # total imports across all DLLs
+
+struct PeImportFn
+    dll_idx: int         # index into dll_names[]
+    name_start: int      # offset into source for name
+    name_len: int
+    iat_rva: int         # filled in by emit — RVA of this fn's IAT slot
+
+struct PeImports
+    dll_names:   [int; 32]     # indices into a string blob (below)
+    dll_name_lens: [int; 32]
+    dll_count:   int
+
+    fns:         [PeImportFn; 1024]
+    fn_count:    int
+
+    name_blob:   [int; 4096]   # packed ASCII for DLL names and fn names
+    name_blob_len: int
+
+fn pe_imports_new() -> PeImports
+    return PeImports {
+        dll_names: [0; 32],
+        dll_name_lens: [0; 32],
+        dll_count: 0,
+        fns: [PeImportFn { dll_idx: 0, name_start: 0, name_len: 0, iat_rva: 0 }; 1024],
+        fn_count: 0,
+        name_blob: [0; 4096],
+        name_blob_len: 0
+    }
+
+fn pe_imports_add_dll(@im: PeImports, @dll: str, @dll_len: int) -> int
+    seal @idx = @im.dll_count
+    seal @off = @im.name_blob_len
+    orbit @i in 0..@dll_len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@dll + @i)
+        @im.name_blob[@im.name_blob_len] = @ch
+        @im.name_blob_len = @im.name_blob_len + 1
+    @im.name_blob[@im.name_blob_len] = 0
+    @im.name_blob_len = @im.name_blob_len + 1
+    @im.dll_names[@idx] = @off
+    @im.dll_name_lens[@idx] = @dll_len
+    @im.dll_count = @im.dll_count + 1
+    return @idx
+
+fn pe_imports_add_fn(@im: PeImports, @dll_idx: int, @fn_name: str, @fn_len: int) -> int
+    seal @idx = @im.fn_count
+    seal @off = @im.name_blob_len
+    # Hint (2 bytes, zero) + name + NUL — we'll actually emit hint separately;
+    # here we just store the name bytes.
+    orbit @i in 0..@fn_len
+        @ch = 0
+        unsafe
+            @ch = volatile_read(@fn_name + @i)
+        @im.name_blob[@im.name_blob_len] = @ch
+        @im.name_blob_len = @im.name_blob_len + 1
+    @im.name_blob[@im.name_blob_len] = 0
+    @im.name_blob_len = @im.name_blob_len + 1
+    @im.fns[@idx] = PeImportFn {
+        dll_idx: @dll_idx,
+        name_start: @off,
+        name_len: @fn_len,
+        iat_rva: 0
+    }
+    @im.fn_count = @im.fn_count + 1
+    return @idx
+
+# =============================================================================
+# SECTION 3B — BASE RELOCATION TABLE (.reloc)
+# =============================================================================
+# Windows ASLR refuses to rebase an image that advertises DYNAMIC_BASE
+# without a matching DIR_BASERELOC data directory.  We collect every
+# RELOC_ABS64 site from Forge, group them by 4 KiB page, and emit one
+# IMAGE_BASE_RELOCATION block per page.
+#
+# Each block:
+#   u32 VirtualAddress   — page RVA (4 KiB-aligned)
+#   u32 SizeOfBlock      — 8 (header) + 2 * entry_count (padded to 4)
+#   u16[n] TypeOffset    — (IMAGE_REL_BASED_DIR64 << 12) | (offset_in_page)
+
+const PE_RELOC_MAX_ENTRIES: int = 4096
+
+struct PeRelocTable
+    # Parallel arrays — page_rvas[i] is the 4 KiB-aligned page for
+    # rel_offsets[i] (offset inside that page, 0..0xFFF).
+    page_rvas:   [int; 4096]
+    rel_offsets: [int; 4096]
+    count:       int
+
+fn pe_reloc_table_new() -> PeRelocTable
+    return PeRelocTable {
+        page_rvas: [0; 4096],
+        rel_offsets: [0; 4096],
+        count: 0
+    }
+
+# Walk @f.relocs and pick up every RELOC_ABS64 site; convert its byte
+# offset in @f.code into an RVA inside the .text section.  Entries end up
+# roughly sorted (Forge appends relocs in emit order, which is already
+# monotonically increasing), so we don't bother with an extra sort pass —
+# pages get grouped correctly anyway because consecutive increments stay
+# on the same page until they cross a 4 KiB boundary.
+fn pe_collect_base_relocs(@f: Forge, @text_rva: int) -> PeRelocTable
+    @tbl = pe_reloc_table_new()
+    orbit @i in 0..@f.reloc_count
+        @r = @f.relocs[@i]
+        if @r.kind != RELOC_ABS64
+            continue
+        if @tbl.count >= PE_RELOC_MAX_ENTRIES
+            break
+        seal @site_rva = @text_rva + @r.at_offset
+        seal @page     = @site_rva & (-4096)    # 4 KiB-align down
+        seal @in_page  = @site_rva & 0xFFF
+        @tbl.page_rvas[@tbl.count]   = @page
+        @tbl.rel_offsets[@tbl.count] = @in_page
+        @tbl.count = @tbl.count + 1
+    return @tbl
+
+# Emit the .reloc section body.  Returns the total byte length written
+# so the caller can set SizeOfRawData / VirtualSize on the section header.
+# The caller is expected to record @w.len as raw_ptr before calling.
+fn pe_emit_reloc_section(@w: PeWriter, @tbl: PeRelocTable, @section_rva: int) -> int
+    seal @start = @w.len
+    meow @i: int = 0
+    while @i < @tbl.count
+        seal @page = @tbl.page_rvas[@i]
+        # Count how many consecutive entries share this page
+        meow @n: int = 0
+        orbit @j in @i..@tbl.count
+            if @tbl.page_rvas[@j] != @page
+                break
+            @n = @n + 1
+        # SizeOfBlock = 8 header + 2 * n entries, padded to 4-byte boundary
+        meow @bytes: int = 8 + 2 * @n
+        if (@bytes & 2) != 0
+            @bytes = @bytes + 2     # pad with one extra IMAGE_REL_BASED_ABSOLUTE entry
+        pew_u32(@w, @page)
+        pew_u32(@w, @bytes)
+        orbit @k in 0..@n
+            seal @off = @tbl.rel_offsets[@i + @k] & 0xFFF
+            pew_u16(@w, (IMAGE_REL_BASED_DIR64 << 12) | @off)
+        # emit padding entry if we had to round up
+        if (8 + 2 * @n) != @bytes
+            pew_u16(@w, IMAGE_REL_BASED_ABSOLUTE << 12)
+        @i = @i + @n
+    return @w.len - @start
+
+# =============================================================================
+# SECTION 4 — DOS HEADER + STUB
+# =============================================================================
+# 128 bytes total.  First 64 = MZ header, next 64 = stub program that just
+# prints "This program cannot be run in DOS mode." — we embed a minimal
+# version here. e_lfanew (file offset 0x3C) points to the PE signature.
+
+fn emit_dos_header(@w: PeWriter)
+    # "MZ" + zero pad + e_lfanew at 0x3C
+    pew_u8(@w, 0x4D)        # 'M'
+    pew_u8(@w, 0x5A)        # 'Z'
+    # 58 bytes of filler — standard Windows zeros/dos fields
+    pew_zero(@w, 58)
+    # e_lfanew at offset 0x3C: file offset where PE signature lives
+    pew_u32(@w, PE_DOS_STUB_END)
+    # DOS stub: 64 bytes that print a message.  For simplicity we just
+    # fill with zeros — every modern loader ignores the stub.
+    pew_zero(@w, PE_DOS_STUB_END - 0x40)
+
+# =============================================================================
+# SECTION 5 — PE HEADERS
+# =============================================================================
+
+struct PeHeaderPatches
+    entry_rva_at:       int
+    code_rva_at:        int
+    image_size_at:      int
+    import_dir_rva_at:  int
+    import_dir_size_at: int
+    iat_dir_rva_at:     int
+    iat_dir_size_at:    int
+    reloc_dir_rva_at:   int
+    reloc_dir_size_at:  int
+
+fn emit_pe_header(@w: PeWriter, @num_sections: int) -> PeHeaderPatches
+    # --- PE signature ---
+    pew_u8(@w, 0x50)        # 'P'
+    pew_u8(@w, 0x45)        # 'E'
+    pew_u8(@w, 0)
+    pew_u8(@w, 0)
+
+    # --- COFF file header (20 bytes) ---
+    pew_u16(@w, IMAGE_FILE_MACHINE_AMD64)
+    pew_u16(@w, @num_sections)                  # NumberOfSections
+    pew_u32(@w, 0)                              # TimeDateStamp
+    pew_u32(@w, 0)                              # PointerToSymbolTable
+    pew_u32(@w, 0)                              # NumberOfSymbols
+    pew_u16(@w, 240)                            # SizeOfOptionalHeader (PE32+ = 240)
+    pew_u16(@w, IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE)
+
+    # --- Optional header: PE32+ (240 bytes) ---
+    pew_u16(@w, 0x020B)                         # Magic = PE32+
+    pew_u8(@w, 14)                              # MajorLinkerVersion
+    pew_u8(@w, 0)                               # MinorLinkerVersion
+    # Size fields — patched later
+    seal @size_of_code_at = @w.len
+    pew_u32(@w, 0)                              # SizeOfCode
+    pew_u32(@w, 0)                              # SizeOfInitializedData
+    pew_u32(@w, 0)                              # SizeOfUninitializedData
+
+    seal @entry_rva_at = @w.len
+    pew_u32(@w, 0)                              # AddressOfEntryPoint (RVA — patched)
+
+    seal @code_rva_at = @w.len
+    pew_u32(@w, 0)                              # BaseOfCode (patched)
+
+    pew_u64(@w, PE_IMAGE_BASE)                  # ImageBase
+    pew_u32(@w, PE_SECTION_ALIGN)               # SectionAlignment
+    pew_u32(@w, PE_FILE_ALIGN)                  # FileAlignment
+    pew_u16(@w, 6)                              # MajorOperatingSystemVersion
+    pew_u16(@w, 0)                              # MinorOperatingSystemVersion
+    pew_u16(@w, 0)                              # MajorImageVersion
+    pew_u16(@w, 0)                              # MinorImageVersion
+    pew_u16(@w, 6)                              # MajorSubsystemVersion
+    pew_u16(@w, 0)                              # MinorSubsystemVersion
+    pew_u32(@w, 0)                              # Win32VersionValue (reserved)
+
+    seal @image_size_at = @w.len
+    pew_u32(@w, 0)                              # SizeOfImage (patched)
+
+    pew_u32(@w, PE_FILE_ALIGN)                  # SizeOfHeaders (~conservative)
+    pew_u32(@w, 0)                              # CheckSum
+    pew_u16(@w, IMAGE_SUBSYSTEM_WINDOWS_CUI)    # Subsystem
+    # DllCharacteristics: announce ASLR + DEP support.  Without a matching
+    # .reloc section the Windows loader will refuse to honour DYNAMIC_BASE,
+    # so the top-level emit always pairs this flag with a real .reloc.
+    pew_u16(@w, IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE | IMAGE_DLLCHARACTERISTICS_NX_COMPAT)
+    pew_u64(@w, 0x100000)                       # SizeOfStackReserve
+    pew_u64(@w, 0x1000)                         # SizeOfStackCommit
+    pew_u64(@w, 0x100000)                       # SizeOfHeapReserve
+    pew_u64(@w, 0x1000)                         # SizeOfHeapCommit
+    pew_u32(@w, 0)                              # LoaderFlags
+    pew_u32(@w, 16)                             # NumberOfRvaAndSizes
+
+    # --- Data directories (16 × 8 bytes = 128 bytes) ---
+    # Each entry is { RVA, Size } (both u32).  We patch Import, IAT, and
+    # BASERELOC after their sections are laid out.
+    meow @import_dir_rva_at: int = 0
+    meow @import_dir_size_at: int = 0
+    meow @iat_dir_rva_at: int = 0
+    meow @iat_dir_size_at: int = 0
+    meow @reloc_dir_rva_at: int = 0
+    meow @reloc_dir_size_at: int = 0
+    orbit @i in 0..16
+        if @i == DIR_IMPORT
+            @import_dir_rva_at = @w.len
+            pew_u32(@w, 0)                      # Import RVA (patched)
+            @import_dir_size_at = @w.len
+            pew_u32(@w, 0)                      # Import Size (patched)
+        eclipse if @i == DIR_IAT
+            @iat_dir_rva_at = @w.len
+            pew_u32(@w, 0)                      # IAT RVA (patched)
+            @iat_dir_size_at = @w.len
+            pew_u32(@w, 0)                      # IAT Size (patched)
+        eclipse if @i == DIR_BASERELOC
+            @reloc_dir_rva_at = @w.len
+            pew_u32(@w, 0)                      # BaseReloc RVA (patched)
+            @reloc_dir_size_at = @w.len
+            pew_u32(@w, 0)                      # BaseReloc Size (patched)
+        else
+            pew_u32(@w, 0)                      # RVA
+            pew_u32(@w, 0)                      # Size
+
+    return PeHeaderPatches {
+        entry_rva_at: @entry_rva_at,
+        code_rva_at: @code_rva_at,
+        image_size_at: @image_size_at,
+        import_dir_rva_at: @import_dir_rva_at,
+        import_dir_size_at: @import_dir_size_at,
+        iat_dir_rva_at: @iat_dir_rva_at,
+        iat_dir_size_at: @iat_dir_size_at,
+        reloc_dir_rva_at: @reloc_dir_rva_at,
+        reloc_dir_size_at: @reloc_dir_size_at
+    }
+
+# =============================================================================
+# SECTION 6 — SECTION HEADERS
+# =============================================================================
+
+fn emit_section_header(@w: PeWriter, @name: str, @name_len: int,
+                       @virt_size: int, @virt_addr: int,
+                       @raw_size: int, @raw_ptr: int,
+                       @characteristics: int)
+    # Section name — 8 bytes, NUL-padded, truncated if longer
+    orbit @i in 0..8
+        if @i < @name_len
+            @ch = 0
+            unsafe
+                @ch = volatile_read(@name + @i)
+            pew_u8(@w, @ch)
+        else
+            pew_u8(@w, 0)
+    pew_u32(@w, @virt_size)
+    pew_u32(@w, @virt_addr)
+    pew_u32(@w, @raw_size)
+    pew_u32(@w, @raw_ptr)
+    pew_u32(@w, 0)    # PointerToRelocations (unused for executables)
+    pew_u32(@w, 0)    # PointerToLinenumbers (unused)
+    pew_u16(@w, 0)    # NumberOfRelocations
+    pew_u16(@w, 0)    # NumberOfLinenumbers
+    pew_u32(@w, @characteristics)
+
+# =============================================================================
+# SECTION 7 — TOP-LEVEL EMIT
+# =============================================================================
+# Produces the full PE64 image from a Forge state plus an import list.
+# @entry_offset is the byte offset of _start in @f.code.
+
+fn forge_emit_pe64(@f: Forge, @im: PeImports, @entry_offset: int) -> PeWriter
+    @w = pew_new()
+
+    # --- DOS header + stub (0..0x80) -------------------------------------
+    emit_dos_header(@w)
+
+    # --- PE signature + headers + section table --------------------------
+    # We emit 3 sections: .text, .idata, .reloc.  The .reloc section
+    # carries the base-relocation table that DYNAMIC_BASE requires —
+    # even when it's empty it must be present for the loader to rebase.
+    seal @num_sections = 3
+    @hp = emit_pe_header(@w, @num_sections)
+
+    # Section headers: placeholder slots, we'll patch RVAs/sizes later.
+    # We emit them now but fill in sizes after layout.
+    seal @sh_start = @w.len
+    pew_zero(@w, 40 * @num_sections)    # two 40-byte section headers
+
+    # Align to FileAlignment before first section data
+    pew_pad_to(@w, PE_FILE_ALIGN)
+
+    # --- .text section ---------------------------------------------------
+    seal @text_raw_ptr = @w.len
+    seal @text_rva = PE_SECTION_ALIGN       # first section after headers
+    orbit @i in 0..@f.code_len
+        pew_u8(@w, @f.code[@i])
+    seal @text_raw_size = @w.len - @text_raw_ptr
+    seal @text_virt_size = @text_raw_size
+    # Pad to FileAlignment
+    pew_pad_to(@w, PE_FILE_ALIGN)
+
+    # --- .idata section --------------------------------------------------
+    # Layout:
+    #   IDT[dll_count + 1]       -- 20 bytes per entry, 1 null terminator
+    #   ILT per DLL              -- 8 bytes per fn + 8-byte null
+    #   IAT per DLL              -- same shape as ILT (identical until loader fixes)
+    #   HNT (hint/name table)    -- 2-byte hint + NUL-terminated name, even-aligned
+    #   DLL names                -- NUL-terminated ASCII strings
+    seal @idata_raw_ptr = @w.len
+    seal @idata_rva = ((@text_rva + @text_virt_size + PE_SECTION_ALIGN - 1) / PE_SECTION_ALIGN) * PE_SECTION_ALIGN
+
+    # Reserve IDT — one entry per DLL plus a null terminator, 20 bytes each
+    seal @idt_start_off = @w.len
+    seal @idt_count = @im.dll_count
+    pew_zero(@w, 20 * (@idt_count + 1))
+
+    # Per-DLL ILT, IAT, HNTs
+    meow @ilt_starts: [int; 32] = [0; 32]
+    meow @iat_starts: [int; 32] = [0; 32]
+    meow @dll_name_rvas: [int; 32] = [0; 32]
+    meow @hnt_rvas: [int; 1024] = [0; 1024]
+
+    # --- Emit per-DLL data -----------------------------------------------
+    orbit @d in 0..@idt_count
+        # ILT
+        @ilt_starts[@d] = @w.len
+        orbit @f_i in 0..@im.fn_count
+            if @im.fns[@f_i].dll_idx == @d
+                pew_u64(@w, 0)       # slot (RVA to HNT) — patched below
+        pew_u64(@w, 0)               # null terminator
+
+        # IAT (identical layout to ILT; loader writes real addresses here)
+        @iat_starts[@d] = @w.len
+        orbit @f_i in 0..@im.fn_count
+            if @im.fns[@f_i].dll_idx == @d
+                seal @slot_off = @w.len
+                # Record the IAT slot RVA into the fn descriptor so callers
+                # can compute `call [rip + disp32]` displacement.
+                @im.fns[@f_i].iat_rva = @idata_rva + (@slot_off - @idata_raw_ptr)
+                pew_u64(@w, 0)       # slot (RVA to HNT) — patched below
+        pew_u64(@w, 0)
+
+    # --- HNT (hint/name) per function, with even-address alignment -------
+    orbit @f_i in 0..@im.fn_count
+        # Align to even byte
+        if (@w.len % 2) != 0
+            pew_u8(@w, 0)
+        seal @hnt_off = @w.len
+        @hnt_rvas[@f_i] = @idata_rva + (@hnt_off - @idata_raw_ptr)
+        pew_u16(@w, 0)    # Hint = 0 (ordinal hint unknown)
+        # Name — already in name_blob at fns[@f_i].name_start / name_len
+        seal @ns = @im.fns[@f_i].name_start
+        seal @nl = @im.fns[@f_i].name_len
+        orbit @j in 0..@nl
+            pew_u8(@w, @im.name_blob[@ns + @j])
+        pew_u8(@w, 0)
+
+    # --- DLL name strings -------------------------------------------------
+    orbit @d in 0..@idt_count
+        seal @dll_name_off = @w.len
+        @dll_name_rvas[@d] = @idata_rva + (@dll_name_off - @idata_raw_ptr)
+        seal @ds = @im.dll_names[@d]
+        seal @dl = @im.dll_name_lens[@d]
+        orbit @j in 0..@dl
+            pew_u8(@w, @im.name_blob[@ds + @j])
+        pew_u8(@w, 0)
+
+    # --- Patch IDT entries ------------------------------------------------
+    # IDT entry format:
+    #   u32 OriginalFirstThunk (RVA of ILT)
+    #   u32 TimeDateStamp
+    #   u32 ForwarderChain
+    #   u32 Name (RVA of DLL name string)
+    #   u32 FirstThunk (RVA of IAT)
+    orbit @d in 0..@idt_count
+        seal @entry_off = @idt_start_off + @d * 20
+        seal @ilt_rva = @idata_rva + (@ilt_starts[@d] - @idata_raw_ptr)
+        seal @iat_rva = @idata_rva + (@iat_starts[@d] - @idata_raw_ptr)
+        pew_patch_u32(@w, @entry_off + 0,  @ilt_rva)
+        pew_patch_u32(@w, @entry_off + 4,  0)
+        pew_patch_u32(@w, @entry_off + 8,  0)
+        pew_patch_u32(@w, @entry_off + 12, @dll_name_rvas[@d])
+        pew_patch_u32(@w, @entry_off + 16, @iat_rva)
+
+    # --- Patch ILT & IAT slots to point at HNT entries --------------------
+    meow @fn_slot_idx: int = 0
+    orbit @d in 0..@idt_count
+        meow @slot: int = 0
+        orbit @f_i in 0..@im.fn_count
+            if @im.fns[@f_i].dll_idx == @d
+                seal @ilt_slot_off = @ilt_starts[@d] + @slot * 8
+                seal @iat_slot_off = @iat_starts[@d] + @slot * 8
+                # Both slots contain the RVA of the HNT entry (low 63 bits;
+                # bit 63 = 0 means "import by name").
+                pew_patch_u64(@w, @ilt_slot_off, @hnt_rvas[@f_i])
+                pew_patch_u64(@w, @iat_slot_off, @hnt_rvas[@f_i])
+                @slot = @slot + 1
+                @fn_slot_idx = @fn_slot_idx + 1
+
+    # .idata end
+    seal @idata_raw_size = @w.len - @idata_raw_ptr
+    seal @idata_virt_size = @idata_raw_size
+    pew_pad_to(@w, PE_FILE_ALIGN)
+
+    # --- .reloc section -------------------------------------------------
+    # Collect every RELOC_ABS64 site in Forge, group by 4 KiB page,
+    # emit IMAGE_BASE_RELOCATION blocks.  An empty table still produces
+    # an empty section — the loader accepts both.
+    seal @reloc_raw_ptr = @w.len
+    seal @reloc_rva = ((@idata_rva + @idata_virt_size + PE_SECTION_ALIGN - 1) / PE_SECTION_ALIGN) * PE_SECTION_ALIGN
+    @reloc_tbl = pe_collect_base_relocs(@f, @text_rva)
+    pe_emit_reloc_section(@w, @reloc_tbl, @reloc_rva)
+    seal @reloc_raw_size  = @w.len - @reloc_raw_ptr
+    seal @reloc_virt_size = @reloc_raw_size
+    pew_pad_to(@w, PE_FILE_ALIGN)
+
+    # --- Patch section header table --------------------------------------
+    # .text
+    @w.len = @sh_start
+    emit_section_header(@w, ".text", 5,
+        @text_virt_size, @text_rva,
+        @text_raw_size,  @text_raw_ptr,
+        IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE)
+    # .idata
+    emit_section_header(@w, ".idata", 6,
+        @idata_virt_size, @idata_rva,
+        @idata_raw_size,  @idata_raw_ptr,
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)
+    # .reloc — read-only, discardable initialised data.
+    emit_section_header(@w, ".reloc", 6,
+        @reloc_virt_size, @reloc_rva,
+        @reloc_raw_size,  @reloc_raw_ptr,
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE)
+    # Restore writer cursor to end of data (past .reloc padding).
+    @w.len = @reloc_raw_ptr + @reloc_raw_size
+    pew_pad_to(@w, PE_FILE_ALIGN)
+
+    # --- Patch Optional-Header data directories --------------------------
+    pew_patch_u32(@w, @hp.import_dir_rva_at,  @idata_rva)
+    pew_patch_u32(@w, @hp.import_dir_size_at, 20 * (@idt_count + 1))
+    # IAT covers all per-DLL IATs back-to-back — approximate as the full
+    # .idata extent. Windows loaders are forgiving about this.
+    pew_patch_u32(@w, @hp.iat_dir_rva_at,  @idata_rva)
+    pew_patch_u32(@w, @hp.iat_dir_size_at, @idata_virt_size)
+    # Base reloc directory — always present (DYNAMIC_BASE requires it).
+    pew_patch_u32(@w, @hp.reloc_dir_rva_at,  @reloc_rva)
+    pew_patch_u32(@w, @hp.reloc_dir_size_at, @reloc_virt_size)
+
+    pew_patch_u32(@w, @hp.entry_rva_at, @text_rva + @entry_offset)
+    pew_patch_u32(@w, @hp.code_rva_at,  @text_rva)
+
+    # SizeOfImage = highest RVA + aligned section size
+    seal @image_size = ((@reloc_rva + @reloc_virt_size + PE_SECTION_ALIGN - 1) / PE_SECTION_ALIGN) * PE_SECTION_ALIGN
+    pew_patch_u32(@w, @hp.image_size_at, @image_size)
+
+    return @w
+
+# =============================================================================
+# SECTION 8 — HIGH-LEVEL HELPER — FROM FORGE EXTERN SYMBOLS
+# =============================================================================
+# Walk Forge's symbol table, group extern-stdcall symbols by DLL hint, and
+# build a PeImports.  Until Forge carries an explicit "lib" field per
+# extern, we infer the DLL from naming conventions used in aether.luna
+# (CreateFileA → kernel32, socket → ws2_32, BCryptGenRandom → bcrypt).
+
+fn guess_dll_for(@name: str, @name_len: int) -> int
+    # Returns 0=kernel32, 1=ws2_32, 2=bcrypt, 3=unknown (we drop unknowns
+    # with a forge error count bump at a higher layer).
+    if @name_len >= 6
+        @c0 = 0; @c1 = 0; @c2 = 0; @c3 = 0; @c4 = 0; @c5 = 0
+        unsafe
+            @c0 = volatile_read(@name + 0)
+            @c1 = volatile_read(@name + 1)
+            @c2 = volatile_read(@name + 2)
+            @c3 = volatile_read(@name + 3)
+            @c4 = volatile_read(@name + 4)
+            @c5 = volatile_read(@name + 5)
+        # "BCrypt..." → bcrypt
+        if @c0 == 66 and @c1 == 67 and @c2 == 114 and @c3 == 121 and @c4 == 112 and @c5 == 116
+            return 2
+        # "WSA..."   → ws2_32
+        if @c0 == 87 and @c1 == 83 and @c2 == 65
+            return 1
+    # Winsock functions whose names collide with POSIX: socket, connect,
+    # send, recv, accept, bind, listen, closesocket, shutdown, setsockopt,
+    # sendto, recvfrom, getaddrinfo, freeaddrinfo.  We use a short list.
+    if @name_len == 6
+        # "socket"
+        @b0 = 0; @b1 = 0
+        unsafe
+            @b0 = volatile_read(@name + 0)
+            @b1 = volatile_read(@name + 5)
+        if @b0 == 115 and @b1 == 116
+            return 1
+    if @name_len >= 4
+        # closesocket
+        @b0 = 0
+        unsafe
+            @b0 = volatile_read(@name + 0)
+        if @b0 == 99        # 'c' — connect / closesocket
+            return 1
+        if @b0 == 115 and @name_len == 4    # send, sendto
+            return 1
+        if @b0 == 114        # recv, recvfrom
+            return 1
+        if @b0 == 97 and @name_len == 6     # accept
+            return 1
+        if @b0 == 98 and @name_len == 4     # bind
+            return 1
+        if @b0 == 108 and @name_len == 6    # listen
+            return 1
+        if @b0 == 115 and @name_len >= 8    # shutdown, setsockopt, sendto
+            return 1
+        if @b0 == 103 and @name_len >= 11   # getaddrinfo
+            return 1
+        if @b0 == 102 and @name_len >= 12   # freeaddrinfo
+            return 1
+    # Everything else (CreateFileA, ReadFile, WriteFile, ExitProcess, Sleep,
+    # VirtualAlloc, GetStdHandle, GetEnvironmentVariableA, etc.) is kernel32.
+    return 0
+
+fn build_pe_imports_from_forge(@f: Forge) -> PeImports
+    @im = pe_imports_new()
+    seal @k32 = pe_imports_add_dll(@im, "kernel32.dll", 12)
+    seal @ws2 = pe_imports_add_dll(@im, "ws2_32.dll",   10)
+    seal @bcr = pe_imports_add_dll(@im, "bcrypt.dll",   10)
+
+    orbit @i in 0..@f.symbol_count
+        @s = @f.symbols[@i]
+        if @s.is_extern == 0
+            continue
+        if @s.abi != 1
+            # Only stdcall symbols go through PE imports.
+            continue
+        # Resolve the symbol name through the module-level active-source
+        # binding that parser.luna publishes via parser_extract_name.
+        # parser_extract_name returns a Luna str; guess_dll_for inspects
+        # its bytes to route the symbol to the right DLL.
+        seal @name = parser_extract_name(@s.name_start, @s.name_len)
+        seal @dll = guess_dll_for(@name, @s.name_len)
+        pe_imports_add_fn(@im, @dll, @name, @s.name_len)
+    return @im
+
+# Lookup by Forge symbol index — a convenience wrapper kept for any caller
+# that has a symbol index but not the raw name.  Uses the same
+# parser-source route as `build_pe_imports_from_forge`.
+fn guess_dll_for_by_symbol(@f: Forge, @sym_idx: int) -> int
+    if @sym_idx < 0 or @sym_idx >= @f.symbol_count
+        return 0
+    @s = @f.symbols[@sym_idx]
+    seal @name = parser_extract_name(@s.name_start, @s.name_len)
+    return guess_dll_for(@name, @s.name_len)
+
+# =============================================================================
+# SECTION 9 — SELF-TESTS
+# =============================================================================
+
+fn pe_selftest_headers() -> int
+    @w = pew_new()
+    emit_dos_header(@w)
+    if @w.len != PE_DOS_STUB_END
+        return 1
+    if @w.bytes[0] != 0x4D or @w.bytes[1] != 0x5A     # 'MZ'
+        return 2
+    if @w.bytes[0x3C] != PE_DOS_STUB_END              # e_lfanew little-endian
+        return 3
+    return 0
+
+fn pe_selftest_minimal_image() -> int
+    # Build a Forge that does nothing (ret) and wrap it in PE.
+    @f = forge_new()
+    emit_ret(@f)
+    @im = pe_imports_new()
+    # No imports for this trivial case.
+    pe_imports_add_dll(@im, "kernel32.dll", 12)
+    @w = forge_emit_pe64(@f, @im, 0)
+    # PE signature at offset 0x80
+    if @w.bytes[0x80] != 0x50 or @w.bytes[0x81] != 0x45
+        return 1
+    # Machine = AMD64
+    @machine_lo = @w.bytes[0x84]
+    @machine_hi = @w.bytes[0x85]
+    if @machine_lo != 0x64 or @machine_hi != 0x86     # 0x8664 LE
+        return 2
+    return 0
+
+fn pe_selftest_reloc() -> int
+    # Emit a Forge image with one `mov rax, imm64` (10 bytes) and flag its
+    # immediate field with a RELOC_ABS64.  Then wrap in PE and confirm
+    # the .reloc section exists at a non-zero RVA and contains exactly
+    # one IMAGE_BASE_RELOCATION block.
+    @f = forge_new()
+    # REX.W + B8 + imm64 — the mov_reg_imm64 emitter writes 10 bytes.
+    emit_mov_reg_imm64(@f, 0, 0xDEADBEEFCAFEBABE)
+    # Immediate lives at offset 2 (after the REX.W + opcode bytes).
+    @sym = forge_define_symbol(@f, 0, 3)
+    forge_add_reloc(@f, 2, RELOC_ABS64, @sym, 0)
+    emit_ret(@f)
+    @im = pe_imports_new()
+    pe_imports_add_dll(@im, "kernel32.dll", 12)
+    @w = forge_emit_pe64(@f, @im, 0)
+
+    # The .reloc section name should appear in one of the 40-byte
+    # section-table entries right after the optional header.  Each
+    # section-table entry starts at:
+    #   0x80 (PE sig) + 4 + 20 (COFF) + 240 (opt hdr) + i * 40
+    # = 0x188 + i * 40.  With 3 sections, .reloc is the third (i=2).
+    seal @sh_base = 0x188 + 2 * 40
+    if @w.bytes[@sh_base + 0] != 0x2E        # '.'
+        return 1
+    if @w.bytes[@sh_base + 1] != 0x72        # 'r'
+        return 2
+    if @w.bytes[@sh_base + 2] != 0x65        # 'e'
+        return 3
+    if @w.bytes[@sh_base + 3] != 0x6C        # 'l'
+        return 4
+    if @w.bytes[@sh_base + 4] != 0x6F        # 'o'
+        return 5
+    if @w.bytes[@sh_base + 5] != 0x63        # 'c'
+        return 6
+
+    # Section-header VirtualAddress lives at offset +12 (u32, LE).
+    @va_lo0 = @w.bytes[@sh_base + 12]
+    @va_lo1 = @w.bytes[@sh_base + 13]
+    @va_lo2 = @w.bytes[@sh_base + 14]
+    @va_lo3 = @w.bytes[@sh_base + 15]
+    @reloc_va = @va_lo0 | (@va_lo1 << 8) | (@va_lo2 << 16) | (@va_lo3 << 24)
+    if @reloc_va == 0
+        return 7
+
+    # Verify the .reloc payload starts with one IMAGE_BASE_RELOCATION.
+    # PointerToRawData at offset +20.
+    @rp0 = @w.bytes[@sh_base + 20]
+    @rp1 = @w.bytes[@sh_base + 21]
+    @rp2 = @w.bytes[@sh_base + 22]
+    @rp3 = @w.bytes[@sh_base + 23]
+    @reloc_raw = @rp0 | (@rp1 << 8) | (@rp2 << 16) | (@rp3 << 24)
+    # SizeOfBlock sits at @reloc_raw + 4; first block's SizeOfBlock should
+    # be non-zero for one entry (8 header + 2 entry + 2 pad = 12 bytes).
+    @sz0 = @w.bytes[@reloc_raw + 4]
+    @sz1 = @w.bytes[@reloc_raw + 5]
+    @block_size = @sz0 | (@sz1 << 8)
+    if @block_size == 0
+        return 8
+    if @block_size != 12                  # 8 header + 2 DIR64 + 2 ABSOLUTE pad
+        return 9
+
+    # DllCharacteristics — DYNAMIC_BASE|NX_COMPAT at optional-header +70.
+    # Optional header starts at 0x80 + 4 + 20 = 0x98, so DllCharacteristics
+    # lives at 0x98 + 70 = 0xDE (two bytes, little-endian).
+    @dc_lo = @w.bytes[0xDE]
+    @dc_hi = @w.bytes[0xDF]
+    @dll_char = @dc_lo | (@dc_hi << 8)
+    if (@dll_char & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) == 0
+        return 10
+    if (@dll_char & IMAGE_DLLCHARACTERISTICS_NX_COMPAT) == 0
+        return 11
+    return 0
+
+fn run_forge_pe_selftests() -> int
+    @pass = 0
+    if pe_selftest_headers() == 0
+        @pass = @pass + 1
+    if pe_selftest_minimal_image() == 0
+        @pass = @pass + 1
+    if pe_selftest_reloc() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+# SECTION 10 — ROADMAP
+# =============================================================================
+#
+# What this file produces is a minimal-but-legal PE64 executable whose code
+# section is the Forge output and whose import section references a fixed
+# trio of DLLs (kernel32, ws2_32, bcrypt).  That's sufficient for every
+# aether.luna stdcall call.
+#
+# Still TODO for production quality:
+#
+#   1. **Symbol-accurate DLL routing**
+#      `build_pe_imports_from_forge` currently drops a placeholder name.
+#      It needs to read the real symbol strings from the parser (via
+#      parser_extract_name) and feed them through guess_dll_for.
+#
+#   2. **Relocation patching**
+#      When forge emits `call [rip + disp32]` via emit_call_rip_rel for an
+#      extern, disp32 is left at zero plus a RELOC_IAT32 record.  After PE
+#      layout we know the IAT slot RVA; we should walk @f.relocs and patch
+#      each call site with:
+#          disp32 = iat_slot_rva - (call_end_rva)
+#      where call_end_rva is the instruction's RVA + 6.
+#
+#   3. **.rdata / .data sections**
+#      String literals and read-only globals need their own section.
+#
+#   4. **Base relocations (.reloc)**
+#      Required for ASLR.  Table of {type, RVA} pairs covering every
+#      absolute 64-bit immediate in the text.  Without this, the OS
+#      refuses to rebase if the preferred image base is taken.
+#
+#   5. **TLS callbacks**
+#      Unneeded until we ship a multi-threaded static binary.
+# =============================================================================
+
+export {
+    # constants
+    PE_IMAGE_BASE, PE_SECTION_ALIGN, PE_FILE_ALIGN,
+    IMAGE_FILE_MACHINE_AMD64,
+    IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_EXECUTE,
+    IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_WRITE,
+    IMAGE_SCN_MEM_DISCARDABLE,
+    IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLLCHARACTERISTICS_NX_COMPAT,
+    IMAGE_REL_BASED_ABSOLUTE, IMAGE_REL_BASED_DIR64,
+    DIR_IMPORT, DIR_IAT, DIR_BASERELOC,
+    PE_RELOC_MAX_ENTRIES,
+
+    # types
+    PeWriter, PeImports, PeImportFn, PeHeaderPatches, PeRelocTable,
+
+    # writer primitives
+    pew_new, pew_u8, pew_u16, pew_u32, pew_u64,
+    pew_zero, pew_pad_to, pew_patch_u32, pew_patch_u64, pew_write_ascii,
+
+    # imports API
+    pe_imports_new, pe_imports_add_dll, pe_imports_add_fn,
+
+    # base-reloc API
+    pe_reloc_table_new, pe_collect_base_relocs, pe_emit_reloc_section,
+
+    # high-level emit
+    forge_emit_pe64, build_pe_imports_from_forge, guess_dll_for,
+
+    # selftests
+    run_forge_pe_selftests
+}

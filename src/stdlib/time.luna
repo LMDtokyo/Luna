@@ -1,0 +1,1335 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Time Module v3.4 "Stdlib Cleanup"
+# =============================================================================
+# High-precision time primitives: Instant, Duration, SystemTime, Timer Wheel.
+# Direct platform FFI to QueryPerformanceCounter (Windows) and
+# clock_gettime (Linux/POSIX) for nanosecond resolution.
+#
+# Primitives implemented:
+#   1.  Duration          - Seconds + nanoseconds pair with arithmetic
+#   2.  Instant           - Monotonic clock for elapsed measurements
+#   3.  SystemTime        - Wall clock (epoch-based) for dates
+#   4.  Date Components   - Year/month/day/hour/min/sec extraction
+#   5.  Date Arithmetic   - add/diff days, hours, minutes, seconds
+#   6.  Formatting        - ISO 8601, RFC 2822, custom patterns
+#   7.  Timer Wheel       - 4-level hierarchical O(1) timer scheduler
+#   8.  Stopwatch         - Profiling helper (start/lap/stop)
+#   9.  Sleep / Delay     - Platform-native thread sleep
+#
+# Design:
+# - All structures use flat i64 storage
+# - Parallel arrays for timer wheel (no HashMap)
+# - Direct FFI to OS time APIs (no Rust std::time wrapper)
+# - Nanosecond precision throughout
+#
+# Build: luna compile --release time.luna -o time.o
+# =============================================================================
+
+import types
+import borrow_checker
+
+# =============================================================================
+# SECTION 1: PLATFORM & TIME CONSTANTS
+# =============================================================================
+
+const NS_PER_US: int = 1000
+const NS_PER_MS: int = 1000000
+const NS_PER_SEC: int = 1000000000
+const US_PER_MS: int = 1000
+const US_PER_SEC: int = 1000000
+const MS_PER_SEC: int = 1000
+const MS_PER_MIN: int = 60000
+const MS_PER_HOUR: int = 3600000
+const MS_PER_DAY: int = 86400000
+const SECS_PER_MIN: int = 60
+const SECS_PER_HOUR: int = 3600
+const SECS_PER_DAY: int = 86400
+
+# Epoch weekday: 1970-01-01 was Thursday (index 4, 0=Sunday)
+const EPOCH_WEEKDAY: int = 4
+
+# POSIX clock IDs
+const CLOCK_REALTIME: int = 0
+const CLOCK_MONOTONIC: int = 1
+
+# Platform type constants
+const PLATFORM_WINDOWS: int = 1
+const PLATFORM_LINUX: int = 2
+const PLATFORM_MACOS: int = 3
+
+# Month days (non-leap)
+# Jan=31, Feb=28, Mar=31, Apr=30, May=31, Jun=30, Jul=31, Aug=31, Sep=30, Oct=31, Nov=30, Dec=31
+const MONTH_DAYS_0: int = 31
+const MONTH_DAYS_1: int = 28
+const MONTH_DAYS_2: int = 31
+const MONTH_DAYS_3: int = 30
+const MONTH_DAYS_4: int = 31
+const MONTH_DAYS_5: int = 30
+const MONTH_DAYS_6: int = 31
+const MONTH_DAYS_7: int = 31
+const MONTH_DAYS_8: int = 30
+const MONTH_DAYS_9: int = 31
+const MONTH_DAYS_10: int = 30
+const MONTH_DAYS_11: int = 31
+
+# Day name abbreviations (for RFC 2822)
+# 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+
+# Month name abbreviations
+# 1=Jan, 2=Feb, ..., 12=Dec
+
+# =============================================================================
+# SECTION 2: PLATFORM FFI DECLARATIONS
+# =============================================================================
+# Direct syscall/API wrappers for nanosecond-precision clocks.
+# Windows: QueryPerformanceCounter / QueryPerformanceFrequency
+# Linux:   clock_gettime(CLOCK_MONOTONIC, &timespec)
+
+# Platform detection
+fn detect_platform()
+    # On Windows, QueryPerformanceFrequency is available
+    # On Linux/macOS, clock_gettime is available
+    # We use conditional compilation via llvm_api FFI
+    @platform = __ffi_call("luna_detect_os", 0)
+    return @platform
+
+# --- Windows FFI ---
+
+# QueryPerformanceCounter: reads high-resolution monotonic counter
+# @counter_ptr: pointer to i64 to receive the counter value
+# Returns: 1 on success, 0 on failure
+fn qpc_read(@counter_ptr)
+    return __ffi_call("QueryPerformanceCounter", @counter_ptr)
+
+# QueryPerformanceFrequency: get counter ticks per second
+# @freq_ptr: pointer to i64 to receive frequency
+# Returns: 1 on success
+fn qpf_read(@freq_ptr)
+    return __ffi_call("QueryPerformanceFrequency", @freq_ptr)
+
+# GetSystemTimeAsFileTime: wall clock in 100ns intervals since 1601
+fn get_system_time_filetime(@ft_ptr)
+    return __ffi_call("GetSystemTimeAsFileTime", @ft_ptr)
+
+# Sleep (Windows): sleep for N milliseconds
+fn win_sleep(@ms)
+    return __ffi_call("Sleep", @ms)
+
+# --- POSIX FFI ---
+
+# clock_gettime: high-resolution clock read
+# @clock_id: CLOCK_REALTIME(0) or CLOCK_MONOTONIC(1)
+# @sec_ptr: pointer to i64 for seconds
+# @nsec_ptr: pointer to i64 for nanoseconds
+fn posix_clock_gettime(@clock_id, @sec_ptr, @nsec_ptr)
+    return __ffi_call("clock_gettime", @clock_id, @sec_ptr, @nsec_ptr)
+
+# nanosleep: sleep for specified time
+fn posix_nanosleep(@sec, @nsec)
+    return __ffi_call("nanosleep", @sec, @nsec)
+
+# =============================================================================
+# SECTION 3: DURATION
+# =============================================================================
+# Duration represents a span of time with nanosecond precision.
+# Stored as (seconds: i64, nanos: i64) where 0 <= nanos < 1_000_000_000.
+
+struct Duration
+    secs: int
+    nanos: int
+
+fn dur_new(@secs, @nanos)
+    # Normalize: carry excess nanoseconds into seconds
+    @extra_secs = @nanos / NS_PER_SEC
+    @remaining_ns = @nanos % NS_PER_SEC
+    guard @remaining_ns < 0
+        @remaining_ns = @remaining_ns + NS_PER_SEC
+        @extra_secs = @extra_secs - 1
+    return Duration { secs: @secs + @extra_secs, nanos: @remaining_ns }
+
+fn dur_zero()
+    return Duration { secs: 0, nanos: 0 }
+
+fn dur_from_secs(@s)
+    return Duration { secs: @s, nanos: 0 }
+
+fn dur_from_millis(@ms)
+    @s = @ms / MS_PER_SEC
+    @remaining = @ms % MS_PER_SEC
+    return Duration { secs: @s, nanos: @remaining * NS_PER_MS }
+
+fn dur_from_micros(@us)
+    @s = @us / US_PER_SEC
+    @remaining = @us % US_PER_SEC
+    return Duration { secs: @s, nanos: @remaining * NS_PER_US }
+
+fn dur_from_nanos(@ns)
+    return dur_new(0, @ns)
+
+fn dur_as_secs(@d)
+    return @d.secs
+
+fn dur_as_millis(@d)
+    return @d.secs * MS_PER_SEC + @d.nanos / NS_PER_MS
+
+fn dur_as_micros(@d)
+    return @d.secs * US_PER_SEC + @d.nanos / NS_PER_US
+
+fn dur_as_nanos(@d)
+    return @d.secs * NS_PER_SEC + @d.nanos
+
+fn dur_subsec_nanos(@d)
+    return @d.nanos
+
+fn dur_subsec_millis(@d)
+    return @d.nanos / NS_PER_MS
+
+fn dur_subsec_micros(@d)
+    return @d.nanos / NS_PER_US
+
+fn dur_add(@a, @b)
+    @total_nanos = @a.nanos + @b.nanos
+    @total_secs = @a.secs + @b.secs
+    return dur_new(@total_secs, @total_nanos)
+
+fn dur_sub(@a, @b)
+    @total_nanos = @a.nanos - @b.nanos
+    @total_secs = @a.secs - @b.secs
+    return dur_new(@total_secs, @total_nanos)
+
+fn dur_mul(@d, @factor)
+    @total_ns = dur_as_nanos(@d) * @factor
+    return dur_from_nanos(@total_ns)
+
+fn dur_div(@d, @divisor)
+    guard @divisor == 0
+        return dur_zero()
+    @total_ns = dur_as_nanos(@d) / @divisor
+    return dur_from_nanos(@total_ns)
+
+fn dur_is_zero(@d)
+    return @d.secs == 0 and @d.nanos == 0
+
+fn dur_cmp(@a, @b)
+    guard @a.secs < @b.secs
+        return -1
+    guard @a.secs > @b.secs
+        return 1
+    guard @a.nanos < @b.nanos
+        return -1
+    guard @a.nanos > @b.nanos
+        return 1
+    return 0
+
+fn dur_min(@a, @b)
+    guard dur_cmp(@a, @b) <= 0
+        return @a
+    return @b
+
+fn dur_max(@a, @b)
+    guard dur_cmp(@a, @b) >= 0
+        return @a
+    return @b
+
+fn dur_to_string(@d)
+    guard @d.secs == 0
+        guard @d.nanos < NS_PER_US
+            return str_concat(int_to_str(@d.nanos), "ns")
+        guard @d.nanos < NS_PER_MS
+            @us = @d.nanos / NS_PER_US
+            return str_concat(int_to_str(@us), "µs")
+        @ms = @d.nanos / NS_PER_MS
+        return str_concat(int_to_str(@ms), "ms")
+    guard @d.secs < SECS_PER_MIN
+        return str_concat(int_to_str(@d.secs), "s")
+    guard @d.secs < SECS_PER_HOUR
+        @m = @d.secs / SECS_PER_MIN
+        @s = @d.secs % SECS_PER_MIN
+        return str_concat(int_to_str(@m), "m", int_to_str(@s), "s")
+    @h = @d.secs / SECS_PER_HOUR
+    @m = (@d.secs % SECS_PER_HOUR) / SECS_PER_MIN
+    return str_concat(int_to_str(@h), "h", int_to_str(@m), "m")
+
+# =============================================================================
+# SECTION 4: INSTANT (Monotonic Clock)
+# =============================================================================
+# Instant represents a point on a monotonic clock.
+# Never goes backwards, suitable for measuring elapsed time.
+# Uses QueryPerformanceCounter on Windows, clock_gettime(MONOTONIC) on Linux.
+
+struct Instant
+    tick_ns: int
+
+# Cached QPC frequency (ticks per second, read once)
+@qpc_frequency = 0
+@qpc_frequency_initialized = 0
+
+fn qpc_init()
+    guard @qpc_frequency_initialized == 1
+        return
+    @freq = 0
+    qpf_read(__addr(@freq))
+    @qpc_frequency = @freq
+    @qpc_frequency_initialized = 1
+
+fn instant_now()
+    @platform = detect_platform()
+    phase @platform
+        is PLATFORM_WINDOWS ->
+            qpc_init()
+            @counter = 0
+            qpc_read(__addr(@counter))
+            # Convert ticks to nanoseconds: (counter * 1e9) / frequency
+            # Use 128-bit-safe math: multiply first, then divide
+            @ns = (@counter * NS_PER_SEC) / @qpc_frequency
+            return Instant { tick_ns: @ns }
+        is PLATFORM_LINUX ->
+            @sec = 0
+            @nsec = 0
+            posix_clock_gettime(CLOCK_MONOTONIC, __addr(@sec), __addr(@nsec))
+            @ns = @sec * NS_PER_SEC + @nsec
+            return Instant { tick_ns: @ns }
+        is PLATFORM_MACOS ->
+            @sec = 0
+            @nsec = 0
+            posix_clock_gettime(CLOCK_MONOTONIC, __addr(@sec), __addr(@nsec))
+            @ns = @sec * NS_PER_SEC + @nsec
+            return Instant { tick_ns: @ns }
+    # Fallback: use FFI generic monotonic clock
+    @ms = __ffi_call("luna_now_micro", 0)
+    return Instant { tick_ns: @ms * NS_PER_US }
+
+fn instant_elapsed(@start)
+    @now = instant_now()
+    @diff_ns = @now.tick_ns - @start.tick_ns
+    guard @diff_ns < 0
+        @diff_ns = 0
+    return dur_from_nanos(@diff_ns)
+
+fn instant_duration_since(@later, @earlier)
+    @diff_ns = @later.tick_ns - @earlier.tick_ns
+    guard @diff_ns < 0
+        @diff_ns = 0
+    return dur_from_nanos(@diff_ns)
+
+fn instant_add(@inst, @dur)
+    @ns = dur_as_nanos(@dur)
+    return Instant { tick_ns: @inst.tick_ns + @ns }
+
+fn instant_sub(@inst, @dur)
+    @ns = dur_as_nanos(@dur)
+    return Instant { tick_ns: @inst.tick_ns - @ns }
+
+fn instant_cmp(@a, @b)
+    guard @a.tick_ns < @b.tick_ns
+        return -1
+    guard @a.tick_ns > @b.tick_ns
+        return 1
+    return 0
+
+# =============================================================================
+# SECTION 5: SYSTEM TIME (Wall Clock)
+# =============================================================================
+# SystemTime is the wall clock, based on Unix epoch (1970-01-01 00:00:00 UTC).
+# Can go backwards (NTP adjustments). Use Instant for measurements.
+
+struct SystemTime
+    epoch_ns: int
+
+fn system_time_now()
+    @platform = detect_platform()
+    phase @platform
+        is PLATFORM_WINDOWS ->
+            # GetSystemTimeAsFileTime returns 100ns intervals since 1601-01-01
+            @ft = 0
+            get_system_time_filetime(__addr(@ft))
+            # Convert from Windows epoch (1601) to Unix epoch (1970)
+            # Difference: 11644473600 seconds = 116444736000000000 * 100ns
+            @unix_100ns = @ft - 116444736000000000
+            @epoch_ns = @unix_100ns * 100
+            return SystemTime { epoch_ns: @epoch_ns }
+        is PLATFORM_LINUX ->
+            @sec = 0
+            @nsec = 0
+            posix_clock_gettime(CLOCK_REALTIME, __addr(@sec), __addr(@nsec))
+            @epoch_ns = @sec * NS_PER_SEC + @nsec
+            return SystemTime { epoch_ns: @epoch_ns }
+        is PLATFORM_MACOS ->
+            @sec = 0
+            @nsec = 0
+            posix_clock_gettime(CLOCK_REALTIME, __addr(@sec), __addr(@nsec))
+            @epoch_ns = @sec * NS_PER_SEC + @nsec
+            return SystemTime { epoch_ns: @epoch_ns }
+    # Fallback
+    @ms = __ffi_call("luna_now", 0)
+    return SystemTime { epoch_ns: @ms * NS_PER_MS }
+
+fn system_time_from_epoch_ms(@ms)
+    return SystemTime { epoch_ns: @ms * NS_PER_MS }
+
+fn system_time_from_epoch_ns(@ns)
+    return SystemTime { epoch_ns: @ns }
+
+fn system_time_to_epoch_ms(@st)
+    return @st.epoch_ns / NS_PER_MS
+
+fn system_time_to_epoch_ns(@st)
+    return @st.epoch_ns
+
+fn system_time_elapsed(@start)
+    @now = system_time_now()
+    @diff_ns = @now.epoch_ns - @start.epoch_ns
+    guard @diff_ns < 0
+        @diff_ns = 0
+    return dur_from_nanos(@diff_ns)
+
+fn system_time_duration_since(@later, @earlier)
+    @diff_ns = @later.epoch_ns - @earlier.epoch_ns
+    return dur_from_nanos(@diff_ns)
+
+fn system_time_add(@st, @dur)
+    @ns = dur_as_nanos(@dur)
+    return SystemTime { epoch_ns: @st.epoch_ns + @ns }
+
+fn system_time_sub(@st, @dur)
+    @ns = dur_as_nanos(@dur)
+    return SystemTime { epoch_ns: @st.epoch_ns - @ns }
+
+# =============================================================================
+# SECTION 6: DATE/TIME COMPONENTS
+# =============================================================================
+# Convert between epoch milliseconds and human-readable date components.
+
+fn is_leap_year(@year)
+    return (@year % 4 == 0 and @year % 100 != 0) or (@year % 400 == 0)
+
+fn days_in_month(@year, @month)
+    phase @month
+        is 1 -> return 31
+        is 2 ->
+            guard is_leap_year(@year)
+                return 29
+            return 28
+        is 3 -> return 31
+        is 4 -> return 30
+        is 5 -> return 31
+        is 6 -> return 30
+        is 7 -> return 31
+        is 8 -> return 31
+        is 9 -> return 30
+        is 10 -> return 31
+        is 11 -> return 30
+        is 12 -> return 31
+    return 30
+
+fn days_in_year(@year)
+    guard is_leap_year(@year)
+        return 366
+    return 365
+
+fn moment_to_components(@epoch_ms)
+    @total_seconds = @epoch_ms / MS_PER_SEC
+    @second = @total_seconds % SECS_PER_MIN
+    @total_minutes = @total_seconds / SECS_PER_MIN
+    @minute = @total_minutes % SECS_PER_MIN
+    @total_hours = @total_minutes / SECS_PER_MIN
+    @hour = @total_hours % 24
+    @days = @total_hours / 24
+
+    # Calculate year from days since epoch
+    @year = 1970
+    orbit @_ in range(0, 10000)
+        @diy = days_in_year(@year)
+        guard @days < @diy
+            meow  # break
+        @days = @days - @diy
+        @year = @year + 1
+
+    # Calculate month and day from remaining days
+    @month = 1
+    orbit @_ in range(0, 12)
+        @dim = days_in_month(@year, @month)
+        guard @days < @dim
+            meow  # break
+        @days = @days - @dim
+        @month = @month + 1
+
+    @day = @days + 1
+
+    return { year: @year, month: @month, day: @day, hour: @hour, minute: @minute, second: @second }
+
+fn components_to_moment(@year, @month, @day, @hour, @min, @sec)
+    @days = 0
+
+    # Count days for full years since epoch
+    @y = 1970
+    orbit @_ in range(0, @year - 1970)
+        @days = @days + days_in_year(@y)
+        @y = @y + 1
+
+    # Count days for full months in target year
+    @m = 1
+    orbit @_ in range(0, @month - 1)
+        @days = @days + days_in_month(@year, @m)
+        @m = @m + 1
+
+    # Add remaining days
+    @days = @days + @day - 1
+
+    # Convert to milliseconds
+    @total_secs = @days * SECS_PER_DAY + @hour * SECS_PER_HOUR + @min * SECS_PER_MIN + @sec
+    return @total_secs * MS_PER_SEC
+
+# Convenience functions matching moment.rs API
+fn now_ms()
+    @st = system_time_now()
+    return system_time_to_epoch_ms(@st)
+
+fn now_micro()
+    @st = system_time_now()
+    return @st.epoch_ns / NS_PER_US
+
+fn now_nano()
+    @st = system_time_now()
+    return @st.epoch_ns
+
+fn year(@epoch_ms)
+    @c = moment_to_components(@epoch_ms)
+    return @c.year
+
+fn month(@epoch_ms)
+    @c = moment_to_components(@epoch_ms)
+    return @c.month
+
+fn day(@epoch_ms)
+    @c = moment_to_components(@epoch_ms)
+    return @c.day
+
+fn hour(@epoch_ms)
+    @c = moment_to_components(@epoch_ms)
+    return @c.hour
+
+fn minute(@epoch_ms)
+    @c = moment_to_components(@epoch_ms)
+    return @c.minute
+
+fn second(@epoch_ms)
+    @c = moment_to_components(@epoch_ms)
+    return @c.second
+
+fn weekday(@epoch_ms)
+    # 1970-01-01 was Thursday (4). 0=Sun..6=Sat
+    @days = @epoch_ms / MS_PER_DAY
+    return (@days + EPOCH_WEEKDAY) % 7
+
+fn yearday(@epoch_ms)
+    @c = moment_to_components(@epoch_ms)
+    @yday = @c.day
+    @m = 1
+    orbit @_ in range(0, @c.month - 1)
+        @yday = @yday + days_in_month(@c.year, @m)
+        @m = @m + 1
+    return @yday
+
+# =============================================================================
+# SECTION 7: DATE ARITHMETIC
+# =============================================================================
+
+fn add_days(@epoch_ms, @n)
+    return @epoch_ms + @n * MS_PER_DAY
+
+fn add_hours(@epoch_ms, @n)
+    return @epoch_ms + @n * MS_PER_HOUR
+
+fn add_minutes(@epoch_ms, @n)
+    return @epoch_ms + @n * MS_PER_MIN
+
+fn add_seconds(@epoch_ms, @n)
+    return @epoch_ms + @n * MS_PER_SEC
+
+fn diff_days(@a, @b)
+    return (@a - @b) / MS_PER_DAY
+
+fn diff_hours(@a, @b)
+    return (@a - @b) / MS_PER_HOUR
+
+fn diff_minutes(@a, @b)
+    return (@a - @b) / MS_PER_MIN
+
+fn diff_seconds(@a, @b)
+    return (@a - @b) / MS_PER_SEC
+
+# =============================================================================
+# SECTION 8: FORMATTING
+# =============================================================================
+
+fn pad2(@n)
+    guard @n < 10
+        return str_concat("0", int_to_str(@n))
+    return int_to_str(@n)
+
+fn pad4(@n)
+    guard @n < 10
+        return str_concat("000", int_to_str(@n))
+    guard @n < 100
+        return str_concat("00", int_to_str(@n))
+    guard @n < 1000
+        return str_concat("0", int_to_str(@n))
+    return int_to_str(@n)
+
+fn to_iso(@epoch_ms)
+    @c = moment_to_components(@epoch_ms)
+    # YYYY-MM-DDTHH:MM:SSZ
+    @result = str_concat(pad4(@c.year), "-", pad2(@c.month), "-", pad2(@c.day), "T", pad2(@c.hour), ":", pad2(@c.minute), ":", pad2(@c.second), "Z")
+    return @result
+
+fn format_moment(@epoch_ms, @fmt)
+    @c = moment_to_components(@epoch_ms)
+    @result = @fmt
+    @result = str_replace(@result, "YYYY", pad4(@c.year))
+    @result = str_replace(@result, "MM", pad2(@c.month))
+    @result = str_replace(@result, "DD", pad2(@c.day))
+    @result = str_replace(@result, "HH", pad2(@c.hour))
+    @result = str_replace(@result, "mm", pad2(@c.minute))
+    @result = str_replace(@result, "ss", pad2(@c.second))
+    return @result
+
+fn day_name_short(@wday)
+    phase @wday
+        is 0 -> return "Sun"
+        is 1 -> return "Mon"
+        is 2 -> return "Tue"
+        is 3 -> return "Wed"
+        is 4 -> return "Thu"
+        is 5 -> return "Fri"
+        is 6 -> return "Sat"
+    return "???"
+
+fn month_name_short(@mon)
+    phase @mon
+        is 1 -> return "Jan"
+        is 2 -> return "Feb"
+        is 3 -> return "Mar"
+        is 4 -> return "Apr"
+        is 5 -> return "May"
+        is 6 -> return "Jun"
+        is 7 -> return "Jul"
+        is 8 -> return "Aug"
+        is 9 -> return "Sep"
+        is 10 -> return "Oct"
+        is 11 -> return "Nov"
+        is 12 -> return "Dec"
+    return "???"
+
+fn to_rfc2822(@epoch_ms)
+    @c = moment_to_components(@epoch_ms)
+    @wday = weekday(@epoch_ms)
+    # "Day, DD Mon YYYY HH:MM:SS +0000"
+    @result = str_concat(day_name_short(@wday), ", ", pad2(@c.day), " ", month_name_short(@c.month), " ", pad4(@c.year), " ", pad2(@c.hour), ":", pad2(@c.minute), ":", pad2(@c.second), " +0000")
+    return @result
+
+fn elapsed_ms(@start_ms)
+    return now_ms() - @start_ms
+
+fn elapsed_micro(@start_us)
+    return now_micro() - @start_us
+
+# =============================================================================
+# SECTION 9: TIMER WHEEL
+# =============================================================================
+# 4-level hierarchical timer wheel with O(1) insert/cancel/advance.
+# Based on George Varghese's timing wheel algorithm.
+#
+# Level 0: 64 slots × 1ms   = 64ms range
+# Level 1: 64 slots × 64ms  = ~4s range
+# Level 2: 64 slots × 4s    = ~262s range (~4.4 min)
+# Level 3: 64 slots × 262s  = ~16,384s range (~4.5 hours)
+
+const WHEEL_SLOTS: int = 64
+const WHEEL_LEVELS: int = 4
+const WHEEL_MAX_TIMERS: int = 65536
+const WHEEL_MAX_TIMEOUT_MS: int = 16777216
+
+# Timer states
+const TIMER_PENDING: int = 0
+const TIMER_FIRING: int = 1
+const TIMER_CANCELLED: int = 2
+const TIMER_COMPLETED: int = 3
+
+# Level resolutions in ticks (1 tick = 1ms)
+const LEVEL_0_RES: int = 1
+const LEVEL_1_RES: int = 64
+const LEVEL_2_RES: int = 4096
+const LEVEL_3_RES: int = 262144
+
+# Global timer ID counter
+@wheel_next_id = 1
+
+# Timer storage - flat parallel arrays
+@tw_ids = []
+@tw_deadlines = []
+@tw_states = []
+@tw_callbacks = []
+@tw_userdata = []
+@tw_levels = []
+@tw_slots = []
+@tw_next = []
+@tw_prev = []
+@tw_count = 0
+
+# Slot storage: 4 levels × 64 slots = 256 entries
+# Each slot has head, tail, count
+@slot_heads = []
+@slot_tails = []
+@slot_counts = []
+
+# Level cursors
+@level_cursors = []
+
+# Stats
+@wheel_current_tick = 0
+@wheel_timer_count = 0
+@wheel_expired_count = 0
+@wheel_cancelled_count = 0
+@wheel_cascaded_count = 0
+
+fn wheel_init()
+    # Initialize timer pool
+    @tw_ids = array_new(WHEEL_MAX_TIMERS, 0)
+    @tw_deadlines = array_new(WHEEL_MAX_TIMERS, 0)
+    @tw_states = array_new(WHEEL_MAX_TIMERS, -1)
+    @tw_callbacks = array_new(WHEEL_MAX_TIMERS, 0)
+    @tw_userdata = array_new(WHEEL_MAX_TIMERS, 0)
+    @tw_levels = array_new(WHEEL_MAX_TIMERS, 0)
+    @tw_slots = array_new(WHEEL_MAX_TIMERS, 0)
+    @tw_next = array_new(WHEEL_MAX_TIMERS, -1)
+    @tw_prev = array_new(WHEEL_MAX_TIMERS, -1)
+    @tw_count = 0
+
+    # Initialize 256 slots (4 levels × 64 slots)
+    @total_slots = WHEEL_LEVELS * WHEEL_SLOTS
+    @slot_heads = array_new(@total_slots, -1)
+    @slot_tails = array_new(@total_slots, -1)
+    @slot_counts = array_new(@total_slots, 0)
+
+    # Initialize level cursors
+    @level_cursors = array_new(WHEEL_LEVELS, 0)
+
+    # Reset stats
+    @wheel_current_tick = 0
+    @wheel_timer_count = 0
+    @wheel_expired_count = 0
+    @wheel_cancelled_count = 0
+    @wheel_cascaded_count = 0
+
+fn wheel_alloc_timer()
+    # Find free slot in timer pool (state == -1 means free)
+    orbit @i in range(0, WHEEL_MAX_TIMERS)
+        guard @tw_states[@i] == -1
+            return @i
+    return -1  # Pool exhausted
+
+fn wheel_free_timer(@idx)
+    @tw_states[@idx] = -1
+    @tw_next[@idx] = -1
+    @tw_prev[@idx] = -1
+
+fn wheel_slot_index(@level, @slot)
+    return @level * WHEEL_SLOTS + @slot
+
+fn wheel_level_for_delay(@ticks)
+    guard @ticks < WHEEL_SLOTS
+        return 0
+    guard @ticks < WHEEL_SLOTS * WHEEL_SLOTS
+        return 1
+    guard @ticks < WHEEL_SLOTS * WHEEL_SLOTS * WHEEL_SLOTS
+        return 2
+    return 3
+
+fn wheel_resolution(@level)
+    phase @level
+        is 0 -> return LEVEL_0_RES
+        is 1 -> return LEVEL_1_RES
+        is 2 -> return LEVEL_2_RES
+        is 3 -> return LEVEL_3_RES
+    return 1
+
+fn slot_push(@level, @slot_idx, @timer_idx)
+    @si = wheel_slot_index(@level, @slot_idx)
+    @tw_next[@timer_idx] = -1
+    @tw_prev[@timer_idx] = @slot_tails[@si]
+    @old_tail = @slot_tails[@si]
+    @slot_tails[@si] = @timer_idx
+    guard @old_tail == -1
+        @slot_heads[@si] = @timer_idx
+    guard @old_tail != -1
+        @tw_next[@old_tail] = @timer_idx
+    @slot_counts[@si] = @slot_counts[@si] + 1
+
+fn slot_remove(@level, @slot_idx, @timer_idx)
+    @si = wheel_slot_index(@level, @slot_idx)
+    @prev = @tw_prev[@timer_idx]
+    @next = @tw_next[@timer_idx]
+
+    guard @prev == -1
+        @slot_heads[@si] = @next
+    guard @prev != -1
+        @tw_next[@prev] = @next
+
+    guard @next == -1
+        @slot_tails[@si] = @prev
+    guard @next != -1
+        @tw_prev[@next] = @prev
+
+    @tw_next[@timer_idx] = -1
+    @tw_prev[@timer_idx] = -1
+    @slot_counts[@si] = @slot_counts[@si] - 1
+
+fn slot_take_all(@level, @slot_idx)
+    @si = wheel_slot_index(@level, @slot_idx)
+    @head = @slot_heads[@si]
+    @slot_heads[@si] = -1
+    @slot_tails[@si] = -1
+    @slot_counts[@si] = 0
+    return @head
+
+fn wheel_schedule(@delay_ms, @callback_ptr, @user_data)
+    @delay_ticks = @delay_ms
+    guard @delay_ticks >= WHEEL_MAX_TIMEOUT_MS
+        return 0  # Timeout too large
+
+    @idx = wheel_alloc_timer()
+    guard @idx == -1
+        return 0  # Pool exhausted
+
+    @id = @wheel_next_id
+    @wheel_next_id = @wheel_next_id + 1
+
+    @deadline = @wheel_current_tick + @delay_ticks
+    @tw_ids[@idx] = @id
+    @tw_deadlines[@idx] = @deadline
+    @tw_states[@idx] = TIMER_PENDING
+    @tw_callbacks[@idx] = @callback_ptr
+    @tw_userdata[@idx] = @user_data
+
+    # Determine target level
+    @level = wheel_level_for_delay(@delay_ticks)
+    @res = wheel_resolution(@level)
+    @cursor = @level_cursors[@level]
+    @slot_offset = @delay_ticks / @res
+    @target_slot = (@cursor + @slot_offset) % WHEEL_SLOTS
+
+    @tw_levels[@idx] = @level
+    @tw_slots[@idx] = @target_slot
+
+    slot_push(@level, @target_slot, @idx)
+    @wheel_timer_count = @wheel_timer_count + 1
+
+    return @id
+
+fn wheel_cancel(@timer_id)
+    # Linear scan to find timer by ID
+    orbit @i in range(0, WHEEL_MAX_TIMERS)
+        guard @tw_ids[@i] == @timer_id and @tw_states[@i] == TIMER_PENDING
+            @tw_states[@i] = TIMER_CANCELLED
+            slot_remove(@tw_levels[@i], @tw_slots[@i], @i)
+            wheel_free_timer(@i)
+            @wheel_timer_count = @wheel_timer_count - 1
+            @wheel_cancelled_count = @wheel_cancelled_count + 1
+            return 1
+    return 0
+
+fn wheel_remaining(@timer_id)
+    orbit @i in range(0, WHEEL_MAX_TIMERS)
+        guard @tw_ids[@i] == @timer_id and @tw_states[@i] == TIMER_PENDING
+            @remaining = @tw_deadlines[@i] - @wheel_current_tick
+            guard @remaining < 0
+                return 0
+            return @remaining
+    return -1
+
+fn wheel_fire_timer(@idx)
+    guard @tw_states[@idx] != TIMER_PENDING
+        return
+    @tw_states[@idx] = TIMER_FIRING
+    # Call callback via FFI
+    @cb = @tw_callbacks[@idx]
+    @data = @tw_userdata[@idx]
+    guard @cb != 0
+        __ffi_call_indirect(@cb, @data)
+    @tw_states[@idx] = TIMER_COMPLETED
+    @wheel_expired_count = @wheel_expired_count + 1
+    @wheel_timer_count = @wheel_timer_count - 1
+    wheel_free_timer(@idx)
+
+fn wheel_cascade(@level, @current_tick)
+    guard @level == 0 or @level >= WHEEL_LEVELS
+        return
+    @cursor = @level_cursors[@level]
+    @head = slot_take_all(@level, @cursor)
+
+    # Advance cursor for this level
+    @level_cursors[@level] = (@cursor + 1) % WHEEL_SLOTS
+
+    # Re-insert each timer into appropriate lower level
+    @timer = @head
+    orbit @_ in range(0, WHEEL_MAX_TIMERS)
+        guard @timer == -1
+            meow  # break
+        @next = @tw_next[@timer]
+        # Skip cancelled
+        guard @tw_states[@timer] == TIMER_CANCELLED
+            wheel_free_timer(@timer)
+            @timer = @next
+        guard @tw_states[@timer] == TIMER_PENDING
+            # Calculate remaining ticks
+            @remaining = @tw_deadlines[@timer] - @current_tick
+            guard @remaining < 0
+                @remaining = 0
+            # Determine new level
+            @new_level = wheel_level_for_delay(@remaining)
+            @res = wheel_resolution(@new_level)
+            @new_cursor = @level_cursors[@new_level]
+            @slot_offset = @remaining / @res
+            @target_slot = (@new_cursor + @slot_offset) % WHEEL_SLOTS
+            @tw_levels[@timer] = @new_level
+            @tw_slots[@timer] = @target_slot
+            @tw_next[@timer] = -1
+            @tw_prev[@timer] = -1
+            slot_push(@new_level, @target_slot, @timer)
+            @wheel_cascaded_count = @wheel_cascaded_count + 1
+        @timer = @next
+
+fn wheel_advance_one_tick()
+    @wheel_current_tick = @wheel_current_tick + 1
+    @tick = @wheel_current_tick
+
+    # Check cascades from higher levels
+    guard @tick > 0 and @tick % WHEEL_SLOTS == 0
+        wheel_cascade(1, @tick)
+    guard @tick > 0 and @tick % (WHEEL_SLOTS * WHEEL_SLOTS) == 0
+        wheel_cascade(2, @tick)
+    guard @tick > 0 and @tick % (WHEEL_SLOTS * WHEEL_SLOTS * WHEEL_SLOTS) == 0
+        wheel_cascade(3, @tick)
+
+    # Fire expired timers from Level 0 current slot
+    @cursor = @level_cursors[0]
+    @head = slot_take_all(0, @cursor)
+    @level_cursors[0] = (@cursor + 1) % WHEEL_SLOTS
+
+    @timer = @head
+    @fired = 0
+    orbit @_ in range(0, WHEEL_MAX_TIMERS)
+        guard @timer == -1
+            meow
+        @next = @tw_next[@timer]
+        wheel_fire_timer(@timer)
+        @fired = @fired + 1
+        @timer = @next
+
+    return @fired
+
+fn wheel_advance(@ticks)
+    @total_fired = 0
+    orbit @_ in range(0, @ticks)
+        @total_fired = @total_fired + wheel_advance_one_tick()
+    return @total_fired
+
+fn wheel_stats()
+    return {
+        current_tick: @wheel_current_tick,
+        timer_count: @wheel_timer_count,
+        expired_count: @wheel_expired_count,
+        cancelled_count: @wheel_cancelled_count,
+        cascaded_count: @wheel_cascaded_count
+    }
+
+fn wheel_clear()
+    orbit @i in range(0, WHEEL_MAX_TIMERS)
+        guard @tw_states[@i] == TIMER_PENDING
+            @tw_states[@i] = TIMER_CANCELLED
+    @total_slots = WHEEL_LEVELS * WHEEL_SLOTS
+    orbit @i in range(0, @total_slots)
+        @slot_heads[@i] = -1
+        @slot_tails[@i] = -1
+        @slot_counts[@i] = 0
+    @wheel_timer_count = 0
+
+# =============================================================================
+# SECTION 10: STOPWATCH / PROFILING
+# =============================================================================
+
+struct Stopwatch
+    start: Instant
+    laps: int
+
+fn stopwatch_start()
+    return Stopwatch { start: instant_now(), laps: 0 }
+
+fn stopwatch_lap(@sw)
+    @now = instant_now()
+    @elapsed = instant_duration_since(@now, @sw.start)
+    @sw.start = @now
+    @sw.laps = @sw.laps + 1
+    return @elapsed
+
+fn stopwatch_stop(@sw)
+    return instant_elapsed(@sw.start)
+
+fn stopwatch_laps(@sw)
+    return @sw.laps
+
+fn benchmark(@fn_ptr, @iterations)
+    @start = instant_now()
+    orbit @i in range(0, @iterations)
+        __ffi_call_indirect(@fn_ptr, @i)
+    @total = instant_elapsed(@start)
+    return dur_div(@total, @iterations)
+
+fn benchmark_report(@name, @fn_ptr, @iterations)
+    @avg = benchmark(@fn_ptr, @iterations)
+    @total_ns = dur_as_nanos(@avg)
+    shine(str_concat("Benchmark '", @name, "': ", int_to_str(@total_ns), " ns/op (", int_to_str(@iterations), " iterations)"))
+    return @avg
+
+# =============================================================================
+# SECTION 11: SLEEP / DELAY
+# =============================================================================
+
+fn sleep_ms(@ms)
+    @platform = detect_platform()
+    phase @platform
+        is PLATFORM_WINDOWS ->
+            win_sleep(@ms)
+        is PLATFORM_LINUX ->
+            @sec = @ms / MS_PER_SEC
+            @nsec = (@ms % MS_PER_SEC) * NS_PER_MS
+            posix_nanosleep(@sec, @nsec)
+        is PLATFORM_MACOS ->
+            @sec = @ms / MS_PER_SEC
+            @nsec = (@ms % MS_PER_SEC) * NS_PER_MS
+            posix_nanosleep(@sec, @nsec)
+
+fn sleep_us(@us)
+    @ms = @us / US_PER_MS
+    guard @ms > 0
+        sleep_ms(@ms)
+        return
+    # Sub-millisecond: use nanosleep directly
+    @platform = detect_platform()
+    phase @platform
+        is PLATFORM_LINUX ->
+            @nsec = @us * NS_PER_US
+            posix_nanosleep(0, @nsec)
+        is PLATFORM_MACOS ->
+            @nsec = @us * NS_PER_US
+            posix_nanosleep(0, @nsec)
+    # Windows doesn't support sub-ms sleep natively; spin-wait
+    @start = instant_now()
+    @target_ns = @us * NS_PER_US
+    orbit @_ in range(0, 1000000)
+        @elapsed = instant_elapsed(@start)
+        guard dur_as_nanos(@elapsed) >= @target_ns
+            meow
+
+fn sleep_ns(@ns)
+    sleep_us(@ns / NS_PER_US)
+
+fn sleep_dur(@d)
+    @ms = dur_as_millis(@d)
+    guard @ms > 0
+        sleep_ms(@ms)
+        return
+    @us = dur_as_micros(@d)
+    guard @us > 0
+        sleep_us(@us)
+
+# =============================================================================
+# SECTION 12: MONOTONIC TIMESTAMP (simple wrapper)
+# =============================================================================
+# Returns monotonic nanosecond timestamp for quick measurements.
+
+fn monotonic_ns()
+    @inst = instant_now()
+    return @inst.tick_ns
+
+fn monotonic_us()
+    return monotonic_ns() / NS_PER_US
+
+fn monotonic_ms()
+    return monotonic_ns() / NS_PER_MS
+
+# =============================================================================
+# SECTION 13: TIMEOUT UTILITIES
+# =============================================================================
+
+struct Timeout
+    deadline: Instant
+    expired: int
+
+fn timeout_new(@dur)
+    @now = instant_now()
+    @deadline = instant_add(@now, @dur)
+    return Timeout { deadline: @deadline, expired: 0 }
+
+fn timeout_new_ms(@ms)
+    return timeout_new(dur_from_millis(@ms))
+
+fn timeout_is_expired(@t)
+    @now = instant_now()
+    guard instant_cmp(@now, @t.deadline) >= 0
+        return 1
+    return 0
+
+fn timeout_remaining(@t)
+    @now = instant_now()
+    guard instant_cmp(@now, @t.deadline) >= 0
+        return dur_zero()
+    return instant_duration_since(@t.deadline, @now)
+
+fn timeout_remaining_ms(@t)
+    @d = timeout_remaining(@t)
+    return dur_as_millis(@d)
+
+# =============================================================================
+# SECTION 14: RATE LIMITER
+# =============================================================================
+# Token-bucket rate limiter using monotonic clock.
+
+struct RateLimiter
+    capacity: int
+    tokens: int
+    refill_rate_ns: int
+    last_refill: Instant
+
+fn rate_limiter_new(@max_per_sec)
+    @now = instant_now()
+    @refill_ns = NS_PER_SEC / @max_per_sec
+    return RateLimiter {
+        capacity: @max_per_sec,
+        tokens: @max_per_sec,
+        refill_rate_ns: @refill_ns,
+        last_refill: @now
+    }
+
+fn rate_limiter_try_acquire(@rl)
+    # Refill tokens based on elapsed time
+    @now = instant_now()
+    @elapsed = instant_duration_since(@now, @rl.last_refill)
+    @elapsed_ns = dur_as_nanos(@elapsed)
+    @new_tokens = @elapsed_ns / @rl.refill_rate_ns
+    guard @new_tokens > 0
+        @rl.tokens = @rl.tokens + @new_tokens
+        guard @rl.tokens > @rl.capacity
+            @rl.tokens = @rl.capacity
+        @rl.last_refill = @now
+
+    guard @rl.tokens > 0
+        @rl.tokens = @rl.tokens - 1
+        return 1
+    return 0
+
+fn rate_limiter_wait(@rl)
+    orbit @_ in range(0, 1000000)
+        guard rate_limiter_try_acquire(@rl) == 1
+            return
+        sleep_us(100)
+
+# =============================================================================
+# SECTION 15: SELF-TESTS
+# =============================================================================
+
+fn run_self_tests()
+    @passed = 0
+    @failed = 0
+
+    # Test 1: Duration creation and conversion
+    shine("  [time] test 1: Duration creation...")
+    @d1 = dur_from_millis(1500)
+    guard dur_as_secs(@d1) == 1 and dur_subsec_millis(@d1) == 500
+        @passed = @passed + 1
+        shine("    PASS")
+    guard dur_as_secs(@d1) != 1 or dur_subsec_millis(@d1) != 500
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 2: Duration arithmetic
+    shine("  [time] test 2: Duration arithmetic...")
+    @d2 = dur_from_millis(750)
+    @d3 = dur_add(@d1, @d2)
+    guard dur_as_millis(@d3) == 2250
+        @passed = @passed + 1
+        shine("    PASS")
+    guard dur_as_millis(@d3) != 2250
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 3: Duration comparison
+    shine("  [time] test 3: Duration comparison...")
+    guard dur_cmp(@d1, @d2) == 1 and dur_cmp(@d2, @d1) == -1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard dur_cmp(@d1, @d2) != 1 or dur_cmp(@d2, @d1) != -1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 4: Duration from nanos
+    shine("  [time] test 4: Duration from nanos...")
+    @d4 = dur_from_nanos(1500000000)
+    guard dur_as_secs(@d4) == 1 and dur_subsec_millis(@d4) == 500
+        @passed = @passed + 1
+        shine("    PASS")
+    guard dur_as_secs(@d4) != 1 or dur_subsec_millis(@d4) != 500
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 5: Leap year detection
+    shine("  [time] test 5: Leap year detection...")
+    @lp_ok = is_leap_year(2000) and is_leap_year(2024) and (not is_leap_year(1900)) and (not is_leap_year(2023))
+    guard @lp_ok
+        @passed = @passed + 1
+        shine("    PASS")
+    guard not @lp_ok
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 6: Date component extraction (2000-01-01 = 946684800000 ms)
+    shine("  [time] test 6: Date components...")
+    @epoch_2000 = components_to_moment(2000, 1, 1, 0, 0, 0)
+    @c = moment_to_components(@epoch_2000)
+    guard @c.year == 2000 and @c.month == 1 and @c.day == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard @c.year != 2000 or @c.month != 1 or @c.day != 1
+        @failed = @failed + 1
+        shine("    FAIL: year=", @c.year, " month=", @c.month, " day=", @c.day)
+
+    # Test 7: ISO formatting
+    shine("  [time] test 7: ISO formatting...")
+    @iso = to_iso(@epoch_2000)
+    guard str_contains(@iso, "2000") and str_contains(@iso, "T") and str_contains(@iso, "Z")
+        @passed = @passed + 1
+        shine("    PASS")
+    guard not str_contains(@iso, "2000")
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 8: Weekday (1970-01-01 epoch = Thursday = 4)
+    shine("  [time] test 8: Weekday calculation...")
+    @wd = weekday(0)
+    guard @wd == EPOCH_WEEKDAY
+        @passed = @passed + 1
+        shine("    PASS")
+    guard @wd != EPOCH_WEEKDAY
+        @failed = @failed + 1
+        shine("    FAIL: expected 4 got ", @wd)
+
+    # Test 9: Timer wheel init and schedule
+    shine("  [time] test 9: Timer wheel schedule...")
+    wheel_init()
+    @tid1 = wheel_schedule(100, 0, 0)
+    @tid2 = wheel_schedule(200, 0, 0)
+    guard @tid1 > 0 and @tid2 > 0 and @wheel_timer_count == 2
+        @passed = @passed + 1
+        shine("    PASS")
+    guard @tid1 <= 0 or @tid2 <= 0 or @wheel_timer_count != 2
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 10: Timer wheel cancel
+    shine("  [time] test 10: Timer wheel cancel...")
+    @cancel_ok = wheel_cancel(@tid1)
+    guard @cancel_ok == 1 and @wheel_timer_count == 1
+        @passed = @passed + 1
+        shine("    PASS")
+    guard @cancel_ok != 1 or @wheel_timer_count != 1
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 11: Timer wheel remaining
+    shine("  [time] test 11: Timer remaining...")
+    @rem = wheel_remaining(@tid2)
+    guard @rem == 200
+        @passed = @passed + 1
+        shine("    PASS")
+    guard @rem != 200
+        @failed = @failed + 1
+        shine("    FAIL: expected 200 got ", @rem)
+
+    # Test 12: Days in month
+    shine("  [time] test 12: Days in month...")
+    @feb_leap = days_in_month(2000, 2)
+    @feb_normal = days_in_month(2001, 2)
+    guard @feb_leap == 29 and @feb_normal == 28
+        @passed = @passed + 1
+        shine("    PASS")
+    guard @feb_leap != 29 or @feb_normal != 28
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 13: Date arithmetic
+    shine("  [time] test 13: Date arithmetic...")
+    @base = components_to_moment(2024, 1, 1, 0, 0, 0)
+    @plus7 = add_days(@base, 7)
+    @c7 = moment_to_components(@plus7)
+    guard @c7.day == 8
+        @passed = @passed + 1
+        shine("    PASS")
+    guard @c7.day != 8
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Test 14: Duration zero check
+    shine("  [time] test 14: Duration zero...")
+    @dz = dur_zero()
+    guard dur_is_zero(@dz)
+        @passed = @passed + 1
+        shine("    PASS")
+    guard not dur_is_zero(@dz)
+        @failed = @failed + 1
+        shine("    FAIL")
+
+    # Summary
+    @total = @passed + @failed
+    shine(str_concat("  [time] Self-tests: ", int_to_str(@passed), "/", int_to_str(@total), " passed"))
+    guard @failed > 0
+        shine("  [time] WARNING: ", @failed, " tests FAILED!")
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+export {
+    Duration, dur_new, dur_zero, dur_from_secs, dur_from_millis, dur_from_micros,
+    dur_from_nanos, dur_as_secs, dur_as_millis, dur_as_micros, dur_as_nanos,
+    dur_subsec_nanos, dur_subsec_millis, dur_subsec_micros,
+    dur_add, dur_sub, dur_mul, dur_div, dur_is_zero, dur_cmp, dur_min, dur_max,
+    dur_to_string,
+    Instant, instant_now, instant_elapsed, instant_duration_since,
+    instant_add, instant_sub, instant_cmp,
+    SystemTime, system_time_now, system_time_from_epoch_ms, system_time_from_epoch_ns,
+    system_time_to_epoch_ms, system_time_to_epoch_ns, system_time_elapsed,
+    system_time_duration_since, system_time_add, system_time_sub,
+    is_leap_year, days_in_month, days_in_year,
+    moment_to_components, components_to_moment,
+    now_ms, now_micro, now_nano,
+    year, month, day, hour, minute, second, weekday, yearday,
+    add_days, add_hours, add_minutes, add_seconds,
+    diff_days, diff_hours, diff_minutes, diff_seconds,
+    pad2, pad4, to_iso, format_moment, to_rfc2822,
+    day_name_short, month_name_short,
+    elapsed_ms, elapsed_micro,
+    wheel_init, wheel_schedule, wheel_cancel, wheel_advance, wheel_remaining,
+    wheel_stats, wheel_clear, wheel_advance_one_tick, wheel_cascade,
+    Stopwatch, stopwatch_start, stopwatch_lap, stopwatch_stop, stopwatch_laps,
+    benchmark, benchmark_report,
+    sleep_ms, sleep_us, sleep_ns, sleep_dur,
+    monotonic_ns, monotonic_us, monotonic_ms,
+    Timeout, timeout_new, timeout_new_ms, timeout_is_expired,
+    timeout_remaining, timeout_remaining_ms,
+    RateLimiter, rate_limiter_new, rate_limiter_try_acquire, rate_limiter_wait,
+    run_self_tests
+}

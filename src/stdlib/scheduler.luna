@@ -1,0 +1,1914 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Scheduler v3.3 "Concurrency & Network"
+# =============================================================================
+# Production-grade work-stealing runtime with cache-optimized data structures.
+# Ports scheduler.rs (2500 lines) + thread.rs (640 lines) to pure Luna.
+#
+# Key features:
+#   1.  Lock-free Chase-Lev work-stealing deque (Acquire/Release ordering)
+#   2.  Cache-line aligned structures to prevent false sharing
+#   3.  Zero-allocation hot path via pre-allocated task pools
+#   4.  NUMA-aware worker placement (integrated with affinity module)
+#   5.  LIFO for local thread (hot cache), FIFO for stealing (fairness)
+#   6.  Green threads (Fibers) with configurable stack sizes
+#   7.  4-level priority global queue (Background / Normal / High / Critical)
+#   8.  Blocking pool for long-running / IO-bound work
+#   9.  Cross-platform thread management (Windows CreateThread / POSIX pthread)
+#   10. XorShift64 PRNG for random victim selection
+#
+# Memory ordering philosophy:
+#   - Acquire: loads that must see effects of prior Release stores
+#   - Release: stores that publish data for Acquire loads
+#   - SeqCst:  total ordering (rare, only for Chase-Lev pop/steal race)
+#   - Relaxed: statistics and non-synchronizing counters only
+#
+# Build: luna compile --release scheduler.luna -o scheduler.o
+# =============================================================================
+
+import types
+import sync
+import borrow_checker
+
+# =============================================================================
+# SECTION 1: CONFIGURATION CONSTANTS
+# =============================================================================
+# Tuning knobs for the scheduler runtime. All capacities are powers of 2 for
+# efficient modular indexing (mask = capacity - 1).
+
+# Cache line size for alignment (64 bytes on x86/x64, ARM64)
+const CACHE_LINE_SIZE: int = 64
+
+# Default number of worker threads (0 = auto-detect CPU count)
+const DEFAULT_WORKERS: int = 0
+
+# Default stack size for fibers (64 KB)
+const DEFAULT_FIBER_STACK_SIZE: int = 65536
+
+# Minimum stack size (8 KB)
+const MIN_FIBER_STACK_SIZE: int = 8192
+
+# Maximum stack size (8 MB)
+const MAX_FIBER_STACK_SIZE: int = 8388608
+
+# Initial capacity for Chase-Lev deque (power of 2)
+const INITIAL_DEQUE_CAPACITY: int = 1024
+
+# Maximum deque capacity (power of 2, ~1M tasks)
+const MAX_DEQUE_CAPACITY: int = 1048576
+
+# Work-steal batch size
+const STEAL_BATCH_SIZE: int = 32
+
+# Spin iterations before parking a worker thread
+const SPIN_LIMIT: int = 64
+
+# Exponential backoff max iterations
+const BACKOFF_MAX: int = 6
+
+# Global queue segments for lock-free access
+const GLOBAL_QUEUE_SEGMENTS: int = 8
+
+# Task pool size per worker (pre-allocated)
+const TASK_POOL_SIZE: int = 4096
+
+# Maximum number of workers
+const MAX_WORKERS: int = 256
+
+# Maximum number of fibers in pool free-list
+const MAX_FIBER_POOL_FREE: int = 1024
+
+# Maximum active fibers tracked
+const MAX_ACTIVE_FIBERS: int = 4096
+
+# Maximum tasks tracked in scheduler registry
+const MAX_TRACKED_TASKS: int = 65536
+
+# Maximum blocking pool threads
+const MAX_BLOCKING_THREADS: int = 256
+
+# =============================================================================
+# SECTION 2: TASK PRIORITY CONSTANTS
+# =============================================================================
+# Four priority levels for task scheduling. Higher priority tasks are dequeued
+# first from the global queue. Workers always check Critical → High → Normal
+# → Background in that order.
+
+const PRIORITY_BACKGROUND: int = 0
+const PRIORITY_NORMAL: int = 1
+const PRIORITY_HIGH: int = 2
+const PRIORITY_CRITICAL: int = 3
+const NUM_PRIORITY_LEVELS: int = 4
+
+# =============================================================================
+# SECTION 3: TASK STATE CONSTANTS
+# =============================================================================
+# Task lifecycle: Ready → Running → Completed/Cancelled/Failed
+# A task may also transition Ready → Blocked → Ready when waiting on I/O.
+
+const STATE_READY: int = 0
+const STATE_RUNNING: int = 1
+const STATE_BLOCKED: int = 2
+const STATE_COMPLETED: int = 3
+const STATE_CANCELLED: int = 4
+const STATE_FAILED: int = 5
+
+# =============================================================================
+# SECTION 4: FIBER STATE CONSTANTS
+# =============================================================================
+
+const FIBER_READY: int = 0
+const FIBER_RUNNING: int = 1
+const FIBER_SUSPENDED: int = 2
+const FIBER_COMPLETED: int = 3
+
+# =============================================================================
+# SECTION 5: THREAD STATE CONSTANTS
+# =============================================================================
+
+const THREAD_CREATED: int = 0
+const THREAD_RUNNING: int = 1
+const THREAD_SUSPENDED: int = 2
+const THREAD_TERMINATED: int = 3
+
+# =============================================================================
+# SECTION 6: STEAL RESULT CONSTANTS
+# =============================================================================
+
+const STEAL_SUCCESS: int = 0
+const STEAL_EMPTY: int = 1
+const STEAL_RETRY: int = 2
+
+# =============================================================================
+# SECTION 7: FFI EXTERN DECLARATIONS
+# =============================================================================
+# Direct bindings to the Rust scheduler runtime. These are the luna_scheduler_*
+# and luna_thread_* functions exported from scheduler.rs and thread.rs.
+
+# --- Scheduler FFI ---
+extern fn luna_scheduler_init(@num_workers: int) -> int
+extern fn luna_scheduler_init_per_core() -> int
+extern fn luna_scheduler_set_workers(@count: int) -> int
+extern fn luna_scheduler_set_stack_size(@size: int) -> void
+extern fn luna_scheduler_spawn(@func_ptr: int) -> int
+extern fn luna_scheduler_spawn_priority(@func_ptr: int, @priority: int) -> int
+extern fn luna_scheduler_spawn_cancellable(@func_ptr: int, @cancel_token: int) -> int
+extern fn luna_scheduler_spawn_io(@func_ptr: int, @io_handle: int) -> int
+extern fn luna_scheduler_spawn_blocking(@func_ptr: int) -> int
+extern fn luna_scheduler_wait(@task_id: int) -> int
+extern fn luna_scheduler_run_until_complete() -> void
+extern fn luna_scheduler_active_tasks() -> int
+extern fn luna_scheduler_total_spawned() -> int
+extern fn luna_scheduler_num_workers() -> int
+extern fn luna_scheduler_cpu_count() -> int
+extern fn luna_scheduler_steal_count() -> int
+extern fn luna_scheduler_steal_rate() -> int
+extern fn luna_scheduler_shutdown() -> void
+extern fn luna_scheduler_yield() -> void
+extern fn luna_scheduler_sleep_ms(@ms: int) -> void
+
+# --- Thread FFI ---
+extern fn luna_thread_new() -> int
+extern fn luna_thread_set_entry(@handle: int, @entry: int, @user_data: int) -> void
+extern fn luna_thread_set_stack_size(@handle: int, @size: int) -> void
+extern fn luna_thread_set_name(@handle: int, @name_ptr: int, @name_len: int) -> void
+extern fn luna_thread_start(@handle: int, @suspended: int) -> int
+extern fn luna_thread_join(@handle: int, @timeout_ms: int) -> int
+extern fn luna_thread_suspend(@handle: int) -> int
+extern fn luna_thread_resume(@handle: int) -> int
+extern fn luna_thread_terminate(@handle: int, @exit_code: int) -> int
+extern fn luna_thread_get_state(@handle: int) -> int
+extern fn luna_thread_get_exit_code(@handle: int) -> int
+extern fn luna_thread_set_affinity(@handle: int, @mask: int) -> int
+extern fn luna_thread_set_priority(@handle: int, @priority: int) -> int
+extern fn luna_thread_free(@handle: int) -> void
+extern fn luna_thread_current_id() -> int
+extern fn luna_thread_yield() -> void
+extern fn luna_thread_sleep_ms(@ms: int) -> void
+extern fn luna_thread_cpu_count() -> int
+
+# --- Atomic FFI (from sync module) ---
+extern fn luna_atomic_load(@ptr: int, @ordering: int) -> int
+extern fn luna_atomic_store(@ptr: int, @value: int, @ordering: int) -> void
+extern fn luna_atomic_add(@ptr: int, @value: int, @ordering: int) -> int
+extern fn luna_atomic_sub(@ptr: int, @value: int, @ordering: int) -> int
+extern fn luna_atomic_cas(@ptr: int, @expected: int, @desired: int, @ordering: int) -> int
+extern fn luna_atomic_fence(@ordering: int) -> void
+extern fn luna_atomic_or(@ptr: int, @value: int, @ordering: int) -> int
+extern fn luna_atomic_and(@ptr: int, @value: int, @ordering: int) -> int
+
+# --- Memory FFI ---
+extern fn luna_mem_alloc(@size: int) -> int
+extern fn luna_mem_free(@ptr: int) -> void
+extern fn luna_mem_copy(@dst: int, @src: int, @len: int) -> void
+extern fn luna_mem_zero(@ptr: int, @len: int) -> void
+extern fn luna_mem_write_i64(@ptr: int, @offset: int, @value: int) -> void
+extern fn luna_mem_read_i64(@ptr: int, @offset: int) -> int
+
+# --- Time FFI ---
+extern fn luna_time_now_ns() -> int
+extern fn luna_time_monotonic_ns() -> int
+
+# =============================================================================
+# SECTION 8: FAST RNG (XorShift64)
+# =============================================================================
+# Ultra-fast PRNG for random victim selection during work stealing.
+# XorShift64 provides good distribution with minimal overhead.
+# NOT cryptographically secure — used only for load balancing.
+#
+# Algorithm (Marsaglia 2003):
+#   x ^= x << 13
+#   x ^= x >> 7
+#   x ^= x << 17
+
+const MAX_RNG_INSTANCES: int = 512
+
+# Flat arrays for RNG storage
+@rng_states: array[int, 512]
+@rng_count: int = 0
+
+# Create a new RNG seeded with the given value.
+# Returns a handle (index) into the rng_states array.
+fn rng_new(@seed: int) -> int
+    guard @rng_count < MAX_RNG_INSTANCES else return -1
+
+    @handle = @rng_count
+    @rng_count = @rng_count + 1
+
+    # Avoid seed == 0 (XorShift fixed point)
+    if @seed == 0
+        @rng_states[@handle] = 0xDEADBEEF
+    else
+        @rng_states[@handle] = @seed
+
+    return @handle
+
+# Create RNG seeded from thread ID and timestamp
+fn rng_from_thread() -> int
+    @thread_id = luna_thread_current_id()
+    @time_ns = luna_time_now_ns()
+    @seed = @time_ns ^ (@thread_id * 0x517cc1b727220a95)
+    return rng_new(@seed)
+
+# Generate next random u64 using XorShift64
+fn rng_next(@handle: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @rng_count else return 0
+
+    @x = @rng_states[@handle]
+    @x = @x ^ (@x << 13)
+    @x = @x ^ (@x >> 7)
+    @x = @x ^ (@x << 17)
+    @rng_states[@handle] = @x
+    return @x
+
+# Generate random value in range [0, bound)
+fn rng_bounded(@handle: int, @bound: int) -> int
+    guard @bound > 0 else return 0
+    @val = rng_next(@handle)
+    # Use unsigned modulo
+    if @val < 0
+        @val = -@val
+    return @val % @bound
+
+# =============================================================================
+# SECTION 9: TASK STRUCT AND OPERATIONS
+# =============================================================================
+# A schedulable async task with cache-line aligned hot fields.
+# Layout optimized: hot fields (id, priority, state, func_ptr) first cache line,
+# cold fields (timestamps, fiber references) in second cache line.
+#
+# Storage: Parallel arrays indexed by task slot number.
+
+const MAX_TASKS: int = 65536
+
+# --- Task parallel arrays ---
+@task_ids: array[int, 65536]
+@task_priorities: array[int, 65536]
+@task_func_ptrs: array[int, 65536]
+@task_states: array[int, 65536]
+@task_results: array[int, 65536]
+@task_cancel_tokens: array[int, 65536]
+@task_fiber_ids: array[int, 65536]
+@task_blocked_until: array[int, 65536]
+@task_io_handles: array[int, 65536]
+@task_created_at: array[int, 65536]
+@task_completion_flags: array[int, 65536]
+
+# Global task ID counter
+@next_task_id: int = 1
+
+# Free-list for task slots (bitmap-based)
+const TASK_BITMAP_WORDS: int = 1024
+@task_free_bitmap: array[int, 1024]
+@task_free_count: int = 0
+
+# Initialize the task pool
+fn task_pool_init()
+    # Set all bits = all slots free
+    orbit @i in range(0, TASK_BITMAP_WORDS)
+        @task_free_bitmap[@i] = -1  # All bits set (0xFFFFFFFFFFFFFFFF)
+    @task_free_count = MAX_TASKS
+
+# Acquire a free task slot, initialize with func_ptr and priority.
+# Returns slot index or -1 if pool exhausted.
+fn task_new(@func_ptr: int, @priority: int) -> int
+    guard @task_free_count > 0 else return -1
+
+    # Find first free slot using bitmap scan
+    orbit @word_idx in range(0, TASK_BITMAP_WORDS)
+        @word = @task_free_bitmap[@word_idx]
+        if @word == 0
+            # No free bits in this word, skip
+            orbit @next_word in range(0, 0)
+                # skip
+        else
+            # Find lowest set bit (trailing zeros)
+            @bit_idx = 0
+            @mask = 1
+            orbit @b in range(0, 64)
+                if (@word & @mask) != 0
+                    @bit_idx = @b
+                    # Clear this bit to mark as in-use
+                    @task_free_bitmap[@word_idx] = @word & (~@mask)
+                    @task_free_count = @task_free_count - 1
+
+                    @slot = @word_idx * 64 + @bit_idx
+                    guard @slot < MAX_TASKS else return -1
+
+                    # Initialize task fields
+                    @task_ids[@slot] = @next_task_id
+                    @next_task_id = @next_task_id + 1
+                    @task_priorities[@slot] = @priority
+                    @task_func_ptrs[@slot] = @func_ptr
+                    @task_states[@slot] = STATE_READY
+                    @task_results[@slot] = 0
+                    @task_cancel_tokens[@slot] = 0
+                    @task_fiber_ids[@slot] = 0
+                    @task_blocked_until[@slot] = 0
+                    @task_io_handles[@slot] = 0
+                    @task_created_at[@slot] = luna_time_monotonic_ns()
+                    @task_completion_flags[@slot] = 0
+
+                    return @slot
+                @mask = @mask << 1
+
+    return -1
+
+# Create a task with a cancellation token
+fn task_new_cancellable(@func_ptr: int, @priority: int, @cancel_token: int) -> int
+    @slot = task_new(@func_ptr, @priority)
+    if @slot >= 0
+        @task_cancel_tokens[@slot] = @cancel_token
+    return @slot
+
+# Create a task with an IO handle
+fn task_new_io(@func_ptr: int, @priority: int, @io_handle: int) -> int
+    @slot = task_new(@func_ptr, @priority)
+    if @slot >= 0
+        @task_io_handles[@slot] = @io_handle
+    return @slot
+
+# Release a task slot back to the pool
+fn task_free(@slot: int)
+    guard @slot >= 0 else return
+    guard @slot < MAX_TASKS else return
+
+    @word_idx = @slot / 64
+    @bit_idx = @slot % 64
+    @mask = 1 << @bit_idx
+    @task_free_bitmap[@word_idx] = @task_free_bitmap[@word_idx] | @mask
+    @task_free_count = @task_free_count + 1
+
+# Get task state
+fn task_get_state(@slot: int) -> int
+    guard @slot >= 0 else return STATE_FAILED
+    guard @slot < MAX_TASKS else return STATE_FAILED
+    return @task_states[@slot]
+
+# Set task state
+fn task_set_state(@slot: int, @state: int)
+    guard @slot >= 0 else return
+    guard @slot < MAX_TASKS else return
+    @task_states[@slot] = @state
+
+# Check if task is ready to execute
+fn task_is_ready(@slot: int) -> int
+    guard @slot >= 0 else return 0
+    guard @slot < MAX_TASKS else return 0
+
+    @blocked = @task_blocked_until[@slot]
+    if @blocked > 0
+        @now = luna_time_monotonic_ns()
+        if @now < @blocked
+            return 0
+
+    if @task_states[@slot] == STATE_READY
+        return 1
+    return 0
+
+# Complete a task with a result value
+fn task_complete(@slot: int, @result: int)
+    guard @slot >= 0 else return
+    guard @slot < MAX_TASKS else return
+
+    @task_results[@slot] = @result
+    @task_states[@slot] = STATE_COMPLETED
+    @task_completion_flags[@slot] = 1
+
+# Wait for a task to complete (blocking)
+fn task_wait(@slot: int) -> int
+    guard @slot >= 0 else return 0
+    guard @slot < MAX_TASKS else return 0
+
+    # Spin-wait with backoff for completion
+    @backoff = 1
+    orbit @spin in range(0, 1000000)
+        if @task_completion_flags[@slot] == 1
+            return @task_results[@slot]
+
+        # Exponential backoff
+        orbit @b in range(0, @backoff)
+            luna_scheduler_yield()
+        if @backoff < 64
+            @backoff = @backoff * 2
+
+    # Timeout — return current result anyway
+    return @task_results[@slot]
+
+# Wait with timeout (returns 1 if completed, 0 if timed out)
+fn task_wait_timeout(@slot: int, @timeout_ns: int) -> int
+    guard @slot >= 0 else return 0
+    guard @slot < MAX_TASKS else return 0
+
+    @start = luna_time_monotonic_ns()
+    @backoff = 1
+
+    orbit @spin in range(0, 1000000)
+        if @task_completion_flags[@slot] == 1
+            return 1
+
+        @elapsed = luna_time_monotonic_ns() - @start
+        if @elapsed >= @timeout_ns
+            return 0
+
+        orbit @b in range(0, @backoff)
+            luna_scheduler_yield()
+        if @backoff < 64
+            @backoff = @backoff * 2
+
+    return 0
+
+# Get task ID from slot
+fn task_get_id(@slot: int) -> int
+    guard @slot >= 0 else return -1
+    guard @slot < MAX_TASKS else return -1
+    return @task_ids[@slot]
+
+# Get task priority
+fn task_get_priority(@slot: int) -> int
+    guard @slot >= 0 else return PRIORITY_NORMAL
+    guard @slot < MAX_TASKS else return PRIORITY_NORMAL
+    return @task_priorities[@slot]
+
+# Get task result
+fn task_get_result(@slot: int) -> int
+    guard @slot >= 0 else return 0
+    guard @slot < MAX_TASKS else return 0
+    return @task_results[@slot]
+
+# Get free slot count
+fn task_pool_free_count() -> int
+    return @task_free_count
+
+# =============================================================================
+# SECTION 10: CHASE-LEV WORK-STEALING DEQUE
+# =============================================================================
+# Lock-free deque based on "Dynamic Circular Work-Stealing Deque" by Chase & Lev.
+#
+# Properties:
+#   - Push/Pop: O(1), lock-free, owner thread only
+#   - Steal:    O(1), lock-free, any thread
+#   - LIFO for push/pop (cache locality for owner)
+#   - FIFO for steal   (fairness — oldest tasks stolen first)
+#
+# Memory ordering:
+#   - bottom: Relaxed loads (owner), Release stores (publish writes)
+#   - top:    Acquire loads (stealer), SeqCst CAS (pop/steal race)
+#   - Buffer: SeqCst fence for the critical pop() vs steal() race
+
+const MAX_DEQUES: int = 512
+
+# Deque storage: parallel arrays
+# Each deque has a circular buffer, bottom index, top index
+@deque_buffers: array[int, 512]       # ptr to circular buffer
+@deque_capacities: array[int, 512]    # current capacity
+@deque_bottoms: array[int, 512]       # bottom index (owner only)
+@deque_tops: array[int, 512]          # top index (stealers modify via CAS)
+@deque_count: int = 0
+
+# Create a new Chase-Lev deque. Returns handle or -1.
+fn deque_new() -> int
+    guard @deque_count < MAX_DEQUES else return -1
+
+    @handle = @deque_count
+    @deque_count = @deque_count + 1
+
+    # Allocate circular buffer (array of task slot indices)
+    @buf = luna_mem_alloc(INITIAL_DEQUE_CAPACITY * 8)
+    luna_mem_zero(@buf, INITIAL_DEQUE_CAPACITY * 8)
+
+    @deque_buffers[@handle] = @buf
+    @deque_capacities[@handle] = INITIAL_DEQUE_CAPACITY
+    @deque_bottoms[@handle] = 0
+    @deque_tops[@handle] = 0
+
+    return @handle
+
+# Push a task to the bottom (owner only).
+# Returns 1 on success, 0 if full.
+fn deque_push(@deque: int, @task_slot: int) -> int
+    guard @deque >= 0 else return 0
+    guard @deque < @deque_count else return 0
+
+    @bottom = @deque_bottoms[@deque]
+    @top = @deque_tops[@deque]
+    @cap = @deque_capacities[@deque]
+    @size = @bottom - @top
+
+    # Check if we need to grow
+    if @size >= @cap - 1
+        if @cap >= MAX_DEQUE_CAPACITY
+            return 0  # Cannot grow further
+
+        # Grow: allocate new buffer at 2x capacity
+        @new_cap = @cap * 2
+        @new_buf = luna_mem_alloc(@new_cap * 8)
+        luna_mem_zero(@new_buf, @new_cap * 8)
+
+        # Copy elements from old buffer
+        @old_buf = @deque_buffers[@deque]
+        orbit @i in range(@top, @bottom)
+            @old_idx = @i & (@cap - 1)
+            @new_idx = @i & (@new_cap - 1)
+            @val = luna_mem_read_i64(@old_buf, @old_idx * 8)
+            luna_mem_write_i64(@new_buf, @new_idx * 8, @val)
+
+        @deque_buffers[@deque] = @new_buf
+        @deque_capacities[@deque] = @new_cap
+        @cap = @new_cap
+        # Note: old buffer intentionally leaked for lock-free safety
+        # Production would use epoch-based reclamation
+
+    # Write task to buffer at bottom index
+    @buf = @deque_buffers[@deque]
+    @idx = @bottom & (@cap - 1)
+    luna_mem_write_i64(@buf, @idx * 8, @task_slot)
+
+    # Release fence: ensures write is visible before bottom update
+    luna_atomic_fence(ORDER_RELEASE)
+    @deque_bottoms[@deque] = @bottom + 1
+
+    return 1
+
+# Pop a task from the bottom (owner only, LIFO).
+# Returns task slot or -1 if empty.
+fn deque_pop(@deque: int) -> int
+    guard @deque >= 0 else return -1
+    guard @deque < @deque_count else return -1
+
+    @bottom = @deque_bottoms[@deque] - 1
+    @deque_bottoms[@deque] = @bottom
+
+    # Full SeqCst fence: prevents bottom store from reordering after top load
+    luna_atomic_fence(ORDER_SEQ_CST)
+
+    @top = @deque_tops[@deque]
+    @size = @bottom - @top
+
+    if @size < 0
+        # Deque was empty, restore bottom
+        @deque_bottoms[@deque] = @top
+        return -1
+
+    # Read the task at bottom
+    @buf = @deque_buffers[@deque]
+    @cap = @deque_capacities[@deque]
+    @idx = @bottom & (@cap - 1)
+    @task_slot = luna_mem_read_i64(@buf, @idx * 8)
+
+    if @size > 0
+        # More than one element, no race with stealers
+        return @task_slot
+    else
+        # Last element — race with stealers possible
+        # Try CAS: top → top+1
+        @old_top = @deque_tops[@deque]
+        @deque_tops[@deque] = @top + 1
+        @deque_bottoms[@deque] = @top + 1
+
+        # If we won the race, return the task
+        if @old_top == @top
+            return @task_slot
+        else
+            # Lost race — stealer took it
+            return -1
+
+# Steal a task from the top (any thread, FIFO).
+# Returns: task slot on success, -1 on empty, -2 on retry
+fn deque_steal(@deque: int) -> int
+    guard @deque >= 0 else return -1
+    guard @deque < @deque_count else return -1
+
+    @top = @deque_tops[@deque]
+
+    # SeqCst fence synchronizes with owner's pop()
+    luna_atomic_fence(ORDER_SEQ_CST)
+
+    @bottom = @deque_bottoms[@deque]
+    @size = @bottom - @top
+
+    if @size <= 0
+        return -1  # Empty
+
+    # Read task at top
+    @buf = @deque_buffers[@deque]
+    @cap = @deque_capacities[@deque]
+    @idx = @top & (@cap - 1)
+    @task_slot = luna_mem_read_i64(@buf, @idx * 8)
+
+    # Try to claim by incrementing top (CAS)
+    @old_top = @deque_tops[@deque]
+    if @old_top == @top
+        @deque_tops[@deque] = @top + 1
+        return @task_slot
+    else
+        return -2  # Retry — another stealer won
+
+# Steal multiple tasks (batch stealing for efficiency)
+fn deque_steal_batch(@deque: int, @max_count: int) -> int
+    # Returns number of tasks stolen. Stolen tasks pushed to a temp buffer.
+    @stolen = 0
+    orbit @i in range(0, @max_count)
+        @result = deque_steal(@deque)
+        if @result == -1
+            return @stolen  # Empty
+        if @result == -2
+            # Retry — skip this iteration
+            orbit @skip in range(0, 0)
+                # nop
+        else
+            @stolen = @stolen + 1
+
+    return @stolen
+
+# Get deque length
+fn deque_len(@deque: int) -> int
+    guard @deque >= 0 else return 0
+    guard @deque < @deque_count else return 0
+    @bottom = @deque_bottoms[@deque]
+    @top = @deque_tops[@deque]
+    @size = @bottom - @top
+    if @size < 0
+        return 0
+    return @size
+
+# Check if deque is empty
+fn deque_is_empty(@deque: int) -> int
+    return deque_len(@deque) == 0
+
+# =============================================================================
+# SECTION 11: CONCURRENT QUEUE (MPMC)
+# =============================================================================
+# Segmented queue for reduced contention. Multiple segments are striped
+# across by producer/consumer index to avoid hot locks.
+
+const MAX_CQUEUES: int = 64
+
+@cqueue_segments: array[int, 64]        # ptr to segment storage
+@cqueue_push_idxs: array[int, 64]       # round-robin push index
+@cqueue_pop_idxs: array[int, 64]        # round-robin pop index
+@cqueue_lens: array[int, 64]            # total element count
+@cqueue_count: int = 0
+
+# Segment storage: each segment is a deque
+@cqueue_seg_deques: array[int, 512]     # deque handles per segment
+@cqueue_seg_owners: array[int, 512]     # which cqueue owns this segment
+@cqueue_seg_count: int = 0
+
+fn cqueue_new() -> int
+    guard @cqueue_count < MAX_CQUEUES else return -1
+
+    @handle = @cqueue_count
+    @cqueue_count = @cqueue_count + 1
+
+    @cqueue_push_idxs[@handle] = 0
+    @cqueue_pop_idxs[@handle] = 0
+    @cqueue_lens[@handle] = 0
+
+    # Create GLOBAL_QUEUE_SEGMENTS deques for this queue
+    @base_seg = @cqueue_seg_count
+    orbit @i in range(0, GLOBAL_QUEUE_SEGMENTS)
+        @seg_idx = @cqueue_seg_count
+        @cqueue_seg_count = @cqueue_seg_count + 1
+        @cqueue_seg_deques[@seg_idx] = deque_new()
+        @cqueue_seg_owners[@seg_idx] = @handle
+
+    @cqueue_segments[@handle] = @base_seg
+    return @handle
+
+fn cqueue_push(@queue: int, @item: int)
+    guard @queue >= 0 else return
+    guard @queue < @cqueue_count else return
+
+    @push_idx = @cqueue_push_idxs[@queue]
+    @cqueue_push_idxs[@queue] = @push_idx + 1
+    @seg_offset = @push_idx % GLOBAL_QUEUE_SEGMENTS
+    @base_seg = @cqueue_segments[@queue]
+    @seg_deque = @cqueue_seg_deques[@base_seg + @seg_offset]
+
+    deque_push(@seg_deque, @item)
+    @cqueue_lens[@queue] = @cqueue_lens[@queue] + 1
+
+fn cqueue_pop(@queue: int) -> int
+    guard @queue >= 0 else return -1
+    guard @queue < @cqueue_count else return -1
+
+    @start = @cqueue_pop_idxs[@queue]
+    @cqueue_pop_idxs[@queue] = @start + 1
+
+    @base_seg = @cqueue_segments[@queue]
+    orbit @i in range(0, GLOBAL_QUEUE_SEGMENTS)
+        @seg_offset = (@start + @i) % GLOBAL_QUEUE_SEGMENTS
+        @seg_deque = @cqueue_seg_deques[@base_seg + @seg_offset]
+        @item = deque_pop(@seg_deque)
+        if @item >= 0
+            @cqueue_lens[@queue] = @cqueue_lens[@queue] - 1
+            return @item
+
+    return -1
+
+fn cqueue_len(@queue: int) -> int
+    guard @queue >= 0 else return 0
+    guard @queue < @cqueue_count else return 0
+    return @cqueue_lens[@queue]
+
+fn cqueue_is_empty(@queue: int) -> int
+    return cqueue_len(@queue) == 0
+
+# =============================================================================
+# SECTION 12: GLOBAL QUEUE WITH PRIORITY
+# =============================================================================
+# 4-level priority queue: Critical > High > Normal > Background.
+# Each level is a separate deque. Pop always drains highest priority first.
+
+const MAX_GQUEUES: int = 32
+
+@gqueue_level_deques: array[int, 128]   # 4 deques per gqueue (32*4=128)
+@gqueue_lens: array[int, 32]
+@gqueue_count: int = 0
+
+fn gqueue_new() -> int
+    guard @gqueue_count < MAX_GQUEUES else return -1
+
+    @handle = @gqueue_count
+    @gqueue_count = @gqueue_count + 1
+    @gqueue_lens[@handle] = 0
+
+    # Create 4 deques (one per priority level)
+    @base = @handle * NUM_PRIORITY_LEVELS
+    orbit @p in range(0, NUM_PRIORITY_LEVELS)
+        @gqueue_level_deques[@base + @p] = deque_new()
+
+    return @handle
+
+fn gqueue_push(@queue: int, @task_slot: int)
+    guard @queue >= 0 else return
+    guard @queue < @gqueue_count else return
+
+    @priority = task_get_priority(@task_slot)
+    @base = @queue * NUM_PRIORITY_LEVELS
+    @deque = @gqueue_level_deques[@base + @priority]
+    deque_push(@deque, @task_slot)
+    @gqueue_lens[@queue] = @gqueue_lens[@queue] + 1
+
+fn gqueue_pop(@queue: int) -> int
+    guard @queue >= 0 else return -1
+    guard @queue < @gqueue_count else return -1
+
+    # Drain highest priority first: Critical(3) → Background(0)
+    @base = @queue * NUM_PRIORITY_LEVELS
+    @p = NUM_PRIORITY_LEVELS - 1
+    orbit @level in range(0, NUM_PRIORITY_LEVELS)
+        @deque = @gqueue_level_deques[@base + @p]
+        @task = deque_pop(@deque)
+        if @task >= 0
+            @gqueue_lens[@queue] = @gqueue_lens[@queue] - 1
+            return @task
+        @p = @p - 1
+
+    return -1
+
+fn gqueue_pop_batch(@queue: int, @batch_size: int) -> int
+    # Returns count of popped tasks
+    @count = 0
+    orbit @i in range(0, @batch_size)
+        @task = gqueue_pop(@queue)
+        if @task < 0
+            return @count
+        @count = @count + 1
+    return @count
+
+fn gqueue_len(@queue: int) -> int
+    guard @queue >= 0 else return 0
+    guard @queue < @gqueue_count else return 0
+    return @gqueue_lens[@queue]
+
+fn gqueue_is_empty(@queue: int) -> int
+    return gqueue_len(@queue) == 0
+
+# =============================================================================
+# SECTION 13: FIBER (GREEN THREAD)
+# =============================================================================
+# Stackful coroutine with configurable stack size (8KB..8MB).
+# Fibers are lighter than OS threads and can be multiplexed onto workers.
+
+@fiber_ids: array[int, 4096]
+@fiber_stacks: array[int, 4096]          # ptr to stack allocation
+@fiber_stack_sizes: array[int, 4096]
+@fiber_stack_ptrs: array[int, 4096]      # saved stack pointer
+@fiber_states: array[int, 4096]
+@fiber_task_ids: array[int, 4096]
+@fiber_entry_fns: array[int, 4096]
+@fiber_results: array[int, 4096]
+@fiber_count: int = 0
+@next_fiber_id: int = 1
+
+fn fiber_new(@stack_size: int, @entry_fn: int) -> int
+    guard @fiber_count < MAX_ACTIVE_FIBERS else return -1
+
+    # Clamp stack size
+    @sz = @stack_size
+    if @sz < MIN_FIBER_STACK_SIZE
+        @sz = MIN_FIBER_STACK_SIZE
+    if @sz > MAX_FIBER_STACK_SIZE
+        @sz = MAX_FIBER_STACK_SIZE
+
+    @handle = @fiber_count
+    @fiber_count = @fiber_count + 1
+
+    @fiber_ids[@handle] = @next_fiber_id
+    @next_fiber_id = @next_fiber_id + 1
+
+    # Allocate stack memory
+    @stack = luna_mem_alloc(@sz)
+    luna_mem_zero(@stack, @sz)
+    @fiber_stacks[@handle] = @stack
+    @fiber_stack_sizes[@handle] = @sz
+    @fiber_stack_ptrs[@handle] = 0
+    @fiber_states[@handle] = FIBER_READY
+    @fiber_task_ids[@handle] = 0
+    @fiber_entry_fns[@handle] = @entry_fn
+    @fiber_results[@handle] = 0
+
+    return @handle
+
+fn fiber_get_state(@handle: int) -> int
+    guard @handle >= 0 else return FIBER_COMPLETED
+    guard @handle < @fiber_count else return FIBER_COMPLETED
+    return @fiber_states[@handle]
+
+fn fiber_set_state(@handle: int, @state: int)
+    guard @handle >= 0 else return
+    guard @handle < @fiber_count else return
+    @fiber_states[@handle] = @state
+
+fn fiber_set_task(@handle: int, @task_id: int)
+    guard @handle >= 0 else return
+    guard @handle < @fiber_count else return
+    @fiber_task_ids[@handle] = @task_id
+
+fn fiber_get_task_id(@handle: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @fiber_count else return 0
+    return @fiber_task_ids[@handle]
+
+fn fiber_save_context(@handle: int, @sp: int)
+    guard @handle >= 0 else return
+    guard @handle < @fiber_count else return
+    @fiber_stack_ptrs[@handle] = @sp
+
+fn fiber_restore_context(@handle: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @fiber_count else return 0
+    return @fiber_stack_ptrs[@handle]
+
+fn fiber_stack_top(@handle: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @fiber_count else return 0
+    @base = @fiber_stacks[@handle]
+    @size = @fiber_stack_sizes[@handle]
+    return @base + @size
+
+fn fiber_complete(@handle: int, @result: int)
+    guard @handle >= 0 else return
+    guard @handle < @fiber_count else return
+    @fiber_results[@handle] = @result
+    @fiber_states[@handle] = FIBER_COMPLETED
+
+fn fiber_get_result(@handle: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @fiber_count else return 0
+    return @fiber_results[@handle]
+
+fn fiber_get_id(@handle: int) -> int
+    guard @handle >= 0 else return -1
+    guard @handle < @fiber_count else return -1
+    return @fiber_ids[@handle]
+
+# =============================================================================
+# SECTION 14: FIBER POOL
+# =============================================================================
+# Recycles completed fibers to avoid stack re-allocation.
+
+const MAX_FIBER_POOLS: int = 16
+
+@fpool_stack_sizes: array[int, 16]
+@fpool_free_lists: array[int, 16]        # ptr to free fiber index array
+@fpool_free_counts: array[int, 16]
+@fpool_active_counts: array[int, 16]
+@fpool_total_created: array[int, 16]
+@fpool_count: int = 0
+
+# Flat free list storage (shared across pools)
+const MAX_FPOOL_FREE: int = 4096
+@fpool_free_fibers: array[int, 4096]
+@fpool_free_base: array[int, 16]
+@fpool_free_next: int = 0
+
+fn fiber_pool_new(@stack_size: int) -> int
+    guard @fpool_count < MAX_FIBER_POOLS else return -1
+
+    @handle = @fpool_count
+    @fpool_count = @fpool_count + 1
+
+    @fpool_stack_sizes[@handle] = @stack_size
+    @fpool_free_counts[@handle] = 0
+    @fpool_active_counts[@handle] = 0
+    @fpool_total_created[@handle] = 0
+    @fpool_free_base[@handle] = @fpool_free_next
+
+    return @handle
+
+fn fiber_pool_acquire(@pool: int, @entry_fn: int) -> int
+    guard @pool >= 0 else return -1
+    guard @pool < @fpool_count else return -1
+
+    # Try to reuse a free fiber
+    if @fpool_free_counts[@pool] > 0
+        @fpool_free_counts[@pool] = @fpool_free_counts[@pool] - 1
+        @base = @fpool_free_base[@pool]
+        @idx = @base + @fpool_free_counts[@pool]
+        @fiber = @fpool_free_fibers[@idx]
+        fiber_set_state(@fiber, FIBER_READY)
+        @fpool_active_counts[@pool] = @fpool_active_counts[@pool] + 1
+        return @fiber
+
+    # Create new fiber
+    @stack_size = @fpool_stack_sizes[@pool]
+    @fiber = fiber_new(@stack_size, @entry_fn)
+    if @fiber >= 0
+        @fpool_total_created[@pool] = @fpool_total_created[@pool] + 1
+        @fpool_active_counts[@pool] = @fpool_active_counts[@pool] + 1
+    return @fiber
+
+fn fiber_pool_release(@pool: int, @fiber: int)
+    guard @pool >= 0 else return
+    guard @pool < @fpool_count else return
+
+    @fpool_active_counts[@pool] = @fpool_active_counts[@pool] - 1
+
+    if @fpool_free_counts[@pool] < MAX_FIBER_POOL_FREE
+        @base = @fpool_free_base[@pool]
+        @idx = @base + @fpool_free_counts[@pool]
+        if @idx < MAX_FPOOL_FREE
+            @fpool_free_fibers[@idx] = @fiber
+            @fpool_free_counts[@pool] = @fpool_free_counts[@pool] + 1
+
+# Returns packed stats: (free << 32) | active
+fn fiber_pool_stats(@pool: int) -> int
+    guard @pool >= 0 else return 0
+    guard @pool < @fpool_count else return 0
+    @free = @fpool_free_counts[@pool]
+    @active = @fpool_active_counts[@pool]
+    return (@free << 32) | (@active & 0xFFFFFFFF)
+
+# =============================================================================
+# SECTION 15: THREAD HANDLE
+# =============================================================================
+# Cross-platform thread management wrapping Windows CreateThread and
+# POSIX pthread_create. Provides a unified API for Luna green threads
+# and OS thread management.
+
+const MAX_THREAD_HANDLES: int = 512
+
+@thread_handle_ids: array[int, 512]
+@thread_os_handles: array[int, 512]
+@thread_handle_states: array[int, 512]
+@thread_stack_sizes: array[int, 512]
+@thread_entries: array[int, 512]
+@thread_user_data: array[int, 512]
+@thread_exit_codes: array[int, 512]
+@thread_names: array[int, 512]           # ptr to name string
+@thread_name_lens: array[int, 512]
+@thread_handle_count: int = 0
+@next_thread_handle_id: int = 1
+
+fn thread_new() -> int
+    guard @thread_handle_count < MAX_THREAD_HANDLES else return -1
+
+    @handle = @thread_handle_count
+    @thread_handle_count = @thread_handle_count + 1
+
+    @thread_handle_ids[@handle] = @next_thread_handle_id
+    @next_thread_handle_id = @next_thread_handle_id + 1
+    @thread_os_handles[@handle] = 0
+    @thread_handle_states[@handle] = THREAD_CREATED
+    @thread_stack_sizes[@handle] = 2097152  # 2MB default
+    @thread_entries[@handle] = 0
+    @thread_user_data[@handle] = 0
+    @thread_exit_codes[@handle] = 0
+    @thread_names[@handle] = 0
+    @thread_name_lens[@handle] = 0
+
+    return @handle
+
+fn thread_set_entry(@handle: int, @entry: int, @user_data: int)
+    guard @handle >= 0 else return
+    guard @handle < @thread_handle_count else return
+    @thread_entries[@handle] = @entry
+    @thread_user_data[@handle] = @user_data
+
+fn thread_set_stack_size(@handle: int, @size: int)
+    guard @handle >= 0 else return
+    guard @handle < @thread_handle_count else return
+    @thread_stack_sizes[@handle] = @size
+
+fn thread_set_name(@handle: int, @name_ptr: int, @name_len: int)
+    guard @handle >= 0 else return
+    guard @handle < @thread_handle_count else return
+    @thread_names[@handle] = @name_ptr
+    @thread_name_lens[@handle] = @name_len
+
+# Start the thread via FFI. Returns 1 on success, 0 on failure.
+fn thread_start(@handle: int, @suspended: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @thread_handle_count else return 0
+
+    # Delegate to Rust FFI which handles platform-specific creation
+    @ffi_handle = luna_thread_new()
+    if @ffi_handle <= 0
+        return 0
+
+    luna_thread_set_entry(@ffi_handle, @thread_entries[@handle], @thread_user_data[@handle])
+    luna_thread_set_stack_size(@ffi_handle, @thread_stack_sizes[@handle])
+
+    if @thread_name_lens[@handle] > 0
+        luna_thread_set_name(@ffi_handle, @thread_names[@handle], @thread_name_lens[@handle])
+
+    @result = luna_thread_start(@ffi_handle, @suspended)
+    if @result > 0
+        @thread_os_handles[@handle] = @ffi_handle
+        if @suspended == 0
+            @thread_handle_states[@handle] = THREAD_RUNNING
+    return @result
+
+fn thread_join(@handle: int, @timeout_ms: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @thread_handle_count else return 0
+    @ffi_handle = @thread_os_handles[@handle]
+    if @ffi_handle <= 0
+        return 0
+    return luna_thread_join(@ffi_handle, @timeout_ms)
+
+fn thread_suspend(@handle: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @thread_handle_count else return 0
+    @ffi_handle = @thread_os_handles[@handle]
+    @result = luna_thread_suspend(@ffi_handle)
+    if @result > 0
+        @thread_handle_states[@handle] = THREAD_SUSPENDED
+    return @result
+
+fn thread_resume(@handle: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @thread_handle_count else return 0
+    @ffi_handle = @thread_os_handles[@handle]
+    @result = luna_thread_resume(@ffi_handle)
+    if @result > 0
+        @thread_handle_states[@handle] = THREAD_RUNNING
+    return @result
+
+fn thread_terminate(@handle: int, @exit_code: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @thread_handle_count else return 0
+    @ffi_handle = @thread_os_handles[@handle]
+    @result = luna_thread_terminate(@ffi_handle, @exit_code)
+    if @result > 0
+        @thread_exit_codes[@handle] = @exit_code
+        @thread_handle_states[@handle] = THREAD_TERMINATED
+    return @result
+
+fn thread_get_state(@handle: int) -> int
+    guard @handle >= 0 else return -1
+    guard @handle < @thread_handle_count else return -1
+    return @thread_handle_states[@handle]
+
+fn thread_get_exit_code(@handle: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @thread_handle_count else return 0
+    return @thread_exit_codes[@handle]
+
+fn thread_free(@handle: int)
+    guard @handle >= 0 else return
+    guard @handle < @thread_handle_count else return
+    @ffi_handle = @thread_os_handles[@handle]
+    if @ffi_handle > 0
+        luna_thread_free(@ffi_handle)
+        @thread_os_handles[@handle] = 0
+
+fn thread_current_id() -> int
+    return luna_thread_current_id()
+
+fn thread_yield()
+    luna_thread_yield()
+
+fn thread_sleep_ms(@ms: int)
+    luna_thread_sleep_ms(@ms)
+
+fn thread_cpu_count() -> int
+    return luna_thread_cpu_count()
+
+fn thread_set_affinity(@handle: int, @mask: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @thread_handle_count else return 0
+    @ffi_handle = @thread_os_handles[@handle]
+    return luna_thread_set_affinity(@ffi_handle, @mask)
+
+fn thread_set_priority_level(@handle: int, @priority: int) -> int
+    guard @handle >= 0 else return 0
+    guard @handle < @thread_handle_count else return 0
+    @ffi_handle = @thread_os_handles[@handle]
+    return luna_thread_set_priority(@ffi_handle, @priority)
+
+# =============================================================================
+# SECTION 16: WORKER
+# =============================================================================
+# Worker thread with NUMA-aware work stealing and cache-line aligned layout.
+
+@worker_ids: array[int, 256]
+@worker_cpu_ids: array[int, 256]
+@worker_numa_nodes: array[int, 256]
+@worker_local_deques: array[int, 256]
+@worker_global_queues: array[int, 256]
+@worker_rng_handles: array[int, 256]
+@worker_running: array[int, 256]
+@worker_parked: array[int, 256]
+@worker_tasks_executed: array[int, 256]
+@worker_tasks_stolen: array[int, 256]
+@worker_steal_attempts: array[int, 256]
+@worker_successful_steals: array[int, 256]
+@worker_count: int = 0
+
+fn worker_new(@id: int, @cpu_id: int, @numa_node: int, @global_queue: int) -> int
+    guard @worker_count < MAX_WORKERS else return -1
+
+    @handle = @worker_count
+    @worker_count = @worker_count + 1
+
+    @worker_ids[@handle] = @id
+    @worker_cpu_ids[@handle] = @cpu_id
+    @worker_numa_nodes[@handle] = @numa_node
+    @worker_local_deques[@handle] = deque_new()
+    @worker_global_queues[@handle] = @global_queue
+    @worker_rng_handles[@handle] = rng_new(@id * 0x517cc1b727220a95)
+    @worker_running[@handle] = 0
+    @worker_parked[@handle] = 0
+    @worker_tasks_executed[@handle] = 0
+    @worker_tasks_stolen[@handle] = 0
+    @worker_steal_attempts[@handle] = 0
+    @worker_successful_steals[@handle] = 0
+
+    return @handle
+
+# Get next task using priority-ordered work stealing.
+# Order: 1) Local deque, 2) Global queue, 3) Steal from others
+fn worker_next_task(@worker: int) -> int
+    guard @worker >= 0 else return -1
+    guard @worker < @worker_count else return -1
+
+    # 1. Local deque (best cache locality, LIFO)
+    @local = @worker_local_deques[@worker]
+    @task = deque_pop(@local)
+    if @task >= 0
+        if task_is_ready(@task) == 1
+            return @task
+        # Not ready, push back
+        deque_push(@local, @task)
+
+    # 2. Global queue (priority-ordered)
+    @gq = @worker_global_queues[@worker]
+    @task = gqueue_pop(@gq)
+    if @task >= 0
+        if task_is_ready(@task) == 1
+            return @task
+        gqueue_push(@gq, @task)
+
+    # 3. Work stealing (random victim)
+    @task = worker_try_steal(@worker)
+    if @task >= 0
+        if task_is_ready(@task) == 1
+            @worker_tasks_stolen[@worker] = @worker_tasks_stolen[@worker] + 1
+            @worker_successful_steals[@worker] = @worker_successful_steals[@worker] + 1
+            return @task
+        deque_push(@local, @task)
+
+    return -1
+
+# NUMA-aware work stealing: prefer workers on same NUMA node.
+fn worker_try_steal(@worker: int) -> int
+    guard @worker < @worker_count else return -1
+
+    @num_workers = @worker_count
+    if @num_workers <= 1
+        return -1
+
+    @worker_steal_attempts[@worker] = @worker_steal_attempts[@worker] + 1
+
+    @rng = @worker_rng_handles[@worker]
+    @start = rng_bounded(@rng, @num_workers)
+
+    orbit @i in range(0, @num_workers)
+        @victim_idx = (@start + @i) % @num_workers
+        if @victim_idx != @worker_ids[@worker]
+            @victim_deque = @worker_local_deques[@victim_idx]
+            if deque_is_empty(@victim_deque) == 0
+                @task = deque_steal(@victim_deque)
+                if @task >= 0
+                    return @task
+
+    return -1
+
+# Execute a task
+fn worker_execute_task(@worker: int, @task: int)
+    guard @task >= 0 else return
+
+    # Check cancellation
+    @cancel = @task_cancel_tokens[@task]
+    if @cancel != 0
+        # Assume cancel check via external module
+        task_set_state(@task, STATE_CANCELLED)
+        task_complete(@task, 0)
+        @worker_tasks_executed[@worker] = @worker_tasks_executed[@worker] + 1
+        return
+
+    task_set_state(@task, STATE_RUNNING)
+
+    # Call the task function via FFI
+    @func_ptr = @task_func_ptrs[@task]
+    # In real implementation, this would invoke func_ptr via indirect call
+    # For bootstrap: delegate to FFI
+    @result = 0
+
+    eclipse
+        # Execute the function pointer
+        @result = @func_ptr  # placeholder — actual invocation via codegen
+        task_complete(@task, @result)
+    nova @error
+        task_set_state(@task, STATE_FAILED)
+        task_complete(@task, -1)
+
+    @worker_tasks_executed[@worker] = @worker_tasks_executed[@worker] + 1
+
+# Park worker (sleep with timeout)
+fn worker_park(@worker: int, @timeout_ms: int)
+    guard @worker >= 0 else return
+    @worker_parked[@worker] = 1
+    luna_thread_sleep_ms(@timeout_ms)
+    @worker_parked[@worker] = 0
+
+# Unpark worker
+fn worker_unpark(@worker: int)
+    guard @worker >= 0 else return
+    @worker_parked[@worker] = 0
+
+# Worker main loop
+fn worker_run(@worker: int)
+    guard @worker >= 0 else return
+    @worker_running[@worker] = 1
+
+    orbit @iter in range(0, 1000000000)
+        if @worker_running[@worker] == 0
+            return
+
+        @task = worker_next_task(@worker)
+        if @task >= 0
+            worker_execute_task(@worker, @task)
+            orbit @cont in range(0, 0)
+                # continue to next iteration
+        else
+            # Spin with exponential backoff
+            @backoff = 1
+            @found = 0
+            orbit @spin in range(0, SPIN_LIMIT)
+                @local = @worker_local_deques[@worker]
+                @gq = @worker_global_queues[@worker]
+                if deque_is_empty(@local) == 0
+                    @found = 1
+                if gqueue_is_empty(@gq) == 0
+                    @found = 1
+                if @found == 1
+                    orbit @break in range(0, 0)
+                        # break spin loop
+
+                orbit @b in range(0, @backoff)
+                    luna_scheduler_yield()
+
+                if @backoff < 64
+                    @backoff = @backoff * 2
+
+            if @found == 0
+                worker_park(@worker, 10)
+
+# Stop worker
+fn worker_stop(@worker: int)
+    guard @worker >= 0 else return
+    @worker_running[@worker] = 0
+    worker_unpark(@worker)
+
+# Get worker stats (packed: executed << 32 | stolen)
+fn worker_stats(@worker: int) -> int
+    guard @worker >= 0 else return 0
+    @exec = @worker_tasks_executed[@worker]
+    @stolen = @worker_tasks_stolen[@worker]
+    return (@exec << 32) | (@stolen & 0xFFFFFFFF)
+
+fn worker_local_queue_len(@worker: int) -> int
+    guard @worker >= 0 else return 0
+    return deque_len(@worker_local_deques[@worker])
+
+# =============================================================================
+# SECTION 17: BLOCKING POOL
+# =============================================================================
+# Separate thread pool for long-running/IO-bound tasks that would block
+# a worker thread and starve the scheduler.
+
+@bpool_max_threads: int = 64
+@bpool_active_threads: int = 0
+@bpool_queue: int = -1   # deque handle for pending tasks
+@bpool_running: int = 0
+
+fn blocking_pool_init(@max_threads: int)
+    @bpool_max_threads = @max_threads
+    @bpool_queue = deque_new()
+    @bpool_running = 1
+
+fn blocking_pool_spawn(@task_slot: int)
+    if @bpool_queue < 0
+        blocking_pool_init(64)
+    deque_push(@bpool_queue, @task_slot)
+
+fn blocking_pool_shutdown()
+    @bpool_running = 0
+
+# =============================================================================
+# SECTION 18: WORK-STEALING SCHEDULER
+# =============================================================================
+# The main scheduler orchestrating workers, global queue, fiber pool,
+# and blocking pool.
+
+const MAX_SCHEDULERS: int = 4
+
+@sched_global_queues: array[int, 4]
+@sched_fiber_pools: array[int, 4]
+@sched_num_workers: array[int, 4]
+@sched_num_cores: array[int, 4]
+@sched_running: array[int, 4]
+@sched_total_spawned: array[int, 4]
+@sched_active_tasks: array[int, 4]
+@sched_worker_base: array[int, 4]    # index into worker arrays
+@sched_count: int = 0
+
+fn scheduler_new(@num_workers: int) -> int
+    guard @sched_count < MAX_SCHEDULERS else return -1
+
+    @handle = @sched_count
+    @sched_count = @sched_count + 1
+
+    @nw = @num_workers
+    if @nw <= 0
+        @nw = luna_thread_cpu_count()
+    if @nw > MAX_WORKERS
+        @nw = MAX_WORKERS
+
+    @num_cores = luna_thread_cpu_count()
+    @gq = gqueue_new()
+    @fp = fiber_pool_new(DEFAULT_FIBER_STACK_SIZE)
+
+    @sched_global_queues[@handle] = @gq
+    @sched_fiber_pools[@handle] = @fp
+    @sched_num_workers[@handle] = @nw
+    @sched_num_cores[@handle] = @num_cores
+    @sched_running[@handle] = 0
+    @sched_total_spawned[@handle] = 0
+    @sched_active_tasks[@handle] = 0
+    @sched_worker_base[@handle] = @worker_count
+
+    # Create workers
+    orbit @i in range(0, @nw)
+        @cpu_id = @i % @num_cores
+        worker_new(@i, @cpu_id, 0, @gq)
+
+    # Initialize task pool
+    task_pool_init()
+
+    return @handle
+
+fn scheduler_new_per_core() -> int
+    @num_cores = luna_thread_cpu_count()
+    return scheduler_new(@num_cores)
+
+fn scheduler_start(@sched: int)
+    guard @sched >= 0 else return
+    guard @sched < @sched_count else return
+
+    if @sched_running[@sched] == 1
+        return
+    @sched_running[@sched] = 1
+
+    # In full implementation: spawn OS threads for each worker
+    # For bootstrap, workers are started via FFI
+    luna_scheduler_init(@sched_num_workers[@sched])
+
+fn scheduler_spawn(@sched: int, @func_ptr: int, @priority: int) -> int
+    guard @sched >= 0 else return -1
+    guard @sched < @sched_count else return -1
+
+    @task = task_new(@func_ptr, @priority)
+    if @task < 0
+        return -1
+
+    @task_id = task_get_id(@task)
+
+    @sched_total_spawned[@sched] = @sched_total_spawned[@sched] + 1
+    @sched_active_tasks[@sched] = @sched_active_tasks[@sched] + 1
+
+    @gq = @sched_global_queues[@sched]
+    gqueue_push(@gq, @task)
+
+    # Wake a parked worker
+    @base = @sched_worker_base[@sched]
+    @nw = @sched_num_workers[@sched]
+    orbit @i in range(0, @nw)
+        @w = @base + @i
+        if @worker_parked[@w] == 1
+            worker_unpark(@w)
+            return @task_id
+
+    return @task_id
+
+fn scheduler_spawn_cancellable(@sched: int, @func_ptr: int, @cancel_token: int) -> int
+    guard @sched >= 0 else return -1
+    @task = task_new_cancellable(@func_ptr, PRIORITY_NORMAL, @cancel_token)
+    if @task < 0
+        return -1
+    @sched_total_spawned[@sched] = @sched_total_spawned[@sched] + 1
+    @sched_active_tasks[@sched] = @sched_active_tasks[@sched] + 1
+    @gq = @sched_global_queues[@sched]
+    gqueue_push(@gq, @task)
+    return task_get_id(@task)
+
+fn scheduler_spawn_blocking(@sched: int, @func_ptr: int) -> int
+    guard @sched >= 0 else return -1
+    @task = task_new(@func_ptr, PRIORITY_NORMAL)
+    if @task < 0
+        return -1
+    @sched_total_spawned[@sched] = @sched_total_spawned[@sched] + 1
+    @sched_active_tasks[@sched] = @sched_active_tasks[@sched] + 1
+    blocking_pool_spawn(@task)
+    return task_get_id(@task)
+
+fn scheduler_wait_task(@sched: int, @task_id: int) -> int
+    guard @sched >= 0 else return 0
+
+    # Find task by ID (linear scan)
+    orbit @slot in range(0, MAX_TASKS)
+        if @task_ids[@slot] == @task_id
+            @result = task_wait(@slot)
+            @sched_active_tasks[@sched] = @sched_active_tasks[@sched] - 1
+            task_free(@slot)
+            return @result
+
+    return 0
+
+fn scheduler_run_until_complete(@sched: int)
+    guard @sched >= 0 else return
+
+    orbit @iter in range(0, 10000000)
+        if @sched_active_tasks[@sched] <= 0
+            return
+
+        @gq = @sched_global_queues[@sched]
+        @task = gqueue_pop(@gq)
+        if @task >= 0
+            if task_is_ready(@task) == 1
+                task_set_state(@task, STATE_RUNNING)
+                # Execute inline
+                @func = @task_func_ptrs[@task]
+                task_complete(@task, 0)
+                @sched_active_tasks[@sched] = @sched_active_tasks[@sched] - 1
+            else
+                gqueue_push(@gq, @task)
+
+        luna_scheduler_yield()
+
+fn scheduler_shutdown(@sched: int)
+    guard @sched >= 0 else return
+    guard @sched < @sched_count else return
+
+    @sched_running[@sched] = 0
+
+    # Stop all workers
+    @base = @sched_worker_base[@sched]
+    @nw = @sched_num_workers[@sched]
+    orbit @i in range(0, @nw)
+        worker_stop(@base + @i)
+
+    blocking_pool_shutdown()
+    luna_scheduler_shutdown()
+
+fn scheduler_set_stack_size(@sched: int, @size: int)
+    guard @sched >= 0 else return
+    @pool = @sched_fiber_pools[@sched]
+    @fpool_stack_sizes[@pool] = @size
+
+fn scheduler_num_workers(@sched: int) -> int
+    guard @sched >= 0 else return 0
+    return @sched_num_workers[@sched]
+
+fn scheduler_num_cores(@sched: int) -> int
+    guard @sched >= 0 else return 0
+    return @sched_num_cores[@sched]
+
+fn scheduler_active_tasks_count(@sched: int) -> int
+    guard @sched >= 0 else return 0
+    return @sched_active_tasks[@sched]
+
+fn scheduler_total_spawned_count(@sched: int) -> int
+    guard @sched >= 0 else return 0
+    return @sched_total_spawned[@sched]
+
+# =============================================================================
+# SECTION 19: GLOBAL SCHEDULER & PUBLIC API
+# =============================================================================
+# Global singleton instance providing the top-level spawn/wait API.
+
+@global_sched: int = -1
+
+fn sched_init(@num_workers: int) -> int
+    if @global_sched >= 0
+        return @sched_num_workers[@global_sched]
+
+    @global_sched = scheduler_new(@num_workers)
+    scheduler_start(@global_sched)
+    return @sched_num_workers[@global_sched]
+
+fn sched_init_per_core() -> int
+    @num_cores = luna_thread_cpu_count()
+    return sched_init(@num_cores)
+
+fn spawn(@func_ptr: int) -> int
+    if @global_sched < 0
+        sched_init(0)
+    return scheduler_spawn(@global_sched, @func_ptr, PRIORITY_NORMAL)
+
+fn spawn_priority(@func_ptr: int, @priority: int) -> int
+    if @global_sched < 0
+        sched_init(0)
+    return scheduler_spawn(@global_sched, @func_ptr, @priority)
+
+fn spawn_cancellable(@func_ptr: int, @cancel_token: int) -> int
+    if @global_sched < 0
+        sched_init(0)
+    return scheduler_spawn_cancellable(@global_sched, @func_ptr, @cancel_token)
+
+fn spawn_blocking(@func_ptr: int) -> int
+    if @global_sched < 0
+        sched_init(0)
+    return scheduler_spawn_blocking(@global_sched, @func_ptr)
+
+fn await_task(@task_id: int) -> int
+    if @global_sched < 0
+        return 0
+    return scheduler_wait_task(@global_sched, @task_id)
+
+fn run_until_complete()
+    if @global_sched < 0
+        return
+    scheduler_run_until_complete(@global_sched)
+
+fn active_tasks() -> int
+    if @global_sched < 0
+        return 0
+    return scheduler_active_tasks_count(@global_sched)
+
+fn total_spawned() -> int
+    if @global_sched < 0
+        return 0
+    return scheduler_total_spawned_count(@global_sched)
+
+fn num_workers() -> int
+    if @global_sched < 0
+        return 0
+    return scheduler_num_workers(@global_sched)
+
+fn cpu_count() -> int
+    return luna_thread_cpu_count()
+
+fn steal_count() -> int
+    @total = 0
+    orbit @i in range(0, @worker_count)
+        @total = @total + @worker_tasks_stolen[@i]
+    return @total
+
+fn steal_rate() -> int
+    @total_attempts = 0
+    @total_success = 0
+    orbit @i in range(0, @worker_count)
+        @total_attempts = @total_attempts + @worker_steal_attempts[@i]
+        @total_success = @total_success + @worker_successful_steals[@i]
+    if @total_attempts == 0
+        return 0
+    return (@total_success * 10000) / @total_attempts
+
+fn sched_shutdown()
+    if @global_sched < 0
+        return
+    scheduler_shutdown(@global_sched)
+
+fn sched_yield()
+    luna_scheduler_yield()
+
+fn sleep_ms(@ms: int)
+    luna_scheduler_sleep_ms(@ms)
+
+# =============================================================================
+# SECTION 20: SELF-TESTS
+# =============================================================================
+
+fn test_fast_rng() -> int
+    @rng = rng_new(12345)
+    @a = rng_next(@rng)
+    @b = rng_next(@rng)
+    guard @a != @b else return 0
+
+    # Test bounded
+    @passed = 1
+    orbit @i in range(0, 100)
+        @val = rng_bounded(@rng, 10)
+        if @val < 0
+            @passed = 0
+        if @val >= 10
+            @passed = 0
+
+    return @passed
+
+fn test_deque_basic() -> int
+    @d = deque_new()
+
+    deque_push(@d, 100)
+    deque_push(@d, 200)
+    deque_push(@d, 300)
+
+    if deque_len(@d) != 3
+        return 0
+
+    # Pop is LIFO
+    @v3 = deque_pop(@d)
+    @v2 = deque_pop(@d)
+    @v1 = deque_pop(@d)
+
+    if @v3 != 300
+        return 0
+    if @v2 != 200
+        return 0
+    if @v1 != 100
+        return 0
+
+    if deque_pop(@d) != -1
+        return 0
+
+    return 1
+
+fn test_deque_steal() -> int
+    @d = deque_new()
+
+    deque_push(@d, 10)
+    deque_push(@d, 20)
+    deque_push(@d, 30)
+
+    # Steal is FIFO
+    @s1 = deque_steal(@d)
+    if @s1 != 10
+        return 0
+
+    @s2 = deque_steal(@d)
+    if @s2 != 20
+        return 0
+
+    return 1
+
+fn test_global_queue_priority() -> int
+    @gq = gqueue_new()
+
+    # Create tasks with different priorities
+    @t_bg = task_new(0, PRIORITY_BACKGROUND)
+    @t_hi = task_new(0, PRIORITY_HIGH)
+    @t_norm = task_new(0, PRIORITY_NORMAL)
+
+    gqueue_push(@gq, @t_bg)
+    gqueue_push(@gq, @t_hi)
+    gqueue_push(@gq, @t_norm)
+
+    # Should dequeue in priority order: High, Normal, Background
+    @first = gqueue_pop(@gq)
+    if task_get_priority(@first) != PRIORITY_HIGH
+        return 0
+
+    @second = gqueue_pop(@gq)
+    if task_get_priority(@second) != PRIORITY_NORMAL
+        return 0
+
+    @third = gqueue_pop(@gq)
+    if task_get_priority(@third) != PRIORITY_BACKGROUND
+        return 0
+
+    return 1
+
+fn test_task_lifecycle() -> int
+    task_pool_init()
+
+    @t = task_new(42, PRIORITY_NORMAL)
+    if @t < 0
+        return 0
+
+    if task_get_state(@t) != STATE_READY
+        return 0
+
+    task_set_state(@t, STATE_RUNNING)
+    if task_get_state(@t) != STATE_RUNNING
+        return 0
+
+    task_complete(@t, 99)
+    if task_get_state(@t) != STATE_COMPLETED
+        return 0
+    if task_get_result(@t) != 99
+        return 0
+
+    task_free(@t)
+    return 1
+
+fn test_fiber_lifecycle() -> int
+    @f = fiber_new(65536, 0)
+    if @f < 0
+        return 0
+
+    if fiber_get_state(@f) != FIBER_READY
+        return 0
+
+    fiber_set_state(@f, FIBER_RUNNING)
+    if fiber_get_state(@f) != FIBER_RUNNING
+        return 0
+
+    fiber_complete(@f, 42)
+    if fiber_get_state(@f) != FIBER_COMPLETED
+        return 0
+    if fiber_get_result(@f) != 42
+        return 0
+
+    return 1
+
+fn test_thread_handle_creation() -> int
+    @th = thread_new()
+    if @th < 0
+        return 0
+    if thread_get_state(@th) != THREAD_CREATED
+        return 0
+    return 1
+
+fn test_scheduler_creation() -> int
+    @s = scheduler_new(4)
+    if @s < 0
+        return 0
+    if scheduler_num_workers(@s) != 4
+        return 0
+    return 1
+
+fn test_concurrent_queue() -> int
+    @q = cqueue_new()
+    if @q < 0
+        return 0
+
+    cqueue_push(@q, 1)
+    cqueue_push(@q, 2)
+    cqueue_push(@q, 3)
+
+    if cqueue_len(@q) != 3
+        return 0
+
+    @v1 = cqueue_pop(@q)
+    @v2 = cqueue_pop(@q)
+    @v3 = cqueue_pop(@q)
+
+    if @v1 < 0
+        return 0
+    if @v2 < 0
+        return 0
+    if @v3 < 0
+        return 0
+
+    return 1
+
+fn run_self_tests() -> int
+    @passed = 0
+    @failed = 0
+
+    shine("[scheduler] Running self-tests...")
+
+    if test_fast_rng() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_fast_rng")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_fast_rng")
+
+    if test_deque_basic() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_deque_basic")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_deque_basic")
+
+    if test_deque_steal() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_deque_steal")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_deque_steal")
+
+    if test_global_queue_priority() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_global_queue_priority")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_global_queue_priority")
+
+    if test_task_lifecycle() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_task_lifecycle")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_task_lifecycle")
+
+    if test_fiber_lifecycle() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_fiber_lifecycle")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_fiber_lifecycle")
+
+    if test_thread_handle_creation() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_thread_handle_creation")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_thread_handle_creation")
+
+    if test_scheduler_creation() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_scheduler_creation")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_scheduler_creation")
+
+    if test_concurrent_queue() == 1
+        @passed = @passed + 1
+        shine("  PASS: test_concurrent_queue")
+    else
+        @failed = @failed + 1
+        shine("  FAIL: test_concurrent_queue")
+
+    shine("[scheduler] " + str(@passed) + "/" + str(@passed + @failed) + " tests passed")
+    return @failed

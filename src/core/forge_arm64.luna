@@ -1,0 +1,1113 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Forge — AArch64 (A64) Instruction Encoder (v0.1, phase L1)
+# =============================================================================
+# "If forge.luna is the floor on x86, forge_arm64.luna is the floor on silicon
+#  wherever the wind blows RISC — M-series Macs, Graviton, Raspberry Pi 4/5,
+#  and Windows-on-ARM laptops."
+#
+# Sister file to src/core/forge.luna.  We share the `Forge` state struct, the
+# symbol / relocation tables, and the low-level byte emitters (emit_u8 ..
+# emit_u64).  The difference: every AArch64 instruction is a fixed 32-bit
+# word, little-endian.  Encoding is therefore "compose a u32, emit it" rather
+# than x86's REX / ModR/M / SIB tango.
+#
+# # Scope
+#
+# This file owns *only* AArch64 encoding.  It does NOT own:
+#   * the Forge struct itself               — forge.luna
+#   * symbol/label/relocation management    — forge.luna
+#   * ELF / Mach-O / PE container writers   — forge_{elf,pe,macho}.luna
+#   * register allocation or lowering       — titan_opt.luna, lower.luna
+#
+# # Target platforms
+#
+#   * Apple Silicon (M1/M2/M3) — Mach-O, page-aligned W^X (thread-jit hack)
+#   * AWS Graviton 2/3         — Linux ELF, baseline ARMv8.2-A
+#   * Raspberry Pi 4 / 5       — Linux ELF, ARMv8-A (Cortex-A72/A76)
+#   * Windows-on-ARM (Surface) — PE32+ ARM64, MSVC ABI
+#
+# # ABI notes (shared across all four platforms)
+#
+#   * X0..X7   — argument / return registers (first 8 args, return in X0/X1)
+#   * X8       — indirect-result / syscall number on Linux
+#   * X9..X15  — caller-saved scratch
+#   * X16, X17 — IP0/IP1 — reserved for linker veneers, long-branch trampolines
+#   * X18      — platform register (TLS on Darwin/Windows — do not touch)
+#   * X19..X28 — callee-saved
+#   * X29      — frame pointer (FP)
+#   * X30      — link register (LR)
+#   * SP       — stack pointer, always 16-byte aligned at function boundaries
+#
+# # Status
+#
+# Version 0.1 — covers ~60 instructions: the arithmetic / logic / memory /
+# branch / FP-double families plus a prologue/epilogue helper.  Enough to
+# bootstrap "hello world + a function call + a loop + an FFI call" on any of
+# the four target platforms.
+# =============================================================================
+
+import forge
+
+# =============================================================================
+# SECTION 1 — GENERAL-PURPOSE REGISTERS
+# =============================================================================
+# A64 has 31 general-purpose 64-bit registers (X0..X30) plus register #31,
+# whose interpretation is context-dependent:
+#   * in most data-processing slots  → XZR (the zero register)
+#   * in addressing / stack slots    → SP  (the stack pointer)
+#
+# The hardware distinguishes them by the instruction, not by the encoding, so
+# we expose the same numeric alias (31) under two constant names — the caller
+# picks whichever name reads best at the call-site.
+
+const A64_X0:  int = 0
+const A64_X1:  int = 1
+const A64_X2:  int = 2
+const A64_X3:  int = 3
+const A64_X4:  int = 4
+const A64_X5:  int = 5
+const A64_X6:  int = 6
+const A64_X7:  int = 7
+const A64_X8:  int = 8
+const A64_X9:  int = 9
+const A64_X10: int = 10
+const A64_X11: int = 11
+const A64_X12: int = 12
+const A64_X13: int = 13
+const A64_X14: int = 14
+const A64_X15: int = 15
+const A64_X16: int = 16     # IP0 — reserved for veneers
+const A64_X17: int = 17     # IP1 — reserved for veneers
+const A64_X18: int = 18     # platform register (TLS on Darwin/Windows)
+const A64_X19: int = 19
+const A64_X20: int = 20
+const A64_X21: int = 21
+const A64_X22: int = 22
+const A64_X23: int = 23
+const A64_X24: int = 24
+const A64_X25: int = 25
+const A64_X26: int = 26
+const A64_X27: int = 27
+const A64_X28: int = 28
+const A64_X29: int = 29     # frame pointer (FP)
+const A64_X30: int = 30     # link register (LR)
+const A64_XZR: int = 31     # zero register (read as 0, writes discarded)
+const A64_SP:  int = 31     # stack pointer — same encoding, context-dependent
+
+# =============================================================================
+# SECTION 2 — SIMD / FLOATING-POINT REGISTERS
+# =============================================================================
+# V0..V31 are 128-bit SIMD registers; their scalar views are B/H/S/D/Q
+# (8/16/32/64/128-bit).  For the scalar-double emitters below we treat them
+# as D-registers (64-bit), which use the same 5-bit encoding as V-registers.
+
+const A64_V0:  int = 0
+const A64_V1:  int = 1
+const A64_V2:  int = 2
+const A64_V3:  int = 3
+const A64_V4:  int = 4
+const A64_V5:  int = 5
+const A64_V6:  int = 6
+const A64_V7:  int = 7
+const A64_V8:  int = 8
+const A64_V9:  int = 9
+const A64_V10: int = 10
+const A64_V11: int = 11
+const A64_V12: int = 12
+const A64_V13: int = 13
+const A64_V14: int = 14
+const A64_V15: int = 15
+const A64_V16: int = 16
+const A64_V17: int = 17
+const A64_V18: int = 18
+const A64_V19: int = 19
+const A64_V20: int = 20
+const A64_V21: int = 21
+const A64_V22: int = 22
+const A64_V23: int = 23
+const A64_V24: int = 24
+const A64_V25: int = 25
+const A64_V26: int = 26
+const A64_V27: int = 27
+const A64_V28: int = 28
+const A64_V29: int = 29
+const A64_V30: int = 30
+const A64_V31: int = 31
+
+# =============================================================================
+# SECTION 3 — CONDITION CODES (B.cond, CSEL, CCMP)
+# =============================================================================
+# Same four-bit encoding the ARM manual uses in the "cond" field of any
+# conditional instruction.  Naming follows the assembler mnemonics; comments
+# give the semantic meaning.
+
+const A64_COND_EQ: int = 0x0    # equal                         (Z == 1)
+const A64_COND_NE: int = 0x1    # not equal                     (Z == 0)
+const A64_COND_CS: int = 0x2    # carry set / unsigned >=       (C == 1)
+const A64_COND_CC: int = 0x3    # carry clear / unsigned <      (C == 0)
+const A64_COND_MI: int = 0x4    # minus / negative              (N == 1)
+const A64_COND_PL: int = 0x5    # plus / positive-or-zero       (N == 0)
+const A64_COND_VS: int = 0x6    # overflow set                  (V == 1)
+const A64_COND_VC: int = 0x7    # overflow clear                (V == 0)
+const A64_COND_HI: int = 0x8    # unsigned >                    (C==1 && Z==0)
+const A64_COND_LS: int = 0x9    # unsigned <=                   (C==0 || Z==1)
+const A64_COND_GE: int = 0xA    # signed >=                     (N == V)
+const A64_COND_LT: int = 0xB    # signed <                      (N != V)
+const A64_COND_GT: int = 0xC    # signed >                      (Z==0 && N==V)
+const A64_COND_LE: int = 0xD    # signed <=                     (Z==1 || N!=V)
+const A64_COND_AL: int = 0xE    # always (unconditional)
+# Encoding 0xF (NV) is reserved and behaves as AL on all modern silicon —
+# we omit it to discourage accidental use.
+
+# =============================================================================
+# SECTION 4 — RELOCATION KINDS (AArch64-specific, added to the shared table)
+# =============================================================================
+# These numbers live alongside forge.luna's RELOC_* constants but describe
+# ARM-specific fix-up families.  The ELF/PE writers branch on them when
+# translating to R_AARCH64_* / IMAGE_REL_ARM64_*.
+
+const RELOC_A64_CALL26:   int = 0x10    # BL  #imm26 (±128 MiB range)
+const RELOC_A64_JUMP26:   int = 0x11    # B   #imm26
+const RELOC_A64_COND19:   int = 0x12    # B.cond / CBZ / CBNZ (±1 MiB)
+const RELOC_A64_ADR_PREL: int = 0x13    # ADRP + ADD page-relative pair
+const RELOC_A64_MOVW:     int = 0x14    # MOVZ/MOVK group-4 for imm64 loads
+
+# =============================================================================
+# SECTION 5 — 32-BIT WORD EMITTER
+# =============================================================================
+# Every A64 instruction is a fixed 32-bit word, little-endian.  We funnel
+# every emitter through this one helper so byte ordering is never ambiguous.
+
+#[inline]
+fn emit_a64_word(@f: Forge, @w: int)
+    emit_u32(@f, @w & 0xFFFFFFFF)
+
+# =============================================================================
+# SECTION 6 — DATA PROCESSING: IMMEDIATE FORMS
+# =============================================================================
+# Move-wide (MOVZ / MOVN / MOVK) and add-immediate / sub-immediate.  The
+# move-wide instructions load a 16-bit chunk into one of four "hw" slots
+# (bits [15:0], [31:16], [47:32], [63:48]).  A full 64-bit immediate therefore
+# takes up to four instructions: one MOVZ + three MOVKs.
+
+# movz Xd, #imm16, LSL #(hw*16)         — base 0xD2800000
+fn emit_a64_mov_imm(@f: Forge, @dst: int, @imm16: int, @shift_hw: int)
+    @w = 0xD2800000 | ((@shift_hw & 3) << 21) | ((@imm16 & 0xFFFF) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# movn Xd, #imm16, LSL #(hw*16)         — base 0x92800000
+# Loads NOT(imm16 << hw*16) — i.e. Xd becomes a bit-inverted sparse value.
+# Useful for loading small negative numbers in one instruction.
+fn emit_a64_movn(@f: Forge, @dst: int, @imm16: int, @shift_hw: int)
+    @w = 0x92800000 | ((@shift_hw & 3) << 21) | ((@imm16 & 0xFFFF) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# movk Xd, #imm16, LSL #(hw*16)         — base 0xF2800000
+# Overwrites the 16-bit slot without touching the other 48 bits.
+fn emit_a64_movk(@f: Forge, @dst: int, @imm16: int, @shift_hw: int)
+    @w = 0xF2800000 | ((@shift_hw & 3) << 21) | ((@imm16 & 0xFFFF) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# Composite: load any 64-bit immediate into Xd using the minimal MOVZ/MOVK
+# sequence.  Always emits 4 instructions for simplicity — titan_opt can
+# later collapse leading-zero groups for smaller code.
+fn emit_a64_mov_imm64(@f: Forge, @dst: int, @imm64: int)
+    @w0 = @imm64 & 0xFFFF
+    @w1 = (@imm64 >> 16) & 0xFFFF
+    @w2 = (@imm64 >> 32) & 0xFFFF
+    @w3 = (@imm64 >> 48) & 0xFFFF
+    emit_a64_mov_imm(@f, @dst, @w0, 0)
+    if @w1 != 0
+        emit_a64_movk(@f, @dst, @w1, 1)
+    if @w2 != 0
+        emit_a64_movk(@f, @dst, @w2, 2)
+    if @w3 != 0
+        emit_a64_movk(@f, @dst, @w3, 3)
+
+# add Xd, Xn, #imm12                    — base 0x91000000
+# "shift" (bit 22) selects #imm12 (0) or #imm12 << 12 (1).  We expose the
+# common unshifted form; for values up to 0xFFFFFF the caller can issue two
+# ADDs (one with shift=0, one with shift=1).
+fn emit_a64_add_imm(@f: Forge, @dst: int, @src: int, @imm12: int)
+    @w = 0x91000000 | ((@imm12 & 0xFFF) << 10) | ((@src & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# sub Xd, Xn, #imm12                    — base 0xD1000000
+fn emit_a64_sub_imm(@f: Forge, @dst: int, @src: int, @imm12: int)
+    @w = 0xD1000000 | ((@imm12 & 0xFFF) << 10) | ((@src & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# cmp Xn, #imm12   ≡ subs xzr, Xn, #imm12   — base 0xF1000000 (S-form SUB)
+fn emit_a64_cmp_imm(@f: Forge, @src: int, @imm12: int)
+    @w = 0xF1000000 | ((@imm12 & 0xFFF) << 10) | ((@src & 31) << 5) | 31
+    emit_a64_word(@f, @w)
+
+# ---------------------------------------------------------------------
+# Bitmask immediate encoder (shared by AND/ORR/EOR imm forms)
+# ---------------------------------------------------------------------
+# The ARM DDI 0487 "DecodeBitMasks" pseudocode expands a 13-bit (N:immr:imms)
+# field into a 32- or 64-bit constant.  We invert it: given a raw 64-bit
+# value, derive the encoding or report the value as non-encodable.
+#
+# Key facts (direct from the ARM ARM):
+#   * Element size is one of {2, 4, 8, 16, 32, 64}.
+#   * N = 1 iff size == 64, else N = 0.
+#   * For size < 64 the top bits of imms encode the size:
+#        size = 32 → imms[5]   = 0
+#        size = 16 → imms[5:4] = 10
+#        size =  8 → imms[5:3] = 110
+#        size =  4 → imms[5:2] = 1110
+#        size =  2 → imms[5:1] = 11110
+#     the remaining low bits store `ones - 1`.
+#   * Within one element the pattern is `ones` 1-bits rotated right by `immr`.
+#   * 0 and all-ones are invalid (no representable form).
+
+# Rotate @x right by @n bits inside a `@bits`-wide window.
+fn a64_ror_window(@x: int, @n: int, @bits: int) -> int
+    seal @mask = if @bits == 64 then -1 else ((1 << @bits) - 1)
+    @x = @x & @mask
+    @n = @n % @bits
+    if @n == 0
+        return @x
+    return (((@x >> @n) | (@x << (@bits - @n))) & @mask)
+
+# Returns encoded 13-bit (N<<12 | immr<<6 | imms) on success, -1 on failure.
+# @sf selects operand size: 1 → 64-bit, 0 → 32-bit (for W-reg forms).
+fn a64_encode_bitmask(@val: int, @sf: int) -> int
+    seal @dw_mask = if @sf == 1 then -1 else 0xFFFFFFFF
+    @val = @val & @dw_mask
+    # Reject trivial non-encodable values.
+    if @val == 0
+        return -1
+    if @sf == 1 and @val == -1
+        return -1
+    if @sf == 0 and @val == 0xFFFFFFFF
+        return -1
+
+    # 1. Find smallest element size where the pattern repeats.
+    #    Try 2, 4, 8, 16, 32, 64 in order.  For sf=0 stop at 32.
+    seal @max_size = if @sf == 1 then 64 else 32
+    meow @size: int = 2
+    meow @found_size: int = 0
+    while @size <= @max_size
+        seal @lo_mask = if @size == 64 then -1 else ((1 << @size) - 1)
+        seal @elem = @val & @lo_mask
+        meow @ok: int = 1
+        meow @k: int = @size
+        while @k < @max_size
+            seal @chunk = (@val >> @k) & @lo_mask
+            if @chunk != @elem
+                @ok = 0
+                break
+            @k = @k + @size
+        if @ok == 1
+            @found_size = @size
+            break
+        @size = @size * 2
+
+    if @found_size == 0
+        return -1
+
+    seal @elem_size = @found_size
+    seal @elem_mask = if @elem_size == 64 then -1 else ((1 << @elem_size) - 1)
+    seal @elem = @val & @elem_mask
+
+    # 2. Validate the element is a rotated run of consecutive 1-bits.
+    #    Strategy: count trailing 0s and trailing 1s of the element (and
+    #    of its rotated form) and confirm the pattern is exactly
+    #    (rotate-right of `ones` 1-bits).
+    #
+    #    We look for `rot` such that after rotating left by `rot`, the
+    #    element becomes (1 << ones) - 1 — i.e. `ones` contiguous 1-bits
+    #    at the bottom.  Iterating 0..elem_size and checking is O(size)
+    #    which is fine for the one-shot encoder path.
+
+    meow @ones: int = 0
+    meow @rot: int = -1
+    orbit @r in 0..@elem_size
+        seal @rotated = a64_ror_window(@elem, @r, @elem_size)
+        # rotated = (1 << k) - 1 for some k in [1, elem_size-1]?
+        # k must be strictly less than elem_size since val != all-ones.
+        meow @k: int = 1
+        meow @match: int = 0
+        while @k < @elem_size
+            seal @candidate = (1 << @k) - 1
+            if @rotated == @candidate
+                @ones = @k
+                @match = 1
+                break
+            @k = @k + 1
+        if @match == 1
+            @rot = @r
+            break
+
+    if @rot < 0 or @ones == 0
+        return -1
+
+    # 3. Derive N / immr / imms.
+    seal @N = if @elem_size == 64 then 1 else 0
+    seal @immr = @rot
+    # imms: top bits encode the element size as the negation of size-1,
+    # low bits hold ones - 1.  The standard trick is:
+    #   imms = ((not-bits)(size) | ones_minus_1) & 0x3F
+    # where (not-bits)(size) clears `log2(elem_size)+1` low bits of 0x3F.
+    # Concretely:
+    #   size 2  → imms = 0b111100 | (ones-1)  (1 low bit)
+    #   size 4  → imms = 0b111000 | (ones-1)  (2 low bits)
+    #   size 8  → imms = 0b110000 | (ones-1)  (3 low bits)
+    #   size 16 → imms = 0b100000 | (ones-1)  (4 low bits)
+    #   size 32 → imms = 0b000000 | (ones-1)  (5 low bits)
+    #   size 64 → imms = (ones-1)             (6 low bits, N=1)
+    seal @imms_top = (~(@elem_size * 2 - 1)) & 0x3F
+    seal @imms = (@imms_top | (@ones - 1)) & 0x3F
+
+    return (@N << 12) | ((@immr & 0x3F) << 6) | (@imms & 0x3F)
+
+# and Xd, Xn, #bitmask   — base 0x92000000 (N:immr:imms bitmask encoding)
+# The 13-bit N:immr:imms field is derived from @bitmask via
+# `a64_encode_bitmask`.  Non-encodable values are rejected: we bump
+# @f.errors and return without emitting any word so the caller can
+# notice the miss instead of corrupting the code stream.
+fn emit_a64_and_imm(@f: Forge, @dst: int, @src: int, @bitmask: int)
+    @enc = a64_encode_bitmask(@bitmask, 1)
+    if @enc < 0
+        @f.errors = @f.errors + 1
+        return
+    @w = 0x92000000 | ((@enc & 0x1FFF) << 10) | ((@src & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# orr Xd, Xn, #bitmask   — base 0xB2000000 (shares bitmask encoder)
+fn emit_a64_orr_imm(@f: Forge, @dst: int, @src: int, @bitmask: int)
+    @enc = a64_encode_bitmask(@bitmask, 1)
+    if @enc < 0
+        @f.errors = @f.errors + 1
+        return
+    @w = 0xB2000000 | ((@enc & 0x1FFF) << 10) | ((@src & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# eor Xd, Xn, #bitmask   — base 0xD2000000 (shares bitmask encoder)
+fn emit_a64_eor_imm(@f: Forge, @dst: int, @src: int, @bitmask: int)
+    @enc = a64_encode_bitmask(@bitmask, 1)
+    if @enc < 0
+        @f.errors = @f.errors + 1
+        return
+    @w = 0xD2000000 | ((@enc & 0x1FFF) << 10) | ((@src & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# =============================================================================
+# SECTION 7 — DATA PROCESSING: REGISTER FORMS
+# =============================================================================
+# The "shifted register" family: every ALU op takes (Xd, Xn, Xm) plus an
+# optional shift we leave at 0 (LSL #0) for clarity.  These are the work-
+# horses the lowerer emits for most arithmetic.
+
+# mov Xd, Xm   ≡ orr Xd, XZR, Xm, LSL #0     — base 0xAA000000 with Rn=31
+fn emit_a64_mov_reg(@f: Forge, @dst: int, @src: int)
+    @w = 0xAA000000 | ((@src & 31) << 16) | (31 << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# add Xd, Xn, Xm                         — base 0x8B000000
+fn emit_a64_add_reg(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0x8B000000 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# sub Xd, Xn, Xm                         — base 0xCB000000
+fn emit_a64_sub_reg(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0xCB000000 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# mul Xd, Xn, Xm   ≡ madd Xd, Xn, Xm, XZR   — base 0x9B000000 with Ra=31
+fn emit_a64_mul(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0x9B000000 | ((@src2 & 31) << 16) | (31 << 10) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# sdiv Xd, Xn, Xm                        — base 0x9AC00C00 (bit 10 = signed)
+fn emit_a64_sdiv(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0x9AC00C00 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# udiv Xd, Xn, Xm                        — base 0x9AC00800
+fn emit_a64_udiv(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0x9AC00800 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# and Xd, Xn, Xm                         — base 0x8A000000
+fn emit_a64_and_reg(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0x8A000000 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# orr Xd, Xn, Xm                         — base 0xAA000000
+fn emit_a64_orr_reg(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0xAA000000 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# eor Xd, Xn, Xm  (XOR)                  — base 0xCA000000
+fn emit_a64_eor_reg(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0xCA000000 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# cmp Xn, Xm   ≡ subs xzr, Xn, Xm        — base 0xEB000000 with Rd=31
+fn emit_a64_cmp_reg(@f: Forge, @src1: int, @src2: int)
+    @w = 0xEB000000 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | 31
+    emit_a64_word(@f, @w)
+
+# =============================================================================
+# SECTION 8 — SHIFTS (canonical UBFM / SBFM aliases)
+# =============================================================================
+# A64 has no dedicated LSL/LSR/ASR immediate opcodes — they're aliases of the
+# bit-field-move family:
+#   * LSL Xd, Xn, #s  ≡ UBFM Xd, Xn, #(-s)%64, #(63-s)
+#   * LSR Xd, Xn, #s  ≡ UBFM Xd, Xn, #s,       #63
+#   * ASR Xd, Xn, #s  ≡ SBFM Xd, Xn, #s,       #63
+#
+# UBFM base = 0xD3400000, SBFM base = 0x9340_0000.  The immr / imms fields
+# live in bits [21:16] and [15:10] respectively.
+
+# lsl Xd, Xn, #shift                     — ubfm Xd, Xn, #(-s)%64, #(63-s)
+fn emit_a64_lsl_imm(@f: Forge, @dst: int, @src: int, @shift: int)
+    @immr = (64 - @shift) & 63
+    @imms = 63 - @shift
+    @w = 0xD3400000 | ((@immr & 63) << 16) | ((@imms & 63) << 10) | ((@src & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# lsr Xd, Xn, #shift                     — ubfm Xd, Xn, #s, #63
+fn emit_a64_lsr_imm(@f: Forge, @dst: int, @src: int, @shift: int)
+    @w = 0xD340FC00 | ((@shift & 63) << 16) | ((@src & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# asr Xd, Xn, #shift                     — sbfm Xd, Xn, #s, #63
+fn emit_a64_asr_imm(@f: Forge, @dst: int, @src: int, @shift: int)
+    @w = 0x9340FC00 | ((@shift & 63) << 16) | ((@src & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# =============================================================================
+# SECTION 9 — MEMORY ACCESS (load / store)
+# =============================================================================
+# AArch64 has three families of load/store forms:
+#   * Unsigned offset, scaled (LDR/STR imm12 × 8)         — LDR Xt, [Xn, #imm]
+#   * Unscaled, signed 9-bit  (LDUR/STUR)                 — LDUR Xt, [Xn, #simm]
+#   * Pair (LDP/STP)          — load/store two regs, imm7 scaled, ±index
+#
+# Scaled form: `imm12_unsigned` here is in *bytes*; we shift it right by 3 to
+# get the doubleword-count the instruction actually encodes.  Range: 0..32760
+# in multiples of 8.  If the byte offset isn't 8-aligned, use LDUR instead.
+#
+# Pair form: `imm7` is the byte offset; we scale by /8 into a 7-bit signed
+# field.  Range: -512..504 in multiples of 8.
+
+# ldr Xt, [Xn, #imm12*8]                 — base 0xF9400000 (unsigned offset)
+fn emit_a64_ldr_x(@f: Forge, @dst_x: int, @base_x: int, @imm12_bytes: int)
+    @scaled = (@imm12_bytes >> 3) & 0xFFF
+    @w = 0xF9400000 | (@scaled << 10) | ((@base_x & 31) << 5) | (@dst_x & 31)
+    emit_a64_word(@f, @w)
+
+# str Xt, [Xn, #imm12*8]                 — base 0xF9000000
+fn emit_a64_str_x(@f: Forge, @src_x: int, @base_x: int, @imm12_bytes: int)
+    @scaled = (@imm12_bytes >> 3) & 0xFFF
+    @w = 0xF9000000 | (@scaled << 10) | ((@base_x & 31) << 5) | (@src_x & 31)
+    emit_a64_word(@f, @w)
+
+# ldur Xt, [Xn, #simm9]                  — base 0xF8400000, simm9 in bits [20:12]
+fn emit_a64_ldur_x(@f: Forge, @dst_x: int, @base_x: int, @simm9: int)
+    @w = 0xF8400000 | ((@simm9 & 0x1FF) << 12) | ((@base_x & 31) << 5) | (@dst_x & 31)
+    emit_a64_word(@f, @w)
+
+# stur Xt, [Xn, #simm9]                  — base 0xF8000000
+fn emit_a64_stur_x(@f: Forge, @src_x: int, @base_x: int, @simm9: int)
+    @w = 0xF8000000 | ((@simm9 & 0x1FF) << 12) | ((@base_x & 31) << 5) | (@src_x & 31)
+    emit_a64_word(@f, @w)
+
+# ldp Xt1, Xt2, [Xn, #imm7]              — base 0xA9400000 (signed offset)
+# imm7 is the byte offset, scaled by /8 into the 7-bit field [21:15].
+fn emit_a64_ldp(@f: Forge, @dst1: int, @dst2: int, @base: int, @imm7_bytes: int)
+    @scaled = (@imm7_bytes >> 3) & 0x7F
+    @w = 0xA9400000 | (@scaled << 15) | ((@dst2 & 31) << 10) | ((@base & 31) << 5) | (@dst1 & 31)
+    emit_a64_word(@f, @w)
+
+# stp Xt1, Xt2, [Xn, #imm7]              — base 0xA9000000 (signed offset)
+fn emit_a64_stp(@f: Forge, @src1: int, @src2: int, @base: int, @imm7_bytes: int)
+    @scaled = (@imm7_bytes >> 3) & 0x7F
+    @w = 0xA9000000 | (@scaled << 15) | ((@src2 & 31) << 10) | ((@base & 31) << 5) | (@src1 & 31)
+    emit_a64_word(@f, @w)
+
+# stp Xt1, Xt2, [Xn, #imm7]!             — base 0xA9800000 (pre-index)
+# The ! form updates Xn = Xn + imm7 *before* the access — the canonical
+# idiom for "push X29/X30" at function entry:
+#     STP X29, X30, [SP, #-16]!
+fn emit_a64_stp_pre(@f: Forge, @src1: int, @src2: int, @base: int, @imm7_bytes: int)
+    @scaled = (@imm7_bytes >> 3) & 0x7F
+    @w = 0xA9800000 | (@scaled << 15) | ((@src2 & 31) << 10) | ((@base & 31) << 5) | (@src1 & 31)
+    emit_a64_word(@f, @w)
+
+# ldp Xt1, Xt2, [Xn], #imm7              — base 0xA8C00000 (post-index)
+# Post-index: access first, then Xn += imm7.  The canonical "pop FP/LR"
+# at epilogue:
+#     LDP X29, X30, [SP], #16
+fn emit_a64_ldp_post(@f: Forge, @dst1: int, @dst2: int, @base: int, @imm7_bytes: int)
+    @scaled = (@imm7_bytes >> 3) & 0x7F
+    @w = 0xA8C00000 | (@scaled << 15) | ((@dst2 & 31) << 10) | ((@base & 31) << 5) | (@dst1 & 31)
+    emit_a64_word(@f, @w)
+
+# =============================================================================
+# SECTION 10 — BRANCHES (direct, conditional, register-indirect)
+# =============================================================================
+# A64 branch encoding comes in four flavours:
+#   * B  / BL               — ±128 MiB, 26-bit signed word offset
+#   * B.cond / CBZ / CBNZ   — ±1 MiB,   19-bit signed word offset
+#   * BR  / BLR  / RET      — register-indirect, no displacement
+#   * TBZ / TBNZ            — ±32 KiB, 14-bit offset (not implemented here)
+#
+# All offsets are in *words* (÷4), not bytes.  Callers that work in bytes
+# must shift right by 2 before handing us `simm26` / `simm19`.
+
+# b #imm26*4                             — base 0x14000000
+# Use for long jumps and tail-calls.  Return value is the byte offset where
+# the displacement lives (always 0 in word 0..25 bits) so the linker /
+# label-resolver can back-patch.
+fn emit_a64_b(@f: Forge, @simm26: int) -> int
+    @at = @f.code_len
+    @w = 0x14000000 | (@simm26 & 0x3FFFFFF)
+    emit_a64_word(@f, @w)
+    return @at
+
+# bl #imm26*4                            — base 0x94000000 (call)
+# Sets X30 = PC+4 before branching.  Mirror of x86 `call rel32`.
+fn emit_a64_bl(@f: Forge, @simm26: int) -> int
+    @at = @f.code_len
+    @w = 0x94000000 | (@simm26 & 0x3FFFFFF)
+    emit_a64_word(@f, @w)
+    return @at
+
+# br Xn                                  — base 0xD61F0000 (indirect jump)
+fn emit_a64_br(@f: Forge, @reg: int)
+    @w = 0xD61F0000 | ((@reg & 31) << 5)
+    emit_a64_word(@f, @w)
+
+# blr Xn                                 — base 0xD63F0000 (indirect call)
+fn emit_a64_blr(@f: Forge, @reg: int)
+    @w = 0xD63F0000 | ((@reg & 31) << 5)
+    emit_a64_word(@f, @w)
+
+# ret X30                                — 0xD65F03C0 (fixed encoding)
+# The alternate form `ret Xn` is legal (bits [9:5] select the link reg), but
+# 99.9% of callers use X30 — we hard-code it.
+fn emit_a64_ret(@f: Forge)
+    emit_a64_word(@f, 0xD65F03C0)
+
+# b.cond #imm19*4                        — base 0x54000000, cond in bits [3:0]
+# Returns the byte offset of the instruction so the label resolver can
+# patch the 19-bit field in place.
+fn emit_a64_b_cond(@f: Forge, @cond: int, @simm19: int) -> int
+    @at = @f.code_len
+    @w = 0x54000000 | ((@simm19 & 0x7FFFF) << 5) | (@cond & 0xF)
+    emit_a64_word(@f, @w)
+    return @at
+
+# cbz Xt, #imm19*4                       — base 0xB4000000
+fn emit_a64_cbz(@f: Forge, @reg: int, @simm19: int) -> int
+    @at = @f.code_len
+    @w = 0xB4000000 | ((@simm19 & 0x7FFFF) << 5) | (@reg & 31)
+    emit_a64_word(@f, @w)
+    return @at
+
+# cbnz Xt, #imm19*4                      — base 0xB5000000
+fn emit_a64_cbnz(@f: Forge, @reg: int, @simm19: int) -> int
+    @at = @f.code_len
+    @w = 0xB5000000 | ((@simm19 & 0x7FFFF) << 5) | (@reg & 31)
+    emit_a64_word(@f, @w)
+    return @at
+
+# =============================================================================
+# SECTION 11 — SYSTEM INSTRUCTIONS
+# =============================================================================
+# SVC is the Linux / Darwin syscall gate.  BRK drops into the debugger (or
+# SIGTRAP if none is attached) — handy for "unimplemented" stubs during
+# bring-up.  NOP is a hint to the CPU that this word can be skipped.
+
+# svc #imm16                             — base 0xD4000001
+fn emit_a64_svc(@f: Forge, @imm16: int)
+    @w = 0xD4000001 | ((@imm16 & 0xFFFF) << 5)
+    emit_a64_word(@f, @w)
+
+# brk #imm16                             — base 0xD4200000
+fn emit_a64_brk(@f: Forge, @imm16: int)
+    @w = 0xD4200000 | ((@imm16 & 0xFFFF) << 5)
+    emit_a64_word(@f, @w)
+
+# nop                                    — 0xD503201F (fixed encoding)
+fn emit_a64_nop(@f: Forge)
+    emit_a64_word(@f, 0xD503201F)
+
+# =============================================================================
+# SECTION 12 — FLOATING-POINT, SCALAR DOUBLE
+# =============================================================================
+# D-register (64-bit scalar double) forms of the common FP ops.  The
+# encodings share a common "Rm | Rn | Rd" layout with type-select bits at
+# [23:22] — 0b01 for double, 0b00 for single.  Everything below uses double.
+
+# fmov Dd, Dn                            — base 0x1E604000
+# Register-to-register copy of a 64-bit FP value.  There's also an fmov
+# form that moves between GP and FP registers (0x9E660000 / 0x9E670000);
+# we expose that as a separate helper if needed later.
+fn emit_a64_fmov_d(@f: Forge, @dst_v: int, @src_v: int)
+    @w = 0x1E604000 | ((@src_v & 31) << 5) | (@dst_v & 31)
+    emit_a64_word(@f, @w)
+
+# fadd Dd, Dn, Dm                        — base 0x1E602800
+fn emit_a64_fadd_d(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0x1E602800 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# fsub Dd, Dn, Dm                        — base 0x1E603800
+fn emit_a64_fsub_d(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0x1E603800 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# fmul Dd, Dn, Dm                        — base 0x1E600800
+fn emit_a64_fmul_d(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0x1E600800 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# fdiv Dd, Dn, Dm                        — base 0x1E601800
+fn emit_a64_fdiv_d(@f: Forge, @dst: int, @src1: int, @src2: int)
+    @w = 0x1E601800 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5) | (@dst & 31)
+    emit_a64_word(@f, @w)
+
+# fcmp Dn, Dm                            — base 0x1E602000 (opcode2 = 00000)
+# Sets NZCV for subsequent B.cond.
+fn emit_a64_fcmp_d(@f: Forge, @src1: int, @src2: int)
+    @w = 0x1E602000 | ((@src2 & 31) << 16) | ((@src1 & 31) << 5)
+    emit_a64_word(@f, @w)
+
+# scvtf Dd, Xn                           — base 0x9E620000 (signed int → double)
+fn emit_a64_scvtf_d_x(@f: Forge, @dst_v: int, @src_x: int)
+    @w = 0x9E620000 | ((@src_x & 31) << 5) | (@dst_v & 31)
+    emit_a64_word(@f, @w)
+
+# fcvtzs Xd, Dn                          — base 0x9E780000 (double → signed int, truncate)
+fn emit_a64_fcvtzs_x_d(@f: Forge, @dst_x: int, @src_v: int)
+    @w = 0x9E780000 | ((@src_v & 31) << 5) | (@dst_x & 31)
+    emit_a64_word(@f, @w)
+
+# =============================================================================
+# SECTION 13 — SYMBOL / RELOCATION CONVENIENCES
+# =============================================================================
+# Thin wrappers that let the lowerer emit ARM-specific branches with a
+# pending relocation, mirroring forge.luna's `emit_call_extern` for x86.
+
+# Emit `bl <symbol>` — the displacement is left as 0 and a RELOC_A64_CALL26
+# is queued so the linker/loader can patch the 26-bit field.
+fn emit_a64_bl_extern(@f: Forge, @symbol_idx: int)
+    if @symbol_idx < 0
+        @f.errors = @f.errors + 1
+        return
+    @at = emit_a64_bl(@f, 0)
+    forge_add_reloc(@f, @at, RELOC_A64_CALL26, @symbol_idx, 0)
+
+# Emit `b <symbol>` — tail-call or long jump with JUMP26 relocation.
+fn emit_a64_b_extern(@f: Forge, @symbol_idx: int)
+    if @symbol_idx < 0
+        @f.errors = @f.errors + 1
+        return
+    @at = emit_a64_b(@f, 0)
+    forge_add_reloc(@f, @at, RELOC_A64_JUMP26, @symbol_idx, 0)
+
+# Linux / Darwin syscall marker.  On Linux the syscall number lives in X8;
+# on Darwin in X16 and flagged with SVC #0x80.  The caller is responsible
+# for staging the right register — this helper just emits the SVC.
+fn emit_a64_linux_syscall(@f: Forge)
+    emit_a64_svc(@f, 0)
+
+fn emit_a64_darwin_syscall(@f: Forge)
+    emit_a64_svc(@f, 0x80)
+
+# =============================================================================
+# SECTION 14 — LABEL BACK-PATCHING (A64 branches)
+# =============================================================================
+# AArch64 branch displacements live in different bit fields than x86's
+# rel32 — the shared forge.luna helpers can't back-patch them generically.
+# We implement our own resolver for the three common field widths:
+#   * 26-bit (B / BL)
+#   * 19-bit (B.cond / CBZ / CBNZ)
+#   * 14-bit (TBZ / TBNZ — not yet emitted, but reserved)
+
+# Read the 32-bit word at @at_offset as a little-endian u32.
+fn a64_read_word(@f: Forge, @at_offset: int) -> int
+    @b0 = @f.code[@at_offset + 0] & 0xFF
+    @b1 = @f.code[@at_offset + 1] & 0xFF
+    @b2 = @f.code[@at_offset + 2] & 0xFF
+    @b3 = @f.code[@at_offset + 3] & 0xFF
+    return @b0 | (@b1 << 8) | (@b2 << 16) | (@b3 << 24)
+
+# Write a 32-bit word back into the code buffer little-endian.
+fn a64_write_word(@f: Forge, @at_offset: int, @w: int)
+    @f.code[@at_offset + 0] = @w & 0xFF
+    @f.code[@at_offset + 1] = (@w >> 8) & 0xFF
+    @f.code[@at_offset + 2] = (@w >> 16) & 0xFF
+    @f.code[@at_offset + 3] = (@w >> 24) & 0xFF
+
+# Patch a B / BL at @patch_at so it targets @label_idx (26-bit imm, ÷4).
+fn forge_a64_resolve_b26(@f: Forge, @patch_at: int, @label_idx: int)
+    if @label_idx < 0 or @label_idx >= @f.label_count
+        return
+    @target = @f.labels[@label_idx].offset
+    if @target < 0
+        @f.errors = @f.errors + 1
+        return
+    @disp_bytes = @target - @patch_at
+    @disp_words = @disp_bytes >> 2
+    @w = a64_read_word(@f, @patch_at)
+    # Clear bits [25:0], splice in new displacement
+    @w = (@w & 0xFC000000) | (@disp_words & 0x3FFFFFF)
+    a64_write_word(@f, @patch_at, @w)
+
+# Patch a B.cond / CBZ / CBNZ (19-bit imm at bits [23:5], ÷4).
+fn forge_a64_resolve_b19(@f: Forge, @patch_at: int, @label_idx: int)
+    if @label_idx < 0 or @label_idx >= @f.label_count
+        return
+    @target = @f.labels[@label_idx].offset
+    if @target < 0
+        @f.errors = @f.errors + 1
+        return
+    @disp_bytes = @target - @patch_at
+    @disp_words = @disp_bytes >> 2
+    @w = a64_read_word(@f, @patch_at)
+    # Clear bits [23:5], splice in new 19-bit displacement
+    @w = (@w & 0xFF00001F) | ((@disp_words & 0x7FFFF) << 5)
+    a64_write_word(@f, @patch_at, @w)
+
+# =============================================================================
+# SECTION 15 — FUNCTION PROLOGUE / EPILOGUE HELPERS
+# =============================================================================
+# AArch64 frame-pointer-preserving convention used by all four target
+# platforms.  The shape mirrors x86's `forge_function_begin` / `_end`:
+#
+#   prologue:
+#       STP  X29, X30, [SP, #-16]!      ; push FP+LR, pre-index SP -= 16
+#       MOV  X29, SP                     ; FP = SP (new frame anchor)
+#       SUB  SP, SP, #locals_bytes       ; reserve stack slot(s) for locals
+#
+#   epilogue:
+#       ADD  SP, SP, #locals_bytes       ; release locals
+#       LDP  X29, X30, [SP], #16         ; pop FP+LR, post-index SP += 16
+#       RET                              ; branch to X30
+#
+# locals_bytes is rounded up to 16 to keep SP 16-byte aligned at all times
+# (mandatory under the AAPCS64 ABI and the Apple variant).
+
+fn forge_a64_function_begin(@f: Forge, @name_start: int, @name_len: int, @locals_bytes: int) -> int
+    @sym = forge_define_symbol(@f, @name_start, @name_len)
+    @f.current_fn = @sym
+    # STP X29, X30, [SP, #-16]!
+    emit_a64_stp_pre(@f, A64_X29, A64_X30, A64_SP, -16)
+    # MOV X29, SP — but "mov reg, sp" must use the ADD-immediate form
+    # (ORR w/ XZR cannot read SP).  ADD X29, SP, #0 does the job.
+    emit_a64_add_imm(@f, A64_X29, A64_SP, 0)
+    if @locals_bytes > 0
+        @aligned = (@locals_bytes + 15) & (-16)
+        emit_a64_sub_imm(@f, A64_SP, A64_SP, @aligned)
+    return @sym
+
+fn forge_a64_function_end(@f: Forge, @locals_bytes: int)
+    if @locals_bytes > 0
+        @aligned = (@locals_bytes + 15) & (-16)
+        emit_a64_add_imm(@f, A64_SP, A64_SP, @aligned)
+    # LDP X29, X30, [SP], #16
+    emit_a64_ldp_post(@f, A64_X29, A64_X30, A64_SP, 16)
+    emit_a64_ret(@f)
+    @f.current_fn = -1
+
+# =============================================================================
+# SECTION 16 — SELF-TESTS
+# =============================================================================
+# Each test encodes one instruction and compares the resulting four bytes
+# against the canonical little-endian encoding from the ARM DDI 0487 manual.
+# Tests return 0 on pass, non-zero on the first failing byte.
+
+# Helper: compare the four bytes at @f.code[0..4] against the little-endian
+# encoding of `@w`.  Returns 0 on match, else a 1-based byte index.
+fn a64_test_word(@f: Forge, @w: int) -> int
+    if @f.code_len != 4
+        return 100
+    if @f.code[0] != (@w & 0xFF)
+        return 1
+    if @f.code[1] != ((@w >> 8) & 0xFF)
+        return 2
+    if @f.code[2] != ((@w >> 16) & 0xFF)
+        return 3
+    if @f.code[3] != ((@w >> 24) & 0xFF)
+        return 4
+    return 0
+
+# ret → C0 03 5F D6  (little-endian of 0xD65F03C0)
+fn forge_a64_selftest_ret() -> int
+    @f = forge_new()
+    emit_a64_ret(@f)
+    return a64_test_word(@f, 0xD65F03C0)
+
+# nop → 1F 20 03 D5
+fn forge_a64_selftest_nop() -> int
+    @f = forge_new()
+    emit_a64_nop(@f)
+    return a64_test_word(@f, 0xD503201F)
+
+# movz x0, #0x1234, lsl #0 → 0xD2824680
+#   base 0xD2800000 | (0<<21) | (0x1234<<5) | 0 = 0xD2824680
+fn forge_a64_selftest_movz() -> int
+    @f = forge_new()
+    emit_a64_mov_imm(@f, A64_X0, 0x1234, 0)
+    return a64_test_word(@f, 0xD2824680)
+
+# add x0, x1, #10 → 0x91002820
+#   base 0x91000000 | (10<<10)=0x2800 | (1<<5)=0x20 | 0 = 0x91002820
+fn forge_a64_selftest_add_imm() -> int
+    @f = forge_new()
+    emit_a64_add_imm(@f, A64_X0, A64_X1, 10)
+    return a64_test_word(@f, 0x91002820)
+
+# ldr x0, [x1, #16] → 0xF9400820
+#   base 0xF9400000 | ((16>>3)=2)<<10 = 0x800 | (1<<5)=0x20 | 0 = 0xF9400820
+fn forge_a64_selftest_ldr() -> int
+    @f = forge_new()
+    emit_a64_ldr_x(@f, A64_X0, A64_X1, 16)
+    return a64_test_word(@f, 0xF9400820)
+
+# stp x29, x30, [sp, #-16]! → 0xA9BF7BFD
+#   base 0xA9800000 | ((-16>>3) & 0x7F)=0x7E << 15 = 0x3F0000 |
+#        (30<<10)=0x7800 | (31<<5)=0x3E0 | 29 = 0xA9BF7BFD
+fn forge_a64_selftest_stp_pre() -> int
+    @f = forge_new()
+    emit_a64_stp_pre(@f, A64_X29, A64_X30, A64_SP, -16)
+    return a64_test_word(@f, 0xA9BF7BFD)
+
+# mov x0, x1 → 0xAA0103E0
+#   base 0xAA000000 | (1<<16)=0x10000 | (31<<5)=0x3E0 | 0 = 0xAA0103E0
+fn forge_a64_selftest_mov_reg() -> int
+    @f = forge_new()
+    emit_a64_mov_reg(@f, A64_X0, A64_X1)
+    return a64_test_word(@f, 0xAA0103E0)
+
+# add x0, x1, x2 → 0x8B020020
+#   base 0x8B000000 | (2<<16)=0x20000 | (1<<5)=0x20 | 0 = 0x8B020020
+fn forge_a64_selftest_add_reg() -> int
+    @f = forge_new()
+    emit_a64_add_reg(@f, A64_X0, A64_X1, A64_X2)
+    return a64_test_word(@f, 0x8B020020)
+
+# svc #0 → 0xD4000001 (Linux syscall gate)
+fn forge_a64_selftest_svc() -> int
+    @f = forge_new()
+    emit_a64_svc(@f, 0)
+    return a64_test_word(@f, 0xD4000001)
+
+# fadd d0, d1, d2 → 0x1E622820
+#   base 0x1E602800 | (2<<16)=0x20000 | (1<<5)=0x20 | 0 = 0x1E622820
+fn forge_a64_selftest_fadd_d() -> int
+    @f = forge_new()
+    emit_a64_fadd_d(@f, A64_V0, A64_V1, A64_V2)
+    return a64_test_word(@f, 0x1E622820)
+
+# b.eq +4 (simm19 = 1) → 0x54000020
+#   base 0x54000000 | (1<<5)=0x20 | 0 = 0x54000020
+fn forge_a64_selftest_b_cond() -> int
+    @f = forge_new()
+    @at = emit_a64_b_cond(@f, A64_COND_EQ, 1)
+    if @at != 0
+        return 99
+    return a64_test_word(@f, 0x54000020)
+
+# bitmask encoder — known-encodable values.
+# Each expected encoding is  (N << 12) | (immr << 6) | imms.
+# AND Xd, Xn, #1 → 64-bit: N=1, immr=0, imms=0 → enc = 0x1000
+# AND Xd, Xn, #3 → 64-bit: N=1, immr=0, imms=1 → enc = 0x1001
+# AND Xd, Xn, #0xFFFFFFFF → N=1, immr=0, imms=31 → enc = 0x101F
+fn forge_a64_selftest_bitmask_enc() -> int
+    @e1 = a64_encode_bitmask(0x1, 1)
+    if @e1 != 0x1000
+        return 1
+    @e2 = a64_encode_bitmask(0x3, 1)
+    if @e2 != 0x1001
+        return 2
+    @e3 = a64_encode_bitmask(0xFFFFFFFF, 1)
+    if @e3 != 0x101F
+        return 3
+    return 0
+
+# Non-encodable: 0x5 (alternating bits not a rotated run of 1s) must
+# return -1 without corrupting the encoder state.
+fn forge_a64_selftest_bitmask_reject() -> int
+    @r = a64_encode_bitmask(0x5, 1)
+    if @r != -1
+        return 1
+    # All-zero and all-ones must also reject.
+    @z = a64_encode_bitmask(0, 1)
+    if @z != -1
+        return 2
+    @o = a64_encode_bitmask(-1, 1)
+    if @o != -1
+        return 3
+    return 0
+
+# Full AND-immediate emission: `and x0, x1, #1` should encode as
+# 0x92400020 = 0x92000000 | (0x1000 << 10) | (1 << 5) | 0
+#           = 0x92000000 | 0x00400000 | 0x20 | 0
+#           = 0x92400020
+fn forge_a64_selftest_and_imm_emit() -> int
+    @f = forge_new()
+    emit_a64_and_imm(@f, A64_X0, A64_X1, 0x1)
+    return a64_test_word(@f, 0x92400020)
+
+fn run_forge_arm64_selftests() -> int
+    @pass = 0
+    if forge_a64_selftest_ret() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_nop() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_movz() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_add_imm() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_ldr() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_stp_pre() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_mov_reg() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_add_reg() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_svc() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_fadd_d() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_b_cond() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_bitmask_enc() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_bitmask_reject() == 0
+        @pass = @pass + 1
+    if forge_a64_selftest_and_imm_emit() == 0
+        @pass = @pass + 1
+    return @pass
+
+# =============================================================================
+# SECTION 17 — ROADMAP / TODO
+# =============================================================================
+# v0.1 (this file) ships ~60 instructions across nine families:
+#
+#   * Move-wide immediate               MOVZ / MOVN / MOVK (+ mov_imm64 helper)
+#   * Data-processing immediate         ADD / SUB / CMP  (imm12)
+#   * Data-processing register          MOV / ADD / SUB / MUL / SDIV / UDIV /
+#                                       AND / ORR / EOR / CMP
+#   * Shifts (UBFM/SBFM aliases)        LSL / LSR / ASR  (imm)
+#   * Memory — unsigned offset          LDR / STR        (imm12 × 8)
+#   * Memory — unscaled signed          LDUR / STUR      (simm9)
+#   * Memory — pair                     LDP / STP / STP-pre / LDP-post
+#   * Branches                          B / BL / BR / BLR / RET /
+#                                       B.cond / CBZ / CBNZ
+#   * System                            SVC / BRK / NOP
+#   * Floating-point (double)           FMOV / FADD / FSUB / FMUL / FDIV /
+#                                       FCMP / SCVTF / FCVTZS
+#
+# Outstanding for "LLVM-parity" on ARM64:
+#
+#   * AND immediate with proper bitmask encoder (N:immr:imms derivation)
+#   * ADR / ADRP (PC-relative page load, PREL21 relocations)
+#   * LDR literal (PC-relative data load)
+#   * Shift-by-register variants: LSLV / LSRV / ASRV
+#   * Conditional select family: CSEL / CSINC / CSINV / CSNEG (used for the
+#     ternary operator and many branch-free idioms)
+#   * Byte / half / word load/store (LDRB / LDRH / LDRSW / etc.)
+#   * Atomics (LDXR / STXR load-exclusive, plus ARMv8.1 LSE CAS / SWP / LDADD)
+#   * Full SIMD / NEON for titan_opt's vector path
+#   * Memory barriers: DMB / DSB / ISB
+#
+# A companion `forge_verify_arm64.luna` will cross-check encodings against
+# `llvm-mc -arch=aarch64 --show-encoding`.  Once green for the above, the
+# ARM backend reaches x86 parity and the four target platforms light up.
+# =============================================================================
+
+export {
+    # GP registers
+    A64_X0, A64_X1, A64_X2, A64_X3, A64_X4, A64_X5, A64_X6, A64_X7,
+    A64_X8, A64_X9, A64_X10, A64_X11, A64_X12, A64_X13, A64_X14, A64_X15,
+    A64_X16, A64_X17, A64_X18, A64_X19, A64_X20, A64_X21, A64_X22, A64_X23,
+    A64_X24, A64_X25, A64_X26, A64_X27, A64_X28, A64_X29, A64_X30,
+    A64_XZR, A64_SP,
+
+    # SIMD / FP registers
+    A64_V0, A64_V1, A64_V2, A64_V3, A64_V4, A64_V5, A64_V6, A64_V7,
+    A64_V8, A64_V9, A64_V10, A64_V11, A64_V12, A64_V13, A64_V14, A64_V15,
+    A64_V16, A64_V17, A64_V18, A64_V19, A64_V20, A64_V21, A64_V22, A64_V23,
+    A64_V24, A64_V25, A64_V26, A64_V27, A64_V28, A64_V29, A64_V30, A64_V31,
+
+    # Condition codes
+    A64_COND_EQ, A64_COND_NE, A64_COND_CS, A64_COND_CC,
+    A64_COND_MI, A64_COND_PL, A64_COND_VS, A64_COND_VC,
+    A64_COND_HI, A64_COND_LS, A64_COND_GE, A64_COND_LT,
+    A64_COND_GT, A64_COND_LE, A64_COND_AL,
+
+    # ARM-specific reloc kinds
+    RELOC_A64_CALL26, RELOC_A64_JUMP26, RELOC_A64_COND19,
+    RELOC_A64_ADR_PREL, RELOC_A64_MOVW,
+
+    # Word emitter
+    emit_a64_word,
+
+    # Data-processing immediate
+    emit_a64_mov_imm, emit_a64_movn, emit_a64_movk, emit_a64_mov_imm64,
+    emit_a64_add_imm, emit_a64_sub_imm, emit_a64_cmp_imm,
+    emit_a64_and_imm, emit_a64_orr_imm, emit_a64_eor_imm,
+    a64_encode_bitmask, a64_ror_window,
+
+    # Data-processing register
+    emit_a64_mov_reg, emit_a64_add_reg, emit_a64_sub_reg,
+    emit_a64_mul, emit_a64_sdiv, emit_a64_udiv,
+    emit_a64_and_reg, emit_a64_orr_reg, emit_a64_eor_reg,
+    emit_a64_cmp_reg,
+
+    # Shifts
+    emit_a64_lsl_imm, emit_a64_lsr_imm, emit_a64_asr_imm,
+
+    # Memory
+    emit_a64_ldr_x, emit_a64_str_x,
+    emit_a64_ldur_x, emit_a64_stur_x,
+    emit_a64_ldp, emit_a64_stp,
+    emit_a64_stp_pre, emit_a64_ldp_post,
+
+    # Branches
+    emit_a64_b, emit_a64_bl, emit_a64_br, emit_a64_blr, emit_a64_ret,
+    emit_a64_b_cond, emit_a64_cbz, emit_a64_cbnz,
+
+    # System
+    emit_a64_svc, emit_a64_brk, emit_a64_nop,
+
+    # Floating-point scalar double
+    emit_a64_fmov_d, emit_a64_fadd_d, emit_a64_fsub_d,
+    emit_a64_fmul_d, emit_a64_fdiv_d, emit_a64_fcmp_d,
+    emit_a64_scvtf_d_x, emit_a64_fcvtzs_x_d,
+
+    # Symbol / relocation helpers
+    emit_a64_bl_extern, emit_a64_b_extern,
+    emit_a64_linux_syscall, emit_a64_darwin_syscall,
+
+    # Label back-patching
+    a64_read_word, a64_write_word,
+    forge_a64_resolve_b26, forge_a64_resolve_b19,
+
+    # Function frames
+    forge_a64_function_begin, forge_a64_function_end,
+
+    # Self-tests
+    forge_a64_selftest_ret, forge_a64_selftest_nop,
+    forge_a64_selftest_movz, forge_a64_selftest_add_imm,
+    forge_a64_selftest_ldr, forge_a64_selftest_stp_pre,
+    forge_a64_selftest_mov_reg, forge_a64_selftest_add_reg,
+    forge_a64_selftest_svc, forge_a64_selftest_fadd_d,
+    forge_a64_selftest_b_cond,
+    forge_a64_selftest_bitmask_enc, forge_a64_selftest_bitmask_reject,
+    forge_a64_selftest_and_imm_emit,
+    run_forge_arm64_selftests
+}

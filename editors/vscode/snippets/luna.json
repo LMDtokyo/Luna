@@ -1,0 +1,276 @@
+{
+    "Function": {
+        "prefix": "fn",
+        "body": [
+            "fn ${1:name}(${2:@param})${3: -> ${4:Type}}",
+            "    ${5:# body}",
+            "    ${0}"
+        ],
+        "description": "Define a function"
+    },
+    "If Statement": {
+        "prefix": "if",
+        "body": [
+            "if ${1:condition}",
+            "    ${2:# then}",
+            "    ${0}"
+        ],
+        "description": "If conditional statement"
+    },
+    "If-Else Statement": {
+        "prefix": "ifelse",
+        "body": [
+            "if ${1:condition}",
+            "    ${2:# then}",
+            "else",
+            "    ${3:# else}",
+            "${0}"
+        ],
+        "description": "If-else conditional statement"
+    },
+    "Orbit Loop": {
+        "prefix": "orbit",
+        "body": [
+            "orbit ${1:@i} in ${2:0..10}",
+            "    ${0}"
+        ],
+        "description": "For loop (orbit iterator)"
+    },
+    "While Loop": {
+        "prefix": "while",
+        "body": [
+            "while ${1:condition}",
+            "    ${0}"
+        ],
+        "description": "While loop"
+    },
+    "Match Expression": {
+        "prefix": "eclipse",
+        "body": [
+            "eclipse ${1:@value}",
+            "    phase ${2:pattern1} -> ${3:result1}",
+            "    phase ${4:pattern2} -> ${5:result2}",
+            "    phase _ -> ${6:default}"
+        ],
+        "description": "Pattern matching (eclipse/phase)"
+    },
+    "Struct Definition": {
+        "prefix": "struct",
+        "body": [
+            "type ${1:Name}",
+            "    @${2:field}: ${3:Type}",
+            "${0}"
+        ],
+        "description": "Define a struct type"
+    },
+    "Actor Definition": {
+        "prefix": "actor",
+        "body": [
+            "type ${1:ActorName}",
+            "    @${2:state}: ${3:Type}",
+            "",
+            "fn ${1:ActorName}.handle(@msg)",
+            "    eclipse @msg",
+            "        phase \"${4:message}\" -> ${5:# handle}",
+            "        phase _ -> shine(\"Unknown message\")"
+        ],
+        "description": "Define an actor with message handling"
+    },
+    "Guard Statement": {
+        "prefix": "guard",
+        "body": [
+            "guard ${1:condition} else ${2:return}",
+            "${0}"
+        ],
+        "description": "Guard clause for early return"
+    },
+    "Async Function": {
+        "prefix": "async",
+        "body": [
+            "async fn ${1:name}(${2:@param}) -> ${3:Type}",
+            "    ${0}"
+        ],
+        "description": "Define an async function"
+    },
+    "Spawn Task": {
+        "prefix": "spawn",
+        "body": [
+            "@${1:task} = spawn fn() ->",
+            "    ${0}"
+        ],
+        "description": "Spawn a concurrent task"
+    },
+    "Use Module": {
+        "prefix": "use",
+        "body": [
+            "use ${1:ModuleName}",
+            "${0}"
+        ],
+        "description": "Import a module"
+    },
+    "Print": {
+        "prefix": "shine",
+        "body": [
+            "shine(${1:\"message\"})"
+        ],
+        "description": "Print to stdout"
+    },
+    "Main Function": {
+        "prefix": "main",
+        "body": [
+            "fn main()",
+            "    ${0:shine(\"Hello, Luna!\")}"
+        ],
+        "description": "Main entry point function"
+    },
+    "Web Server": {
+        "prefix": "webserver",
+        "body": [
+            "use Web",
+            "",
+            "fn handle(@req: Request) -> Response",
+            "    return Response.json({",
+            "        \"message\": \"${1:Hello from Luna!}\"",
+            "    })",
+            "",
+            "ignite(${2:8080}, handle)",
+            "shine(\"Server running at http://localhost:${2:8080}\")"
+        ],
+        "description": "Basic web server template"
+    },
+    "Test Function": {
+        "prefix": "test",
+        "body": [
+            "fn test_${1:name}()",
+            "    # Arrange",
+            "    ${2:@input = ...}",
+            "",
+            "    # Act",
+            "    ${3:@result = ...}",
+            "",
+            "    # Assert",
+            "    nova(@result == ${4:expected}, \"${5:Test failed}\")"
+        ],
+        "description": "Test function template"
+    },
+    "Error Handling": {
+        "prefix": "try",
+        "body": [
+            "@result = try",
+            "    ${1:# risky operation}",
+            "catch @error",
+            "    shine(\"Error: \" + str(@error))",
+            "    ${2:none}"
+        ],
+        "description": "Try-catch error handling"
+    },
+    "Scheduler Task": {
+        "prefix": "scheduler",
+        "body": [
+            "use Scheduler",
+            "",
+            "@pool = Scheduler.create({",
+            "    workers: ${1:4},",
+            "    affinity: true",
+            "})",
+            "",
+            "Scheduler.spawn(@pool, fn() ->",
+            "    ${0:# task body}",
+            ")"
+        ],
+        "description": "Work-stealing scheduler setup"
+    },
+    "Timer": {
+        "prefix": "timer",
+        "body": [
+            "use TimerWheel",
+            "",
+            "@wheel = TimerWheel.create()",
+            "@timer_id = TimerWheel.schedule(@wheel, ${1:5000}, fn() ->",
+            "    ${0:shine(\"Timer fired!\")}",
+            ")"
+        ],
+        "description": "Timer wheel setup"
+    },
+    "Buffer Pool": {
+        "prefix": "bufferpool",
+        "body": [
+            "use BufferPool",
+            "",
+            "@pool = BufferPool.create({",
+            "    small: 64,",
+            "    medium: 1024,",
+            "    large: 65536",
+            "})",
+            "",
+            "@buf = BufferPool.acquire(@pool, ${1:1024})",
+            "${0:# use buffer}",
+            "BufferPool.release(@pool, @buf)"
+        ],
+        "description": "Pre-allocated buffer pool"
+    },
+    "Regex Match": {
+        "prefix": "regex",
+        "body": [
+            "@pattern = regex_compile(\"${1:pattern}\")",
+            "if regex_match(@pattern, ${2:@text})",
+            "    shine(\"Match found!\")",
+            "    ${0}",
+            "else",
+            "    shine(\"No match\")"
+        ],
+        "description": "Regex pattern matching"
+    },
+    "Database Put/Get": {
+        "prefix": "dbput",
+        "body": [
+            "db_put(\"${1:key}\", ${2:@value})",
+            "@result = db_get(\"${1:key}\")",
+            "if @result != none",
+            "    ${0:shine(@result)}"
+        ],
+        "description": "Database key-value store operations"
+    },
+    "HTTP Route Handler": {
+        "prefix": "route",
+        "body": [
+            "route_add(\"${1:GET}\", \"${2:/api/endpoint}\", fn(@req) ->",
+            "    @body = ${3:{ \"status\": \"ok\" }}",
+            "    return http_response_json(200, @body)",
+            ")",
+            "${0}"
+        ],
+        "description": "HTTP route handler"
+    },
+    "GUI Window": {
+        "prefix": "window",
+        "body": [
+            "@window = window_create(\"${1:My App}\", ${2:800}, ${3:600}, WIN_RESIZABLE)",
+            "@webview = webview_create(@window)",
+            "webview_load_html(@webview, \"<html><body>${4:Hello Luna!}</body></html>\")",
+            "window_show(@window)",
+            "gui_run()",
+            "${0}"
+        ],
+        "description": "Desktop window with webview"
+    },
+    "LIDL Interface": {
+        "prefix": "lidl",
+        "body": [
+            "# LIDL Interface Definition",
+            "actor ${1:ServiceName}",
+            "    method ${2:get_data}(@id: i32) -> Result<String>",
+            "    method ${3:set_data}(@id: i32, @data: &String) -> Result<void>",
+            "${0}"
+        ],
+        "description": "LIDL actor interface definition"
+    },
+    "Import Module": {
+        "prefix": "import",
+        "body": [
+            "import ${1:module_name}",
+            "${0}"
+        ],
+        "description": "Import a Luna module"
+    }
+}

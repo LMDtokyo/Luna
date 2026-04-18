@@ -1,0 +1,844 @@
+# (c) 2026 Luna Ecosystem. Lead Architect: LMDtokyo. All rights reserved.
+# Licensed under GPLv3. See LICENSE file.
+
+# =============================================================================
+# Luna Aether — Operating System Contact Surface (v4.3)
+# =============================================================================
+# "Aether is the medium through which Luna reaches the physical machine."
+#
+# This is the ONLY Luna module allowed to declare OS-level extern symbols.
+# Every other stdlib module (io, net, time, sync, scheduler...) must import
+# aether and call its cosmic-named wrappers instead of duplicating FFI.
+#
+# # Independence from Rust
+#
+# aether.luna speaks directly to the operating system kernel or its platform
+# DLLs — NOT to any Rust crate:
+#
+#   * Windows: PE-imported stdcall symbols from kernel32.dll and ws2_32.dll.
+#     The Luna compiler (forge backend, phase L1) emits the import table
+#     directly. No C runtime, no MSVC redistributable, no linker magic.
+#
+#   * Linux: uses the `syscall` instruction with Linux-stable numbers. No
+#     libc, no glibc lock-in. A second "compat" path uses libc for
+#     statically-impure builds; aether picks the right one via
+#     AETHER_USE_SYSCALLS.
+#
+#   * macOS: libSystem.dylib (required — Darwin has no stable syscall ABI).
+#     This is the one platform where we tolerate a vendor runtime, as
+#     Apple mandates it.
+#
+# # Naming
+#
+# Low-level primitives use cosmic-flavoured names so callers that reach for
+# them feel the "this is the floor" gravity:
+#
+#   link_*       — sockets / network tethers between stars
+#   scroll_*     — files / parchments on the host
+#   firmament_*  — stdin/stdout/stderr (the visible heavens)
+#   moment_*     — time (a moment in the light of a star)
+#   stardust_*   — raw memory pages summoned from the void
+#   cosmos_*     — process-scope environment the universe tells us
+#   supernova    — process termination (final collapse)
+#   aether_*     — raw direct-syscall / raw-call dispatch
+#
+# # Compile-time target selection
+#
+# AETHER_PLATFORM is injected by the compiler.  Values:
+#   0 = Linux, 1 = Windows, 2 = macOS, 3 = *BSD (best-effort POSIX)
+#
+# AETHER_USE_SYSCALLS = 1 chooses Linux direct syscalls (libc-free build);
+# set to 0 to route through libc for maximum compatibility.
+# =============================================================================
+
+import borrow_checker
+
+# =============================================================================
+# SECTION 1 — PLATFORM CONSTANTS
+# =============================================================================
+
+const PLATFORM_LINUX: int   = 0
+const PLATFORM_WINDOWS: int = 1
+const PLATFORM_MACOS: int   = 2
+const PLATFORM_BSD: int     = 3
+
+# Injected by the compiler. Do NOT edit here — it's the target triple, not
+# the build host. During bootstrap on an unknown host we default to Linux.
+const AETHER_PLATFORM: int = 0
+# Prefer the Linux syscall path? Has no effect outside AETHER_PLATFORM==0.
+const AETHER_USE_SYSCALLS: int = 1
+
+# =============================================================================
+# SECTION 2 — ERROR SIGNS
+# =============================================================================
+# Return values for aether_* functions that can fail. These are our own —
+# we do NOT propagate errno / GetLastError integers upward. Translate at
+# the call site so errors are platform-agnostic to the user.
+
+const AETHER_OK: int            = 0
+const AETHER_FAIL: int          = -1     # generic
+const AETHER_EOF: int           = -2
+const AETHER_CLOSED: int        = -3
+const AETHER_WOULD_BLOCK: int   = -4
+const AETHER_INTERRUPTED: int   = -5
+const AETHER_DENIED: int        = -6
+const AETHER_MISSING: int       = -7
+const AETHER_BUSY: int          = -8
+const AETHER_OVERFLOW: int      = -9
+const AETHER_INVALID: int       = -10
+const AETHER_NO_MEMORY: int     = -11
+const AETHER_UNSUPPORTED: int   = -12
+
+# =============================================================================
+# SECTION 3 — SCROLL (FILE) CONSTANTS
+# =============================================================================
+# Cosmic naming for file access flags. Maps to POSIX O_* and Win32 GENERIC_*.
+
+const SCROLL_READ: int          = 0x0001
+const SCROLL_WRITE: int         = 0x0002
+const SCROLL_APPEND: int        = 0x0004
+const SCROLL_CREATE: int        = 0x0008
+const SCROLL_TRUNCATE: int      = 0x0010
+const SCROLL_EXCLUSIVE: int     = 0x0020
+
+# Seek anchors
+const FROM_START: int           = 0
+const FROM_HERE: int            = 1
+const FROM_END: int             = 2
+
+# =============================================================================
+# SECTION 4 — LINK (SOCKET) CONSTANTS
+# =============================================================================
+
+# Address families
+const LINK_IPV4: int            = 2    # AF_INET
+const LINK_IPV6: int            = 23   # AF_INET6 (differs per OS — real value supplied by platform shim)
+const LINK_UNIX: int            = 1    # AF_UNIX
+
+# Socket kinds
+const LINK_STREAM: int          = 1    # SOCK_STREAM (TCP)
+const LINK_DATAGRAM: int        = 2    # SOCK_DGRAM  (UDP)
+const LINK_RAW: int             = 3    # SOCK_RAW
+
+# Protocols
+const PROTO_IP: int             = 0
+const PROTO_TCP: int            = 6
+const PROTO_UDP: int            = 17
+
+# Shutdown modes
+const SHUT_HEAR: int            = 0    # stop receiving
+const SHUT_WHISPER: int         = 1    # stop sending
+const SHUT_BOTH: int            = 2
+
+# =============================================================================
+# SECTION 5 — STARDUST (MEMORY) CONSTANTS
+# =============================================================================
+# Page-level memory allocation flags. Protection bits match POSIX mmap.
+
+const STARDUST_READ: int        = 0x1
+const STARDUST_WRITE: int       = 0x2
+const STARDUST_EXEC: int        = 0x4
+
+# Memory region lifecycle flags (used by stardust_claim)
+const DUST_PRIVATE: int         = 0x2
+const DUST_ANONYMOUS: int       = 0x20
+
+# =============================================================================
+# SECTION 6 — PLATFORM FFI — LINUX SYSCALLS
+# =============================================================================
+# Numbers are stable Linux x86-64 syscall IDs. See man 2 syscall.
+# The compiler lowers `extern "linux_syscall"` to a `syscall` instruction
+# with the number placed in rax and args in rdi,rsi,rdx,r10,r8,r9.
+#
+# These declarations are only consulted when AETHER_PLATFORM==0 and
+# AETHER_USE_SYSCALLS==1. Compiler may DCE them on other platforms.
+
+extern "linux_syscall" fn sys_read(@fd: int, @buf: int, @n: int) -> int        # 0
+extern "linux_syscall" fn sys_write(@fd: int, @buf: int, @n: int) -> int       # 1
+extern "linux_syscall" fn sys_open(@path: int, @flags: int, @mode: int) -> int # 2
+extern "linux_syscall" fn sys_close(@fd: int) -> int                           # 3
+extern "linux_syscall" fn sys_lseek(@fd: int, @off: int, @whence: int) -> int  # 8
+extern "linux_syscall" fn sys_mmap(@addr: int, @len: int, @prot: int, @flags: int, @fd: int, @off: int) -> int # 9
+extern "linux_syscall" fn sys_munmap(@addr: int, @len: int) -> int             # 11
+extern "linux_syscall" fn sys_rt_sigaction(@sig: int, @act: int, @old: int, @size: int) -> int # 13
+extern "linux_syscall" fn sys_ioctl(@fd: int, @req: int, @arg: int) -> int     # 16
+extern "linux_syscall" fn sys_nanosleep(@req: int, @rem: int) -> int           # 35
+extern "linux_syscall" fn sys_socket(@fam: int, @kind: int, @proto: int) -> int # 41
+extern "linux_syscall" fn sys_connect(@fd: int, @addr: int, @addrlen: int) -> int # 42
+extern "linux_syscall" fn sys_accept(@fd: int, @addr: int, @addrlen: int) -> int # 43
+extern "linux_syscall" fn sys_sendto(@fd: int, @buf: int, @len: int, @flags: int, @dst: int, @dstlen: int) -> int # 44
+extern "linux_syscall" fn sys_recvfrom(@fd: int, @buf: int, @len: int, @flags: int, @src: int, @srclen: int) -> int # 45
+extern "linux_syscall" fn sys_shutdown(@fd: int, @how: int) -> int             # 48
+extern "linux_syscall" fn sys_bind(@fd: int, @addr: int, @len: int) -> int     # 49
+extern "linux_syscall" fn sys_listen(@fd: int, @backlog: int) -> int           # 50
+extern "linux_syscall" fn sys_setsockopt(@fd: int, @lvl: int, @opt: int, @val: int, @len: int) -> int # 54
+extern "linux_syscall" fn sys_clock_gettime(@clk: int, @ts: int) -> int        # 228
+extern "linux_syscall" fn sys_exit_group(@code: int) -> int                    # 231
+extern "linux_syscall" fn sys_getrandom(@buf: int, @len: int, @flags: int) -> int # 318
+
+# Linux flag values as they appear in kernel ABI (not libc abstractions):
+const L_O_RDONLY: int   = 0
+const L_O_WRONLY: int   = 1
+const L_O_RDWR: int     = 2
+const L_O_CREAT: int    = 64
+const L_O_EXCL: int     = 128
+const L_O_TRUNC: int    = 512
+const L_O_APPEND: int   = 1024
+const L_O_NONBLOCK: int = 2048
+const L_MAP_PRIVATE: int   = 2
+const L_MAP_ANONYMOUS: int = 32
+const L_CLOCK_MONOTONIC: int = 1
+const L_CLOCK_REALTIME: int  = 0
+
+# =============================================================================
+# SECTION 7 — PLATFORM FFI — WINDOWS (PE imports)
+# =============================================================================
+# kernel32.dll / ws2_32.dll stdcall imports. The Luna compiler (L1 forge)
+# emits these as PE IAT entries — no C runtime, no MSVC dependency.
+
+extern "stdcall" fn CreateFileA(@path: int, @access: int, @share: int, @sec: int, @disp: int, @flags: int, @tmpl: int) -> int
+extern "stdcall" fn CloseHandle(@h: int) -> int
+extern "stdcall" fn ReadFile(@h: int, @buf: int, @n: int, @got: int, @over: int) -> int
+extern "stdcall" fn WriteFile(@h: int, @buf: int, @n: int, @put: int, @over: int) -> int
+extern "stdcall" fn SetFilePointerEx(@h: int, @dist: int, @got: int, @method: int) -> int
+extern "stdcall" fn GetFileSizeEx(@h: int, @out: int) -> int
+extern "stdcall" fn FlushFileBuffers(@h: int) -> int
+extern "stdcall" fn SetEndOfFile(@h: int) -> int
+extern "stdcall" fn GetStdHandle(@which: int) -> int
+extern "stdcall" fn ExitProcess(@code: int) -> int
+extern "stdcall" fn Sleep(@ms: int)
+extern "stdcall" fn GetTickCount64() -> int
+extern "stdcall" fn QueryPerformanceCounter(@out: int) -> int
+extern "stdcall" fn QueryPerformanceFrequency(@out: int) -> int
+extern "stdcall" fn GetEnvironmentVariableA(@name: int, @buf: int, @size: int) -> int
+extern "stdcall" fn SetEnvironmentVariableA(@name: int, @value: int) -> int
+extern "stdcall" fn VirtualAlloc(@addr: int, @size: int, @type: int, @protect: int) -> int
+extern "stdcall" fn VirtualFree(@addr: int, @size: int, @type: int) -> int
+extern "stdcall" fn GetSystemTimeAsFileTime(@out: int)
+extern "stdcall" fn BCryptGenRandom(@h: int, @buf: int, @n: int, @flags: int) -> int   # bcrypt.dll
+
+# Winsock (ws2_32.dll)
+extern "stdcall" fn WSAStartup(@ver: int, @data: int) -> int
+extern "stdcall" fn WSACleanup() -> int
+extern "stdcall" fn socket(@family: int, @kind: int, @proto: int) -> int
+extern "stdcall" fn closesocket(@s: int) -> int
+extern "stdcall" fn connect(@s: int, @addr: int, @alen: int) -> int
+extern "stdcall" fn bind(@s: int, @addr: int, @alen: int) -> int
+extern "stdcall" fn listen(@s: int, @backlog: int) -> int
+extern "stdcall" fn accept(@s: int, @addr: int, @alen: int) -> int
+extern "stdcall" fn send(@s: int, @buf: int, @n: int, @flags: int) -> int
+extern "stdcall" fn recv(@s: int, @buf: int, @n: int, @flags: int) -> int
+extern "stdcall" fn sendto(@s: int, @buf: int, @n: int, @flags: int, @dst: int, @dlen: int) -> int
+extern "stdcall" fn recvfrom(@s: int, @buf: int, @n: int, @flags: int, @src: int, @slen: int) -> int
+extern "stdcall" fn shutdown(@s: int, @how: int) -> int
+extern "stdcall" fn setsockopt(@s: int, @lvl: int, @opt: int, @val: int, @len: int) -> int
+extern "stdcall" fn getaddrinfo(@node: int, @svc: int, @hints: int, @res: int) -> int
+extern "stdcall" fn freeaddrinfo(@res: int)
+
+# Windows constants (subset — only what aether wrappers below actually use)
+const W_GENERIC_READ: int        = 0x80000000
+const W_GENERIC_WRITE: int       = 0x40000000
+const W_FILE_SHARE_READ: int     = 1
+const W_FILE_SHARE_WRITE: int    = 2
+const W_OPEN_EXISTING: int       = 3
+const W_OPEN_ALWAYS: int         = 4
+const W_CREATE_ALWAYS: int       = 2
+const W_FILE_BEGIN: int          = 0
+const W_FILE_CURRENT: int        = 1
+const W_FILE_END: int            = 2
+const W_STD_INPUT_HANDLE: int    = -10
+const W_STD_OUTPUT_HANDLE: int   = -11
+const W_STD_ERROR_HANDLE: int    = -12
+const W_MEM_COMMIT: int          = 0x1000
+const W_MEM_RESERVE: int         = 0x2000
+const W_MEM_RELEASE: int         = 0x8000
+const W_PAGE_READWRITE: int      = 0x04
+const W_INVALID_HANDLE_VALUE: int = -1
+
+# =============================================================================
+# SECTION 8 — PLATFORM FFI — macOS / BSD (libSystem / libc)
+# =============================================================================
+# Darwin has no stable syscall interface, so we go through libSystem.dylib.
+# On BSD we use libc.so. Both are direct C calls — still no Rust involvement.
+
+extern "C" fn posix_open(@path: int, @flags: int, @mode: int) -> int
+extern "C" fn posix_close(@fd: int) -> int
+extern "C" fn posix_read(@fd: int, @buf: int, @n: int) -> int
+extern "C" fn posix_write(@fd: int, @buf: int, @n: int) -> int
+extern "C" fn posix_lseek(@fd: int, @off: int, @whence: int) -> int
+extern "C" fn posix_mmap(@addr: int, @len: int, @prot: int, @flags: int, @fd: int, @off: int) -> int
+extern "C" fn posix_munmap(@addr: int, @len: int) -> int
+extern "C" fn posix_socket(@fam: int, @kind: int, @proto: int) -> int
+extern "C" fn posix_connect(@fd: int, @addr: int, @alen: int) -> int
+extern "C" fn posix_bind(@fd: int, @addr: int, @alen: int) -> int
+extern "C" fn posix_listen(@fd: int, @backlog: int) -> int
+extern "C" fn posix_accept(@fd: int, @addr: int, @alen: int) -> int
+extern "C" fn posix_send(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn posix_recv(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn posix_shutdown(@fd: int, @how: int) -> int
+extern "C" fn posix_setsockopt(@fd: int, @lvl: int, @opt: int, @val: int, @len: int) -> int
+extern "C" fn posix_getaddrinfo(@host: int, @svc: int, @hints: int, @res: int) -> int
+extern "C" fn posix_freeaddrinfo(@res: int)
+extern "C" fn posix_clock_gettime(@clk: int, @ts: int) -> int
+extern "C" fn posix_nanosleep(@req: int, @rem: int) -> int
+extern "C" fn posix_getenv(@name: int) -> int
+extern "C" fn posix_setenv(@name: int, @value: int, @overwrite: int) -> int
+extern "C" fn posix_exit(@code: int)
+extern "C" fn posix_errno_get() -> int
+extern "C" fn posix_getrandom_fallback(@buf: int, @n: int) -> int   # fallback /dev/urandom shim
+
+# =============================================================================
+# SECTION 9 — SCROLL (FILE) WRAPPERS
+# =============================================================================
+# Unified cosmic API.  All wrappers accept raw byte-pointer arguments like the
+# rest of Luna's stdlib and return non-negative success or AETHER_* negative
+# signs on failure.
+
+# Open a scroll for reading/writing. @flags is the OR of SCROLL_* bits.
+fn scroll_unseal(@path_ptr: int, @path_len: int, @flags: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        return scroll_unseal_windows(@path_ptr, @path_len, @flags)
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        return scroll_unseal_linux(@path_ptr, @flags)
+    return scroll_unseal_posix(@path_ptr, @flags)
+
+fn scroll_unseal_linux(@path: int, @flags: int) -> int
+    @f = 0
+    if (@flags & SCROLL_READ) != 0 and (@flags & SCROLL_WRITE) != 0
+        @f = L_O_RDWR
+    eclipse if (@flags & SCROLL_WRITE) != 0
+        @f = L_O_WRONLY
+    else
+        @f = L_O_RDONLY
+    if (@flags & SCROLL_CREATE) != 0
+        @f = @f | L_O_CREAT
+    if (@flags & SCROLL_TRUNCATE) != 0
+        @f = @f | L_O_TRUNC
+    if (@flags & SCROLL_APPEND) != 0
+        @f = @f | L_O_APPEND
+    if (@flags & SCROLL_EXCLUSIVE) != 0
+        @f = @f | L_O_EXCL
+    @fd = sys_open(@path, @f, 420)   # 0644
+    if @fd < 0
+        return AETHER_FAIL
+    return @fd
+
+fn scroll_unseal_posix(@path: int, @flags: int) -> int
+    @f = 0
+    if (@flags & SCROLL_READ) != 0 and (@flags & SCROLL_WRITE) != 0
+        @f = L_O_RDWR
+    eclipse if (@flags & SCROLL_WRITE) != 0
+        @f = L_O_WRONLY
+    else
+        @f = L_O_RDONLY
+    if (@flags & SCROLL_CREATE) != 0
+        @f = @f | L_O_CREAT
+    if (@flags & SCROLL_TRUNCATE) != 0
+        @f = @f | L_O_TRUNC
+    if (@flags & SCROLL_APPEND) != 0
+        @f = @f | L_O_APPEND
+    if (@flags & SCROLL_EXCLUSIVE) != 0
+        @f = @f | L_O_EXCL
+    @fd = posix_open(@path, @f, 420)
+    if @fd < 0
+        return AETHER_FAIL
+    return @fd
+
+fn scroll_unseal_windows(@path: int, @path_len: int, @flags: int) -> int
+    @access = 0
+    if (@flags & SCROLL_READ) != 0
+        @access = @access | W_GENERIC_READ
+    if (@flags & SCROLL_WRITE) != 0
+        @access = @access | W_GENERIC_WRITE
+    @share = W_FILE_SHARE_READ | W_FILE_SHARE_WRITE
+    @disp = W_OPEN_EXISTING
+    if (@flags & SCROLL_CREATE) != 0 and (@flags & SCROLL_TRUNCATE) != 0
+        @disp = W_CREATE_ALWAYS
+    eclipse if (@flags & SCROLL_CREATE) != 0
+        @disp = W_OPEN_ALWAYS
+    eclipse if (@flags & SCROLL_TRUNCATE) != 0
+        @disp = W_CREATE_ALWAYS
+    @h = CreateFileA(@path, @access, @share, 0, @disp, 128, 0)   # FILE_ATTRIBUTE_NORMAL
+    if @h == W_INVALID_HANDLE_VALUE
+        return AETHER_FAIL
+    return @h
+
+fn scroll_read(@fd: int, @buf: int, @n: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        meow @got: [int; 1] = [0; 1]
+        @ok = ReadFile(@fd, @buf, @n, @got, 0)
+        if @ok == 0
+            return AETHER_FAIL
+        if @got[0] == 0
+            return AETHER_EOF
+        return @got[0]
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_read(@fd, @buf, @n)
+        if @r < 0
+            return AETHER_FAIL
+        if @r == 0
+            return AETHER_EOF
+        return @r
+    @r = posix_read(@fd, @buf, @n)
+    if @r < 0
+        return AETHER_FAIL
+    if @r == 0
+        return AETHER_EOF
+    return @r
+
+fn scroll_inscribe(@fd: int, @buf: int, @n: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        meow @put: [int; 1] = [0; 1]
+        @ok = WriteFile(@fd, @buf, @n, @put, 0)
+        if @ok == 0
+            return AETHER_FAIL
+        return @put[0]
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_write(@fd, @buf, @n)
+        if @r < 0
+            return AETHER_FAIL
+        return @r
+    @r = posix_write(@fd, @buf, @n)
+    if @r < 0
+        return AETHER_FAIL
+    return @r
+
+fn scroll_drift(@fd: int, @offset: int, @anchor: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        meow @got: [int; 1] = [0; 1]
+        @method = @anchor   # FROM_START=0 matches FILE_BEGIN=0, etc.
+        @ok = SetFilePointerEx(@fd, @offset, @got, @method)
+        if @ok == 0
+            return AETHER_FAIL
+        return @got[0]
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_lseek(@fd, @offset, @anchor)
+        if @r < 0
+            return AETHER_FAIL
+        return @r
+    @r = posix_lseek(@fd, @offset, @anchor)
+    if @r < 0
+        return AETHER_FAIL
+    return @r
+
+fn scroll_reseal(@fd: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @ok = CloseHandle(@fd)
+        if @ok == 0
+            return AETHER_FAIL
+        return AETHER_OK
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        return sys_close(@fd)
+    return posix_close(@fd)
+
+# =============================================================================
+# SECTION 10 — FIRMAMENT (STDIO) WRAPPERS
+# =============================================================================
+
+# Compile-time-safe way to get the native stdout handle.
+fn firmament_stdout() -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        return GetStdHandle(W_STD_OUTPUT_HANDLE)
+    return 1   # POSIX fd
+
+fn firmament_stderr() -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        return GetStdHandle(W_STD_ERROR_HANDLE)
+    return 2
+
+fn firmament_stdin() -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        return GetStdHandle(W_STD_INPUT_HANDLE)
+    return 0
+
+fn firmament_shine(@buf: int, @len: int) -> int
+    return scroll_inscribe(firmament_stdout(), @buf, @len)
+
+fn firmament_dim(@buf: int, @len: int) -> int
+    return scroll_inscribe(firmament_stderr(), @buf, @len)
+
+fn firmament_listen(@buf: int, @len: int) -> int
+    return scroll_read(firmament_stdin(), @buf, @len)
+
+# =============================================================================
+# SECTION 11 — LINK (SOCKET) WRAPPERS
+# =============================================================================
+# Windows requires WSAStartup before any socket call. We do it lazily on
+# first link_forge. `meow @winsock_ready` is module-local mutable state.
+
+meow @winsock_ready: int = 0
+
+fn link_ensure_winsock()
+    if AETHER_PLATFORM != PLATFORM_WINDOWS
+        return
+    if @winsock_ready == 1
+        return
+    meow @wsa_data: [int; 32] = [0; 32]   # WSADATA is ~400 bytes; oversize-aligned
+    @r = WSAStartup(0x0202, @wsa_data)    # version 2.2
+    if @r == 0
+        @winsock_ready = 1
+
+fn link_forge(@family: int, @kind: int, @protocol: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        link_ensure_winsock()
+        @s = socket(@family, @kind, @protocol)
+        if @s < 0
+            return AETHER_FAIL
+        return @s
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @s = sys_socket(@family, @kind, @protocol)
+        if @s < 0
+            return AETHER_FAIL
+        return @s
+    @s = posix_socket(@family, @kind, @protocol)
+    if @s < 0
+        return AETHER_FAIL
+    return @s
+
+fn link_reach(@fd: int, @addr: int, @addr_len: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = connect(@fd, @addr, @addr_len)
+        if @r < 0
+            return AETHER_FAIL
+        return AETHER_OK
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_connect(@fd, @addr, @addr_len)
+        if @r < 0
+            return AETHER_FAIL
+        return AETHER_OK
+    @r = posix_connect(@fd, @addr, @addr_len)
+    if @r < 0
+        return AETHER_FAIL
+    return AETHER_OK
+
+fn link_anchor(@fd: int, @addr: int, @addr_len: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = bind(@fd, @addr, @addr_len)
+        if @r < 0
+            return AETHER_FAIL
+        return AETHER_OK
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_bind(@fd, @addr, @addr_len)
+        if @r < 0
+            return AETHER_FAIL
+        return AETHER_OK
+    @r = posix_bind(@fd, @addr, @addr_len)
+    if @r < 0
+        return AETHER_FAIL
+    return AETHER_OK
+
+fn link_await(@fd: int, @backlog: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = listen(@fd, @backlog)
+        if @r < 0
+            return AETHER_FAIL
+        return AETHER_OK
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_listen(@fd, @backlog)
+        if @r < 0
+            return AETHER_FAIL
+        return AETHER_OK
+    @r = posix_listen(@fd, @backlog)
+    if @r < 0
+        return AETHER_FAIL
+    return AETHER_OK
+
+fn link_receive(@fd: int, @addr_out: int, @addr_len_out: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = accept(@fd, @addr_out, @addr_len_out)
+        if @r < 0
+            return AETHER_FAIL
+        return @r
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_accept(@fd, @addr_out, @addr_len_out)
+        if @r < 0
+            return AETHER_FAIL
+        return @r
+    @r = posix_accept(@fd, @addr_out, @addr_len_out)
+    if @r < 0
+        return AETHER_FAIL
+    return @r
+
+fn link_whisper(@fd: int, @buf: int, @n: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = send(@fd, @buf, @n, 0)
+        if @r < 0
+            return AETHER_FAIL
+        return @r
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_sendto(@fd, @buf, @n, 0, 0, 0)
+        if @r < 0
+            return AETHER_FAIL
+        return @r
+    @r = posix_send(@fd, @buf, @n, 0)
+    if @r < 0
+        return AETHER_FAIL
+    return @r
+
+fn link_hear(@fd: int, @buf: int, @n: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = recv(@fd, @buf, @n, 0)
+        if @r < 0
+            return AETHER_FAIL
+        if @r == 0
+            return AETHER_EOF
+        return @r
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_recvfrom(@fd, @buf, @n, 0, 0, 0)
+        if @r < 0
+            return AETHER_FAIL
+        if @r == 0
+            return AETHER_EOF
+        return @r
+    @r = posix_recv(@fd, @buf, @n, 0)
+    if @r < 0
+        return AETHER_FAIL
+    if @r == 0
+        return AETHER_EOF
+    return @r
+
+fn link_sever(@fd: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = closesocket(@fd)
+        if @r < 0
+            return AETHER_FAIL
+        return AETHER_OK
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        return sys_close(@fd)
+    return posix_close(@fd)
+
+fn link_eclipse(@fd: int, @how: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = shutdown(@fd, @how)
+        if @r < 0
+            return AETHER_FAIL
+        return AETHER_OK
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_shutdown(@fd, @how)
+        if @r < 0
+            return AETHER_FAIL
+        return AETHER_OK
+    @r = posix_shutdown(@fd, @how)
+    if @r < 0
+        return AETHER_FAIL
+    return AETHER_OK
+
+# =============================================================================
+# SECTION 12 — MOMENT (TIME) WRAPPERS
+# =============================================================================
+# moment_now() returns a monotonic counter in nanoseconds since an unspecified
+# origin. Suitable for measuring intervals; NOT wall-clock.
+# moment_drift() sleeps for at least @ms milliseconds.
+
+fn moment_now() -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        meow @counter: [int; 1] = [0; 1]
+        meow @freq: [int; 1] = [0; 1]
+        QueryPerformanceCounter(@counter)
+        QueryPerformanceFrequency(@freq)
+        if @freq[0] == 0
+            return 0
+        # counter * 1_000_000_000 / freq — split to avoid overflow
+        @sec = @counter[0] / @freq[0]
+        @rem = @counter[0] % @freq[0]
+        return @sec * 1000000000 + (@rem * 1000000000) / @freq[0]
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        meow @ts: [int; 2] = [0; 2]
+        sys_clock_gettime(L_CLOCK_MONOTONIC, @ts)
+        return @ts[0] * 1000000000 + @ts[1]
+    meow @ts: [int; 2] = [0; 2]
+    posix_clock_gettime(L_CLOCK_MONOTONIC, @ts)
+    return @ts[0] * 1000000000 + @ts[1]
+
+fn moment_drift(@ms: int)
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        Sleep(@ms)
+        return
+    # POSIX/Linux: nanosleep with struct timespec { sec, nsec }
+    meow @req: [int; 2] = [0; 2]
+    @req[0] = @ms / 1000
+    @req[1] = (@ms % 1000) * 1000000
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        sys_nanosleep(@req, 0)
+        return
+    posix_nanosleep(@req, 0)
+
+# =============================================================================
+# SECTION 13 — STARDUST (MEMORY) WRAPPERS
+# =============================================================================
+# Page-granular allocator. Coarse but platform-direct — higher-level allocators
+# (runtime_core NaN-boxing pool) build on top.
+
+fn stardust_claim(@bytes: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @p = VirtualAlloc(0, @bytes, W_MEM_COMMIT | W_MEM_RESERVE, W_PAGE_READWRITE)
+        if @p == 0
+            return AETHER_NO_MEMORY
+        return @p
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @p = sys_mmap(0, @bytes, STARDUST_READ | STARDUST_WRITE,
+                      L_MAP_PRIVATE | L_MAP_ANONYMOUS, -1, 0)
+        if @p < 0
+            return AETHER_NO_MEMORY
+        return @p
+    @p = posix_mmap(0, @bytes, STARDUST_READ | STARDUST_WRITE,
+                    L_MAP_PRIVATE | L_MAP_ANONYMOUS, -1, 0)
+    if @p < 0
+        return AETHER_NO_MEMORY
+    return @p
+
+fn stardust_return(@ptr: int, @bytes: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @ok = VirtualFree(@ptr, 0, W_MEM_RELEASE)
+        if @ok == 0
+            return AETHER_FAIL
+        return AETHER_OK
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        return sys_munmap(@ptr, @bytes)
+    return posix_munmap(@ptr, @bytes)
+
+# =============================================================================
+# SECTION 14 — COSMOS (ENVIRONMENT) WRAPPERS
+# =============================================================================
+# Portable env-var access. On POSIX we copy getenv's result into @out; on
+# Windows GetEnvironmentVariableA writes directly and returns the byte length.
+
+fn cosmos_peek(@name_ptr: int, @name_len: int, @out: int, @out_len: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @n = GetEnvironmentVariableA(@name_ptr, @out, @out_len)
+        if @n == 0
+            return AETHER_MISSING
+        return @n
+    # POSIX path: getenv returns a pointer to an internal buffer.
+    @src = 0
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        # No direct syscall for getenv; fall back to POSIX even under syscalls build.
+        @src = posix_getenv(@name_ptr)
+    else
+        @src = posix_getenv(@name_ptr)
+    if @src == 0
+        return AETHER_MISSING
+    @i = 0
+    orbit _ in 0..@out_len
+        @b = 0
+        unsafe
+            @b = volatile_read(@src + @i)
+        if @b == 0
+            break
+        unsafe
+            volatile_write(@out + @i, @b)
+        @i = @i + 1
+    return @i
+
+fn cosmos_impress(@name_ptr: int, @name_len: int, @value_ptr: int, @value_len: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = SetEnvironmentVariableA(@name_ptr, @value_ptr)
+        if @r == 0
+            return AETHER_FAIL
+        return AETHER_OK
+    @r = posix_setenv(@name_ptr, @value_ptr, 1)
+    if @r < 0
+        return AETHER_FAIL
+    return AETHER_OK
+
+# =============================================================================
+# SECTION 15 — STARLIGHT (RANDOMNESS) WRAPPERS
+# =============================================================================
+# Cryptographically secure bytes — routed to the OS entropy source.
+
+fn starlight_draw(@buf: int, @n: int) -> int
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        @r = BCryptGenRandom(0, @buf, @n, 2)   # BCRYPT_USE_SYSTEM_PREFERRED_RNG
+        if @r != 0
+            return AETHER_FAIL
+        return @n
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        @r = sys_getrandom(@buf, @n, 0)
+        if @r < 0
+            return AETHER_FAIL
+        return @r
+    @r = posix_getrandom_fallback(@buf, @n)   # reads /dev/urandom
+    if @r < 0
+        return AETHER_FAIL
+    return @r
+
+# =============================================================================
+# SECTION 16 — SUPERNOVA (PROCESS TERMINATION)
+# =============================================================================
+
+fn supernova(@code: int)
+    if AETHER_PLATFORM == PLATFORM_WINDOWS
+        ExitProcess(@code)
+        return
+    if AETHER_PLATFORM == PLATFORM_LINUX and AETHER_USE_SYSCALLS == 1
+        sys_exit_group(@code)
+        return
+    posix_exit(@code)
+
+# =============================================================================
+# SECTION 17 — SANITY CHECKS
+# =============================================================================
+# Compile-time self-tests. Guarded behind a `meow` flag so release builds
+# elide them entirely. Runtime-visible when aether is imported with
+# AETHER_RUN_SELFTESTS set.
+
+meow @AETHER_RUN_SELFTESTS: int = 0
+
+fn aether_selftest() -> int
+    if @AETHER_RUN_SELFTESTS == 0
+        return 0
+    seal @buf = "aether selftest: write to firmament\n"
+    firmament_shine(@buf, 35)
+    seal @t0 = moment_now()
+    moment_drift(1)
+    seal @t1 = moment_now()
+    if @t1 <= @t0
+        return AETHER_FAIL
+    return AETHER_OK
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+export {
+    # constants
+    PLATFORM_LINUX, PLATFORM_WINDOWS, PLATFORM_MACOS, PLATFORM_BSD,
+    AETHER_OK, AETHER_FAIL, AETHER_EOF, AETHER_CLOSED, AETHER_WOULD_BLOCK,
+    AETHER_INTERRUPTED, AETHER_DENIED, AETHER_MISSING, AETHER_BUSY,
+    AETHER_OVERFLOW, AETHER_INVALID, AETHER_NO_MEMORY, AETHER_UNSUPPORTED,
+    SCROLL_READ, SCROLL_WRITE, SCROLL_APPEND, SCROLL_CREATE,
+    SCROLL_TRUNCATE, SCROLL_EXCLUSIVE,
+    FROM_START, FROM_HERE, FROM_END,
+    LINK_IPV4, LINK_IPV6, LINK_UNIX, LINK_STREAM, LINK_DATAGRAM, LINK_RAW,
+    PROTO_IP, PROTO_TCP, PROTO_UDP,
+    SHUT_HEAR, SHUT_WHISPER, SHUT_BOTH,
+    STARDUST_READ, STARDUST_WRITE, STARDUST_EXEC,
+
+    # scrolls
+    scroll_unseal, scroll_read, scroll_inscribe, scroll_drift, scroll_reseal,
+
+    # firmament
+    firmament_stdin, firmament_stdout, firmament_stderr,
+    firmament_shine, firmament_dim, firmament_listen,
+
+    # links
+    link_forge, link_reach, link_anchor, link_await, link_receive,
+    link_whisper, link_hear, link_sever, link_eclipse,
+
+    # moments
+    moment_now, moment_drift,
+
+    # stardust
+    stardust_claim, stardust_return,
+
+    # cosmos
+    cosmos_peek, cosmos_impress,
+
+    # starlight
+    starlight_draw,
+
+    # supernova
+    supernova,
+
+    # selftest
+    aether_selftest
+}
