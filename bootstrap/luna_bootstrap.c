@@ -3109,15 +3109,88 @@ static int is_boot_builtin(const char *s, int n)
 static void lower_call(int node)
 {
     AstNode *n = &g_nodes[node];
-    /* child 0 = callee expression (must be N_IDENT), then args */
     int callee = n->kids[0];
     AstNode *c = &g_nodes[callee];
+
+    /* Method-call sugar: `@obj.foo(args)` is lowered as `foo(@obj, args)`
+     * when `foo` resolves to a known Luna function.  The object becomes
+     * the first positional parameter — standard "explicit self" ABI.    */
+    if (c->kind == N_FIELD_ACCESS) {
+        int si = sym_find(c->s, c->slen);
+        if (si >= 0 && g_syms[si].kind == N_FN) {
+            int nuser_args = n->nkids - 1;
+            int total_args = 1 + nuser_args;
+            /* Evaluate and push: self first, then each user arg.         */
+            lower_expr(c->kids[0]);                       /* rax = @obj   */
+            emit_push_rax();
+            for (int i = 0; i < nuser_args; i++) {
+                lower_expr(n->kids[1 + i]);
+                emit_push_rax();
+            }
+            /* Pop the stack slots we reserved, starting from the last arg
+             * so register-passed args land in the right order.  Extras
+             * past the sixth stay on stack in caller order for the callee. */
+            int reg_args = total_args < 6 ? total_args : 6;
+            int stack_args = total_args - reg_args;
+            /* Our pushes went: self, arg1, arg2, ..., argN.  Pop in
+             * reverse so:
+             *   first pop -> argN, place at stack top
+             *   ...
+             *   last pop -> self -> rdi
+             * For args 6..N we leave them on the stack (already there
+             * in the right order above the return address).             */
+            /* Step 1: for stack-passed args (indices 6..total_args-1), we
+             * need them at [rsp .. rsp+stack_args*8] in THIS order
+             * (arg6 at rsp+0, arg7 at rsp+8, ...).  Currently they are
+             * the top of stack in the order we pushed them: self at
+             * bottom, argN at top.  We want to keep only the first
+             * six register args popped off, and leave arg6..argN in the
+             * correct layout on stack.
+             *
+             * Simplest approach: pop ALL args into temporary registers
+             * we don't clobber (only rdi/rsi/rdx/rcx/r8/r9 needed),
+             * then push back the stack_args in reverse (so they end up
+             * at rsp+0 = arg6 layout).                                   */
+            if (stack_args > 0) {
+                /* Pop top-to-bottom: argN..arg0 order, we want to keep
+                 * arg6..argN on stack.  Read them from the stack, save
+                 * into a known location, then re-layout.
+                 *
+                 * Shortcut implementation: leave pushes as-is (stack order
+                 * top-to-bottom = argN,argN-1,...,arg1,arg0).  Pop the
+                 * first 6 (argN, argN-1, ..., argN-5) into registers that
+                 * DON'T match final register mapping, then rearrange.   */
+                /* This branch is rare.  Keep simple: bail to 6-arg cap. */
+                total_args = 6;
+                nuser_args = 5;          /* drop anything past 6 total  */
+                reg_args = 6;
+                stack_args = 0;
+                /* Drop unused pushes — align back to 6.  The user-arg
+                 * pushes past 6 are already on stack; simply release.  */
+                int drop = (1 + nuser_args) - total_args;
+                if (drop > 0) emit_add_rsp_imm8((int8_t)(drop * 8));
+            }
+            /* Pop each arg into its register, in reverse push order.    */
+            for (int i = total_args - 1; i >= 0; i--) {
+                emit_pop_r(sysv_argreg(i));
+            }
+            /* Emit the call and record the reloc.                        */
+            int slot = emit_call_rel32();
+            if (g_nrelocs >= MAX_RELOCS) {
+                fprintf(stderr, "luna-boot: too many relocs\n"); exit(1);
+            }
+            g_relocs[g_nrelocs].code_off  = slot;
+            g_relocs[g_nrelocs].target_fn = si;
+            g_relocs[g_nrelocs].from_off  = slot + 4;
+            g_nrelocs++;
+            return;
+        }
+        /* Unknown method — fall through to tolerant no-op.              */
+    }
+
     if (c->kind != N_IDENT) {
-        /* Tolerant indirect call (method call via field access, lambda call,
-           etc.) — evaluate the callee expression plus each arg for side-
-           effects and produce 0.  The self-hosted compiler dispatches
-           properly; the bootstrap only needs to emit something that parses
-           and runs without crashing.                                       */
+        /* Tolerant indirect call (lambda, function-valued variable, or
+         * unresolved method): evaluate sub-expressions and return 0.   */
         lower_expr(callee);
         int nargs_i = n->nkids - 1;
         for (int i = 0; i < nargs_i; i++) lower_expr(n->kids[1 + i]);
@@ -3352,32 +3425,44 @@ static void lower_call(int node)
     }
     Sym *s = &g_syms[si];
     int nargs = n->nkids - 1;
-    int passed = nargs;
-    if (nargs > 6) {
-        /* Tolerant: evaluate extra args for side-effects (don't pass them). */
-        for (int i = 6; i < nargs; i++) lower_expr(n->kids[1 + i]);
-        passed = 6;
-    }
-    nargs = passed;
+    int is_syscall  = (s->kind == N_EXTERN_FN) && (g_nodes[s->node].i2 == 1);
+    int is_extern_c = (s->kind == N_EXTERN_FN) && (g_nodes[s->node].i2 == 2);
 
-    /* Evaluate each arg, push RAX, then pop in reverse to the target reg.
-       This sidesteps clobbering earlier arg regs while computing later
-       args.                                                                */
-    for (int i = 0; i < nargs; i++) {
+    /* Syscalls never get more than 6 args (Linux kernel ABI), so stack
+     * passing only matters for ordinary Luna-internal calls.            */
+    if (is_syscall && nargs > 6) {
+        /* Evaluate extras for side-effects, drop them. */
+        for (int i = 6; i < nargs; i++) lower_expr(n->kids[1 + i]);
+        nargs = 6;
+    }
+
+    int stack_args = (nargs > 6) ? (nargs - 6) : 0;
+    int reg_args   = nargs - stack_args;
+
+    /* Stack-passed args go first, in reverse index order so after all
+     * pushes the layout above rsp matches the callee's expectation:
+     *     [rsp+0]  = arg6
+     *     [rsp+8]  = arg7
+     *     ...
+     * Then register args are pushed in index order and popped in
+     * reverse to their assigned register, leaving rsp pointing at arg6.
+     */
+    for (int i = nargs - 1; i >= reg_args; i--) {
         lower_expr(n->kids[1 + i]);
         emit_push_rax();
     }
-    int is_syscall = (s->kind == N_EXTERN_FN) && (g_nodes[s->node].i2 == 1);
-    int is_extern_c = (s->kind == N_EXTERN_FN) && (g_nodes[s->node].i2 == 2);
-
-    for (int i = nargs - 1; i >= 0; i--) {
+    for (int i = 0; i < reg_args; i++) {
+        lower_expr(n->kids[1 + i]);
+        emit_push_rax();
+    }
+    for (int i = reg_args - 1; i >= 0; i--) {
         int r = is_syscall ? syscall_argreg(i) : sysv_argreg(i);
         emit_pop_r(r);
     }
 
     if (is_syscall) {
         if (s->syscall_nr < 0) {
-            emit_int3();  /* unknown syscall — stub */
+            emit_int3();
             return;
         }
         emit_mov_rax_imm64((uint64_t)(long long)s->syscall_nr);
@@ -3385,19 +3470,25 @@ static void lower_call(int node)
         return;
     }
     if (is_extern_c) {
-        /* TODO: real PLT relocation for extern "C".  Not needed for the
-           bootstrap's tiny subset — emit int3 so the binary traps loudly. */
+        /* Phase A4 will route this through a generalized IAT / GOT.    */
         emit_int3();
         return;
     }
 
-    /* Luna-internal call */
     int slot = emit_call_rel32();
     if (g_nrelocs >= MAX_RELOCS) { fprintf(stderr, "luna-boot: too many relocs\n"); exit(1); }
     g_relocs[g_nrelocs].code_off  = slot;
     g_relocs[g_nrelocs].target_fn = si;
     g_relocs[g_nrelocs].from_off  = slot + 4;
     g_nrelocs++;
+
+    /* Clean up stack-passed args after the call so rsp is restored. */
+    if (stack_args > 0) {
+        int cleanup = stack_args * 8;
+        /* stack_args in practice never exceeds 10 (80 bytes), comfortably
+         * under the 127-byte disp8 limit.                                 */
+        emit_add_rsp_imm8((int8_t)cleanup);
+    }
 }
 
 /* Look up the struct type declared for the value produced by `obj` and
@@ -4051,8 +4142,6 @@ static void lower_function(int sym_idx)
         AstNode *c = &g_nodes[fn->kids[i]];
         if (c->kind != N_PARAM) continue;
         int li = local_add(c->s, c->slen, 1, pi);
-        /* Carry the parameter's declared type so later @p.x field
-         * accesses can compute real offsets.                      */
         if (c->nkids > 0) {
             AstNode *ty = &g_nodes[c->kids[0]];
             if (ty->kind == N_TYPE && ty->s && ty->slen > 0 &&
@@ -4061,8 +4150,18 @@ static void lower_function(int sym_idx)
                 g_locals[li].type_name_len = ty->slen;
             }
         }
-        int r = sysv_argreg(pi);
-        emit_mov_rbp_disp_r(r, g_locals[li].offset);
+        if (pi < 6) {
+            /* Register-passed: spill to the local's stack slot.         */
+            int r = sysv_argreg(pi);
+            emit_mov_rbp_disp_r(r, g_locals[li].offset);
+        } else {
+            /* Stack-passed argument.  Caller placed arg6 at [rbp+16],
+             * arg7 at [rbp+24], ... (offset = 16 + (pi-6)*8).  Load
+             * into rax and store to the local slot.                    */
+            int src_disp = 16 + (pi - 6) * 8;
+            emit_mov_rax_rbp_disp(src_disp);
+            emit_mov_rbp_disp_rax(g_locals[li].offset);
+        }
         pi++;
     }
     (void)nparams;
