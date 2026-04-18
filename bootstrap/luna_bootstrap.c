@@ -2993,6 +2993,27 @@ static void emit_mov_mem_rcx_rax_x8_rdx(void)
     uint8_t b[] = { 0x48, 0x89, 0x14, 0xc1 };
     code_emit_bytes(b, 4);
 }
+/* mov reg, [rsp + disp8]  — reg in 0..15.  mod=01, rm=100 (SIB), sib=0x24 (rsp) */
+static void emit_mov_r_rsp_disp8(int reg, int8_t d)
+{
+    uint8_t rex = (reg >= 8) ? 0x4C : 0x48;
+    code_emit_byte(rex);
+    code_emit_byte(0x8B);
+    code_emit_byte((uint8_t)((1 << 6) | ((reg & 7) << 3) | 4));
+    code_emit_byte(0x24);
+    code_emit_byte((uint8_t)d);
+}
+/* mov [rsp + disp8], reg */
+static void emit_mov_rsp_disp8_r(int8_t d, int reg)
+{
+    uint8_t rex = (reg >= 8) ? 0x4C : 0x48;
+    code_emit_byte(rex);
+    code_emit_byte(0x89);
+    code_emit_byte((uint8_t)((1 << 6) | ((reg & 7) << 3) | 4));
+    code_emit_byte(0x24);
+    code_emit_byte((uint8_t)d);
+}
+
 /* mov [rbx + disp32], rax — store element into a heap-allocated array /
  * struct whose base we parked in rbx (48 89 83 xx xx xx xx).           */
 static void emit_mov_mem_rbx_disp32_rax(int32_t disp)
@@ -3076,32 +3097,82 @@ enum {
     IAT_EXITPROCESS  = 2
 };
 
-/* Import descriptor.  The PE backend builds the IAT/ILT/hint-name
- * tables from whatever ends up here by the time write_pe64 runs.
- * Entries 0..2 above are pre-registered unconditionally so shine /
- * print / exit can rely on them; further entries are added lazily by
- * ffi_register() when the parser sees `extern "C" fn Foo(...)`.       */
+/* Each Windows import tracks which DLL provides it so the PE writer
+ * can emit one IMAGE_IMPORT_DESCRIPTOR per unique DLL and group the
+ * per-function slots under the right one.                             */
+typedef struct {
+    const char *fn_name;
+    const char *dll_name;
+} WinImport;
+
 #define MAX_IMPORTS 256
-static const char *g_imports[MAX_IMPORTS];
-static int         g_nimports;
+static WinImport g_imports[MAX_IMPORTS];
+static int       g_nimports;
+
+/* Maps a WinAPI / CRT function name to the DLL that exports it.  The
+ * common ones are hardcoded; unknown names default to KERNEL32.DLL.  */
+static const char *winapi_dll(const char *name, int len)
+{
+    static const struct { const char *fn; const char *dll; } T[] = {
+        /* KERNEL32 — Win32 core                                    */
+        { "GetStdHandle",    "KERNEL32.DLL" },
+        { "WriteFile",       "KERNEL32.DLL" },
+        { "ReadFile",        "KERNEL32.DLL" },
+        { "ExitProcess",     "KERNEL32.DLL" },
+        { "CreateFileA",     "KERNEL32.DLL" },
+        { "GetFileSize",     "KERNEL32.DLL" },
+        { "GetFileSizeEx",   "KERNEL32.DLL" },
+        { "CloseHandle",     "KERNEL32.DLL" },
+        { "VirtualAlloc",    "KERNEL32.DLL" },
+        { "VirtualFree",     "KERNEL32.DLL" },
+        { "GetLastError",    "KERNEL32.DLL" },
+        { "GetCommandLineA", "KERNEL32.DLL" },
+        { "Sleep",           "KERNEL32.DLL" },
+        { "GetTickCount",    "KERNEL32.DLL" },
+        /* msvcrt — Microsoft C runtime                             */
+        { "fopen",   "msvcrt.dll" }, { "fclose",  "msvcrt.dll" },
+        { "fread",   "msvcrt.dll" }, { "fwrite",  "msvcrt.dll" },
+        { "fseek",   "msvcrt.dll" }, { "ftell",   "msvcrt.dll" },
+        { "fflush",  "msvcrt.dll" }, { "fprintf", "msvcrt.dll" },
+        { "printf",  "msvcrt.dll" }, { "puts",    "msvcrt.dll" },
+        { "malloc",  "msvcrt.dll" }, { "free",    "msvcrt.dll" },
+        { "realloc", "msvcrt.dll" }, { "calloc",  "msvcrt.dll" },
+        { "strlen",  "msvcrt.dll" }, { "strcpy",  "msvcrt.dll" },
+        { "strcmp",  "msvcrt.dll" }, { "strcat",  "msvcrt.dll" },
+        { "strchr",  "msvcrt.dll" }, { "memcpy",  "msvcrt.dll" },
+        { "getenv",  "msvcrt.dll" }, { "system",  "msvcrt.dll" },
+        { "exit",    "msvcrt.dll" }, { "atoi",    "msvcrt.dll" },
+        { "sprintf", "msvcrt.dll" }, { "time",    "msvcrt.dll" },
+        { "_open",   "msvcrt.dll" }, { "_read",   "msvcrt.dll" },
+        { "_write",  "msvcrt.dll" }, { "_close",  "msvcrt.dll" },
+        { "_lseek",  "msvcrt.dll" },
+        /* user32 — windowing                                         */
+        { "MessageBoxA", "USER32.DLL" },
+        { NULL, NULL }
+    };
+    for (int i = 0; T[i].fn; i++) {
+        int fl = (int)strlen(T[i].fn);
+        if (fl == len && memcmp(T[i].fn, name, len) == 0) return T[i].dll;
+    }
+    return "KERNEL32.DLL";
+}
 
 static int ffi_register(const char *name, int len)
 {
     for (int i = 0; i < g_nimports; i++) {
-        if ((int)strlen(g_imports[i]) == len &&
-            memcmp(g_imports[i], name, len) == 0) {
+        if ((int)strlen(g_imports[i].fn_name) == len &&
+            memcmp(g_imports[i].fn_name, name, len) == 0) {
             return i;
         }
     }
     if (g_nimports >= MAX_IMPORTS) {
         fprintf(stderr, "luna-boot: too many FFI imports\n"); exit(1);
     }
-    char *buf = arena_strndup(name, len);
-    g_imports[g_nimports] = buf;
+    g_imports[g_nimports].fn_name  = arena_strndup(name, len);
+    g_imports[g_nimports].dll_name = winapi_dll(name, len);
     return g_nimports++;
 }
 
-/* Seed the core slots at startup so their enum positions are stable. */
 static void ffi_init_core(void)
 {
     ffi_register("GetStdHandle", 12);
@@ -3494,6 +3565,138 @@ static void lower_call(int node)
         emit_mov_rax_imm64(0);
         return;
     }
+    /* Windows target: intercept read_file / write_file BEFORE sym_find.
+     * Prelude provides a Linux implementation via sys_open/etc., but on
+     * Windows we must bypass that and route through the msvcrt CRT
+     * (fopen / fread / fseek / ftell / fwrite / fclose).               */
+    if (g_target == TARGET_WINDOWS &&
+        c->slen == 9 && memcmp(c->s, "read_file", 9) == 0 && n->nkids >= 2)
+    {
+        int fopen_s  = ffi_register("fopen",  5);
+        int fseek_s  = ffi_register("fseek",  5);
+        int ftell_s  = ffi_register("ftell",  5);
+        int fread_s  = ffi_register("fread",  5);
+        int fclose_s = ffi_register("fclose", 6);
+
+        lower_expr(n->kids[1]);                 /* rax = path ptr        */
+
+        /* Stack layout after `push rbx + sub rsp, 64` (rsp 16-aligned):
+         *   [rsp +  0..31]   shadow for WinAPI calls
+         *   [rsp + 32]       fp / saved path
+         *   [rsp + 40]       size
+         *   [rsp + 48]       buf ptr
+         *   [rsp + 56]       pad                                      */
+        emit_push_r(3 /* rbx */);
+        emit_sub_rsp_imm8(56);                  /* 16-align post-push   */
+        emit_mov_rsp_disp8_r(32, REG_RAX);      /* [rsp+32] = path      */
+
+        /* fopen(path, "rb") */
+        emit_mov_r_rsp_disp8(REG_RCX, 32);      /* rcx = path           */
+        /* Register a "rb" rodata literal.                              */
+        int rb_idx = strpool_add("rb", 2);
+        emit_lea_rax_rip_rodata(g_strs[rb_idx].off);
+        emit_mov_r_r(REG_RDX, REG_RAX);         /* rdx = "rb"           */
+        emit_call_iat(fopen_s);
+        emit_mov_rsp_disp8_r(32, REG_RAX);      /* [rsp+32] = fp        */
+
+        /* fseek(fp, 0, SEEK_END=2) */
+        emit_mov_r_rsp_disp8(REG_RCX, 32);
+        emit_mov_r_imm64(REG_RDX, 0);
+        emit_mov_r_imm64(8 /* r8 */, 2);
+        emit_call_iat(fseek_s);
+
+        /* ftell(fp) -> size */
+        emit_mov_r_rsp_disp8(REG_RCX, 32);
+        emit_call_iat(ftell_s);
+        emit_mov_rsp_disp8_r(40, REG_RAX);      /* [rsp+40] = size      */
+
+        /* fseek(fp, 0, SEEK_SET=0) */
+        emit_mov_r_rsp_disp8(REG_RCX, 32);
+        emit_mov_r_imm64(REG_RDX, 0);
+        emit_mov_r_imm64(8, 0);
+        emit_call_iat(fseek_s);
+
+        /* Allocate new_str(size) inline via bump allocator.             */
+        emit_mov_r_rsp_disp8(REG_RAX, 40);      /* rax = size           */
+        emit_add_rax_imm32(8 + 7);
+        /* and rax, -8 -> 48 83 E0 F8                                    */
+        { uint8_t b[] = { 0x48, 0x83, 0xe0, 0xf8 }; code_emit_bytes(b, 4); }
+        emit_mov_rcx_rax2();                    /* rcx = aligned size   */
+        emit_mov_rax_mem_rip_bss(BSS_HEAP_TOP_OFF);
+        emit_mov_rsp_disp8_r(48, REG_RAX);      /* [rsp+48] = header    */
+        /* add rax, rcx -> 48 01 c8                                      */
+        { uint8_t b[] = { 0x48, 0x01, 0xc8 }; code_emit_bytes(b, 3); }
+        emit_mov_mem_rip_rax_bss(BSS_HEAP_TOP_OFF);
+        emit_mov_r_rsp_disp8(REG_RAX, 48);      /* rax = header         */
+        emit_mov_r_rsp_disp8(REG_RDX, 40);      /* rdx = size           */
+        /* mov [rax], rdx -> 48 89 10                                    */
+        { uint8_t b[] = { 0x48, 0x89, 0x10 }; code_emit_bytes(b, 3); }
+        /* add rax, 8 -> 48 83 c0 08                                     */
+        { uint8_t b[] = { 0x48, 0x83, 0xc0, 0x08 }; code_emit_bytes(b, 4); }
+        emit_mov_rsp_disp8_r(48, REG_RAX);      /* [rsp+48] = data ptr  */
+
+        /* fread(buf, 1, size, fp) */
+        emit_mov_r_rsp_disp8(REG_RCX, 48);      /* rcx = buf            */
+        emit_mov_r_imm64(REG_RDX, 1);
+        emit_mov_r_rsp_disp8(8 /* r8 */, 40);   /* r8 = size            */
+        emit_mov_r_rsp_disp8(9 /* r9 */, 32);   /* r9 = fp              */
+        emit_call_iat(fread_s);
+
+        /* fclose(fp) */
+        emit_mov_r_rsp_disp8(REG_RCX, 32);
+        emit_call_iat(fclose_s);
+
+        /* Return buf.                                                   */
+        emit_mov_r_rsp_disp8(REG_RAX, 48);
+        emit_add_rsp_imm8(56);
+        emit_pop_r(3);
+        return;
+    }
+
+    if (g_target == TARGET_WINDOWS &&
+        c->slen == 10 && memcmp(c->s, "write_file", 10) == 0 && n->nkids >= 3)
+    {
+        int fopen_s  = ffi_register("fopen",  5);
+        int fwrite_s = ffi_register("fwrite", 6);
+        int fclose_s = ffi_register("fclose", 6);
+
+        /* Evaluate path (rax) and content separately.                  */
+        lower_expr(n->kids[1]);                 /* rax = path           */
+        emit_push_r(3);                         /* push rbx             */
+        emit_sub_rsp_imm8(56);                  /* 16-align post-push   */
+        /* Stack:  [rsp +  0..31] shadow, [rsp+32] fp, [rsp+40] content */
+        emit_mov_rsp_disp8_r(32, REG_RAX);      /* stash path there     */
+
+        lower_expr(n->kids[2]);                 /* rax = content        */
+        emit_mov_rsp_disp8_r(40, REG_RAX);
+
+        /* fopen(path, "wb") */
+        emit_mov_r_rsp_disp8(REG_RCX, 32);
+        int wb_idx = strpool_add("wb", 2);
+        emit_lea_rax_rip_rodata(g_strs[wb_idx].off);
+        emit_mov_r_r(REG_RDX, REG_RAX);
+        emit_call_iat(fopen_s);
+        emit_mov_rsp_disp8_r(32, REG_RAX);      /* [rsp+32] = fp        */
+
+        /* fwrite(content, 1, str_len(content), fp) */
+        emit_mov_r_rsp_disp8(REG_RCX, 40);      /* rcx = content        */
+        emit_mov_r_imm64(REG_RDX, 1);
+        /* r8 = [rcx - 8] = length */
+        /* Current rcx already = content, so: mov r8, [rcx-8] -> 4C 8B 41 F8 */
+        { uint8_t b[] = { 0x4c, 0x8b, 0x41, 0xf8 }; code_emit_bytes(b, 4); }
+        emit_mov_r_rsp_disp8(9, 32);            /* r9 = fp              */
+        emit_call_iat(fwrite_s);
+
+        /* fclose(fp) */
+        emit_mov_r_rsp_disp8(REG_RCX, 32);
+        emit_call_iat(fclose_s);
+
+        emit_mov_rax_imm64(0);
+        emit_add_rsp_imm8(56);
+        emit_pop_r(3);
+        return;
+    }
+
     int si = sym_find(c->s, c->slen);
     if (si < 0) {
         /* --- Inline string intrinsics --------------------------------
@@ -5036,118 +5239,146 @@ static uint32_t pe_align_up(uint32_t v, uint32_t a)
 static void write_pe64(const char *out_path)
 {
     /* ---- Build .rdata contents (rodata | imports).  We need to know the
-     * final .rdata RVA before patching any code relocs, but the IAT slot
-     * offsets within .rdata are static given the layout below.          */
+     * final .rdata RVA before patching any code relocs.  Imports are
+     * grouped per DLL: each DLL gets its own ILT / IAT pair terminated
+     * by a zero qword.                                                  */
     int n_imports = g_nimports;
-    const char **imp_names = g_imports;
+
+    /* Collect unique DLLs in first-appearance order.                    */
+    #define MAX_DLLS 16
+    const char *dll_names[MAX_DLLS];
+    int n_dlls = 0;
+    int dll_of[MAX_IMPORTS];          /* DLL index per global import    */
+    int pos_in_dll[MAX_IMPORTS];      /* position within that DLL's IAT */
+    int count_per_dll[MAX_DLLS] = {0};
+    for (int i = 0; i < n_imports; i++) {
+        const char *dn = g_imports[i].dll_name;
+        int di = -1;
+        for (int j = 0; j < n_dlls; j++) {
+            if (strcmp(dll_names[j], dn) == 0) { di = j; break; }
+        }
+        if (di < 0) {
+            if (n_dlls >= MAX_DLLS) {
+                fprintf(stderr, "luna-boot: too many distinct FFI DLLs\n"); exit(1);
+            }
+            di = n_dlls;
+            dll_names[n_dlls++] = dn;
+        }
+        dll_of[i] = di;
+        pos_in_dll[i] = count_per_dll[di]++;
+    }
 
     int user_rod_size = g_rodata_len;
     int cur = pe_align_up((uint32_t)user_rod_size, 8);
 
-    int iat_off = cur;
-    cur += (n_imports + 1) * 8;
-    int ilt_off = cur;
-    cur += (n_imports + 1) * 8;
+    /* Per-DLL IAT and ILT start offsets.                                */
+    int iat_start[MAX_DLLS];
+    int ilt_start[MAX_DLLS];
+    for (int d = 0; d < n_dlls; d++) {
+        iat_start[d] = cur;
+        cur += (count_per_dll[d] + 1) * 8;
+    }
+    int first_iat_off = iat_start[0];
+    int iat_total_bytes = cur - first_iat_off;
+    for (int d = 0; d < n_dlls; d++) {
+        ilt_start[d] = cur;
+        cur += (count_per_dll[d] + 1) * 8;
+    }
 
     int hint_off[MAX_IMPORTS];
     for (int i = 0; i < n_imports; i++) {
         hint_off[i] = cur;
-        int nl = (int)strlen(imp_names[i]);
+        int nl = (int)strlen(g_imports[i].fn_name);
         int size = 2 + nl + 1;
         if (size & 1) size++;
         cur += size;
     }
-    int dll_name_off = cur;
-    const char *dll_name = "KERNEL32.DLL";
-    cur += (int)strlen(dll_name) + 1;
+
+    int dll_name_off[MAX_DLLS];
+    for (int d = 0; d < n_dlls; d++) {
+        dll_name_off[d] = cur;
+        cur += (int)strlen(dll_names[d]) + 1;
+    }
     cur = pe_align_up((uint32_t)cur, 4);
 
     int import_dir_off = cur;
-    cur += 40;                       /* one descriptor + zero terminator */
+    cur += (n_dlls + 1) * 20;          /* N descriptors + zero terminator */
 
     int total_rdata = cur;
 
-    /* Make sure rodata buffer has room, then write the extra bytes.      */
     if (g_rodata_len + total_rdata - user_rod_size > RODATA_CAP) {
         fprintf(stderr, "luna-boot: rodata overflow in PE writer\n"); exit(1);
     }
-    /* Zero-fill any padding between user rodata and IAT.                 */
-    for (int i = user_rod_size; i < iat_off; i++) g_rodata[i] = 0;
+    for (int i = user_rod_size; i < (n_dlls > 0 ? iat_start[0] : cur); i++)
+        g_rodata[i] = 0;
 
-    /* Section RVAs. */
     int text_len = g_code_len;
     uint32_t text_file_off   = PE_FILE_ALIGN;
     uint32_t text_file_size  = pe_align_up((uint32_t)text_len, PE_FILE_ALIGN);
     uint32_t text_vsize      = pe_align_up((uint32_t)text_len, PE_SECTION_ALIGN);
-    uint32_t text_rva        = PE_SECTION_ALIGN;      /* 0x1000 */
+    uint32_t text_rva        = PE_SECTION_ALIGN;
     uint32_t rdata_rva       = text_rva + text_vsize;
     uint32_t rdata_file_off  = text_file_off + text_file_size;
     uint32_t rdata_file_size = pe_align_up((uint32_t)total_rdata, PE_FILE_ALIGN);
     uint32_t rdata_vsize     = pe_align_up((uint32_t)total_rdata, PE_SECTION_ALIGN);
 
-    uint32_t iat_rva    = rdata_rva + iat_off;
-    uint32_t ilt_rva    = rdata_rva + ilt_off;
     uint32_t import_dir_rva = rdata_rva + import_dir_off;
+    uint32_t first_iat_rva  = rdata_rva + first_iat_off;
 
-    /* .bss — uninitialised, writable.  Placed immediately after .rdata.
-     * SizeOfRawData is zero so the file size doesn't blow up; the
-     * Windows loader zero-fills VirtualSize bytes in memory.          */
     uint32_t bss_rva     = rdata_rva + rdata_vsize;
     uint32_t bss_vsize   = (uint32_t)BSS_BYTES;
     uint32_t bss_vsize_a = pe_align_up(bss_vsize, PE_SECTION_ALIGN);
 
-    /* ---- Fill IAT / ILT / hint-name / DLL-name / import-dir in g_rodata ---- */
-
-    /* IAT and ILT entries point at the hint/name RVAs.  Bit 63 = 0 so they
-     * are "by name" imports, not ordinals.                              */
+    /* Fill IAT and ILT entries per DLL.                                */
     for (int i = 0; i < n_imports; i++) {
+        int d = dll_of[i], pos = pos_in_dll[i];
         uint64_t ptr_by_name = (uint64_t)(rdata_rva + hint_off[i]);
-        uint8_t *p = g_rodata + iat_off + i * 8;
-        for (int b = 0; b < 8; b++) p[b] = (uint8_t)(ptr_by_name >> (b * 8));
-        uint8_t *q = g_rodata + ilt_off + i * 8;
-        for (int b = 0; b < 8; b++) q[b] = (uint8_t)(ptr_by_name >> (b * 8));
+        uint8_t *pi = g_rodata + iat_start[d] + pos * 8;
+        uint8_t *pl = g_rodata + ilt_start[d] + pos * 8;
+        for (int b = 0; b < 8; b++) pi[b] = (uint8_t)(ptr_by_name >> (b * 8));
+        for (int b = 0; b < 8; b++) pl[b] = (uint8_t)(ptr_by_name >> (b * 8));
     }
-    for (int b = 0; b < 8; b++) {
-        g_rodata[iat_off + n_imports * 8 + b] = 0;
-        g_rodata[ilt_off + n_imports * 8 + b] = 0;
+    /* Per-DLL terminators.                                             */
+    for (int d = 0; d < n_dlls; d++) {
+        for (int b = 0; b < 8; b++) {
+            g_rodata[iat_start[d] + count_per_dll[d] * 8 + b] = 0;
+            g_rodata[ilt_start[d] + count_per_dll[d] * 8 + b] = 0;
+        }
     }
 
+    /* Hint/name entries.                                                */
     for (int i = 0; i < n_imports; i++) {
         uint8_t *p = g_rodata + hint_off[i];
         p[0] = 0; p[1] = 0;
-        int nl = (int)strlen(imp_names[i]);
-        memcpy(p + 2, imp_names[i], (size_t)nl);
+        int nl = (int)strlen(g_imports[i].fn_name);
+        memcpy(p + 2, g_imports[i].fn_name, (size_t)nl);
         p[2 + nl] = 0;
         if ((2 + nl + 1) & 1) p[2 + nl + 1] = 0;
     }
 
-    /* DLL name */
-    {
-        int nl = (int)strlen(dll_name);
-        memcpy(g_rodata + dll_name_off, dll_name, (size_t)nl);
-        g_rodata[dll_name_off + nl] = 0;
+    /* DLL names.                                                        */
+    for (int d = 0; d < n_dlls; d++) {
+        int nl = (int)strlen(dll_names[d]);
+        memcpy(g_rodata + dll_name_off[d], dll_names[d], (size_t)nl);
+        g_rodata[dll_name_off[d] + nl] = 0;
     }
 
-    /* Import directory: one entry + zero terminator.                     */
-    {
-        uint8_t *d = g_rodata + import_dir_off;
-        /* OriginalFirstThunk (RVA of ILT) */
-        uint32_t v = ilt_rva;    for (int b = 0; b < 4; b++) d[b]     = (uint8_t)(v >> (b*8));
-        /* TimeDateStamp */
-                                 for (int b = 0; b < 4; b++) d[4 + b] = 0;
-        /* ForwarderChain */
-                                 for (int b = 0; b < 4; b++) d[8 + b] = 0;
-        /* Name RVA */
-        v = rdata_rva + dll_name_off;
-                                 for (int b = 0; b < 4; b++) d[12 + b] = (uint8_t)(v >> (b*8));
-        /* FirstThunk (RVA of IAT) */
-        v = iat_rva;             for (int b = 0; b < 4; b++) d[16 + b] = (uint8_t)(v >> (b*8));
-        /* Zero terminator (20 bytes) */
-        for (int b = 0; b < 20; b++) d[20 + b] = 0;
+    /* Import directory: one descriptor per DLL + zero terminator.      */
+    for (int d = 0; d < n_dlls; d++) {
+        uint8_t *dp = g_rodata + import_dir_off + d * 20;
+        uint32_t v;
+        v = rdata_rva + ilt_start[d];
+        for (int b = 0; b < 4; b++) dp[b]      = (uint8_t)(v >> (b * 8));
+        for (int b = 0; b < 4; b++) dp[4 + b]  = 0;
+        for (int b = 0; b < 4; b++) dp[8 + b]  = 0;
+        v = rdata_rva + dll_name_off[d];
+        for (int b = 0; b < 4; b++) dp[12 + b] = (uint8_t)(v >> (b * 8));
+        v = rdata_rva + iat_start[d];
+        for (int b = 0; b < 4; b++) dp[16 + b] = (uint8_t)(v >> (b * 8));
     }
+    for (int b = 0; b < 20; b++) g_rodata[import_dir_off + n_dlls * 20 + b] = 0;
 
-    /* Patch rodata rip-relative loads (`lea rax, [rip + disp]`) against
-     * the rdata_rva base.                                                */
+    /* Patch rodata rip-relative loads.                                  */
     for (int i = 0; i < g_nrodrelocs; i++) {
         RodataReloc *r = &g_rodrelocs[i];
         uint32_t rip   = text_rva + r->from_rip;
@@ -5155,11 +5386,14 @@ static void write_pe64(const char *out_path)
         int32_t disp  = (int32_t)(target - rip);
         code_patch_u32(r->code_off, (uint32_t)disp);
     }
-    /* Patch IAT call-through-pointer relocs.                             */
+    /* Patch IAT call-through-pointer relocs, mapping global slot to
+     * the per-DLL IAT position.                                         */
     for (int i = 0; i < g_niatrelocs; i++) {
         IatReloc *r = &g_iatrelocs[i];
+        int d = dll_of[r->iat_slot];
+        int pos = pos_in_dll[r->iat_slot];
         uint32_t rip   = text_rva + r->code_off + 4;
-        uint32_t target = iat_rva + r->iat_slot * 8;
+        uint32_t target = rdata_rva + iat_start[d] + pos * 8;
         int32_t disp  = (int32_t)(target - rip);
         code_patch_u32(r->code_off, (uint32_t)disp);
     }
@@ -5226,8 +5460,8 @@ static void write_pe64(const char *out_path)
     /* Data Directories (16 * 8 = 128) — all zero except Import [1] & IAT [12] */
     for (int i = 0; i < 16; i++) {
         uint32_t rva = 0, size = 0;
-        if (i == 1) { rva = import_dir_rva; size = 20; }       /* Import table */
-        if (i == 12){ rva = iat_rva;        size = (n_imports + 1) * 8; } /* IAT */
+        if (i == 1) { rva = import_dir_rva; size = (uint32_t)(n_dlls * 20); }
+        if (i == 12){ rva = first_iat_rva;  size = (uint32_t)iat_total_bytes; }
         write_u32(f, rva);
         write_u32(f, size);
     }
