@@ -1,0 +1,42 @@
+fn main() -> int
+    if args_count() < 2
+        shine("usage: wc <file>")
+        return 1
+    @path = arg(1)
+    @content = read_file(@path)
+    @len = str_len(@content)
+    if @len == 0
+        shine("cannot read file or empty")
+        return 1
+
+    @lines = 0
+    @words = 0
+    @in_word = 0
+    @i = 0
+    while @i < @len
+        @c = str_byte(@content, @i)
+        if @c == 10
+            @lines = @lines + 1
+        if @c == 32
+            @in_word = 0
+        if @c == 9
+            @in_word = 0
+        if @c == 10
+            @in_word = 0
+        if @c == 13
+            @in_word = 0
+        if @c > 32
+            if @in_word == 0
+                @words = @words + 1
+                @in_word = 1
+        @i = @i + 1
+
+    print(" ")
+    print_int(@lines)
+    print(" ")
+    print_int(@words)
+    print(" ")
+    print_int(@len)
+    print(" ")
+    shine(@path)
+    return 0

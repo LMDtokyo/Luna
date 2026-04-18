@@ -2680,6 +2680,12 @@ static void emit_mov_rax_mem_rcx_rax_x8(void)
     uint8_t b[] = { 0x48, 0x8b, 0x04, 0xc1 };
     code_emit_bytes(b, 4);
 }
+/* mov rax, [rax + rcx*8]  (48 8b 04 c8) — base=rax, index=rcx */
+static void emit_mov_rax_mem_rax_rcx_x8(void)
+{
+    uint8_t b[] = { 0x48, 0x8b, 0x04, 0xc8 };
+    code_emit_bytes(b, 4);
+}
 /* ------------------------------------------------------------------------
  * Heap allocator relocations
  *
@@ -2702,6 +2708,8 @@ static int      g_nbssrelocs;
 
 #define BSS_BYTES          (16 * 1024 * 1024 + 64)
 #define BSS_HEAP_TOP_OFF   0
+#define BSS_ARGC_OFF       8
+#define BSS_ARGV_OFF       16
 #define BSS_HEAP_BASE_OFF  64
 
 /* Emit `lea rax, [rip + bss_disp]` with deferred patching. */
@@ -3158,6 +3166,32 @@ static void lower_call(int node)
             /* mov [rdx], al -> 88 02                                    */
             { uint8_t b[] = { 0x88, 0x02 }; code_emit_bytes(b, 2); }
             emit_mov_rax_imm64(0);
+            return;
+        }
+
+        /* args_count() — number of command-line arguments (including
+         * argv[0], the program name).  0 on Windows until FFI lands.   */
+        if (c->slen == 10 && memcmp(c->s, "args_count", 10) == 0) {
+            if (g_target == TARGET_LINUX) {
+                emit_mov_rax_mem_rip_bss(BSS_ARGC_OFF);
+            } else {
+                emit_mov_rax_imm64(0);
+            }
+            return;
+        }
+        /* arg_raw(i) — i-th argv pointer (raw, NUL-terminated C string,
+         * NOT a length-prefixed Luna string).  The prelude wraps this in
+         * arg(i) which converts to a proper Luna string.               */
+        if (c->slen == 7 && memcmp(c->s, "arg_raw", 7) == 0 && n->nkids >= 2) {
+            if (g_target == TARGET_LINUX) {
+                lower_expr(n->kids[1]);                 /* rax = i        */
+                emit_push_rax();
+                emit_mov_rax_mem_rip_bss(BSS_ARGV_OFF); /* rax = argv     */
+                emit_pop_r(REG_RCX);                    /* rcx = i        */
+                emit_mov_rax_mem_rax_rcx_x8();          /* rax = argv[i]  */
+            } else {
+                emit_mov_rax_imm64(0);
+            }
             return;
         }
 
@@ -4061,6 +4095,17 @@ static void lower_all(void)
     /* Emit _start.  The shape depends on the output target: Linux uses the
      * exit_group syscall, Windows routes through ExitProcess in the IAT.  */
     int start_off = g_code_len;
+    /* On Linux the kernel puts argc at [rsp] and argv at [rsp+8] when it
+     * jumps to our entry point.  Snapshot them into BSS slots before the
+     * prologue perturbs rsp so arg(i) / args_count() can find them.     */
+    if (g_target == TARGET_LINUX) {
+        /* mov rax, [rsp]          -> 48 8b 04 24               */
+        { uint8_t b[] = { 0x48, 0x8b, 0x04, 0x24 }; code_emit_bytes(b, 4); }
+        emit_mov_mem_rip_rax_bss(BSS_ARGC_OFF);
+        /* lea rax, [rsp+8]        -> 48 8d 44 24 08            */
+        { uint8_t b[] = { 0x48, 0x8d, 0x44, 0x24, 0x08 }; code_emit_bytes(b, 5); }
+        emit_mov_mem_rip_rax_bss(BSS_ARGV_OFF);
+    }
     /* Initialise the bump-allocator: _luna_heap_top = &_luna_heap_base.
      * This runs before main() so every struct / array literal has a live
      * heap to draw from.                                                */

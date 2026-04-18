@@ -165,3 +165,17 @@ fn write_file(@path: int, @content: int) -> int
     sys_write(@fd, @content, @n)
     sys_close(@fd)
     return @n
+
+fn arg(@i: int) -> int
+    @raw = arg_raw(@i)
+    if @raw == 0
+        return ""
+    @len = 0
+    while str_byte(@raw, @len) != 0
+        @len = @len + 1
+    @s = new_str(@len)
+    @k = 0
+    while @k < @len
+        str_set_byte(@s, @k, str_byte(@raw, @k))
+        @k = @k + 1
+    return @s
