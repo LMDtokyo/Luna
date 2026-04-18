@@ -2947,42 +2947,79 @@ static void lower_call(int node)
                 return;
             }
             if (g_target == TARGET_WINDOWS) {
-                /* Windows shine(): evaluate argument so rax = str ptr, then
-                 * shuttle through rbx (non-volatile under Win64) while we
-                 * call GetStdHandle(STD_OUTPUT_HANDLE) followed by
-                 * WriteFile(h, buf, len, &bytesWritten, NULL).  We reserve
-                 * 56 bytes of stack for: 32-byte shadow (required before
-                 * every WinAPI call), 8 for the 5th arg (lpOverlapped=NULL),
-                 * 8 for lpNumberOfBytesWritten scratch, 8 keeping rsp
-                 * 16-byte aligned after `push rbx`.                        */
-                lower_expr(n->kids[1]);                      /* rax = str */
-                emit_push_r(3 /* rbx */);                    /* save rbx */
-                emit_mov_r_r(3 /* rbx */, REG_RAX);          /* rbx = str */
+                lower_expr(n->kids[1]);
+                emit_push_r(3 /* rbx */);
+                emit_mov_r_r(3 /* rbx */, REG_RAX);
                 emit_sub_rsp_imm8(56);
-                /* GetStdHandle(-11) — STD_OUTPUT_HANDLE */
                 emit_mov_r_imm64(REG_RCX, (uint64_t)(int64_t)-11);
                 emit_call_iat(IAT_GETSTDHANDLE);
-                /* WriteFile(rax, rbx, [rbx-8], &[rsp+40], 0) */
-                emit_mov_r_r(REG_RCX, REG_RAX);              /* hFile */
-                emit_mov_r_r(REG_RDX, 3 /* rbx */);          /* buf */
-                emit_mov_r8_mem_rbx_disp8(-8);               /* r8 = len */
-                emit_lea_r9_rsp_disp8(40);                   /* r9 = &wrote */
-                emit_mov_qword_rsp_disp8_imm0(32);           /* [rsp+32]=0 */
+                emit_mov_r_r(REG_RCX, REG_RAX);
+                emit_mov_r_r(REG_RDX, 3 /* rbx */);
+                emit_mov_r8_mem_rbx_disp8(-8);
+                emit_lea_r9_rsp_disp8(40);
+                emit_mov_qword_rsp_disp8_imm0(32);
                 emit_call_iat(IAT_WRITEFILE);
-                /* Print newline: WriteFile(handle_from_GSH, nl, 1, ...)
-                 * We could call GetStdHandle again, but simpler: stash
-                 * the handle from the first call.  After WriteFile, rax
-                 * holds its boolean return — handle is lost.  Recall via
-                 * another GetStdHandle call — Windows caches it, cheap.  */
                 emit_mov_r_imm64(REG_RCX, (uint64_t)(int64_t)-11);
                 emit_call_iat(IAT_GETSTDHANDLE);
                 if (g_newline_str_idx < 0) {
                     g_newline_str_idx = strpool_add("\n", 1);
                 }
-                emit_mov_r_r(REG_RCX, REG_RAX);              /* hFile */
+                emit_mov_r_r(REG_RCX, REG_RAX);
                 emit_lea_rax_rip_rodata(g_strs[g_newline_str_idx].off);
-                emit_mov_r_r(REG_RDX, REG_RAX);              /* buf */
-                emit_mov_r_imm64(8 /* r8 */, 1);             /* len = 1 */
+                emit_mov_r_r(REG_RDX, REG_RAX);
+                emit_mov_r_imm64(8 /* r8 */, 1);
+                emit_lea_r9_rsp_disp8(40);
+                emit_mov_qword_rsp_disp8_imm0(32);
+                emit_call_iat(IAT_WRITEFILE);
+                emit_add_rsp_imm8(56);
+                emit_pop_r(3 /* rbx */);
+                emit_mov_rax_imm64(0);
+                return;
+            }
+        }
+        /* exit(code) — terminate the process with the given exit status.
+         * On Linux this becomes exit_group(code); on Windows it becomes
+         * ExitProcess(code).  Code-noreturn: we still emit `mov rax, 0`
+         * for downstream expression compatibility, but control never
+         * reaches it.                                                     */
+        if (c->slen == 4 && memcmp(c->s, "exit", 4) == 0 && n->nkids >= 2) {
+            lower_expr(n->kids[1]);                  /* rax = code */
+            if (g_target == TARGET_WINDOWS) {
+                emit_mov_r_r(REG_RCX, REG_RAX);      /* rcx = code */
+                emit_sub_rsp_imm8(40);               /* shadow + align  */
+                emit_call_iat(IAT_EXITPROCESS);
+                emit_int3();                         /* unreachable     */
+            } else {
+                emit_mov_r_r(REG_RDI, REG_RAX);      /* rdi = code */
+                emit_mov_rax_imm64((uint64_t)SYS_EXIT_GROUP);
+                emit_syscall();
+                emit_int3();
+            }
+            emit_mov_rax_imm64(0);
+            return;
+        }
+        /* print(s) — write string without trailing newline.  Mirrors
+         * shine() minus the final newline syscall/WriteFile.            */
+        if (c->slen == 5 && memcmp(c->s, "print", 5) == 0 && n->nkids >= 2) {
+            lower_expr(n->kids[1]);
+            if (g_target == TARGET_LINUX) {
+                emit_mov_r_r(REG_RSI, REG_RAX);
+                emit_mov_r_mem_rax_disp8(REG_RDX, -8);
+                emit_mov_r_imm64(REG_RDI, 1);
+                emit_mov_rax_imm64(SYS_WRITE);
+                emit_syscall();
+                emit_mov_rax_imm64(0);
+                return;
+            }
+            if (g_target == TARGET_WINDOWS) {
+                emit_push_r(3 /* rbx */);
+                emit_mov_r_r(3 /* rbx */, REG_RAX);
+                emit_sub_rsp_imm8(56);
+                emit_mov_r_imm64(REG_RCX, (uint64_t)(int64_t)-11);
+                emit_call_iat(IAT_GETSTDHANDLE);
+                emit_mov_r_r(REG_RCX, REG_RAX);
+                emit_mov_r_r(REG_RDX, 3 /* rbx */);
+                emit_mov_r8_mem_rbx_disp8(-8);
                 emit_lea_r9_rsp_disp8(40);
                 emit_mov_qword_rsp_disp8_imm0(32);
                 emit_call_iat(IAT_WRITEFILE);

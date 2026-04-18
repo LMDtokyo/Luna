@@ -1,102 +1,70 @@
-# =============================================================================
-# Telegram Bot (cosmic edition) — Luna v4.3
-# =============================================================================
-# Shows off the post-L4 cosmic stdlib: beam / lumen / chrono / cosmos, plus
-# the phase<T> propagator (`?`) that replaces manual error plumbing.
-#
-# Before/after in one line:
-#
-#   # before (legacy)
-#   @resp = http_post_json(@url, @url_len, @body, @body_len)
-#   if @resp.ok == 0 { retry(); continue }
-#
-#   # after (cosmic)
-#   seal @echo = beam.push_lumen(@url, @body)?   # Dim(Fault) auto-propagates
-#
-# The bot echoes every inbound text message back to the chat.  Token is read
-# from the cosmos (env var).  No Rust in the call path — beam uses veil for
-# HTTPS, veil rides orbit, orbit talks to aether, aether talks to the OS.
-# =============================================================================
-
-import beam        # was http    — outbound/inbound HTTP beams
-import lumen       # was json    — JSON is a shaped beam of light
-import chrono      # was time    — moments and arcs
-import cosmos      # was env     — process environment
-import nebula      # was scheduler — spawn / pulse
-
-# ---------------------------------------------------------------------------
-# Reply shape — one update from /getUpdates
-# ---------------------------------------------------------------------------
+import beam
+import lumen
+import chrono
+import cosmos
 
 struct Incoming
     update_id: int
     chat_id:   int
     text:      str
 
-# Convert a single lumen node into an Incoming.  Returns phase<Incoming>:
-# Bright if the update is a plain text message we can handle; Dim otherwise
-# (the caller's `orbit` loop skips those naturally via the `?` propagator).
+seal @tg_api = "https://api.telegram.org/bot"
+
 fn parse_incoming(@node: lumen.Node) -> phase<Incoming>
-    seal @uid = @node.at("update_id").as_int()?
-    seal @msg = @node.at("message")?                # not all updates carry a message
+    seal @uid  = @node.at("update_id").as_int()?
+    seal @msg  = @node.at("message")?
     seal @chat = @msg.at("chat")?
-    seal @cid = @chat.at("id").as_int()?
+    seal @cid  = @chat.at("id").as_int()?
     seal @text = @msg.at("text").as_text()?
     shine Bright(Incoming { update_id: @uid, chat_id: @cid, text: @text })
 
-# ---------------------------------------------------------------------------
-# Telegram surface
-# ---------------------------------------------------------------------------
-
-seal @tg_api = "https://api.telegram.org/bot"
-
-# Ask Telegram for fresh updates, blocking up to 25 s server-side.
 fn fetch_updates(@token: str, @offset: int) -> phase<lumen.Node>
-    seal @url = @tg_api + @token +
-                "/getUpdates?timeout=25&offset=" + @offset.show() +
-                "&allowed_updates=%5B%22message%22%5D"
+    seal @url = @tg_api + @token
+                + "/getUpdates?timeout=25&offset=" + @offset.show()
+                + "&allowed_updates=%5B%22message%22%5D"
     seal @echo = beam.fetch(@url)?
     unless @echo.status.is_ok()
-        shine Dim(Fault.net("telegram: " + @echo.status.show()))
+        shine Dim(Fault.net("getUpdates " + @echo.status.show()))
     shine Bright(lumen.parse(@echo.carry)?)
 
-# Echo one message back.
-fn reply_echo(@token: str, @chat: int, @text: str) -> phase<unit>
+fn reply(@token: str, @chat: int, @text: str) -> phase<unit>
     seal @url = @tg_api + @token + "/sendMessage"
-    seal @payload = lumen.compose
+    seal @body = lumen.compose
         "chat_id": @chat
         "text":    @text
-    seal @echo = beam.push_lumen(@url, @payload)?
+    seal @echo = beam.push_lumen(@url, @body)?
     unless @echo.status.is_ok()
         shine Dim(Fault.net("sendMessage " + @echo.status.show()))
     shine Bright(unit)
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+fn handle(@token: str, @msg: Incoming) -> phase<unit>
+    if @msg.text == "/start"
+        reply(@token, @msg.chat_id, "Luna bot online.")?
+        shine Bright(unit)
+    if @msg.text.starts_with("/echo ")
+        seal @payload = @msg.text.slice(6, @msg.text.len())
+        reply(@token, @msg.chat_id, @payload)?
+        shine Bright(unit)
+    reply(@token, @msg.chat_id, @msg.text)?
+    shine Bright(unit)
 
 fn main() -> phase<int>
     seal @token = cosmos.peek("TELEGRAM_BOT_TOKEN")?
-    shine "luna-bot is lit; token present"
+    shine "telegram bot ready"
 
     meow @offset: int = 0
     orbit _ in 0..9999999999
         phase fetch_updates(@token, @offset)
             Bright(@doc) =>
-                # `doc.at("result")` is a lumen array of updates.  We walk it.
                 orbit @raw in @doc.at("result")?.items()
                     phase parse_incoming(@raw)
                         Bright(@msg) =>
-                            # Propagate any send failure by collapsing the
-                            # whole main() via `?`.  If we'd rather keep the
-                            # loop alive, we'd pattern-match instead.
-                            reply_echo(@token, @msg.chat_id, @msg.text)?
+                            handle(@token, @msg)?
                             if @msg.update_id >= @offset
                                 @offset = @msg.update_id + 1
                         Dim(_) =>
-                            # Non-text update (photo, sticker, ...).  Skip.
                             pass
             Dim(@fault) =>
-                shine "poll dimmed: " + @fault.msg
+                shine "poll failed: " + @fault.msg
                 chrono.slumber(arc.seconds(3))
     shine Bright(0)

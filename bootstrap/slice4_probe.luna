@@ -1,0 +1,6 @@
+fn main() -> int
+    print("no-newline ")
+    shine("line1")
+    print("mid ")
+    shine("end")
+    exit(7)

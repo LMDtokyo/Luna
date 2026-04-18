@@ -1,0 +1,4 @@
+fn main() -> int
+    shine("before exit")
+    exit(42)
+    shine("unreachable")

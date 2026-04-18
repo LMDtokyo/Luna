@@ -1,58 +1,31 @@
-# =============================================================================
-# Discord Bot (cosmic edition) — Luna v4.3
-# =============================================================================
-# Connects to Discord Gateway v10 over a secure cascade (WSS), identifies as
-# a bot, and replies "pong" to any message that starts with "!ping".
-#
-# Uses:
-#   * cascade         — bi-directional pulse chain (was WebSocket)
-#   * beam            — HTTP for REST replies (was http)
-#   * lumen           — JSON (was json)
-#   * chrono          — moments and arcs (was time)
-#   * cosmos          — env vars (was getenv)
-#   * nebula.spawn    — structured concurrency for the heartbeat pulse
-#
-# The phase<T> / `?` propagator drastically shortens the original bot, and
-# `nebula.spawn` keeps the heartbeat alive in a sibling fibre that shares
-# the parent's cascade handle.
-# =============================================================================
+import cascade
+import beam
+import lumen
+import chrono
+import cosmos
+import nebula
 
-import cascade      # was websocket
-import beam         # was http
-import lumen        # was json
-import chrono       # was time
-import cosmos       # was env
-import nebula       # was scheduler (spawn / pulse)
+const OP_DISPATCH:        int = 0
+const OP_HEARTBEAT:       int = 1
+const OP_IDENTIFY:        int = 2
+const OP_RESUME:          int = 6
+const OP_RECONNECT:       int = 7
+const OP_INVALID_SESSION: int = 9
+const OP_HELLO:           int = 10
+const OP_HEARTBEAT_ACK:   int = 11
 
-# ---------------------------------------------------------------------------
-# Gateway op codes and intents (unchanged — these come from Discord's spec)
-# ---------------------------------------------------------------------------
-
-const OP_DISPATCH:         int = 0
-const OP_HEARTBEAT:        int = 1
-const OP_IDENTIFY:         int = 2
-const OP_RESUME:           int = 6
-const OP_RECONNECT:        int = 7
-const OP_INVALID_SESSION:  int = 9
-const OP_HELLO:            int = 10
-const OP_HEARTBEAT_ACK:    int = 11
-
-const INTENT_GUILD_MESSAGES:  int = 512       # 1 << 9
-const INTENT_MESSAGE_CONTENT: int = 32768     # 1 << 15
+const INTENT_GUILD_MESSAGES:  int = 512
+const INTENT_MESSAGE_CONTENT: int = 32768
 
 seal @gateway_url = "wss://gateway.discord.gg/?v=10&encoding=json"
 seal @api_base    = "https://discord.com/api/v10"
 
-# ---------------------------------------------------------------------------
-# Identify frame
-# ---------------------------------------------------------------------------
-
 fn identify_frame(@token: str, @intents: int) -> lumen.Node
     return lumen.compose
-        "op": 2
+        "op": OP_IDENTIFY
         "d":
-            "token":      @token
-            "intents":    @intents
+            "token":   @token
+            "intents": @intents
             "properties":
                 "os":      "luna"
                 "browser": "luna"
@@ -60,12 +33,8 @@ fn identify_frame(@token: str, @intents: int) -> lumen.Node
 
 fn heartbeat_frame(@last_seq: seen<int>) -> lumen.Node
     return lumen.compose
-        "op": 1
-        "d":  @last_seq                       # lumen.compose serialises `Gone` as null
-
-# ---------------------------------------------------------------------------
-# REST reply
-# ---------------------------------------------------------------------------
+        "op": OP_HEARTBEAT
+        "d":  @last_seq
 
 fn send_message(@token: str, @channel: str, @content: str) -> phase<unit>
     seal @url = @api_base + "/channels/" + @channel + "/messages"
@@ -73,49 +42,49 @@ fn send_message(@token: str, @channel: str, @content: str) -> phase<unit>
         "content": @content
     seal @echo = beam.push_lumen_with_auth(@url, @body, "Bot " + @token)?
     unless @echo.status.is_ok()
-        shine Dim(Fault.net("discord: " + @echo.status.show()))
+        shine Dim(Fault.net("sendMessage " + @echo.status.show()))
     shine Bright(unit)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+fn handle_message(@token: str, @d: lumen.Node) -> phase<unit>
+    seal @channel = @d.at("channel_id")?.as_text()?
+    seal @content = @d.at("content")?.as_text()?
+    if @content == "!ping"
+        send_message(@token, @channel, "pong")?
+        shine Bright(unit)
+    if @content.starts_with("!echo ")
+        seal @payload = @content.slice(6, @content.len())
+        send_message(@token, @channel, @payload)?
+        shine Bright(unit)
+    shine Bright(unit)
 
 fn main() -> phase<int>
     seal @token = cosmos.peek("DISCORD_BOT_TOKEN")?
-    shine "luna-discord waking the cascade..."
+    shine "discord bot ready"
 
-    # Open the secure cascade (TLS-wrapped WebSocket).
     meow @cx: cascade.Link = cascade.link_secure(@gateway_url)?
 
-    # Wait for HELLO and extract heartbeat_interval.
-    seal @hello = @cx.catch()?                # phase<Frame>
+    seal @hello     = @cx.catch()?
     seal @hello_doc = lumen.parse(@hello.carry)?
     guard @hello_doc.at("op")?.as_int()? == OP_HELLO
-        else shine Dim(Fault.net("expected HELLO, got different op"))
+        else shine Dim(Fault.net("expected HELLO"))
     seal @heartbeat_ms = @hello_doc.at("d")?.at("heartbeat_interval")?.as_int()?
 
-    # Send IDENTIFY.
-    @cx.emit_lumen(identify_frame(@token, INTENT_GUILD_MESSAGES | INTENT_MESSAGE_CONTENT))?
+    @cx.emit_lumen(identify_frame(@token,
+        INTENT_GUILD_MESSAGES | INTENT_MESSAGE_CONTENT))?
 
-    # Shared state between the main loop and the heartbeat sibling.
     meow @last_seq: seen<int> = Gone
     meow @running: beacon = beacon.new(1)
 
-    # Heartbeat pulses in a sibling fibre.  beacon + seen<int> keep it safe.
     nebula.spawn
         orbit _ in 0..9999999999
             guard @running.read() == 1 else break
             chrono.slumber(arc.millis(@heartbeat_ms))
-            @cx.emit_lumen(heartbeat_frame(@last_seq))
-                ?? pass       # silently drop; recv loop will notice the close
-    # The `??` above is `seen_or(..., pass)`: if the pulse dies, we do
-    # nothing rather than collapse.  The main loop handles reconnection.
+            @cx.emit_lumen(heartbeat_frame(@last_seq)) ?? pass
 
-    # Main event loop
     orbit _ in 0..9999999999
         phase @cx.catch()
             Bright(@frame) =>
-                seal @ev = lumen.parse(@frame.carry)?
+                seal @ev  = lumen.parse(@frame.carry)?
                 seal @op  = @ev.at("op")?.as_int()?
                 seal @seq = @ev.at("s").as_int()
                 phase @seq
@@ -123,22 +92,18 @@ fn main() -> phase<int>
                     Gone     => pass
 
                 if @op == OP_HEARTBEAT_ACK
-                    pass          # ack — no action needed
+                    pass
                 eclipse if @op == OP_HEARTBEAT
                     @cx.emit_lumen(heartbeat_frame(@last_seq))?
                 eclipse if @op == OP_RECONNECT or @op == OP_INVALID_SESSION
-                    shine "discord: gateway wants a reconnect"
+                    shine "reconnect requested"
                     break
                 eclipse if @op == OP_DISPATCH
                     seal @t = @ev.at("t")?.as_text()?
                     if @t == "MESSAGE_CREATE"
-                        seal @d = @ev.at("d")?
-                        seal @channel = @d.at("channel_id")?.as_text()?
-                        seal @content = @d.at("content")?.as_text()?
-                        if @content.starts_with("!ping")
-                            send_message(@token, @channel, "pong")?
+                        handle_message(@token, @ev.at("d")?)?
             Dim(@fault) =>
-                shine "cascade dimmed: " + @fault.msg
+                shine "gateway closed: " + @fault.msg
                 break
 
     @running.flash(0)
