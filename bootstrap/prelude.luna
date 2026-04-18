@@ -138,3 +138,30 @@ fn str_find(@s: int, @needle: int) -> int
             return @i
         @i = @i + 1
     return 0 - 1
+
+extern "linux_syscall" fn sys_open(@path: int, @flags: int, @mode: int) -> int
+extern "linux_syscall" fn sys_read(@fd: int, @buf: int, @n: int) -> int
+extern "linux_syscall" fn sys_write(@fd: int, @buf: int, @n: int) -> int
+extern "linux_syscall" fn sys_close(@fd: int) -> int
+extern "linux_syscall" fn sys_lseek(@fd: int, @off: int, @whence: int) -> int
+extern "linux_syscall" fn sys_creat(@path: int, @mode: int) -> int
+
+fn read_file(@path: int) -> int
+    @fd = sys_open(@path, 0, 0)
+    if @fd < 0
+        return 0
+    @size = sys_lseek(@fd, 0, 2)
+    sys_lseek(@fd, 0, 0)
+    @buf = new_str(@size)
+    sys_read(@fd, @buf, @size)
+    sys_close(@fd)
+    return @buf
+
+fn write_file(@path: int, @content: int) -> int
+    @fd = sys_creat(@path, 420)
+    if @fd < 0
+        return 0 - 1
+    @n = str_len(@content)
+    sys_write(@fd, @content, @n)
+    sys_close(@fd)
+    return @n

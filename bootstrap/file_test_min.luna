@@ -1,0 +1,9 @@
+fn main() -> int
+    @fd = sys_open("/tmp/luna_test.txt", 0, 0)
+    if @fd < 0
+        shine("open failed")
+        return 1
+    shine("opened, fd=")
+    println_int(@fd)
+    sys_close(@fd)
+    return 0

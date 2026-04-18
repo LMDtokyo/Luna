@@ -1,0 +1,9 @@
+fn main() -> int
+    @text = "Hello from Luna file I/O!\nThis is line 2.\nLine 3 here.\n"
+    write_file("/tmp/luna_test.txt", @text)
+    shine("wrote file, reading back:")
+    @back = read_file("/tmp/luna_test.txt")
+    shine(@back)
+    print("length read = ")
+    println_int(str_len(@back))
+    return 0

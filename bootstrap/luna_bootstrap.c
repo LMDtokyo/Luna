@@ -2391,6 +2391,9 @@ static int syscall_number_for(const char *name, int len)
     if (streq_n(name, len, "sys_exit"))        return SYS_EXIT;
     if (streq_n(name, len, "sys_exit_group")) return SYS_EXIT_GROUP;
     if (streq_n(name, len, "sys_nanosleep"))  return SYS_NANOSLEEP;
+    if (streq_n(name, len, "sys_lseek"))       return 8;
+    if (streq_n(name, len, "sys_mmap"))        return 9;
+    if (streq_n(name, len, "sys_creat"))       return 85;
     return -1;
 }
 
