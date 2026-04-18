@@ -39,7 +39,7 @@
 
 #define MAX_SRC_BYTES     (8 * 1024 * 1024)
 #define MAX_TOKENS        (1 << 20)
-#define MAX_NODES         (1 << 17)       /* 128K — plenty for real programs */
+#define MAX_NODES         (1 << 18)       /* 256K — match arms add nodes */
 #define MAX_FILES         256
 #define KIDS_INLINE       256             /* max children per AST node */
 #define MAX_SYMS          (1 << 16)
@@ -132,6 +132,7 @@ enum {
     TK_LBRACK, TK_RBRACK,
     TK_COMMA, TK_SEMI, TK_COLON, TK_DOT, TK_DOTDOT,
     TK_ARROW,        /* ->                                  */
+    TK_FAT_ARROW,    /* =>  (pattern/body separator)        */
     TK_ASSIGN,       /* =                                   */
     TK_EQ,           /* ==                                  */
     TK_NE,           /* !=                                  */
@@ -199,7 +200,9 @@ enum {
     N_FIELD_INIT,     /* s = field name; kid[0] = value expr       */
     N_ARRAY_LIT,      /* kids = [value, count]  for [v; N] form    */
     N_INDEX,          /* kids = [base, index]   for a[i]           */
-    N_MATCH_STUB      /* match/phase that we can't yet compile     */
+    N_MATCH_STUB,     /* match/phase with unsupported patterns     */
+    N_MATCH,          /* kids = [scrutinee, arm1, arm2, ...]       */
+    N_MATCH_ARM       /* kids = [pattern, body]                    */
 };
 
 typedef struct AstNode {
@@ -874,6 +877,7 @@ static void lex_file(int file_idx)
         /* multi-char punctuation */
         if (c == '-' && p+1 < end && p[1] == '>') { push_tok(TK_ARROW, file_idx, line, col, p, 2, 0); p += 2; col += 2; continue; }
         if (c == '=' && p+1 < end && p[1] == '=') { push_tok(TK_EQ, file_idx, line, col, p, 2, 0); p += 2; col += 2; continue; }
+        if (c == '=' && p+1 < end && p[1] == '>') { push_tok(TK_FAT_ARROW, file_idx, line, col, p, 2, 0); p += 2; col += 2; continue; }
         if (c == '!' && p+1 < end && p[1] == '=') { push_tok(TK_NE, file_idx, line, col, p, 2, 0); p += 2; col += 2; continue; }
         if (c == '<' && p+1 < end && p[1] == '=') { push_tok(TK_LE, file_idx, line, col, p, 2, 0); p += 2; col += 2; continue; }
         if (c == '>' && p+1 < end && p[1] == '=') { push_tok(TK_GE, file_idx, line, col, p, 2, 0); p += 2; col += 2; continue; }
@@ -963,6 +967,7 @@ static const char *tok_name(int k)
         case TK_DOT:     return "'.'";
         case TK_DOTDOT:  return "'..'";
         case TK_ARROW:   return "'->'";
+        case TK_FAT_ARROW: return "'=>'";
         case TK_ASSIGN:  return "'='";
         case TK_EQ:      return "'=='";
         case TK_NE:      return "'!='";
@@ -1889,22 +1894,102 @@ static int parse_stmt(void)
         return u;
     }
     if (t->kind == TK_KW_MATCH || t->kind == TK_KW_PHASE) {
-        /* Tolerant skip: the bootstrap can't generate real pattern-matching
-           code, but it CAN recognise the shape `match EXPR { ... }` and
-           consume the whole thing so parsing succeeds.  The emitted code
-           just traps with `int3` at runtime so if the self-hosted compiler
-           somehow reaches this path in production, it halts loudly.        */
+        /* Parse match/phase arms into a real AST.  Supported patterns
+         * are limited — int literal, wildcard '_', and bare identifier
+         * binding — but the full syntax (including ADT patterns like
+         * Bright(@x)) parses tolerantly so unsupported arms become
+         * "always match, body returns opaque".                         */
         g_tpos++;
-        (void)parse_expr();                     /* scrutinee */
+        int saved = g_no_struct_lit; g_no_struct_lit = 1;
+        int scrut = parse_expr();
+        g_no_struct_lit = saved;
         expect(TK_LBRACE, "'{' starting match arms");
-        int brace = 1;
-        while (brace > 0 && peek()->kind != TK_EOF) {
-            if (peek()->kind == TK_LBRACE) brace++;
-            else if (peek()->kind == TK_RBRACE) brace--;
-            if (brace > 0) g_tpos++;
+
+        int m = node_new(N_MATCH, t);
+        node_add(m, scrut);
+
+        while (peek()->kind != TK_RBRACE && peek()->kind != TK_EOF) {
+            /* Parse the pattern loosely — the concrete shape is recorded
+             * as an N_INT, N_IDENT or N_PASS; anything more elaborate is
+             * read as a tolerant expression and treated as "wildcard".
+             * Accept optional `is` prefix (alternative cosmic spelling
+             * seen in stdlib/veil.luna).                              */
+            if (peek()->kind == TK_IDENT && peek()->len == 2 &&
+                peek()->str[0] == 'i' && peek()->str[1] == 's') {
+                g_tpos++;
+            }
+            Tok *pt = peek();
+            int pat = -1;
+            if (pt->kind == TK_INT) {
+                g_tpos++;
+                pat = node_new(N_INT, pt);
+                g_nodes[pat].iv = pt->int_val;
+            } else if (pt->kind == TK_IDENT && pt->len == 1 && pt->str[0] == '_') {
+                g_tpos++;
+                pat = node_new(N_PASS, pt);
+            } else if (pt->kind == TK_ATIDENT || pt->kind == TK_IDENT) {
+                /* Bare @name or name — bind (treated as wildcard for now). */
+                g_tpos++;
+                pat = node_new(N_IDENT, pt);
+                g_nodes[pat].s = pt->str;
+                g_nodes[pat].slen = pt->len;
+                /* Tolerate constructor-style patterns: @name(...)        */
+                if (peek()->kind == TK_LPAREN) {
+                    int depth = 0;
+                    do {
+                        if (peek()->kind == TK_LPAREN) depth++;
+                        else if (peek()->kind == TK_RPAREN) depth--;
+                        g_tpos++;
+                    } while (depth > 0 && peek()->kind != TK_EOF);
+                }
+            } else {
+                /* Fallback: consume until '=>' or newline, produce wildcard. */
+                while (peek()->kind != TK_FAT_ARROW &&
+                       peek()->kind != TK_RBRACE &&
+                       peek()->kind != TK_EOF &&
+                       peek()->line == pt->line) {
+                    g_tpos++;
+                }
+                pat = node_new(N_PASS, pt);
+            }
+
+            /* Optional `if guard` — bootstrap ignores the guard. */
+            if (peek()->kind == TK_KW_IF) {
+                g_tpos++;
+                int sv = g_no_struct_lit; g_no_struct_lit = 1;
+                (void)parse_expr();
+                g_no_struct_lit = sv;
+            }
+
+            /* Separator: accept `=>` or `->`.  Both are used in the wild. */
+            if (!accept(TK_FAT_ARROW)) {
+                (void)accept(TK_ARROW);
+            }
+
+            /* Parse body.  Four shapes seen in real Luna:
+             *    PAT => expr                         (single expr)
+             *    PAT => return expr                  (statement)
+             *    PAT => shine("...")                 (call stmt)
+             *    PAT <newline>                       (indent-opened
+             *        block                            block body)      */
+            int body;
+            if (peek()->kind == TK_LBRACE) {
+                body = parse_block_seq();
+            } else {
+                body = parse_stmt();
+            }
+
+            int arm = node_new(N_MATCH_ARM, pt);
+            node_add(arm, pat);
+            node_add(arm, body);
+            node_add(m, arm);
+
+            /* Arms are separated implicitly by newlines or commas.       */
+            accept(TK_COMMA);
+            accept(TK_SEMI);
         }
         expect(TK_RBRACE, "'}' closing match");
-        return node_new(N_MATCH_STUB, t);
+        return m;
     }
     if (t->kind == TK_KW_ACTOR || t->kind == TK_KW_FLOW) {
         /* actor/flow NAME { ... } — tolerant skip.  Bootstrap doesn't emit
@@ -4017,12 +4102,64 @@ static void lower_expr(int node)
             return;
         }
         case N_MATCH_STUB:
-            /* Pattern matching lowers to a safe no-op (rax = 0) until real
-             * arm dispatch lands.  The caller's control flow continues as
-             * if the match produced zero — prevents crashes in stdlib
-             * code that uses `match` ceremonially.                      */
             emit_mov_rax_imm64(0);
             return;
+        case N_MATCH: {
+            /* Lower `match SCRUT { P1 => B1, P2 => B2, _ => Bd }` as an
+             * if-else chain over the stashed scrutinee.                */
+            int scrut = n->kids[0];
+            lower_expr(scrut);
+            emit_push_rax();                        /* [rsp+0] = scrut */
+
+            int done_slots[64];
+            int ndone = 0;
+            int narms = n->nkids - 1;
+
+            for (int i = 0; i < narms; i++) {
+                int arm = n->kids[1 + i];
+                AstNode *a = &g_nodes[arm];
+                if (a->nkids < 2) continue;
+                int pat  = a->kids[0];
+                int body = a->kids[1];
+                AstNode *p = &g_nodes[pat];
+
+                int skip_slot = -1;
+                if (p->kind == N_INT) {
+                    /* Reload scrut: mov rax, [rsp+0]  -> 48 8b 04 24  */
+                    uint8_t b[] = { 0x48, 0x8b, 0x04, 0x24 };
+                    code_emit_bytes(b, 4);
+                    /* cmp rax, imm32 (sign-extended)  -> 48 3d imm32  */
+                    uint8_t c2[] = { 0x48, 0x3d };
+                    code_emit_bytes(c2, 2);
+                    code_emit_u32((uint32_t)(int32_t)p->iv);
+                    skip_slot = emit_jne_rel32();
+                } else if (p->kind == N_IDENT) {
+                    /* Bind @name to scrutinee: create a local and copy  */
+                    int li = local_add(p->s, p->slen, 0, 0);
+                    uint8_t b[] = { 0x48, 0x8b, 0x04, 0x24 };
+                    code_emit_bytes(b, 4);
+                    emit_mov_rbp_disp_rax(g_locals[li].offset);
+                }
+                /* N_PASS / fallback: always matches, no skip.           */
+
+                lower_stmt(body);
+                int d = emit_jmp_rel32();
+                if (ndone < 64) done_slots[ndone++] = d;
+
+                if (skip_slot >= 0) {
+                    int here = g_code_len;
+                    code_patch_u32(skip_slot, (uint32_t)(here - (skip_slot + 4)));
+                }
+            }
+
+            int done_here = g_code_len;
+            for (int i = 0; i < ndone; i++) {
+                code_patch_u32(done_slots[i],
+                               (uint32_t)(done_here - (done_slots[i] + 4)));
+            }
+            emit_add_rsp_imm8(8);                  /* drop scrutinee   */
+            return;
+        }
         default:
             die_unsup("expression kind", g_files[n->file].path, n->line);
     }
@@ -4248,6 +4385,10 @@ static void lower_stmt(int node)
            expected.  We re-route through lower_expr and discard the rax. */
         case N_MATCH_STUB:
             /* Statement form of an unsupported match — safely no-op. */
+            return;
+        case N_MATCH:
+            /* Use the expression lowering; discard its rax result.    */
+            lower_expr(node);
             return;
         case N_INT:   case N_BOOL:   case N_NILV:  case N_STR:
         case N_IDENT: case N_GROUP:  case N_BIN:   case N_UNARY:
