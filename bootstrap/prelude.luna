@@ -179,3 +179,120 @@ fn arg(@i: int) -> int
         str_set_byte(@s, @k, str_byte(@raw, @k))
         @k = @k + 1
     return @s
+
+fn min(@a: int, @b: int) -> int
+    if @a < @b
+        return @a
+    return @b
+
+fn max(@a: int, @b: int) -> int
+    if @a > @b
+        return @a
+    return @b
+
+fn abs(@n: int) -> int
+    if @n < 0
+        return 0 - @n
+    return @n
+
+fn clamp(@n: int, @lo: int, @hi: int) -> int
+    if @n < @lo
+        return @lo
+    if @n > @hi
+        return @hi
+    return @n
+
+fn str_starts_with(@s: int, @prefix: int) -> int
+    @ls = str_len(@s)
+    @lp = str_len(@prefix)
+    if @lp > @ls
+        return 0
+    @i = 0
+    while @i < @lp
+        if str_byte(@s, @i) != str_byte(@prefix, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+fn str_ends_with(@s: int, @suffix: int) -> int
+    @ls = str_len(@s)
+    @lp = str_len(@suffix)
+    if @lp > @ls
+        return 0
+    @i = 0
+    while @i < @lp
+        if str_byte(@s, @ls - @lp + @i) != str_byte(@suffix, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+fn str_contains(@s: int, @needle: int) -> int
+    if str_find(@s, @needle) < 0
+        return 0
+    return 1
+
+fn str_to_upper(@s: int) -> int
+    @n = str_len(@s)
+    @out = new_str(@n)
+    @i = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c >= 97
+            if @c <= 122
+                @c = @c - 32
+        str_set_byte(@out, @i, @c)
+        @i = @i + 1
+    return @out
+
+fn str_to_lower(@s: int) -> int
+    @n = str_len(@s)
+    @out = new_str(@n)
+    @i = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c >= 65
+            if @c <= 90
+                @c = @c + 32
+        str_set_byte(@out, @i, @c)
+        @i = @i + 1
+    return @out
+
+fn str_substr(@s: int, @start: int, @len: int) -> int
+    @ls = str_len(@s)
+    if @start < 0
+        @start = 0
+    if @start >= @ls
+        return ""
+    if @start + @len > @ls
+        @len = @ls - @start
+    @out = new_str(@len)
+    @i = 0
+    while @i < @len
+        str_set_byte(@out, @i, str_byte(@s, @start + @i))
+        @i = @i + 1
+    return @out
+
+fn _is_ws(@c: int) -> int
+    if @c == 32
+        return 1
+    if @c == 9
+        return 1
+    if @c == 10
+        return 1
+    if @c == 13
+        return 1
+    return 0
+
+fn str_trim(@s: int) -> int
+    @n = str_len(@s)
+    @start = 0
+    while @start < @n
+        if _is_ws(str_byte(@s, @start)) == 0
+            break
+        @start = @start + 1
+    @end = @n
+    while @end > @start
+        if _is_ws(str_byte(@s, @end - 1)) == 0
+            break
+        @end = @end - 1
+    return str_substr(@s, @start, @end - @start)
