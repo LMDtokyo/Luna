@@ -939,6 +939,107 @@ static Tok *tok_at(int i) { return &g_toks[i]; }
 static Tok *peek(void)    { return &g_toks[g_tpos]; }
 static Tok *peek_n(int n) { return &g_toks[g_tpos + n]; }
 
+/* Human-readable name for a token kind — turns "kind=72" into "','". */
+static const char *tok_name(int k)
+{
+    switch (k) {
+        case TK_EOF:     return "end of file";
+        case TK_IDENT:   return "identifier";
+        case TK_ATIDENT: return "@identifier";
+        case TK_INT:     return "integer literal";
+        case TK_STR:     return "string literal";
+        case TK_LPAREN:  return "'('";
+        case TK_RPAREN:  return "')'";
+        case TK_LBRACE:  return "'{'";
+        case TK_RBRACE:  return "'}'";
+        case TK_LBRACK:  return "'['";
+        case TK_RBRACK:  return "']'";
+        case TK_COMMA:   return "','";
+        case TK_SEMI:    return "';'";
+        case TK_COLON:   return "':'";
+        case TK_DOT:     return "'.'";
+        case TK_DOTDOT:  return "'..'";
+        case TK_ARROW:   return "'->'";
+        case TK_ASSIGN:  return "'='";
+        case TK_EQ:      return "'=='";
+        case TK_NE:      return "'!='";
+        case TK_LT:      return "'<'";
+        case TK_LE:      return "'<='";
+        case TK_GT:      return "'>'";
+        case TK_GE:      return "'>='";
+        case TK_PLUS:    return "'+'";
+        case TK_MINUS:   return "'-'";
+        case TK_STAR:    return "'*'";
+        case TK_SLASH:   return "'/'";
+        case TK_PERCENT: return "'%'";
+        case TK_ANDAND:  return "'&&'";
+        case TK_OROR:    return "'||'";
+        case TK_AMP:     return "'&'";
+        case TK_PIPE:    return "'|'";
+        case TK_CARET:   return "'^'";
+        case TK_TILDE:   return "'~'";
+        case TK_BANG:    return "'!'";
+        case TK_SHL:     return "'<<'";
+        case TK_SHR:     return "'>>'";
+        case TK_AT:      return "'@'";
+        case TK_KW_FN:      return "'fn'";
+        case TK_KW_LET:     return "'let'";
+        case TK_KW_CONST:   return "'const'";
+        case TK_KW_MEOW:    return "'meow'";
+        case TK_KW_RETURN:  return "'return'";
+        case TK_KW_IF:      return "'if'";
+        case TK_KW_ELSE:    return "'else'";
+        case TK_KW_ECLIPSE: return "'eclipse'";
+        case TK_KW_WHILE:   return "'while'";
+        case TK_KW_ORBIT:   return "'orbit'";
+        case TK_KW_IN:      return "'in'";
+        case TK_KW_BREAK:   return "'break'";
+        case TK_KW_CONTINUE:return "'continue'";
+        case TK_KW_STRUCT:  return "'struct'";
+        case TK_KW_EXTERN:  return "'extern'";
+        case TK_KW_IMPORT:  return "'import'";
+        case TK_KW_SHINE:   return "'shine'";
+        case TK_KW_NOVA:    return "'nova'";
+        case TK_KW_SEAL:    return "'seal'";
+        case TK_KW_PHASE:   return "'phase'";
+        case TK_KW_MATCH:   return "'match'";
+        case TK_KW_GUARD:   return "'guard'";
+        default:            return "unknown token";
+    }
+}
+
+/* Print `file:line: cause` followed by the source line itself with a
+ * caret pointing at the column.  Helps turn a raw "kind=72" into
+ * something a human can act on.                                    */
+static void diag_tok(const char *kind_label, const char *msg, Tok *t)
+{
+    const char *path = "?";
+    const char *src  = NULL;
+    int src_len = 0;
+    if (t && t->file >= 0 && t->file < g_nfiles) {
+        path    = g_files[t->file].path;
+        src     = g_files[t->file].src;
+        src_len = g_files[t->file].src_len;
+    }
+    int ln = t ? t->line : 0;
+    fprintf(stderr, "luna-boot: %s: %s:%d: %s\n", kind_label, path, ln, msg);
+    if (src) {
+        int cur_line = 1;
+        const char *line_start = src;
+        for (const char *p = src; p < src + src_len && cur_line < ln; p++) {
+            if (*p == '\n') { cur_line++; line_start = p + 1; }
+        }
+        const char *line_end = line_start;
+        while (line_end < src + src_len && *line_end != '\n') line_end++;
+        fprintf(stderr, "   | ");
+        for (const char *p = line_start; p < line_end; p++) {
+            if (*p == '\t') fputc(' ', stderr);
+            else            fputc(*p, stderr);
+        }
+        fputc('\n', stderr);
+    }
+}
+
 static int accept(int k)
 {
     if (g_tpos < g_tend && g_toks[g_tpos].kind == k) { g_tpos++; return 1; }
@@ -948,11 +1049,11 @@ static int accept(int k)
 static Tok *expect(int k, const char *what)
 {
     if (g_tpos >= g_tend || g_toks[g_tpos].kind != k) {
-        int ln = (g_tpos < g_tend) ? g_toks[g_tpos].line : 0;
-        const char *path = g_files[g_cur_file].path;
-        fprintf(stderr, "luna-boot: parse error: expected %s at %s:%d (got kind=%d)\n",
-                what, path, ln,
-                (g_tpos < g_tend) ? g_toks[g_tpos].kind : -1);
+        Tok *got = (g_tpos < g_tend) ? &g_toks[g_tpos] : NULL;
+        char msg[256];
+        snprintf(msg, sizeof(msg), "expected %s, but saw %s",
+                 what, got ? tok_name(got->kind) : "end of file");
+        diag_tok("parse error", msg, got);
         exit(1);
     }
     return &g_toks[g_tpos++];
@@ -1401,8 +1502,12 @@ static int parse_primary(void)
         }
     }
 
-    fprintf(stderr, "luna-boot: parse error: unexpected token kind=%d at %s:%d\n",
-            t->kind, g_files[g_cur_file].path, t->line);
+    {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "unexpected %s at start of expression",
+                 tok_name(t->kind));
+        diag_tok("parse error", msg, t);
+    }
     exit(1);
 }
 
@@ -2059,9 +2164,12 @@ static Tok *expect_ident_or_kw(const char *what)
         g_tpos++;
         return t;
     }
-    /* Produce the same error shape as expect() */
-    fprintf(stderr, "luna-boot: parse error: expected %s at %s:%d (got kind=%d)\n",
-            what, g_files[g_cur_file].path, t->line, t->kind);
+    {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "expected %s, but saw %s",
+                 what, tok_name(t->kind));
+        diag_tok("parse error", msg, t);
+    }
     exit(1);
 }
 
@@ -2256,8 +2364,11 @@ static int parse_file(int file_idx)
             d = node_new(N_PASS, t);
         }
         else {
-            fprintf(stderr, "luna-boot: parse error: unexpected top-level token kind=%d at %s:%d\n",
-                    t->kind, u->path, t->line);
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "unexpected %s at top level (expected import, fn, struct, const, ...)",
+                     tok_name(t->kind));
+            diag_tok("parse error", msg, t);
             exit(1);
         }
         if (g_nodes[cur].nkids == 7) {
