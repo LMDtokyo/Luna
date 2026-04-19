@@ -1,0 +1,72 @@
+fn usage() -> int
+    shine("usage:")
+    shine("  token_tool hash   <input>")
+    shine("  token_tool sign   <secret> <payload>")
+    shine("  token_tool verify <secret> <token>")
+    shine("")
+    shine("token format: <payload>.<hmac_hex>")
+    return 1
+
+fn find_dot(@s: int) -> int
+    @n = str_len(@s)
+    @i = @n - 1
+    while @i >= 0
+        if str_byte(@s, @i) == 46
+            return @i
+        @i = @i - 1
+    return -1
+
+fn str_const_eq(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    if @la != @lb
+        return 0
+    @diff = 0
+    @i = 0
+    while @i < @la
+        @diff = @diff | (str_byte(@a, @i) ^ str_byte(@b, @i))
+        @i = @i + 1
+    if @diff == 0
+        return 1
+    return 0
+
+fn main() -> int
+    if args_count() < 3
+        return usage()
+    @cmd = arg(1)
+
+    if str_eq(@cmd, "hash")
+        shine(sha256_hex(arg(2)))
+        return 0
+
+    if str_eq(@cmd, "sign")
+        if args_count() < 4
+            return usage()
+        @secret = arg(2)
+        @payload = arg(3)
+        @tag = hmac_sha256_hex(@secret, @payload)
+        @out = str_concat(@payload, ".")
+        @out = str_concat(@out, @tag)
+        shine(@out)
+        return 0
+
+    if str_eq(@cmd, "verify")
+        if args_count() < 4
+            return usage()
+        @secret = arg(2)
+        @token = arg(3)
+        @dot = find_dot(@token)
+        if @dot < 0
+            shine("malformed token")
+            return 1
+        @payload = str_substr(@token, 0, @dot)
+        @tag = str_substr(@token, @dot + 1, str_len(@token) - @dot - 1)
+        @expected = hmac_sha256_hex(@secret, @payload)
+        if str_const_eq(@tag, @expected) == 1
+            shine("OK")
+            print("payload: "); shine(@payload)
+            return 0
+        shine("INVALID")
+        return 1
+
+    return usage()

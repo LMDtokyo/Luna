@@ -1,0 +1,146 @@
+extern "C" fn socket(@dom: int, @type: int, @proto: int) -> int
+extern "C" fn bind(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn listen(@fd: int, @backlog: int) -> int
+extern "C" fn accept(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn recv(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn send(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn close(@fd: int) -> int
+extern "C" fn setsockopt(@fd: int, @level: int, @opt: int, @val: int, @len: int) -> int
+extern "C" fn fflush(@s: int)
+
+fn sockaddr_in(@port: int) -> int
+    @sa = new_str(16)
+    str_set_byte(@sa, 0, 2)
+    str_set_byte(@sa, 2, @port / 256)
+    str_set_byte(@sa, 3, @port % 256)
+    return @sa
+
+fn req_method(@req: int) -> int
+    @n = str_len(@req)
+    @i = 0
+    while @i < @n
+        if str_byte(@req, @i) == 32
+            return str_substr(@req, 0, @i)
+        @i = @i + 1
+    return ""
+
+fn req_path(@req: int) -> int
+    @n = str_len(@req)
+    @start = 0
+    while @start < @n
+        if str_byte(@req, @start) == 32
+            @start = @start + 1
+            @end = @start
+            while @end < @n
+                if str_byte(@req, @end) == 32
+                    return str_substr(@req, @start, @end - @start)
+                @end = @end + 1
+            return ""
+        @start = @start + 1
+    return ""
+
+fn req_body(@req: int) -> int
+    @n = str_len(@req)
+    @i = 0
+    while @i < @n - 3
+        if str_byte(@req, @i) == 13
+            if str_byte(@req, @i + 1) == 10
+                if str_byte(@req, @i + 2) == 13
+                    if str_byte(@req, @i + 3) == 10
+                        return str_substr(@req, @i + 4, @n - @i - 4)
+        @i = @i + 1
+    return ""
+
+fn short_code(@url: int) -> int
+    @h = sha256_hex(@url)
+    return str_substr(@h, 0, 8)
+
+fn respond(@fd: int, @status: int, @ctype: int, @body: int) -> int
+    @sp = " "
+    @crlf = "\r\n"
+    @resp = str_concat("HTTP/1.1 ", int_to_str(@status))
+    @resp = str_concat(@resp, " OK\r\nContent-Type: ")
+    @resp = str_concat(@resp, @ctype)
+    @resp = str_concat(@resp, "\r\nContent-Length: ")
+    @resp = str_concat(@resp, int_to_str(str_len(@body)))
+    @resp = str_concat(@resp, "\r\n\r\n")
+    @resp = str_concat(@resp, @body)
+    send(@fd, @resp, str_len(@resp), 0)
+    return 0
+
+fn handle(@fd: int, @req: int, @store: Map) -> int
+    @method = req_method(@req)
+    @path = req_path(@req)
+
+    if str_eq(@method, "POST")
+        if str_eq(@path, "/shorten")
+            @url = req_body(@req)
+            if str_len(@url) == 0
+                respond(@fd, 400, "text/plain", "empty url\n")
+                return 0
+            @code = short_code(@url)
+            map_set(@store, @code, @url)
+            @jb = json_begin()
+            json_field_str(@jb, "code", @code)
+            json_field_str(@jb, "url",  @url)
+            respond(@fd, 200, "application/json", json_end(@jb))
+            return 0
+
+    if str_eq(@method, "GET")
+        if str_starts_with(@path, "/s/")
+            @code = str_substr(@path, 3, str_len(@path) - 3)
+            if map_has(@store, @code)
+                @url = map_get(@store, @code)
+                @jb = json_begin()
+                json_field_str(@jb, "code", @code)
+                json_field_str(@jb, "url",  @url)
+                respond(@fd, 200, "application/json", json_end(@jb))
+                return 0
+            respond(@fd, 404, "application/json", "{\"error\":\"not found\"}")
+            return 0
+        if str_eq(@path, "/")
+            respond(@fd, 200, "text/plain", "luna url shortener\nPOST /shorten  body=url\nGET  /s/<code>\n")
+            return 0
+
+    respond(@fd, 404, "text/plain", "not found\n")
+    return 0
+
+fn main() -> int
+    @sock = socket(2, 1, 0)
+    if @sock < 0
+        shine("socket() failed")
+        return 1
+
+    @one = new_str(4)
+    str_set_byte(@one, 0, 1)
+    setsockopt(@sock, 1, 2, @one, 4)
+
+    @sa = sockaddr_in(8080)
+    if bind(@sock, @sa, 16) < 0
+        shine("bind() failed")
+        close(@sock)
+        return 1
+
+    listen(@sock, 32)
+    shine("luna url-shortener on :8080")
+    shine("  POST /shorten  body=<url>   -> {code,url}")
+    shine("  GET  /s/<code>              -> {code,url}")
+    fflush(0)
+
+    @store = map_new()
+
+    @i = 0
+    while @i < 1000
+        @client = accept(@sock, 0, 0)
+        if @client < 0
+            @i = @i + 1
+            continue
+        @buf = new_str(8192)
+        @n = recv(@client, @buf, 8192, 0)
+        if @n > 0
+            handle(@client, @buf, @store)
+        close(@client)
+        @i = @i + 1
+
+    close(@sock)
+    return 0
