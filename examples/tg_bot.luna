@@ -1,0 +1,97 @@
+fn api_url(@token: int, @method: int) -> int
+    @u = str_concat("https://api.telegram.org/bot", @token)
+    @u = str_concat(@u, "/")
+    return str_concat(@u, @method)
+
+fn send_message(@token: int, @chat_id: int, @text: int) -> int
+    @url = api_url(@token, "sendMessage")
+    @jb = json_begin()
+    json_field_int(@jb, "chat_id", @chat_id)
+    json_field_str(@jb, "text",    @text)
+    @body = json_end(@jb)
+    @resp = http_post_json(@url, @body)
+    return 0
+
+fn handle_message(@token: int, @msg: int) -> int
+    @chat = json_pick_obj(@msg, "chat")
+    @chat_id = json_get_int(@chat, "id")
+    @text = json_get_str(@msg, "text")
+
+    shine(str_concat(str_concat("<- ", int_to_str(@chat_id)), str_concat(": ", @text)))
+
+    if str_eq(@text, "/start")
+        send_message(@token, @chat_id, "hello from luna bot!")
+        return 0
+    if str_eq(@text, "/time")
+        send_message(@token, @chat_id, iso_timestamp())
+        return 0
+    if str_starts_with(@text, "/hash ")
+        @payload = str_substr(@text, 6, str_len(@text) - 6)
+        send_message(@token, @chat_id, sha256_hex(@payload))
+        return 0
+    @reply = str_concat("echo: ", @text)
+    send_message(@token, @chat_id, @reply)
+    return 0
+
+fn process_updates(@token: int, @body: int, @last_id: int) -> int
+    @ok_pos = json_find_key(@body, "ok")
+    if @ok_pos < 0
+        shine("telegram api: no 'ok' field, raw:")
+        shine(@body)
+        return @last_id
+    if json_bool(@body, @ok_pos) == 0
+        shine("telegram api returned ok=false, raw:")
+        shine(@body)
+        return @last_id
+
+    @p = json_find_key(@body, "result")
+    if @p < 0
+        return @last_id
+    @arr_end = _json_skip_value(@body, @p)
+
+    @idx = 0
+    while 1
+        @item_pos = json_array_at(@body, @p, @idx)
+        if @item_pos < 0
+            return @last_id
+        if @item_pos >= @arr_end
+            return @last_id
+
+        @upd = json_subobj(@body, @item_pos)
+        @uid = json_get_int(@upd, "update_id")
+        if @uid > @last_id
+            @last_id = @uid
+
+        @msg = json_pick_obj(@upd, "message")
+        if str_len(@msg) > 0
+            handle_message(@token, @msg)
+
+        @idx = @idx + 1
+    return @last_id
+
+fn main() -> int
+    @token = env_get("BOT_TOKEN")
+    if str_len(@token) == 0
+        shine("set BOT_TOKEN environment variable first")
+        shine("example: BOT_TOKEN=123:AAA ./tg_bot")
+        return 1
+
+    shine("luna telegram bot online. long-polling /getUpdates...")
+    @offset = 0
+    @loops = 0
+    while @loops < 100000
+        @url = api_url(@token, "getUpdates")
+        @url = str_concat(@url, "?timeout=25&offset=")
+        @url = str_concat(@url, int_to_str(@offset + 1))
+
+        @resp = http_get(@url)
+        if str_len(@resp) == 0
+            shine("http_get returned empty, sleeping 3s")
+            sleep(3)
+            @loops = @loops + 1
+            continue
+
+        @new_offset = process_updates(@token, @resp, @offset)
+        @offset = @new_offset
+        @loops = @loops + 1
+    return 0

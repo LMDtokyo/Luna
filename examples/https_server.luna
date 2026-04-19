@@ -1,0 +1,101 @@
+extern "C" fn socket(@dom: int, @type: int, @proto: int) -> int
+extern "C" fn bind(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn listen(@fd: int, @backlog: int) -> int
+extern "C" fn accept(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn close(@fd: int) -> int
+extern "C" fn setsockopt(@fd: int, @level: int, @opt: int, @val: int, @len: int) -> int
+
+extern "C" fn OPENSSL_init_ssl(@opts: int, @settings: int) -> int
+extern "C" fn TLS_server_method() -> int
+extern "C" fn SSL_CTX_new(@method: int) -> int
+extern "C" fn SSL_CTX_use_certificate_file(@ctx: int, @file: int, @type: int) -> int
+extern "C" fn SSL_CTX_use_PrivateKey_file(@ctx: int, @file: int, @type: int) -> int
+extern "C" fn SSL_CTX_check_private_key(@ctx: int) -> int
+extern "C" fn SSL_CTX_free(@ctx: int)
+extern "C" fn SSL_new(@ctx: int) -> int
+extern "C" fn SSL_set_fd(@ssl: int, @fd: int) -> int
+extern "C" fn SSL_accept(@ssl: int) -> int
+extern "C" fn SSL_read(@ssl: int, @buf: int, @n: int) -> int
+extern "C" fn SSL_write(@ssl: int, @buf: int, @n: int) -> int
+extern "C" fn SSL_shutdown(@ssl: int) -> int
+extern "C" fn SSL_free(@ssl: int)
+extern "C" fn ERR_print_errors_fp(@fp: int)
+
+fn sockaddr_in(@port: int) -> int
+    @sa = new_str(16)
+    str_set_byte(@sa, 0, 2)
+    str_set_byte(@sa, 2, @port / 256)
+    str_set_byte(@sa, 3, @port % 256)
+    return @sa
+
+fn handle_tls(@ssl: int) -> int
+    @buf = new_str(4096)
+    @n = SSL_read(@ssl, @buf, 4096)
+    if @n <= 0
+        return 0
+    @body = "hello over TLS from luna\n"
+    @resp = str_concat("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ", int_to_str(str_len(@body)))
+    @resp = str_concat(@resp, "\r\nConnection: close\r\n\r\n")
+    @resp = str_concat(@resp, @body)
+    SSL_write(@ssl, @resp, str_len(@resp))
+    SSL_shutdown(@ssl)
+    return 0
+
+fn main() -> int
+    OPENSSL_init_ssl(0, 0)
+    @ctx = SSL_CTX_new(TLS_server_method())
+    if @ctx == 0
+        shine("SSL_CTX_new failed")
+        return 1
+
+    @cert = "cert.pem"
+    @key  = "key.pem"
+    if SSL_CTX_use_certificate_file(@ctx, @cert, 1) <= 0
+        shine("cert load failed (need cert.pem)")
+        SSL_CTX_free(@ctx)
+        return 1
+    if SSL_CTX_use_PrivateKey_file(@ctx, @key, 1) <= 0
+        shine("key load failed (need key.pem)")
+        SSL_CTX_free(@ctx)
+        return 1
+    if SSL_CTX_check_private_key(@ctx) == 0
+        shine("cert/key mismatch")
+        SSL_CTX_free(@ctx)
+        return 1
+
+    @sock = socket(2, 1, 0)
+    if @sock < 0
+        shine("socket() failed")
+        return 1
+    @one = new_str(4)
+    str_set_byte(@one, 0, 1)
+    setsockopt(@sock, 1, 2, @one, 4)
+    @sa = sockaddr_in(8443)
+    if bind(@sock, @sa, 16) < 0
+        shine("bind() failed (port 8443 in use?)")
+        close(@sock)
+        return 1
+    listen(@sock, 16)
+
+    shine("luna HTTPS server on :8443")
+    shine("try: curl -k https://localhost:8443/")
+    shine("generate a self-signed cert first:")
+    shine("  openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj /CN=localhost")
+
+    while 1
+        @client = accept(@sock, 0, 0)
+        if @client < 0
+            continue
+        @ssl = SSL_new(@ctx)
+        SSL_set_fd(@ssl, @client)
+        if SSL_accept(@ssl) <= 0
+            SSL_free(@ssl)
+            close(@client)
+            continue
+        handle_tls(@ssl)
+        SSL_free(@ssl)
+        close(@client)
+
+    SSL_CTX_free(@ctx)
+    close(@sock)
+    return 0

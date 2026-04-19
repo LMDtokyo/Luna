@@ -467,6 +467,20 @@ fn json_get_str(@json: int, @key: int) -> int
         return ""
     return json_string(@json, @p)
 
+fn json_subobj(@json: int, @p: int) -> int
+    if @p < 0
+        return ""
+    @end = _json_skip_value(@json, @p)
+    return str_substr(@json, @p, @end - @p)
+
+fn json_pick_obj(@json: int, @key: int) -> int
+    @p = json_find_key(@json, @key)
+    return json_subobj(@json, @p)
+
+fn json_array_item(@json: int, @idx: int) -> int
+    @p = _json_skip_ws(@json, 0)
+    return json_subobj(@json, json_array_at(@json, @p, @idx))
+
 fn json_escape_str(@s: int) -> int
     @n = str_len(@s)
     @out = new_str(@n * 6 + 2)
@@ -948,6 +962,73 @@ extern "C" fn rename(@from: int, @to: int) -> int
 extern "C" fn mkdir(@path: int, @mode: int) -> int
 extern "C" fn rmdir(@path: int) -> int
 extern "C" fn access(@path: int, @mode: int) -> int
+extern "C" fn srand(@seed: int) -> int
+extern "C" fn rand() -> int
+
+fn random_seed(@s: int) -> int
+    return srand(@s)
+
+fn random() -> int
+    return rand()
+
+fn random_range(@lo: int, @hi: int) -> int
+    @span = @hi - @lo + 1
+    if @span <= 0
+        return @lo
+    return @lo + (rand() % @span)
+
+fn random_u32() -> int
+    @a = rand() & 65535
+    @b = rand() & 65535
+    return (@a << 16) | @b
+
+fn _rand_byte() -> int
+    return rand() & 255
+
+fn rand_bytes(@n: int) -> int
+    @buf = new_str(@n)
+    @i = 0
+    while @i < @n
+        str_set_byte(@buf, @i, _rand_byte())
+        @i = @i + 1
+    return @buf
+
+fn urandom_bytes(@n: int) -> int
+    @fd = sys_open("/dev/urandom", 0, 0)
+    if @fd < 0
+        return rand_bytes(@n)
+    @buf = new_str(@n)
+    sys_read(@fd, @buf, @n)
+    sys_close(@fd)
+    return @buf
+
+fn uuid_v4() -> int
+    @raw = rand_bytes(16)
+    @b6 = (str_byte(@raw, 6) & 15) | 64
+    str_set_byte(@raw, 6, @b6)
+    @b8 = (str_byte(@raw, 8) & 63) | 128
+    str_set_byte(@raw, 8, @b8)
+    @hex = hex_encode(@raw)
+    @out = new_str(36)
+    @i = 0
+    @j = 0
+    while @i < 32
+        if @j == 8
+            str_set_byte(@out, @j, 45)
+            @j = @j + 1
+        if @j == 13
+            str_set_byte(@out, @j, 45)
+            @j = @j + 1
+        if @j == 18
+            str_set_byte(@out, @j, 45)
+            @j = @j + 1
+        if @j == 23
+            str_set_byte(@out, @j, 45)
+            @j = @j + 1
+        str_set_byte(@out, @j, str_byte(@hex, @i))
+        @i = @i + 1
+        @j = @j + 1
+    return @out
 
 fn file_exists(@path: int) -> int
     if access(@path, 0) == 0

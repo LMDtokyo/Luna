@@ -1,0 +1,103 @@
+extern "C" fn socket(@dom: int, @type: int, @proto: int) -> int
+extern "C" fn bind(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn listen(@fd: int, @backlog: int) -> int
+extern "C" fn accept(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn recv(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn send(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn close(@fd: int) -> int
+extern "C" fn setsockopt(@fd: int, @level: int, @opt: int, @val: int, @len: int) -> int
+extern "C" fn fork() -> int
+extern "C" fn waitpid(@pid: int, @status: int, @opts: int) -> int
+extern "C" fn _exit(@code: int)
+extern "C" fn signal(@signum: int, @handler: int) -> int
+
+fn sockaddr_in(@port: int) -> int
+    @sa = new_str(16)
+    str_set_byte(@sa, 0, 2)
+    str_set_byte(@sa, 2, @port / 256)
+    str_set_byte(@sa, 3, @port % 256)
+    return @sa
+
+fn req_path(@req: int) -> int
+    @n = str_len(@req)
+    @start = 0
+    while @start < @n
+        if str_byte(@req, @start) == 32
+            @start = @start + 1
+            @end = @start
+            while @end < @n
+                if str_byte(@req, @end) == 32
+                    return str_substr(@req, @start, @end - @start)
+                @end = @end + 1
+            return ""
+        @start = @start + 1
+    return ""
+
+fn respond(@fd: int, @status: int, @body: int) -> int
+    @resp = str_concat("HTTP/1.1 ", int_to_str(@status))
+    @resp = str_concat(@resp, " OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: ")
+    @resp = str_concat(@resp, int_to_str(str_len(@body)))
+    @resp = str_concat(@resp, "\r\n\r\n")
+    @resp = str_concat(@resp, @body)
+    send(@fd, @resp, str_len(@resp), 0)
+    return 0
+
+fn handle_child(@client: int) -> int
+    @buf = new_str(4096)
+    @n = recv(@client, @buf, 4096, 0)
+    if @n <= 0
+        close(@client)
+        _exit(0)
+        return 0
+    @path = req_path(@buf)
+    if str_eq(@path, "/")
+        respond(@client, 200, "hi from luna multiclient server\n")
+    if str_eq(@path, "/uuid")
+        random_seed(now_unix())
+        respond(@client, 200, str_concat(uuid_v4(), "\n"))
+    if str_eq(@path, "/time")
+        respond(@client, 200, str_concat(iso_timestamp(), "\n"))
+    if str_eq(@path, "/slow")
+        sleep(3)
+        respond(@client, 200, "slow response\n")
+    close(@client)
+    _exit(0)
+    return 0
+
+fn main() -> int
+    signal(17, 1)
+
+    @sock = socket(2, 1, 0)
+    if @sock < 0
+        shine("socket() failed")
+        return 1
+
+    @one = new_str(4)
+    str_set_byte(@one, 0, 1)
+    setsockopt(@sock, 1, 2, @one, 4)
+
+    @sa = sockaddr_in(8090)
+    if bind(@sock, @sa, 16) < 0
+        shine("bind() failed (port 8090 in use?)")
+        close(@sock)
+        return 1
+
+    listen(@sock, 64)
+    shine("luna multiclient server on :8090")
+    shine("  /       -> hello")
+    shine("  /uuid   -> uuid v4")
+    shine("  /time   -> iso timestamp")
+    shine("  /slow   -> 3s delay (test concurrency)")
+
+    while 1
+        @client = accept(@sock, 0, 0)
+        if @client < 0
+            continue
+        @pid = fork()
+        if @pid == 0
+            close(@sock)
+            handle_child(@client)
+        close(@client)
+
+    close(@sock)
+    return 0
