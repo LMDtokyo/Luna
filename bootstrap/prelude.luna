@@ -655,6 +655,168 @@ fn url_decode(@s: int) -> int
             @i = @i + 1
     return str_substr(@out, 0, @o)
 
+fn ptr_u64(@p: int, @off: int) -> int
+    @v = 0
+    @i = 7
+    while @i >= 0
+        @v = (@v << 8) | str_byte(@p, @off + @i)
+        @i = @i - 1
+    return @v
+
+fn cstr_to_str(@raw: int) -> int
+    if @raw == 0
+        return ""
+    @len = 0
+    while str_byte(@raw, @len) != 0
+        @len = @len + 1
+    @s = new_str(@len)
+    @i = 0
+    while @i < @len
+        str_set_byte(@s, @i, str_byte(@raw, @i))
+        @i = @i + 1
+    return @s
+
+extern "C" fn getenv(@name: int) -> int
+
+fn env_get(@name: int) -> int
+    @raw = getenv(@name)
+    if @raw == 0
+        return ""
+    @len = 0
+    while str_byte(@raw, @len) != 0
+        @len = @len + 1
+    @s = new_str(@len)
+    @i = 0
+    while @i < @len
+        str_set_byte(@s, @i, str_byte(@raw, @i))
+        @i = @i + 1
+    return @s
+
+fn http_parse_method(@raw: int) -> int
+    @n = str_len(@raw)
+    @i = 0
+    while @i < @n
+        if str_byte(@raw, @i) == 32
+            return str_substr(@raw, 0, @i)
+        @i = @i + 1
+    return ""
+
+fn http_parse_path(@raw: int) -> int
+    @n = str_len(@raw)
+    @i = 0
+    while @i < @n
+        if str_byte(@raw, @i) == 32
+            break
+        @i = @i + 1
+    @i = @i + 1
+    @path_start = @i
+    while @i < @n
+        @c = str_byte(@raw, @i)
+        if @c == 32
+            break
+        if @c == 63
+            break
+        @i = @i + 1
+    return str_substr(@raw, @path_start, @i - @path_start)
+
+fn http_parse_query(@raw: int) -> int
+    @n = str_len(@raw)
+    @i = 0
+    while @i < @n
+        if str_byte(@raw, @i) == 32
+            break
+        @i = @i + 1
+    @i = @i + 1
+    while @i < @n
+        @c = str_byte(@raw, @i)
+        if @c == 32
+            return ""
+        if @c == 63
+            @i = @i + 1
+            @q_start = @i
+            while @i < @n
+                if str_byte(@raw, @i) == 32
+                    break
+                @i = @i + 1
+            return str_substr(@raw, @q_start, @i - @q_start)
+        @i = @i + 1
+    return ""
+
+fn http_parse_body(@raw: int) -> int
+    @p = str_find(@raw, "\r\n\r\n")
+    if @p < 0
+        return ""
+    @p = @p + 4
+    return str_substr(@raw, @p, str_len(@raw) - @p)
+
+fn http_parse_header(@raw: int, @name: int) -> int
+    @needle = str_concat(str_concat("\r\n", @name), ":")
+    @p = str_find(@raw, @needle)
+    if @p < 0
+        return ""
+    @p = @p + str_len(@needle)
+    while @p < str_len(@raw)
+        @c = str_byte(@raw, @p)
+        if @c != 32
+            break
+        @p = @p + 1
+    @end = @p
+    @n = str_len(@raw)
+    while @end < @n
+        @c = str_byte(@raw, @end)
+        if @c == 13
+            break
+        if @c == 10
+            break
+        @end = @end + 1
+    return str_substr(@raw, @p, @end - @p)
+
+fn query_get(@query: int, @name: int) -> int
+    @n = str_len(@query)
+    @kl = str_len(@name)
+    @i = 0
+    while @i + @kl < @n
+        @match = 1
+        @j = 0
+        while @j < @kl
+            if str_byte(@query, @i + @j) != str_byte(@name, @j)
+                @match = 0
+                @j = @kl
+            @j = @j + 1
+        if @match == 1
+            if @i + @kl < @n
+                if str_byte(@query, @i + @kl) == 61
+                    @v_start = @i + @kl + 1
+                    @v_end = @v_start
+                    while @v_end < @n
+                        if str_byte(@query, @v_end) == 38
+                            break
+                        @v_end = @v_end + 1
+                    return url_decode(str_substr(@query, @v_start, @v_end - @v_start))
+        @i = @i + 1
+    return ""
+
+fn http_response(@status: int, @status_text: int, @content_type: int, @body: int) -> int
+    @r = str_concat("HTTP/1.1 ", int_to_str(@status))
+    @r = str_concat(@r, " ")
+    @r = str_concat(@r, @status_text)
+    @r = str_concat(@r, "\r\nContent-Type: ")
+    @r = str_concat(@r, @content_type)
+    @r = str_concat(@r, "\r\nContent-Length: ")
+    @r = str_concat(@r, int_to_str(str_len(@body)))
+    @r = str_concat(@r, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n")
+    @r = str_concat(@r, @body)
+    return @r
+
+fn http_ok(@body: int) -> int
+    return http_response(200, "OK", "text/plain", @body)
+
+fn http_json(@body: int) -> int
+    return http_response(200, "OK", "application/json", @body)
+
+fn http_not_found() -> int
+    return http_response(404, "Not Found", "text/plain", "not found\n")
+
 extern "C" fn curl_easy_init() -> int
 extern "C" fn curl_easy_setopt(@c: int, @opt: int, @val: int) -> int
 extern "C" fn curl_easy_perform(@c: int) -> int
@@ -682,6 +844,125 @@ fn http_get(@url: int) -> int
     @body = read_file(@tmp)
     remove(@tmp)
     return @body
+
+extern "C" fn socket(@dom: int, @type: int, @proto: int) -> int
+extern "C" fn connect(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn send(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn recv(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn close(@fd: int) -> int
+
+fn _sockaddr_in(@port: int, @ip_a: int, @ip_b: int, @ip_c: int, @ip_d: int) -> int
+    @sa = new_str(16)
+    str_set_byte(@sa, 0, 2)
+    str_set_byte(@sa, 1, 0)
+    str_set_byte(@sa, 2, @port / 256)
+    str_set_byte(@sa, 3, @port % 256)
+    str_set_byte(@sa, 4, @ip_a)
+    str_set_byte(@sa, 5, @ip_b)
+    str_set_byte(@sa, 6, @ip_c)
+    str_set_byte(@sa, 7, @ip_d)
+    return @sa
+
+fn tcp_connect_local(@port: int) -> int
+    @fd = socket(2, 1, 0)
+    if @fd < 0
+        return 0 - 1
+    @sa = _sockaddr_in(@port, 127, 0, 0, 1)
+    if connect(@fd, @sa, 16) < 0
+        close(@fd)
+        return 0 - 1
+    return @fd
+
+fn redis_connect(@port: int) -> int
+    return tcp_connect_local(@port)
+
+fn _redis_send_cmd(@fd: int, @cmd: int) -> int
+    send(@fd, @cmd, str_len(@cmd), 0)
+    return 0
+
+fn _redis_recv_line(@fd: int) -> int
+    @buf = new_str(4096)
+    @n = recv(@fd, @buf, 4096, 0)
+    if @n <= 0
+        return ""
+    return str_substr(@buf, 0, @n)
+
+fn _build_cmd3(@a: int, @b: int, @c: int) -> int
+    @r = "*3\r\n$"
+    @r = str_concat(@r, int_to_str(str_len(@a)))
+    @r = str_concat(@r, "\r\n")
+    @r = str_concat(@r, @a)
+    @r = str_concat(@r, "\r\n$")
+    @r = str_concat(@r, int_to_str(str_len(@b)))
+    @r = str_concat(@r, "\r\n")
+    @r = str_concat(@r, @b)
+    @r = str_concat(@r, "\r\n$")
+    @r = str_concat(@r, int_to_str(str_len(@c)))
+    @r = str_concat(@r, "\r\n")
+    @r = str_concat(@r, @c)
+    @r = str_concat(@r, "\r\n")
+    return @r
+
+fn _build_cmd2(@a: int, @b: int) -> int
+    @r = "*2\r\n$"
+    @r = str_concat(@r, int_to_str(str_len(@a)))
+    @r = str_concat(@r, "\r\n")
+    @r = str_concat(@r, @a)
+    @r = str_concat(@r, "\r\n$")
+    @r = str_concat(@r, int_to_str(str_len(@b)))
+    @r = str_concat(@r, "\r\n")
+    @r = str_concat(@r, @b)
+    @r = str_concat(@r, "\r\n")
+    return @r
+
+fn redis_set(@fd: int, @key: int, @value: int) -> int
+    @cmd = _build_cmd3("SET", @key, @value)
+    _redis_send_cmd(@fd, @cmd)
+    @resp = _redis_recv_line(@fd)
+    if str_len(@resp) > 0
+        if str_byte(@resp, 0) == 43
+            return 1
+    return 0
+
+fn redis_get(@fd: int, @key: int) -> int
+    @cmd = _build_cmd2("GET", @key)
+    _redis_send_cmd(@fd, @cmd)
+    @resp = _redis_recv_line(@fd)
+    @n = str_len(@resp)
+    if @n < 3
+        return ""
+    if str_byte(@resp, 0) != 36
+        return ""
+    @i = 1
+    @len = 0
+    while @i < @n
+        @c = str_byte(@resp, @i)
+        if @c == 13
+            break
+        @len = @len * 10 + (@c - 48)
+        @i = @i + 1
+    if @len < 0
+        return ""
+    @i = @i + 2
+    return str_substr(@resp, @i, @len)
+
+fn redis_del(@fd: int, @key: int) -> int
+    @cmd = _build_cmd2("DEL", @key)
+    _redis_send_cmd(@fd, @cmd)
+    @resp = _redis_recv_line(@fd)
+    if str_len(@resp) > 0
+        if str_byte(@resp, 0) == 58
+            return parse_int(str_substr(@resp, 1, str_len(@resp) - 3))
+    return 0
+
+fn redis_incr(@fd: int, @key: int) -> int
+    @cmd = _build_cmd2("INCR", @key)
+    _redis_send_cmd(@fd, @cmd)
+    @resp = _redis_recv_line(@fd)
+    if str_len(@resp) > 0
+        if str_byte(@resp, 0) == 58
+            return parse_int(str_substr(@resp, 1, str_len(@resp) - 3))
+    return 0
 
 fn http_post_json(@url: int, @body: int) -> int
     @curl = curl_easy_init()

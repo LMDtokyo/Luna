@@ -5004,11 +5004,21 @@ static void write_elf64(const char *out_path)
     int n_needed = 0;
     needed_libs[n_needed++] = "libc.so.6";
     int need_curl = 0;
+    int need_sqlite = 0;
+    int need_ssl = 0;
+    int need_crypto = 0;
     for (int i = 0; i < g_nlinux_imports; i++) {
         const char *nm = g_linux_imports[i];
-        if (strncmp(nm, "curl_", 5) == 0) { need_curl = 1; }
+        if (strncmp(nm, "curl_",    5) == 0) need_curl = 1;
+        if (strncmp(nm, "sqlite3_", 8) == 0) need_sqlite = 1;
+        if (strncmp(nm, "SSL_",     4) == 0) need_ssl = 1;
+        if (strncmp(nm, "EVP_",     4) == 0) need_crypto = 1;
+        if (strncmp(nm, "SHA",      3) == 0) need_crypto = 1;
     }
-    if (need_curl) needed_libs[n_needed++] = "libcurl.so.4";
+    if (need_curl)   needed_libs[n_needed++] = "libcurl.so.4";
+    if (need_sqlite) needed_libs[n_needed++] = "libsqlite3.so.0";
+    if (need_ssl)    needed_libs[n_needed++] = "libssl.so.3";
+    if (need_crypto) needed_libs[n_needed++] = "libcrypto.so.3";
 
     /* Build .dynstr: NUL, each needed-lib name, each import symbol name. */
     static uint8_t dynstr_buf[8192];
