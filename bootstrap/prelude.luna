@@ -467,6 +467,105 @@ fn json_get_str(@json: int, @key: int) -> int
         return ""
     return json_string(@json, @p)
 
+fn json_escape_str(@s: int) -> int
+    @n = str_len(@s)
+    @out = new_str(@n * 6 + 2)
+    @o = 0
+    str_set_byte(@out, @o, 34)
+    @o = @o + 1
+    @i = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c == 34
+            str_set_byte(@out, @o, 92)
+            str_set_byte(@out, @o + 1, 34)
+            @o = @o + 2
+        else
+            if @c == 92
+                str_set_byte(@out, @o, 92)
+                str_set_byte(@out, @o + 1, 92)
+                @o = @o + 2
+            else
+                if @c == 10
+                    str_set_byte(@out, @o, 92)
+                    str_set_byte(@out, @o + 1, 110)
+                    @o = @o + 2
+                else
+                    if @c == 13
+                        str_set_byte(@out, @o, 92)
+                        str_set_byte(@out, @o + 1, 114)
+                        @o = @o + 2
+                    else
+                        if @c == 9
+                            str_set_byte(@out, @o, 92)
+                            str_set_byte(@out, @o + 1, 116)
+                            @o = @o + 2
+                        else
+                            if @c < 32
+                                str_set_byte(@out, @o, 92)
+                                str_set_byte(@out, @o + 1, 117)
+                                str_set_byte(@out, @o + 2, 48)
+                                str_set_byte(@out, @o + 3, 48)
+                                str_set_byte(@out, @o + 4, _hex_char(@c >> 4))
+                                str_set_byte(@out, @o + 5, _hex_char(@c & 15))
+                                @o = @o + 6
+                            else
+                                str_set_byte(@out, @o, @c)
+                                @o = @o + 1
+        @i = @i + 1
+    str_set_byte(@out, @o, 34)
+    @o = @o + 1
+    return str_substr(@out, 0, @o)
+
+struct JsonBuilder
+    buf: int
+    first: int
+
+fn json_begin() -> JsonBuilder
+    return JsonBuilder { buf: "{", first: 1 }
+
+fn json_field_str(@b: JsonBuilder, @key: int, @val: int) -> int
+    if @b.first == 0
+        @b.buf = str_concat(@b.buf, ",")
+    @b.buf = str_concat(@b.buf, json_escape_str(@key))
+    @b.buf = str_concat(@b.buf, ":")
+    @b.buf = str_concat(@b.buf, json_escape_str(@val))
+    @b.first = 0
+    return 0
+
+fn json_field_int(@b: JsonBuilder, @key: int, @val: int) -> int
+    if @b.first == 0
+        @b.buf = str_concat(@b.buf, ",")
+    @b.buf = str_concat(@b.buf, json_escape_str(@key))
+    @b.buf = str_concat(@b.buf, ":")
+    @b.buf = str_concat(@b.buf, int_to_str(@val))
+    @b.first = 0
+    return 0
+
+fn json_field_bool(@b: JsonBuilder, @key: int, @val: int) -> int
+    if @b.first == 0
+        @b.buf = str_concat(@b.buf, ",")
+    @b.buf = str_concat(@b.buf, json_escape_str(@key))
+    @b.buf = str_concat(@b.buf, ":")
+    if @val != 0
+        @b.buf = str_concat(@b.buf, "true")
+    else
+        @b.buf = str_concat(@b.buf, "false")
+    @b.first = 0
+    return 0
+
+fn json_field_raw(@b: JsonBuilder, @key: int, @val: int) -> int
+    if @b.first == 0
+        @b.buf = str_concat(@b.buf, ",")
+    @b.buf = str_concat(@b.buf, json_escape_str(@key))
+    @b.buf = str_concat(@b.buf, ":")
+    @b.buf = str_concat(@b.buf, @val)
+    @b.first = 0
+    return 0
+
+fn json_end(@b: JsonBuilder) -> int
+    return str_concat(@b.buf, "}")
+
 fn _hex_char(@n: int) -> int
     if @n < 10
         return 48 + @n
@@ -839,6 +938,47 @@ fn map_del(@m: Map, @key: int) -> int
     return 1
 
 extern "C" fn getenv(@name: int) -> int
+extern "C" fn time(@t_out: int) -> int
+extern "C" fn localtime(@t_in: int) -> int
+extern "C" fn gmtime(@t_in: int) -> int
+extern "C" fn strftime(@buf: int, @size: int, @fmt: int, @tm: int) -> int
+extern "C" fn sleep(@seconds: int) -> int
+extern "C" fn unlink(@path: int) -> int
+extern "C" fn rename(@from: int, @to: int) -> int
+extern "C" fn mkdir(@path: int, @mode: int) -> int
+extern "C" fn rmdir(@path: int) -> int
+extern "C" fn access(@path: int, @mode: int) -> int
+
+fn file_exists(@path: int) -> int
+    if access(@path, 0) == 0
+        return 1
+    return 0
+
+fn file_delete(@path: int) -> int
+    return unlink(@path)
+
+fn file_rename(@from: int, @to: int) -> int
+    return rename(@from, @to)
+
+fn dir_create(@path: int) -> int
+    return mkdir(@path, 493)
+
+fn dir_delete(@path: int) -> int
+    return rmdir(@path)
+
+fn now_unix() -> int
+    return time(0)
+
+fn format_time(@fmt: int) -> int
+    @ts_slot = new_str(16)
+    @unix = time(@ts_slot)
+    @tm = localtime(@ts_slot)
+    @buf = new_str(256)
+    @n = strftime(@buf, 256, @fmt, @tm)
+    return str_substr(@buf, 0, @n)
+
+fn iso_timestamp() -> int
+    return format_time("%Y-%m-%dT%H:%M:%SZ")
 
 fn env_get(@name: int) -> int
     @raw = getenv(@name)

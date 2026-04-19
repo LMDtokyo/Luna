@@ -3145,6 +3145,12 @@ static const char *winapi_dll(const char *name, int len)
         { "_open",   "msvcrt.dll" }, { "_read",   "msvcrt.dll" },
         { "_write",  "msvcrt.dll" }, { "_close",  "msvcrt.dll" },
         { "_lseek",  "msvcrt.dll" },
+        { "localtime", "msvcrt.dll" }, { "gmtime",  "msvcrt.dll" },
+        { "strftime",  "msvcrt.dll" }, { "remove",  "msvcrt.dll" },
+        { "rename",    "msvcrt.dll" }, { "tmpnam",  "msvcrt.dll" },
+        { "_unlink",   "msvcrt.dll" }, { "_mkdir",   "msvcrt.dll" },
+        { "_rmdir",    "msvcrt.dll" }, { "_access",  "msvcrt.dll" },
+        { "_stat64",   "msvcrt.dll" }, { "_sleep",   "msvcrt.dll" },
         { "__getmainargs", "msvcrt.dll" },
         /* user32 — windowing                                         */
         { "MessageBoxA", "USER32.DLL" },
@@ -3159,6 +3165,24 @@ static const char *winapi_dll(const char *name, int len)
 
 static int ffi_register(const char *name, int len)
 {
+    /* Windows aliases: POSIX names without leading underscore are
+     * exported by msvcrt.dll under their underscore-prefixed form.
+     * Rewrite so the IAT sees the real exported symbol.           */
+    static const char *posix_aliases[] = {
+        "unlink", "mkdir", "rmdir", "access", "stat64", "sleep", NULL
+    };
+    char alias[32];
+    for (int i = 0; posix_aliases[i]; i++) {
+        int al = (int)strlen(posix_aliases[i]);
+        if (al == len && memcmp(posix_aliases[i], name, len) == 0) {
+            alias[0] = '_';
+            memcpy(alias + 1, name, len);
+            alias[len + 1] = 0;
+            name = alias;
+            len = len + 1;
+            break;
+        }
+    }
     for (int i = 0; i < g_nimports; i++) {
         if ((int)strlen(g_imports[i].fn_name) == len &&
             memcmp(g_imports[i].fn_name, name, len) == 0) {
@@ -5048,6 +5072,8 @@ static void write_elf64(const char *out_path)
     int need_sqlite = 0;
     int need_ssl = 0;
     int need_crypto = 0;
+    int need_pq = 0;
+    int need_pthread = 0;
     for (int i = 0; i < g_nlinux_imports; i++) {
         const char *nm = g_linux_imports[i];
         if (strncmp(nm, "curl_",    5) == 0) need_curl = 1;
@@ -5055,11 +5081,15 @@ static void write_elf64(const char *out_path)
         if (strncmp(nm, "SSL_",     4) == 0) need_ssl = 1;
         if (strncmp(nm, "EVP_",     4) == 0) need_crypto = 1;
         if (strncmp(nm, "SHA",      3) == 0) need_crypto = 1;
+        if (strncmp(nm, "PQ",       2) == 0) need_pq = 1;
+        if (strncmp(nm, "pthread_", 8) == 0) need_pthread = 1;
     }
-    if (need_curl)   needed_libs[n_needed++] = "libcurl.so.4";
-    if (need_sqlite) needed_libs[n_needed++] = "libsqlite3.so.0";
-    if (need_ssl)    needed_libs[n_needed++] = "libssl.so.3";
-    if (need_crypto) needed_libs[n_needed++] = "libcrypto.so.3";
+    if (need_curl)    needed_libs[n_needed++] = "libcurl.so.4";
+    if (need_sqlite)  needed_libs[n_needed++] = "libsqlite3.so.0";
+    if (need_ssl)     needed_libs[n_needed++] = "libssl.so.3";
+    if (need_crypto)  needed_libs[n_needed++] = "libcrypto.so.3";
+    if (need_pq)      needed_libs[n_needed++] = "libpq.so.5";
+    if (need_pthread) needed_libs[n_needed++] = "libpthread.so.0";
 
     /* Build .dynstr: NUL, each needed-lib name, each import symbol name. */
     static uint8_t dynstr_buf[8192];
