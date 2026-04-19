@@ -676,6 +676,168 @@ fn cstr_to_str(@raw: int) -> int
         @i = @i + 1
     return @s
 
+fn u64_get(@buf: int, @word_idx: int) -> int
+    @off = @word_idx * 8
+    @v = 0
+    @i = 7
+    while @i >= 0
+        @v = (@v << 8) | str_byte(@buf, @off + @i)
+        @i = @i - 1
+    return @v
+
+fn u64_set(@buf: int, @word_idx: int, @val: int) -> int
+    @off = @word_idx * 8
+    @i = 0
+    while @i < 8
+        str_set_byte(@buf, @off + @i, @val & 255)
+        @val = @val >> 8
+        @i = @i + 1
+    return 0
+
+struct Vec
+    len: int
+    cap: int
+    data: int
+
+fn vec_new() -> Vec
+    @v = Vec { len: 0, cap: 8, data: 0 }
+    @v.data = new_str(8 * 8)
+    return @v
+
+fn vec_len(@v: Vec) -> int
+    return @v.len
+
+fn vec_get(@v: Vec, @i: int) -> int
+    return u64_get(@v.data, @i)
+
+fn vec_set(@v: Vec, @i: int, @x: int) -> int
+    return u64_set(@v.data, @i, @x)
+
+fn _vec_grow(@v: Vec) -> int
+    @new_cap = @v.cap * 2
+    @new_data = new_str(@new_cap * 8)
+    @i = 0
+    while @i < @v.len
+        u64_set(@new_data, @i, u64_get(@v.data, @i))
+        @i = @i + 1
+    @v.cap = @new_cap
+    @v.data = @new_data
+    return 0
+
+fn vec_push(@v: Vec, @x: int) -> int
+    if @v.len >= @v.cap
+        _vec_grow(@v)
+    u64_set(@v.data, @v.len, @x)
+    @v.len = @v.len + 1
+    return 0
+
+fn vec_pop(@v: Vec) -> int
+    if @v.len == 0
+        return 0
+    @v.len = @v.len - 1
+    return u64_get(@v.data, @v.len)
+
+fn _fnv1a(@s: int) -> int
+    @h = 2166136261
+    @n = str_len(@s)
+    @i = 0
+    while @i < @n
+        @h = (@h ^ str_byte(@s, @i)) * 16777619
+        @h = @h & 4294967295
+        @i = @i + 1
+    return @h
+
+struct Map
+    cap: int
+    count: int
+    keys: int
+    vals: int
+
+fn map_new() -> Map
+    @m = Map { cap: 16, count: 0, keys: 0, vals: 0 }
+    @m.keys = new_str(16 * 8)
+    @m.vals = new_str(16 * 8)
+    return @m
+
+fn _map_probe(@m: Map, @key: int) -> int
+    @mask = @m.cap - 1
+    @h = _fnv1a(@key) & @mask
+    @i = 0
+    while @i < @m.cap
+        @slot = u64_get(@m.keys, @h)
+        if @slot == 0
+            return @h
+        if str_eq(@slot, @key)
+            return @h
+        @h = (@h + 1) & @mask
+        @i = @i + 1
+    return @h
+
+fn _map_rehash(@m: Map, @new_cap: int) -> int
+    @old_cap = @m.cap
+    @old_keys = @m.keys
+    @old_vals = @m.vals
+    @m.cap = @new_cap
+    @m.count = 0
+    @m.keys = new_str(@new_cap * 8)
+    @m.vals = new_str(@new_cap * 8)
+    @i = 0
+    while @i < @old_cap
+        @k = u64_get(@old_keys, @i)
+        if @k != 0
+            @idx = _map_probe(@m, @k)
+            u64_set(@m.keys, @idx, @k)
+            u64_set(@m.vals, @idx, u64_get(@old_vals, @i))
+            @m.count = @m.count + 1
+        @i = @i + 1
+    return 0
+
+fn map_set(@m: Map, @key: int, @val: int) -> int
+    if (@m.count + 1) * 2 > @m.cap
+        _map_rehash(@m, @m.cap * 2)
+    @idx = _map_probe(@m, @key)
+    @existing = u64_get(@m.keys, @idx)
+    if @existing == 0
+        u64_set(@m.keys, @idx, @key)
+        @m.count = @m.count + 1
+    u64_set(@m.vals, @idx, @val)
+    return 0
+
+fn map_get(@m: Map, @key: int) -> int
+    @idx = _map_probe(@m, @key)
+    if u64_get(@m.keys, @idx) == 0
+        return 0
+    return u64_get(@m.vals, @idx)
+
+fn map_has(@m: Map, @key: int) -> int
+    @idx = _map_probe(@m, @key)
+    if u64_get(@m.keys, @idx) == 0
+        return 0
+    return 1
+
+fn map_len(@m: Map) -> int
+    return @m.count
+
+fn map_del(@m: Map, @key: int) -> int
+    @idx = _map_probe(@m, @key)
+    if u64_get(@m.keys, @idx) == 0
+        return 0
+    u64_set(@m.keys, @idx, 0)
+    @m.count = @m.count - 1
+    @mask = @m.cap - 1
+    @j = (@idx + 1) & @mask
+    while u64_get(@m.keys, @j) != 0
+        @k2 = u64_get(@m.keys, @j)
+        @v2 = u64_get(@m.vals, @j)
+        u64_set(@m.keys, @j, 0)
+        @m.count = @m.count - 1
+        @ni = _map_probe(@m, @k2)
+        u64_set(@m.keys, @ni, @k2)
+        u64_set(@m.vals, @ni, @v2)
+        @m.count = @m.count + 1
+        @j = (@j + 1) & @mask
+    return 1
+
 extern "C" fn getenv(@name: int) -> int
 
 fn env_get(@name: int) -> int

@@ -2626,14 +2626,13 @@ static void tc_collect_decl(int d)
                         n->slen, n->s);
             }
         }
-        if (n->i2 == 2) {  /* extern "C" — platform FFI                 */
-            if (g_target == TARGET_WINDOWS) {
-                int slot = ffi_register(n->s, n->slen);
-                g_syms[s].syscall_nr = slot;   /* IAT index on Windows   */
-            } else if (g_target == TARGET_LINUX) {
-                int slot = ffi_register_linux(n->s, n->slen);
-                g_syms[s].syscall_nr = slot;   /* GOT index on Linux     */
-            }
+        /* extern "C" imports are registered lazily at call time, not at
+         * declaration time.  Prelude can safely list prototypes that
+         * belong to libraries only available on one platform (curl_*,
+         * socket, etc.) without polluting the IAT/GOT of binaries that
+         * never actually call them.                                    */
+        if (n->i2 == 2) {
+            g_syms[s].syscall_nr = -2;        /* marker: lazy extern "C" */
         }
     } else if (n->kind == N_CONST) {
         sym_add(N_CONST, n->s, n->slen, d);
@@ -3983,24 +3982,30 @@ static void lower_call(int node)
         return;
     }
     if (is_extern_c) {
-        if (g_target == TARGET_WINDOWS && s->syscall_nr >= 0) {
-            /* extern "C" fn via IAT.  Args arrived in sysv order — shuffle
-             * to Win64 order (rcx,rdx,r8,r9) before the call.            */
+        /* Lazy-register import slot on first actual call.               */
+        int slot = s->syscall_nr;
+        if (slot < 0) {
+            const char *nm = s->name;
+            int nlen = s->name_len;
+            if (g_target == TARGET_WINDOWS) {
+                slot = ffi_register(nm, nlen);
+            } else if (g_target == TARGET_LINUX) {
+                slot = ffi_register_linux(nm, nlen);
+            }
+            s->syscall_nr = slot;
+        }
+        if (g_target == TARGET_WINDOWS && slot >= 0) {
             if (reg_args >= 4) emit_mov_r_r(9 /* r9 */,  REG_RCX);
             if (reg_args >= 3) emit_mov_r_r(8 /* r8 */,  REG_RDX);
             if (reg_args >= 2) emit_mov_r_r(REG_RDX,     REG_RSI);
             if (reg_args >= 1) emit_mov_r_r(REG_RCX,     REG_RDI);
             emit_sub_rsp_imm8(32);
-            emit_call_iat(s->syscall_nr);
+            emit_call_iat(slot);
             emit_add_rsp_imm8(32);
             return;
         }
-        if (g_target == TARGET_LINUX && s->syscall_nr >= 0) {
-            /* extern "C" fn on Linux uses the sysv ABI natively — args
-             * are already in rdi/rsi/rdx/rcx/r8/r9 from the generic
-             * push/pop loop above.  Call via the GOT so ld.so resolves
-             * the symbol at load time.                                  */
-            emit_call_got(s->syscall_nr);
+        if (g_target == TARGET_LINUX && slot >= 0) {
+            emit_call_got(slot);
             return;
         }
         emit_int3();
@@ -4775,6 +4780,39 @@ static void lower_function(int sym_idx)
    or implicit when we don't find a main and the caller asked for -c mode. */
 extern int g_allow_no_main;
 
+/* Dead-code elimination: mark which fn symbols are reachable from main
+ * (transitively through N_CALL N_IDENT references) and only lower those.
+ * Keeps extern "C" prelude stubs that nobody calls out of the produced
+ * binary's import table — critical on Windows where an unused
+ * libcurl/sockets prototype would otherwise land in KERNEL32.DLL.    */
+static uint8_t g_reachable[MAX_SYMS];
+
+static void dce_visit_node(int node_idx);
+
+static void dce_mark_sym(int sym_idx)
+{
+    if (sym_idx < 0 || sym_idx >= g_nsyms) return;
+    if (g_reachable[sym_idx]) return;
+    g_reachable[sym_idx] = 1;
+    if (g_syms[sym_idx].kind != N_FN) return;
+    dce_visit_node(g_syms[sym_idx].node);
+}
+
+static void dce_visit_node(int node_idx)
+{
+    if (node_idx < 0 || node_idx >= g_nnodes) return;
+    AstNode *n = &g_nodes[node_idx];
+    if (n->kind == N_CALL && n->nkids > 0) {
+        AstNode *c = &g_nodes[n->kids[0]];
+        if ((c->kind == N_IDENT || c->kind == N_FIELD_ACCESS)
+            && c->s && c->slen > 0) {
+            int si = sym_find(c->s, c->slen);
+            if (si >= 0) dce_mark_sym(si);
+        }
+    }
+    for (int i = 0; i < n->nkids; i++) dce_visit_node(n->kids[i]);
+}
+
 static void lower_all(void)
 {
     int main_sym = sym_find("main", 4);
@@ -4874,10 +4912,13 @@ static void lower_all(void)
         code_patch_u32(call_slot, (uint32_t)(main_code - (call_slot + 4)));
     }
 
-    /* Emit every other N_FN. */
+    /* Compute reachability from main, then emit only those fns. */
+    memset(g_reachable, 0, sizeof(g_reachable));
+    if (main_sym >= 0) dce_mark_sym(main_sym);
     for (int i = 0; i < g_nsyms; i++) {
         if (i == main_sym) continue;
         if (g_syms[i].kind != N_FN) continue;
+        if (!g_reachable[i]) continue;
         lower_function(i);
     }
 
