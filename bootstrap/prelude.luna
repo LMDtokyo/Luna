@@ -1002,6 +1002,242 @@ fn urandom_bytes(@n: int) -> int
     sys_close(@fd)
     return @buf
 
+struct StrBuf
+    buf: int
+    len: int
+    cap: int
+
+fn strbuf_new() -> StrBuf
+    @b = StrBuf { buf: 0, len: 0, cap: 64 }
+    @b.buf = new_str(64)
+    return @b
+
+fn _strbuf_grow(@b: StrBuf, @need: int) -> int
+    @new_cap = @b.cap * 2
+    while @new_cap < @b.len + @need
+        @new_cap = @new_cap * 2
+    @new_buf = new_str(@new_cap)
+    @i = 0
+    while @i < @b.len
+        str_set_byte(@new_buf, @i, str_byte(@b.buf, @i))
+        @i = @i + 1
+    @b.buf = @new_buf
+    @b.cap = @new_cap
+    return 0
+
+fn strbuf_add_byte(@b: StrBuf, @x: int) -> int
+    if @b.len + 1 > @b.cap
+        _strbuf_grow(@b, 1)
+    str_set_byte(@b.buf, @b.len, @x)
+    @b.len = @b.len + 1
+    return 0
+
+fn strbuf_add_str(@b: StrBuf, @s: int) -> int
+    @n = str_len(@s)
+    if @b.len + @n > @b.cap
+        _strbuf_grow(@b, @n)
+    @i = 0
+    while @i < @n
+        str_set_byte(@b.buf, @b.len + @i, str_byte(@s, @i))
+        @i = @i + 1
+    @b.len = @b.len + @n
+    return 0
+
+fn strbuf_add_int(@b: StrBuf, @x: int) -> int
+    return strbuf_add_str(@b, int_to_str(@x))
+
+fn strbuf_done(@b: StrBuf) -> int
+    return str_substr(@b.buf, 0, @b.len)
+
+fn _fmt_apply(@tpl: int, @repls: int, @types: int, @vals: int) -> int
+    @b = strbuf_new()
+    @n = str_len(@tpl)
+    @i = 0
+    @arg = 0
+    while @i < @n
+        @c = str_byte(@tpl, @i)
+        if @c == 123
+            if @i + 1 < @n
+                if str_byte(@tpl, @i + 1) == 125
+                    if @arg < @repls
+                        @t = u64_get(@types, @arg)
+                        @v = u64_get(@vals, @arg)
+                        if @t == 1
+                            strbuf_add_int(@b, @v)
+                        else
+                            strbuf_add_str(@b, @v)
+                        @arg = @arg + 1
+                    @i = @i + 2
+                    continue
+        strbuf_add_byte(@b, @c)
+        @i = @i + 1
+    return strbuf_done(@b)
+
+fn fmt1_s(@tpl: int, @a: int) -> int
+    @types = new_str(8)
+    @vals  = new_str(8)
+    u64_set(@types, 0, 0)
+    u64_set(@vals,  0, @a)
+    return _fmt_apply(@tpl, 1, @types, @vals)
+
+fn fmt1_i(@tpl: int, @a: int) -> int
+    @types = new_str(8)
+    @vals  = new_str(8)
+    u64_set(@types, 0, 1)
+    u64_set(@vals,  0, @a)
+    return _fmt_apply(@tpl, 1, @types, @vals)
+
+fn fmt2_ss(@tpl: int, @a: int, @b: int) -> int
+    @types = new_str(16)
+    @vals  = new_str(16)
+    u64_set(@types, 0, 0)
+    u64_set(@vals,  0, @a)
+    u64_set(@types, 1, 0)
+    u64_set(@vals,  1, @b)
+    return _fmt_apply(@tpl, 2, @types, @vals)
+
+fn fmt2_si(@tpl: int, @a: int, @b: int) -> int
+    @types = new_str(16)
+    @vals  = new_str(16)
+    u64_set(@types, 0, 0)
+    u64_set(@vals,  0, @a)
+    u64_set(@types, 1, 1)
+    u64_set(@vals,  1, @b)
+    return _fmt_apply(@tpl, 2, @types, @vals)
+
+fn fmt2_ii(@tpl: int, @a: int, @b: int) -> int
+    @types = new_str(16)
+    @vals  = new_str(16)
+    u64_set(@types, 0, 1)
+    u64_set(@vals,  0, @a)
+    u64_set(@types, 1, 1)
+    u64_set(@vals,  1, @b)
+    return _fmt_apply(@tpl, 2, @types, @vals)
+
+struct Tester
+    pass: int
+    fail: int
+
+fn test_new() -> Tester
+    return Tester { pass: 0, fail: 0 }
+
+fn _test_record(@t: Tester, @ok: int, @name: int) -> int
+    if @ok == 1
+        @t.pass = @t.pass + 1
+        shine(str_concat("  ok   ", @name))
+        return 0
+    @t.fail = @t.fail + 1
+    shine(str_concat("  FAIL ", @name))
+    return 0
+
+fn assert_true(@t: Tester, @name: int, @cond: int) -> int
+    if @cond != 0
+        return _test_record(@t, 1, @name)
+    return _test_record(@t, 0, @name)
+
+fn assert_false(@t: Tester, @name: int, @cond: int) -> int
+    if @cond == 0
+        return _test_record(@t, 1, @name)
+    return _test_record(@t, 0, @name)
+
+fn assert_eq(@t: Tester, @name: int, @got: int, @want: int) -> int
+    if @got == @want
+        return _test_record(@t, 1, @name)
+    _test_record(@t, 0, @name)
+    shine(fmt2_ii("      got={} want={}", @got, @want))
+    return 0
+
+fn assert_str_eq(@t: Tester, @name: int, @got: int, @want: int) -> int
+    if str_eq(@got, @want) == 1
+        return _test_record(@t, 1, @name)
+    _test_record(@t, 0, @name)
+    shine(str_concat("      got:  ", @got))
+    shine(str_concat("      want: ", @want))
+    return 0
+
+fn test_summary(@t: Tester) -> int
+    shine("")
+    shine(fmt2_ii("tests: {} passed, {} failed", @t.pass, @t.fail))
+    if @t.fail == 0
+        return 0
+    return 1
+
+fn fmt3_sis(@tpl: int, @a: int, @b: int, @c: int) -> int
+    @types = new_str(24)
+    @vals  = new_str(24)
+    u64_set(@types, 0, 0)
+    u64_set(@vals,  0, @a)
+    u64_set(@types, 1, 1)
+    u64_set(@vals,  1, @b)
+    u64_set(@types, 2, 0)
+    u64_set(@vals,  2, @c)
+    return _fmt_apply(@tpl, 3, @types, @vals)
+
+fn _re_match_here(@pat: int, @pi: int, @txt: int, @ti: int) -> int
+    @pn = str_len(@pat)
+    @tn = str_len(@txt)
+    if @pi >= @pn
+        return 1
+    if @pi + 1 < @pn
+        if str_byte(@pat, @pi + 1) == 42
+            return _re_match_star(str_byte(@pat, @pi), @pat, @pi + 2, @txt, @ti)
+    if str_byte(@pat, @pi) == 36
+        if @pi + 1 >= @pn
+            if @ti >= @tn
+                return 1
+            return 0
+    if @ti < @tn
+        @pc = str_byte(@pat, @pi)
+        @tc = str_byte(@txt, @ti)
+        if @pc == 46
+            return _re_match_here(@pat, @pi + 1, @txt, @ti + 1)
+        if @pc == @tc
+            return _re_match_here(@pat, @pi + 1, @txt, @ti + 1)
+    return 0
+
+fn _re_match_star(@c: int, @pat: int, @pi: int, @txt: int, @ti: int) -> int
+    @tn = str_len(@txt)
+    while 1
+        if _re_match_here(@pat, @pi, @txt, @ti) == 1
+            return 1
+        if @ti >= @tn
+            return 0
+        if @c == 46
+            @ti = @ti + 1
+            continue
+        if str_byte(@txt, @ti) != @c
+            return 0
+        @ti = @ti + 1
+    return 0
+
+fn re_match(@pat: int, @txt: int) -> int
+    @pn = str_len(@pat)
+    @tn = str_len(@txt)
+    if @pn > 0
+        if str_byte(@pat, 0) == 94
+            return _re_match_here(@pat, 1, @txt, 0)
+    @i = 0
+    while @i <= @tn
+        if _re_match_here(@pat, 0, @txt, @i) == 1
+            return 1
+        @i = @i + 1
+    return 0
+
+fn re_find(@pat: int, @txt: int) -> int
+    @pn = str_len(@pat)
+    @tn = str_len(@txt)
+    if @pn > 0
+        if str_byte(@pat, 0) == 94
+            if _re_match_here(@pat, 1, @txt, 0) == 1
+                return 0
+            return 0 - 1
+    @i = 0
+    while @i <= @tn
+        if _re_match_here(@pat, 0, @txt, @i) == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
 fn uuid_v4() -> int
     @raw = rand_bytes(16)
     @b6 = (str_byte(@raw, 6) & 15) | 64
