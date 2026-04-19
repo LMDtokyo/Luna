@@ -4997,17 +4997,31 @@ static void write_elf64(const char *out_path)
 
     /* ---------- Dynamic-link path: libc.so.6 via DT_NEEDED ---------- */
 
-    /* Build .dynstr: index 0 is a NUL terminator, then library name,
-     * then every imported symbol name.                                 */
-    static uint8_t dynstr_buf[4096];
-    int dynstr_len = 1;                                /* [0] = '\0'    */
+    /* Decide which shared libraries the binary will pull in.  libc.so.6
+     * is unconditional.  Additional DT_NEEDED entries are added when
+     * imported symbol names belong to a known library (curl_*, ssl_*).  */
+    const char *needed_libs[8];
+    int n_needed = 0;
+    needed_libs[n_needed++] = "libc.so.6";
+    int need_curl = 0;
+    for (int i = 0; i < g_nlinux_imports; i++) {
+        const char *nm = g_linux_imports[i];
+        if (strncmp(nm, "curl_", 5) == 0) { need_curl = 1; }
+    }
+    if (need_curl) needed_libs[n_needed++] = "libcurl.so.4";
+
+    /* Build .dynstr: NUL, each needed-lib name, each import symbol name. */
+    static uint8_t dynstr_buf[8192];
+    int dynstr_len = 1;
     dynstr_buf[0] = 0;
-    int libc_name_off = dynstr_len;
-    const char *LIBC_NAME = "libc.so.6";
-    int libc_name_len = (int)strlen(LIBC_NAME);
-    memcpy(dynstr_buf + dynstr_len, LIBC_NAME, (size_t)libc_name_len);
-    dynstr_len += libc_name_len;
-    dynstr_buf[dynstr_len++] = 0;
+    int lib_name_off[8];
+    for (int L = 0; L < n_needed; L++) {
+        lib_name_off[L] = dynstr_len;
+        int nl = (int)strlen(needed_libs[L]);
+        memcpy(dynstr_buf + dynstr_len, needed_libs[L], (size_t)nl);
+        dynstr_len += nl;
+        dynstr_buf[dynstr_len++] = 0;
+    }
     int sym_name_off[MAX_LINUX_IMPORTS];
     for (int i = 0; i < g_nlinux_imports; i++) {
         sym_name_off[i] = dynstr_len;
@@ -5067,7 +5081,7 @@ static void write_elf64(const char *out_path)
     int rela_rel     = (int)round_up_u64((uint64_t)(dynsym_rel + dynsym_size), 8);
     int hash_rel     = (int)round_up_u64((uint64_t)(rela_rel + rela_size), 8);
     int dynamic_rel  = (int)round_up_u64((uint64_t)(hash_rel + hash_size), 8);
-    int ndyn = 11;                                      /* see below    */
+    int ndyn = 10 + n_needed;          /* 10 fixed DT_* + one per lib  */
     int dynamic_size = ndyn * 16;
     int got_rel      = (int)round_up_u64((uint64_t)(dynamic_rel + dynamic_size), 8);
     int got_size     = g_nlinux_imports * 8;
@@ -5106,7 +5120,9 @@ static void write_elf64(const char *out_path)
         for (int b = 0; b < 8; b++) dynamic_buf[dyi + 8 + b] = (uint8_t)(v >> (b * 8)); \
         dyi += 16; \
     } while (0)
-    DT_ENTRY(1,  libc_name_off);        /* DT_NEEDED                    */
+    for (int L = 0; L < n_needed; L++) {
+        DT_ENTRY(1, lib_name_off[L]);   /* DT_NEEDED per library        */
+    }
     DT_ENTRY(5,  dynstr_va);            /* DT_STRTAB                    */
     DT_ENTRY(10, dynstr_len);           /* DT_STRSZ                     */
     DT_ENTRY(6,  dynsym_va);            /* DT_SYMTAB                    */

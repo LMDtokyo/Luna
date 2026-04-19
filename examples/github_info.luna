@@ -1,0 +1,29 @@
+fn main() -> int
+    if args_count() < 3
+        shine("usage: github_info <owner> <repo>")
+        shine("example: ./github_info torvalds linux")
+        return 1
+
+    @owner = arg(1)
+    @repo  = arg(2)
+
+    @url = str_concat(str_concat(str_concat("https://api.github.com/repos/", @owner), "/"), @repo)
+
+    shine(str_concat("fetching: ", @url))
+    @body = http_get(@url)
+
+    if str_len(@body) == 0
+        shine("http_get failed")
+        return 1
+
+    shine("")
+    shine("repo info:")
+    print("  full name:   "); shine(json_get_str(@body, "full_name"))
+    print("  description: "); shine(json_get_str(@body, "description"))
+    print("  language:    "); shine(json_get_str(@body, "language"))
+    print("  stars:       "); println_int(json_get_int(@body, "stargazers_count"))
+    print("  forks:       "); println_int(json_get_int(@body, "forks_count"))
+    print("  open issues: "); println_int(json_get_int(@body, "open_issues_count"))
+    print("  created at:  "); shine(json_get_str(@body, "created_at"))
+    print("  license:     "); shine(json_get_str(@body, "spdx_id"))
+    return 0
