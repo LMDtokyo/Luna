@@ -1292,3 +1292,155 @@ fn http_post_json(@url: int, @body: int) -> int
     @resp = read_file(@out_path)
     remove(@out_path)
     return @resp
+
+fn _sha256_rotr(@x: int, @n: int) -> int
+    return ((@x >> @n) | (@x << (32 - @n))) & 4294967295
+
+fn _sha256_ch(@x: int, @y: int, @z: int) -> int
+    return (@x & @y) ^ ((~@x) & @z)
+
+fn _sha256_maj(@x: int, @y: int, @z: int) -> int
+    return (@x & @y) ^ (@x & @z) ^ (@y & @z)
+
+fn _sha256_bsig0(@x: int) -> int
+    return _sha256_rotr(@x, 2) ^ _sha256_rotr(@x, 13) ^ _sha256_rotr(@x, 22)
+
+fn _sha256_bsig1(@x: int) -> int
+    return _sha256_rotr(@x, 6) ^ _sha256_rotr(@x, 11) ^ _sha256_rotr(@x, 25)
+
+fn _sha256_ssig0(@x: int) -> int
+    return _sha256_rotr(@x, 7) ^ _sha256_rotr(@x, 18) ^ (@x >> 3)
+
+fn _sha256_ssig1(@x: int) -> int
+    return _sha256_rotr(@x, 17) ^ _sha256_rotr(@x, 19) ^ (@x >> 10)
+
+fn _sha256_be32(@buf: int, @off: int) -> int
+    return (str_byte(@buf, @off) << 24) | (str_byte(@buf, @off + 1) << 16) | (str_byte(@buf, @off + 2) << 8) | str_byte(@buf, @off + 3)
+
+fn _sha256_pad(@msg: int) -> int
+    @len = str_len(@msg)
+    @pad_len = 64 - ((@len + 9) % 64)
+    if @pad_len == 64
+        @pad_len = 0
+    @total = @len + 1 + @pad_len + 8
+    @padded = new_str(@total)
+    @i = 0
+    while @i < @len
+        str_set_byte(@padded, @i, str_byte(@msg, @i))
+        @i = @i + 1
+    str_set_byte(@padded, @len, 128)
+    @bit_len = @len * 8
+    @j = 0
+    while @j < 8
+        str_set_byte(@padded, @total - 8 + @j, (@bit_len >> ((7 - @j) * 8)) & 255)
+        @j = @j + 1
+    return @padded
+
+fn sha256_raw(@msg: int) -> int
+    @padded = _sha256_pad(@msg)
+    @total = str_len(@padded)
+    @nblocks = @total / 64
+    @H = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+    @K = [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]
+    @mask = 4294967295
+    @blk = 0
+    while @blk < @nblocks
+        @W = new_str(64 * 8)
+        @t = 0
+        while @t < 16
+            u64_set(@W, @t, _sha256_be32(@padded, @blk * 64 + @t * 4))
+            @t = @t + 1
+        while @t < 64
+            @w1 = u64_get(@W, @t - 2)
+            @w2 = u64_get(@W, @t - 7)
+            @w3 = u64_get(@W, @t - 15)
+            @w4 = u64_get(@W, @t - 16)
+            @nw = (_sha256_ssig1(@w1) + @w2 + _sha256_ssig0(@w3) + @w4) & @mask
+            u64_set(@W, @t, @nw)
+            @t = @t + 1
+        @a = @H[0]
+        @b = @H[1]
+        @c = @H[2]
+        @d = @H[3]
+        @e = @H[4]
+        @f = @H[5]
+        @g = @H[6]
+        @hh = @H[7]
+        @t = 0
+        while @t < 64
+            @wt = u64_get(@W, @t)
+            @T1 = (@hh + _sha256_bsig1(@e) + _sha256_ch(@e, @f, @g) + @K[@t] + @wt) & @mask
+            @T2 = (_sha256_bsig0(@a) + _sha256_maj(@a, @b, @c)) & @mask
+            @hh = @g
+            @g = @f
+            @f = @e
+            @e = (@d + @T1) & @mask
+            @d = @c
+            @c = @b
+            @b = @a
+            @a = (@T1 + @T2) & @mask
+            @t = @t + 1
+        @H[0] = (@H[0] + @a) & @mask
+        @H[1] = (@H[1] + @b) & @mask
+        @H[2] = (@H[2] + @c) & @mask
+        @H[3] = (@H[3] + @d) & @mask
+        @H[4] = (@H[4] + @e) & @mask
+        @H[5] = (@H[5] + @f) & @mask
+        @H[6] = (@H[6] + @g) & @mask
+        @H[7] = (@H[7] + @hh) & @mask
+        @blk = @blk + 1
+    @out = new_str(32)
+    @i = 0
+    while @i < 8
+        @hv = @H[@i]
+        str_set_byte(@out, @i * 4,     (@hv >> 24) & 255)
+        str_set_byte(@out, @i * 4 + 1, (@hv >> 16) & 255)
+        str_set_byte(@out, @i * 4 + 2, (@hv >> 8)  & 255)
+        str_set_byte(@out, @i * 4 + 3, @hv & 255)
+        @i = @i + 1
+    return @out
+
+fn sha256_hex(@msg: int) -> int
+    return hex_encode(sha256_raw(@msg))
+
+fn _concat_bytes(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    @out = new_str(@la + @lb)
+    @i = 0
+    while @i < @la
+        str_set_byte(@out, @i, str_byte(@a, @i))
+        @i = @i + 1
+    @i = 0
+    while @i < @lb
+        str_set_byte(@out, @la + @i, str_byte(@b, @i))
+        @i = @i + 1
+    return @out
+
+fn hmac_sha256_raw(@key: int, @msg: int) -> int
+    @k_pad = new_str(64)
+    @klen = str_len(@key)
+    if @klen > 64
+        @hashed = sha256_raw(@key)
+        @i = 0
+        while @i < 32
+            str_set_byte(@k_pad, @i, str_byte(@hashed, @i))
+            @i = @i + 1
+    else
+        @i = 0
+        while @i < @klen
+            str_set_byte(@k_pad, @i, str_byte(@key, @i))
+            @i = @i + 1
+    @inner_key = new_str(64)
+    @outer_key = new_str(64)
+    @i = 0
+    while @i < 64
+        @kb = str_byte(@k_pad, @i)
+        str_set_byte(@inner_key, @i, @kb ^ 54)
+        str_set_byte(@outer_key, @i, @kb ^ 92)
+        @i = @i + 1
+    @inner = sha256_raw(_concat_bytes(@inner_key, @msg))
+    return sha256_raw(_concat_bytes(@outer_key, @inner))
+
+fn hmac_sha256_hex(@key: int, @msg: int) -> int
+    return hex_encode(hmac_sha256_raw(@key, @msg))
