@@ -296,3 +296,173 @@ fn str_trim(@s: int) -> int
             break
         @end = @end - 1
     return str_substr(@s, @start, @end - @start)
+
+fn _json_skip_ws(@json: int, @p: int) -> int
+    @n = str_len(@json)
+    while @p < @n
+        @c = str_byte(@json, @p)
+        if _is_ws(@c) == 0
+            return @p
+        @p = @p + 1
+    return @p
+
+fn _json_skip_value(@json: int, @p: int) -> int
+    @n = str_len(@json)
+    @p = _json_skip_ws(@json, @p)
+    if @p >= @n
+        return @p
+    @c = str_byte(@json, @p)
+    if @c == 34
+        @p = @p + 1
+        while @p < @n
+            @b = str_byte(@json, @p)
+            if @b == 92
+                @p = @p + 2
+            else
+                if @b == 34
+                    return @p + 1
+                @p = @p + 1
+        return @p
+    if @c == 123
+        @depth = 1
+        @p = @p + 1
+        while @p < @n
+            @b = str_byte(@json, @p)
+            if @b == 123
+                @depth = @depth + 1
+            if @b == 125
+                @depth = @depth - 1
+                if @depth == 0
+                    return @p + 1
+            if @b == 34
+                @p = _json_skip_value(@json, @p)
+            else
+                @p = @p + 1
+        return @p
+    if @c == 91
+        @depth = 1
+        @p = @p + 1
+        while @p < @n
+            @b = str_byte(@json, @p)
+            if @b == 91
+                @depth = @depth + 1
+            if @b == 93
+                @depth = @depth - 1
+                if @depth == 0
+                    return @p + 1
+            if @b == 34
+                @p = _json_skip_value(@json, @p)
+            else
+                @p = @p + 1
+        return @p
+    while @p < @n
+        @b = str_byte(@json, @p)
+        if @b == 44
+            return @p
+        if @b == 125
+            return @p
+        if @b == 93
+            return @p
+        @p = @p + 1
+    return @p
+
+fn json_find_key(@json: int, @key: int) -> int
+    @n = str_len(@json)
+    @kl = str_len(@key)
+    @i = 0
+    while @i + @kl + 2 < @n
+        if str_byte(@json, @i) == 34
+            @match = 1
+            @j = 0
+            while @j < @kl
+                if str_byte(@json, @i + 1 + @j) != str_byte(@key, @j)
+                    @match = 0
+                    @j = @kl
+                @j = @j + 1
+            if @match == 1
+                if str_byte(@json, @i + 1 + @kl) == 34
+                    @after = @i + 2 + @kl
+                    @after = _json_skip_ws(@json, @after)
+                    if @after < @n
+                        if str_byte(@json, @after) == 58
+                            return _json_skip_ws(@json, @after + 1)
+        @i = @i + 1
+    return 0 - 1
+
+fn json_int(@json: int, @p: int) -> int
+    @n = str_len(@json)
+    @neg = 0
+    @v = 0
+    if @p < @n
+        if str_byte(@json, @p) == 45
+            @neg = 1
+            @p = @p + 1
+    while @p < @n
+        @c = str_byte(@json, @p)
+        if @c < 48
+            break
+        if @c > 57
+            break
+        @v = @v * 10 + (@c - 48)
+        @p = @p + 1
+    if @neg == 1
+        return 0 - @v
+    return @v
+
+fn json_string(@json: int, @p: int) -> int
+    @n = str_len(@json)
+    if @p >= @n
+        return ""
+    if str_byte(@json, @p) != 34
+        return ""
+    @p = @p + 1
+    @end = @p
+    while @end < @n
+        @b = str_byte(@json, @end)
+        if @b == 92
+            @end = @end + 2
+        else
+            if @b == 34
+                break
+            @end = @end + 1
+    return str_substr(@json, @p, @end - @p)
+
+fn json_bool(@json: int, @p: int) -> int
+    if str_byte(@json, @p) == 116
+        return 1
+    return 0
+
+fn json_array_at(@json: int, @p: int, @idx: int) -> int
+    @n = str_len(@json)
+    if @p >= @n
+        return 0 - 1
+    if str_byte(@json, @p) != 91
+        return 0 - 1
+    @p = @p + 1
+    @p = _json_skip_ws(@json, @p)
+    @cur = 0
+    while @p < @n
+        if str_byte(@json, @p) == 93
+            return 0 - 1
+        if @cur == @idx
+            return @p
+        @p = _json_skip_value(@json, @p)
+        @p = _json_skip_ws(@json, @p)
+        if @p < @n
+            if str_byte(@json, @p) == 44
+                @p = @p + 1
+                @p = _json_skip_ws(@json, @p)
+        @cur = @cur + 1
+    return 0 - 1
+
+fn json_get_int(@json: int, @key: int) -> int
+    @p = json_find_key(@json, @key)
+    if @p < 0
+        return 0
+    return json_int(@json, @p)
+
+fn json_get_str(@json: int, @key: int) -> int
+    @p = json_find_key(@json, @key)
+    if @p < 0
+        return ""
+    return json_string(@json, @p)
