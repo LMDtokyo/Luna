@@ -1354,16 +1354,21 @@ static int parse_primary(void)
                 node_add(al, cnt);
                 g_nodes[al].i1 = 1;  /* 1 = repeat form [v; N] */
             } else {
-                /* Cap stored elements to avoid overflowing the AST node's
-                   child list — very large literals (X.509 trust store has
-                   ~400 integers) don't need to be kept in AST; the
-                   bootstrap never materialises them.                    */
+                /* Cascade overflow into a continuation N_ARRAY_LIT in the
+                   last slot, same trick N_BLOCK / N_MODULE use.  Marker
+                   i1 == 2 tells the lowerer to treat this node as a pure
+                   continuation (no own bump alloc).                      */
+                int cur = al;
                 while (accept(TK_COMMA)) {
                     if (peek()->kind == TK_RBRACK) break;
                     int e = parse_expr();
-                    if (g_nodes[al].nkids < KIDS_INLINE - 4) {
-                        node_add(al, e);
+                    if (g_nodes[cur].nkids >= KIDS_INLINE - 4) {
+                        int nxt = node_new(N_ARRAY_LIT, t);
+                        g_nodes[nxt].i1 = 2;  /* 2 = continuation */
+                        node_add(cur, nxt);
+                        cur = nxt;
                     }
+                    node_add(cur, e);
                 }
             }
         }
@@ -4352,17 +4357,24 @@ static void lower_expr(int node)
         }
         case N_STRUCT_LIT: lower_struct_lit(node); return;
         case N_ARRAY_LIT: {
-            /* Two forms, disambiguated by i1:
+            /* Forms:
              *   i1 == 0:  [v1, v2, ...]     — N elements, each evaluated
-             *   i1 == 1:  [v; N]           — one value, repeated N times
+             *   i1 == 1:  [v; N]            — one value, repeated N times
+             *   i1 == 2:  continuation      — overflow from a parent list;
+             *                                 handled via chain walk below.
              *
-             * Both forms bump-allocate N*8 bytes from the global heap.
-             * The heap pointer lives in a dedicated BSS slot; struct and
-             * array literals consume it directly so the returned pointer
-             * survives the enclosing function's return.                 */
+             * Both value forms bump-allocate N*8 bytes from the global
+             * heap.  Long list literals (> KIDS_INLINE-4 elements) cascade
+             * through continuation nodes so the AST child cap can't
+             * silently drop elements.                                    */
             const int MAX_ARRAY_BYTES = 1024 * 1024;    /* 128 Ki slots */
             int count = 0;
-            int is_repeat = n->i1;
+            int is_repeat = n->i1 == 1;
+            if (n->i1 == 2) {
+                /* pure continuation — should only be reached via chain walk */
+                emit_mov_rax_imm64(0);
+                return;
+            }
             if (is_repeat) {
                 if (n->nkids < 2) { emit_mov_rax_imm64(0); return; }
                 AstNode *cn = &g_nodes[n->kids[1]];
@@ -4373,7 +4385,22 @@ static void lower_expr(int node)
                 }
                 count = (int)cn->iv;
             } else {
-                count = n->nkids;
+                /* walk continuation chain to sum element count */
+                int cur = node;
+                while (cur >= 0) {
+                    AstNode *cn = &g_nodes[cur];
+                    int nk = cn->nkids;
+                    int next = -1;
+                    if (nk > 0) {
+                        AstNode *last = &g_nodes[cn->kids[nk - 1]];
+                        if (last->kind == N_ARRAY_LIT && last->i1 == 2) {
+                            next = cn->kids[nk - 1];
+                            nk--;
+                        }
+                    }
+                    count += nk;
+                    cur = next;
+                }
             }
             int bytes = count * 8;
             if (bytes <= 0 || bytes > MAX_ARRAY_BYTES) {
@@ -4391,9 +4418,25 @@ static void lower_expr(int node)
                     emit_mov_mem_rbx_disp32_rax(i * 8);
                 }
             } else {
-                for (int i = 0; i < count; i++) {
-                    lower_expr(n->kids[i]);
-                    emit_mov_mem_rbx_disp32_rax(i * 8);
+                int slot = 0;
+                int cur = node;
+                while (cur >= 0) {
+                    AstNode *cn = &g_nodes[cur];
+                    int nk = cn->nkids;
+                    int next = -1;
+                    if (nk > 0) {
+                        AstNode *last = &g_nodes[cn->kids[nk - 1]];
+                        if (last->kind == N_ARRAY_LIT && last->i1 == 2) {
+                            next = cn->kids[nk - 1];
+                            nk--;
+                        }
+                    }
+                    for (int i = 0; i < nk; i++) {
+                        lower_expr(cn->kids[i]);
+                        emit_mov_mem_rbx_disp32_rax(slot * 8);
+                        slot++;
+                    }
+                    cur = next;
                 }
             }
             emit_mov_r_r(REG_RAX, 3 /* rbx */);    /* rax = base */
