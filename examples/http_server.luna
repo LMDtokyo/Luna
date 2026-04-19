@@ -1,0 +1,97 @@
+extern "C" fn socket(@dom: int, @type: int, @proto: int) -> int
+extern "C" fn bind(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn listen(@fd: int, @backlog: int) -> int
+extern "C" fn accept(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn recv(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn send(@fd: int, @buf: int, @n: int, @flags: int) -> int
+extern "C" fn close(@fd: int) -> int
+extern "C" fn setsockopt(@fd: int, @level: int, @opt: int, @val: int, @len: int) -> int
+extern "C" fn printf(@fmt: int, @a: int) -> int
+extern "C" fn fflush(@s: int)
+
+fn sockaddr_in(@port: int) -> int
+    @sa = new_str(16)
+    str_set_byte(@sa, 0, 2)
+    str_set_byte(@sa, 1, 0)
+    str_set_byte(@sa, 2, @port / 256)
+    str_set_byte(@sa, 3, @port % 256)
+    return @sa
+
+fn extract_path(@req: int) -> int
+    @n = str_len(@req)
+    @start = 0
+    while @start < @n
+        if str_byte(@req, @start) == 32
+            @start = @start + 1
+            @end = @start
+            while @end < @n
+                if str_byte(@req, @end) == 32
+                    return str_substr(@req, @start, @end - @start)
+                @end = @end + 1
+            return ""
+        @start = @start + 1
+    return ""
+
+fn send_response(@fd: int, @status: int, @body: int) -> int
+    @len_str = int_to_str(str_len(@body))
+    @code_str = int_to_str(@status)
+    @resp = str_concat("HTTP/1.1 ", @code_str)
+    @resp = str_concat(@resp, " OK\r\nContent-Type: text/plain\r\nContent-Length: ")
+    @resp = str_concat(@resp, @len_str)
+    @resp = str_concat(@resp, "\r\n\r\n")
+    @resp = str_concat(@resp, @body)
+    send(@fd, @resp, str_len(@resp), 0)
+    return 0
+
+fn handle(@fd: int, @req: int) -> int
+    @path = extract_path(@req)
+    if str_eq(@path, "/")
+        send_response(@fd, 200, "Hello from Luna HTTP server!\n")
+        return 0
+    if str_eq(@path, "/ping")
+        send_response(@fd, 200, "pong\n")
+        return 0
+    if str_starts_with(@path, "/echo/")
+        @payload = str_substr(@path, 6, str_len(@path) - 6)
+        send_response(@fd, 200, @payload)
+        return 0
+    send_response(@fd, 404, "not found\n")
+    return 0
+
+fn main() -> int
+    @sock = socket(2, 1, 0)
+    if @sock < 0
+        shine("socket() failed")
+        return 1
+
+    @one = new_str(4)
+    str_set_byte(@one, 0, 1)
+    setsockopt(@sock, 1, 2, @one, 4)
+
+    @sa = sockaddr_in(8787)
+    if bind(@sock, @sa, 16) < 0
+        shine("bind() failed")
+        close(@sock)
+        return 1
+
+    listen(@sock, 16)
+    shine("Luna HTTP server listening on :8787")
+    shine("routes:  /   /ping   /echo/<text>")
+    fflush(0)
+
+    @i = 0
+    while @i < 100
+        @client = accept(@sock, 0, 0)
+        if @client < 0
+            @i = @i + 1
+            continue
+        @buf = new_str(4096)
+        @n = recv(@client, @buf, 4096, 0)
+        if @n > 0
+            handle(@client, @buf)
+        close(@client)
+        @i = @i + 1
+
+    close(@sock)
+    shine("done")
+    return 0
