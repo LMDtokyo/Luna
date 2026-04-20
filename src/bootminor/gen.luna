@@ -2164,6 +2164,127 @@ fn parse_primary(@g: Gen) -> int
             _advance(@g)
             _emit_syscall_intrinsic(@g, 2, 35)
             return 0
+        # Threading primitives. sys_clone: raw clone(2). Beware that the
+        # child resumes at the instruction right after the syscall and
+        # that its rsp is the caller-supplied stack — using thread_spawn
+        # is almost always what you want instead.
+        if str_eq(@name, "sys_clone") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 5, 56)
+            return 0
+        if str_eq(@name, "sys_futex") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 6, 202)
+            return 0
+        if str_eq(@name, "sys_gettid") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 0, 186)
+            return 0
+        if str_eq(@name, "sys_tgkill") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 234)
+            return 0
+        # thread_spawn(fn_ptr, arg) -> tid
+        # Compound intrinsic: mmaps a 64 KB child stack, plants (fn, arg)
+        # at its top, clones with CLONE_VM | CLONE_THREAD | ... so the
+        # child shares the address space and signal handlers, and on the
+        # child side calls fn(arg) and exits. Parent returns the tid.
+        #
+        # NB: the bump heap is not lock-free yet — allocating from
+        # multiple threads concurrently races. Either have the child do
+        # all its allocation before the parent re-enters an allocating
+        # path, or guard new_arr calls with sys_futex.
+        if str_eq(@name, "thread_spawn") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after thread_spawn")
+            parse_expr(@g)                       # rax = fn_ptr
+            _em_push_rax(@g)                     # [rsp+8] = fn_ptr (after next push)
+            _expect(@g, TK_COMMA, "expected ',' in thread_spawn")
+            parse_expr(@g)                       # rax = arg
+            _em_push_rax(@g)                     # [rsp] = arg
+            _expect(@g, TK_RPAREN, "expected ')' after thread_spawn")
+            # mmap(NULL, 65536, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0)
+            _eb(@g, 49)
+            _eb(@g, 255)                         # xor edi, edi
+            _eb(@g, 190)                         # mov esi, imm32
+            _e32(@g, 65536)
+            _eb(@g, 186)                         # mov edx, imm32
+            _e32(@g, 3)
+            _eb(@g, 65)
+            _eb(@g, 186)                         # mov r10d, imm32
+            _e32(@g, 34)                         # 0x22 MAP_PRIVATE|MAP_ANON
+            _eb(@g, 73)
+            _eb(@g, 199)
+            _eb(@g, 192)                         # mov r8, imm32 (sign-ext)
+            _e32(@g, 0 - 1)                      # -1 (fd)
+            _eb(@g, 69)
+            _eb(@g, 49)
+            _eb(@g, 201)                         # xor r9d, r9d
+            _eb(@g, 184)                         # mov eax, imm32
+            _e32(@g, 9)                          # sys_mmap
+            _em_syscall(@g)
+            # r13 = rax + 65520  (top-16 stays 16-aligned)
+            _eb(@g, 76)
+            _eb(@g, 141)
+            _eb(@g, 168)                         # lea r13, [rax + disp32]
+            _e32(@g, 65520)
+            # pop arg, store at [r13+8]
+            _em_pop_rax(@g)
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 69)
+            _eb(@g, 8)                           # mov [r13+8], rax
+            # pop fn_ptr, store at [r13]
+            _em_pop_rax(@g)
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 69)
+            _eb(@g, 0)                           # mov [r13+0], rax
+            # clone(0x50f00, r13, 0, 0, 0)
+            _eb(@g, 191)                         # mov edi, imm32
+            _e32(@g, 330496)                     # 0x50f00 CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM
+            _eb(@g, 76)
+            _eb(@g, 137)
+            _eb(@g, 238)                         # mov rsi, r13
+            _eb(@g, 49)
+            _eb(@g, 210)                         # xor edx, edx
+            _eb(@g, 77)
+            _eb(@g, 49)
+            _eb(@g, 210)                         # xor r10, r10
+            _eb(@g, 69)
+            _eb(@g, 49)
+            _eb(@g, 192)                         # xor r8d, r8d
+            _eb(@g, 184)                         # mov eax, imm32
+            _e32(@g, 56)                         # sys_clone
+            _em_syscall(@g)
+            # test rax, rax ; jnz parent_ret (skip child block, rel32 patched)
+            _eb(@g, 72)
+            _eb(@g, 133)
+            _eb(@g, 192)                         # test rax, rax
+            _eb(@g, 15)
+            _eb(@g, 133)                         # jnz rel32
+            @par_patch = _code_len(@g)
+            _e32(@g, 0)
+            # Child path — rsp == r13 == child stack top.
+            # mov rdi, [rsp+8] ; rax = [rsp] ; call rax ; sys_exit(0)
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 124)
+            _eb(@g, 36)
+            _eb(@g, 8)                           # mov rdi, [rsp+8]
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 4)
+            _eb(@g, 36)                          # mov rax, [rsp]
+            _em_call_rax(@g)
+            _eb(@g, 49)
+            _eb(@g, 255)                         # xor edi, edi
+            _eb(@g, 184)                         # mov eax, imm32
+            _e32(@g, 60)                         # sys_exit
+            _em_syscall(@g)
+            # Parent lands here; rax = child tid.
+            _patch_here(@g, @par_patch)
+            return 0
         # --- Hot-swap metadata accessors ---
         # Each emits `mov rax, qword [rip + disp32]` reading the u64
         # stored at the corresponding data-section metadata offset.

@@ -1,0 +1,25 @@
+fn worker1(@shared: int) -> int
+    u64_set(@shared, 0, 10)
+    return 0
+
+fn worker2(@shared: int) -> int
+    u64_set(@shared, 1, 20)
+    return 0
+
+fn worker3(@shared: int) -> int
+    u64_set(@shared, 2, 30)
+    return 0
+
+fn main() -> int
+    @shared = [0; 3]
+    @t1 = thread_spawn(worker1, @shared)
+    @t2 = thread_spawn(worker2, @shared)
+    @t3 = thread_spawn(worker3, @shared)
+    while u64_get(@shared, 0) == 0
+        @d1 = 0
+    while u64_get(@shared, 1) == 0
+        @d2 = 0
+    while u64_get(@shared, 2) == 0
+        @d3 = 0
+    shine_int(u64_get(@shared, 0) + u64_get(@shared, 1) + u64_get(@shared, 2))
+    return 0

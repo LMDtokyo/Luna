@@ -1,0 +1,12 @@
+fn worker(@shared: int) -> int
+    u64_set(@shared, 0, 42)
+    return 0
+
+fn main() -> int
+    @shared = [0; 2]
+    @tid = thread_spawn(worker, @shared)
+    # Spin-wait until child publishes its value.
+    while u64_get(@shared, 0) == 0
+        @dummy = 0
+    shine_int(u64_get(@shared, 0))
+    return 0

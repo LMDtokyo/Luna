@@ -1,0 +1,9 @@
+fn main() -> int
+    @tid = thread_spawn(fn(@a: int) -> int
+        return 0
+    , 42)
+    if @tid > 0
+        shine("spawned")
+    else
+        shine("fail")
+    return 0
