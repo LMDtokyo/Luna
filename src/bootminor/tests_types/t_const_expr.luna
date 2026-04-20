@@ -1,0 +1,17 @@
+const PAGE_SIZE:   int = 1 << 12
+const PAGE_MASK:   int = PAGE_SIZE - 1
+const MASK_HEX:    int = 0xFFFF0000 | 0x0000FFFF
+const SIGN_FLAG:   int = 1 << 63
+const FIVE_MINUS_2: int = 5 - 2
+
+fn main() -> int
+    shine_int(PAGE_SIZE)
+    shine_int(PAGE_MASK)
+    shine_int(MASK_HEX)
+    shine_int(SIGN_FLAG)
+    shine_int(FIVE_MINUS_2)
+
+    # Use in runtime expression.
+    let @p: int = 0x1000 + PAGE_MASK
+    shine_int(@p)
+    return 0

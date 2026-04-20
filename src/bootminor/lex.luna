@@ -52,6 +52,16 @@ const TK_CARET:   int = 52
 const TK_TILDE:   int = 53
 const TK_SHL:     int = 54
 const TK_SHR:     int = 55
+const TK_PLUSEQ:   int = 80
+const TK_MINUSEQ:  int = 81
+const TK_STAREQ:   int = 82
+const TK_SLASHEQ:  int = 83
+const TK_PERCENTEQ: int = 84
+const TK_AMPEQ:    int = 85
+const TK_PIPEEQ:   int = 86
+const TK_CARETEQ:  int = 87
+const TK_SHLEQ:    int = 88
+const TK_SHREQ:    int = 89
 const TK_KW_BREAK:    int = 60
 const TK_KW_CONTINUE: int = 61
 const TK_KW_STRUCT:   int = 62
@@ -360,6 +370,58 @@ fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
                     continue
                 @val = @val * 10 + (@cc - 48)
                 @pos = @pos + 1
+            # Float detection: accept either
+            #   digits . digits [e [+-]? digits]      (has decimal point)
+            #   digits e [+-]? digits                  (scientific, no point)
+            # The `.` case only fires when `.` is immediately followed
+            # by a digit — otherwise `.` is field access.
+            @is_float = 0
+            if @pos < @slen
+                @dc = str_byte(@src, @pos)
+                if @dc == 46
+                    if @pos + 1 < @slen
+                        if _is_digit(str_byte(@src, @pos + 1)) == 1
+                            @is_float = 1
+                elif @dc == 101
+                    @is_float = 1
+                elif @dc == 69
+                    @is_float = 1
+            if @is_float == 1
+                # If we're at a decimal point, consume it + fractional
+                # digits. If we're at an exponent letter, skip straight
+                # to the exponent parser below.
+                if @pos < @slen
+                    if str_byte(@src, @pos) == 46
+                        @pos = @pos + 1
+                        while @pos < @slen
+                            @cc = str_byte(@src, @pos)
+                            if _is_digit(@cc) == 0
+                                if @cc != 95
+                                    break
+                            @pos = @pos + 1
+                # Optional `e[+-]?digits` exponent.
+                if @pos < @slen
+                    @ee = str_byte(@src, @pos)
+                    if @ee == 101
+                        @pos = @pos + 1
+                    elif @ee == 69
+                        @pos = @pos + 1
+                    else
+                        @ee = 0
+                    if @ee != 0
+                        @sg = str_byte(@src, @pos)
+                        if @sg == 43
+                            @pos = @pos + 1
+                        elif @sg == 45
+                            @pos = @pos + 1
+                        while @pos < @slen
+                            if _is_digit(str_byte(@src, @pos)) == 0
+                                break
+                            @pos = @pos + 1
+                # Emit TK_FLOAT with the whole span in start/len.
+                # The integer `iv` slot is unused for floats.
+                _emit(@kind, @start, @len, @iv, TK_FLOAT, @s0, @pos - @s0, 0)
+                continue
             _emit(@kind, @start, @len, @iv, TK_INT, @s0, @pos - @s0, @val)
             continue
 
@@ -395,6 +457,23 @@ fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
             @pos = @next
             continue
 
+        # --- Three-char operators: <<= and >>= ---
+        if @pos + 2 < @slen
+            @c2 = str_byte(@src, @pos + 1)
+            @c3 = str_byte(@src, @pos + 2)
+            if @c == 60
+                if @c2 == 60
+                    if @c3 == 61
+                        _emit(@kind, @start, @len, @iv, TK_SHLEQ, @pos, 3, 0)
+                        @pos = @pos + 3
+                        continue
+            if @c == 62
+                if @c2 == 62
+                    if @c3 == 61
+                        _emit(@kind, @start, @len, @iv, TK_SHREQ, @pos, 3, 0)
+                        @pos = @pos + 3
+                        continue
+
         # --- Two-char operators ---
         if @pos + 1 < @slen
             @c2 = str_byte(@src, @pos + 1)
@@ -429,6 +508,46 @@ fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
                     continue
                 if @c2 == 62
                     _emit(@kind, @start, @len, @iv, TK_SHR, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 43
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_PLUSEQ, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 45
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_MINUSEQ, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 42
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_STAREQ, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 47
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_SLASHEQ, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 37
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_PERCENTEQ, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 38
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_AMPEQ, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 124
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_PIPEEQ, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 94
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_CARETEQ, @pos, 2, 0)
                     @pos = @pos + 2
                     continue
 

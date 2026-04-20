@@ -57,10 +57,11 @@ struct Gen
     local_types:    int  # Vec<str>: type name for each local (or "" if untyped)
     const_names:    int  # Vec<str>: module-level const names
     const_values:   int  # Vec<int>: parallel — their integer values
+    local_sealed:   int  # Vec<int>: 1 if local was bound via `seal`, else 0
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
-    let @g: Gen = new_str(216)
+    let @g: Gen = new_str(224)
     @g.code        = strbuf_new()
     @g.data        = strbuf_new()
     @g.kind        = @kind
@@ -87,6 +88,7 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.local_types   = vec_new()
     @g.const_names   = vec_new()
     @g.const_values  = vec_new()
+    @g.local_sealed  = vec_new()
     # Reserve 8 bytes at the very start of the data section for the
     # heap_top variable. Its initial value (data_vaddr + heap_top_off + 8,
     # i.e. the byte right after itself) is patched in by the driver at
@@ -166,7 +168,94 @@ fn _local_slot(@g: Gen, @name: int) -> int
     vec_push(@g.names, @name)
     vec_push(@g.offs, @off)
     vec_push(@g.local_types, "")
+    vec_push(@g.local_sealed, 0)
     return @off
+
+# Compound-assignment classifier + op emitter (rax OP= rcx).
+fn _is_compound_assign(@k: int) -> int
+    if @k == TK_PLUSEQ
+        return 1
+    if @k == TK_MINUSEQ
+        return 1
+    if @k == TK_STAREQ
+        return 1
+    if @k == TK_SLASHEQ
+        return 1
+    if @k == TK_PERCENTEQ
+        return 1
+    if @k == TK_AMPEQ
+        return 1
+    if @k == TK_PIPEEQ
+        return 1
+    if @k == TK_CARETEQ
+        return 1
+    if @k == TK_SHLEQ
+        return 1
+    if @k == TK_SHREQ
+        return 1
+    return 0
+
+fn _emit_compound_op(@g: Gen, @k: int) -> int
+    if @k == TK_PLUSEQ
+        _em_add_rax_rcx(@g)
+        return 0
+    if @k == TK_MINUSEQ
+        _em_sub_rax_rcx(@g)
+        return 0
+    if @k == TK_STAREQ
+        _em_imul_rax_rcx(@g)
+        return 0
+    if @k == TK_SLASHEQ
+        _em_idiv_rcx(@g)
+        return 0
+    if @k == TK_PERCENTEQ
+        _em_idiv_rcx(@g)
+        _em_mov_rax_rdx(@g)
+        return 0
+    if @k == TK_AMPEQ
+        _em_and_rax_rcx(@g)
+        return 0
+    if @k == TK_PIPEEQ
+        _em_or_rax_rcx(@g)
+        return 0
+    if @k == TK_CARETEQ
+        _em_xor_rax_rcx(@g)
+        return 0
+    if @k == TK_SHLEQ
+        _em_shl_rax_cl(@g)
+        return 0
+    if @k == TK_SHREQ
+        _em_shr_rax_cl(@g)
+        return 0
+    return 0
+
+# Is the given local sealed? Returns 0 if not declared or not sealed.
+fn _local_is_sealed(@g: Gen, @name: int) -> int
+    @n = vec_len(@g.names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.names, @i), @name) == 1
+            return vec_get(@g.local_sealed, @i)
+        @i = @i + 1
+    return 0
+
+# Mark a local as sealed.
+fn _seal_local(@g: Gen, @name: int) -> int
+    @n = vec_len(@g.names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.names, @i), @name) == 1
+            vec_set(@g.local_sealed, @i, 1)
+            return 0
+        @i = @i + 1
+    return 0
+
+# Track whether the current binding keyword was `seal` so parse logic
+# knows to mark the local immutable after the store.
+fn _is_seal_kw(@k: int) -> int
+    if @k == TK_KW_SEAL
+        return 1
+    return 0
 
 # Set the type name for an existing local. Used by `let @x: T = ...`
 # and function parameters with explicit type.
@@ -192,10 +281,11 @@ fn _local_type(@g: Gen, @name: int) -> int
 
 # Reset locals between functions. Called at start of each fn decl.
 fn _reset_locals(@g: Gen) -> int
-    @g.names       = vec_new()
-    @g.offs        = vec_new()
-    @g.local_types = vec_new()
-    @g.frame       = 0
+    @g.names        = vec_new()
+    @g.offs         = vec_new()
+    @g.local_types  = vec_new()
+    @g.local_sealed = vec_new()
+    @g.frame        = 0
     return 0
 
 # Look up a fn's code offset by name. Returns -1 if not yet defined.
@@ -1118,12 +1208,39 @@ fn parse_unary(@g: Gen) -> int
         parse_unary(@g)
         _em_not_rax(@g)
         return _parse_cast_suffix(@g)
-    # Address-of a local: &@name  →  lea rax, [rbp + local_off]
+    # Address-of a local (or one of its fields): &@name[.field]?
+    #   &@x           → lea rax, [rbp + local_off]  (pointer to stack slot)
+    #   &@obj.field   → load @obj into rax, then `add rax, field_off`
     if _peek_kind(@g) == TK_AMP
         if vec_get(@g.kind, @g.pos + 1) == TK_ATIDENT
             _advance(@g)
             @name = _tok_substr(@g, @g.pos)
             _advance(@g)
+            if _peek_kind(@g) == TK_DOT
+                # &@obj.field — emit load of obj (heap ptr) + field offset.
+                _advance(@g)
+                if _peek_kind(@g) != TK_IDENT
+                    _die(@g, "expected field name after '&@obj.'")
+                    return 0
+                @fname = _tok_substr(@g, @g.pos)
+                _advance(@g)
+                @off = _local_slot(@g, @name)
+                _em_load_rbp(@g, @off)          # rax = obj pointer
+                @tname = _local_type(@g, @name)
+                @field_off = 0
+                if str_eq(@tname, "") == 0
+                    @s_idx = _struct_lookup(@g, @tname)
+                    if @s_idx >= 0
+                        @fi = _field_index(@g, @s_idx, @fname)
+                        if @fi >= 0
+                            @field_off = @fi * 8
+                if @field_off != 0
+                    # add rax, field_off ; 48 05 <imm32>
+                    _eb(@g, 72)
+                    _eb(@g, 5)
+                    _e32(@g, @field_off)
+                return _parse_cast_suffix(@g)
+            # Plain &@name → address of stack slot.
             @off = _local_slot(@g, @name)
             _eb(@g, 72)
             _eb(@g, 141)
@@ -1171,6 +1288,108 @@ fn parse_primary(@g: Gen) -> int
         @lea_at = _em_lea_rax_rip_ph(@g)
         vec_push(@g.str_patches, @lea_at)
         vec_push(@g.str_patches, @data_off)
+        return 0
+    if @k == TK_FLOAT
+        # Parse the source span "DDD.FFF[eS?EEE]" into mantissa + decimal
+        # exponent (= fraction_digits + literal_exponent, with sign).
+        @s = vec_get(@g.start, @g.pos)
+        @l = vec_get(@g.tlen,  @g.pos)
+        _advance(@g)
+        @span = str_substr(@g.src, @s, @l)
+        @slen = str_len(@span)
+        @mantissa = 0
+        @frac_digits = 0
+        @seen_dot = 0
+        @exp_val = 0
+        @exp_neg = 0
+        @i = 0
+        while @i < @slen
+            @c = str_byte(@span, @i)
+            if @c == 46
+                @seen_dot = 1
+                @i = @i + 1
+                continue
+            if @c == 95
+                @i = @i + 1
+                continue
+            if @c == 101
+                @i = @i + 1
+                break
+            if @c == 69
+                @i = @i + 1
+                break
+            if @c >= 48
+                if @c <= 57
+                    @mantissa = @mantissa * 10 + (@c - 48)
+                    if @seen_dot == 1
+                        @frac_digits = @frac_digits + 1
+                    @i = @i + 1
+                    continue
+            @i = @i + 1
+        if @i < @slen
+            @se = str_byte(@span, @i)
+            if @se == 43
+                @i = @i + 1
+            elif @se == 45
+                @exp_neg = 1
+                @i = @i + 1
+            while @i < @slen
+                @c2 = str_byte(@span, @i)
+                if @c2 >= 48
+                    if @c2 <= 57
+                        @exp_val = @exp_val * 10 + (@c2 - 48)
+                @i = @i + 1
+            if @exp_neg == 1
+                @exp_val = 0 - @exp_val
+        @total_exp = @exp_val - @frac_digits
+        # Emit: rax = mantissa (int) → cvtsi2sd xmm0 → adjust by 10^total_exp.
+        if @mantissa >= 0
+            if @mantissa < 2147483648
+                _em_mov_eax_imm(@g, @mantissa)
+            else
+                _em_mov_rax_imm64(@g, @mantissa)
+        else
+            _em_mov_rax_imm64(@g, @mantissa)
+        # cvtsi2sd xmm0, rax  ; f2 48 0f 2a c0
+        _eb(@g, 242)
+        _eb(@g, 72)
+        _eb(@g, 15)
+        _eb(@g, 42)
+        _eb(@g, 192)
+        # Adjust by repeated *10 or /10 per total_exp magnitude.
+        @abs_exp = @total_exp
+        if @abs_exp < 0
+            @abs_exp = 0 - @abs_exp
+        if @abs_exp > 0
+            # Load constant 10.0 into xmm1 once via rcx.
+            _em_mov_rax_imm64(@g, 4621819117588971520)     # 0x4024000000000000 = 10.0
+            # movq xmm1, rax ; 66 48 0f 6e c8
+            _eb(@g, 102)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 110)
+            _eb(@g, 200)
+            @k2 = 0
+            while @k2 < @abs_exp
+                if @total_exp >= 0
+                    # mulsd xmm0, xmm1 ; f2 0f 59 c1
+                    _eb(@g, 242)
+                    _eb(@g, 15)
+                    _eb(@g, 89)
+                    _eb(@g, 193)
+                else
+                    # divsd xmm0, xmm1 ; f2 0f 5e c1
+                    _eb(@g, 242)
+                    _eb(@g, 15)
+                    _eb(@g, 94)
+                    _eb(@g, 193)
+                @k2 = @k2 + 1
+        # movq rax, xmm0  ; 66 48 0f 7e c0
+        _eb(@g, 102)
+        _eb(@g, 72)
+        _eb(@g, 15)
+        _eb(@g, 126)
+        _eb(@g, 192)
         return 0
     if @k == TK_ATIDENT
         @name = _tok_substr(@g, @g.pos)
@@ -2189,14 +2408,18 @@ fn _record_str_patch(@g: Gen, @code_off: int, @data_off: int, @patches: Vec) -> 
 
 # Parse a type expression starting at the current token. Returns a
 # string describing the type, or "" if no type recognised. Accepts:
-#   Ident                      e.g. int, u8, u32, Point, Gen
-#   * [mut|const] Ident        raw pointer (stored as "*Ident" marker)
-# Consumes the tokens forming the type.
+#   Ident                         int, u8, u32, Point, Gen, str, etc.
+#   Ident < ... >                 Vec<T>, Option<T> — generics ignored
+#   * [mut|const]? Ident          raw pointer (stored as "*Ident")
+#   & [mut]? Ident                reference (stored as "&Ident")
+#   [ Ident ]                     slice type (stored as "[Ident]")
+#   [ Ident ; N ]                 fixed-size array (stored as "[Ident;N]")
+#   Ident ?                       nullable (stored as "Ident?")
+# Everything collapses to an 8-byte pointer/int at runtime.
 fn _parse_type(@g: Gen) -> int
     @k = _peek_kind(@g)
     if @k == TK_STAR
         _advance(@g)
-        # Skip optional "mut" or "const" identifier after *
         if _peek_kind(@g) == TK_IDENT
             @maybe = _tok_substr(@g, @g.pos)
             if str_eq(@maybe, "mut") == 1
@@ -2208,15 +2431,54 @@ fn _parse_type(@g: Gen) -> int
             _advance(@g)
             return str_concat("*", @inner)
         return "*"
+    if @k == TK_AMP
+        _advance(@g)
+        if _peek_kind(@g) == TK_IDENT
+            @maybe = _tok_substr(@g, @g.pos)
+            if str_eq(@maybe, "mut") == 1
+                _advance(@g)
+        if _peek_kind(@g) == TK_IDENT
+            @inner = _tok_substr(@g, @g.pos)
+            _advance(@g)
+            return str_concat("&", @inner)
+        return "&"
+    if @k == TK_LBRACK
+        _advance(@g)
+        @elem = ""
+        if _peek_kind(@g) == TK_IDENT
+            @elem = _tok_substr(@g, @g.pos)
+            _advance(@g)
+        # Optional `; N` — we discard N for now; type is just "[T]"
+        if _peek_kind(@g) == TK_SEMI
+            _advance(@g)
+            if _peek_kind(@g) == TK_INT
+                _advance(@g)
+        if _peek_kind(@g) == TK_RBRACK
+            _advance(@g)
+        return str_concat(str_concat("[", @elem), "]")
     if @k == TK_IDENT
         @t = _tok_substr(@g, @g.pos)
         _advance(@g)
+        # Swallow generic parameter list `<T, U>`.
+        if _peek_kind(@g) == TK_LT
+            @depth = 1
+            _advance(@g)
+            while @depth > 0
+                @tk = _peek_kind(@g)
+                if @tk == TK_LT
+                    @depth = @depth + 1
+                elif @tk == TK_GT
+                    @depth = @depth - 1
+                elif @tk == TK_EOF
+                    break
+                _advance(@g)
         return @t
     return ""
 
 # Common impl for `let`/`meow`/`seal` bindings: consumes the binding
 # keyword, parses `@name [: type]? = expr`, stores into a fresh local.
-fn _parse_typed_binding(@g: Gen) -> int
+# If @is_seal is 1, flag the local so reassignment fails.
+fn _parse_typed_binding(@g: Gen, @is_seal: int) -> int
     _advance(@g)                                # consume let/meow/seal
     if _peek_kind(@g) != TK_ATIDENT
         _die(@g, "expected @name after binding keyword")
@@ -2233,6 +2495,8 @@ fn _parse_typed_binding(@g: Gen) -> int
     if str_eq(@ltype, "") == 0
         _set_local_type(@g, @lname, @ltype)
     _em_store_rbp(@g, @off)
+    if @is_seal == 1
+        _seal_local(@g, @lname)
     return 0
 
 # Returns 0 on normal statement, 1 if end-of-block (DEDENT/EOF) reached.
@@ -2257,16 +2521,16 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
             _em_epilogue(@g)
         return 0
 
-    # let / meow / seal binding forms (all typed-propagating to enable
-    # struct field access). Semantic difference (let=immutable vs meow=
-    # mutable vs seal=frozen-after-init) is not yet enforced; they all
-    # compile to the same slot-write. This matches Luna spec §1.3.
+    # let / meow / seal binding forms (all typed-propagating).
+    # `seal` additionally flags the local so subsequent writes are a
+    # compile-time error.  `let` and `meow` are mutable (distinction
+    # reserved for a future immutability-by-default pass).
     if @k == TK_KW_LET
-        return _parse_typed_binding(@g)
+        return _parse_typed_binding(@g, 0)
     if @k == TK_KW_MEOW
-        return _parse_typed_binding(@g)
+        return _parse_typed_binding(@g, 0)
     if @k == TK_KW_SEAL
-        return _parse_typed_binding(@g)
+        return _parse_typed_binding(@g, 1)
 
     if @k == TK_IF
         parse_if(@g, @patches)
@@ -2285,6 +2549,21 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
         @ph = _em_jmp_placeholder(@g)
         @bv = vec_get(@g.loop_breaks, @top)
         vec_push(@bv, @ph)
+        return 0
+
+    # Pointer write: *expr = expr   →  mov [ptr], val
+    if @k == TK_STAR
+        _advance(@g)
+        parse_unary(@g)                        # rax = pointer (may contain * chains)
+        _em_push_rax(@g)
+        _expect(@g, TK_ASSIGN, "expected '=' after *expr")
+        parse_expr(@g)                         # rax = value
+        _em_mov_rcx_rax(@g)                    # rcx = value
+        _em_pop_rax(@g)                        # rax = pointer
+        # mov [rax], rcx  ; 48 89 08
+        _eb(@g, 72)
+        _eb(@g, 137)
+        _eb(@g, 8)
         return 0
 
     if @k == TK_KW_CONTINUE
@@ -2367,9 +2646,28 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
                 _set_local_type(@g, @name, @ltype)
             _em_store_rbp(@g, @off)
             return 0
+        # Compound assignment: @x OP= expr  →  @x = @x OP expr
+        @opk = _peek_kind(@g)
+        if _is_compound_assign(@opk) == 1
+            _advance(@g)
+            @off = _local_slot(@g, @name)
+            if _local_is_sealed(@g, @name) == 1
+                _die(@g, str_concat("cannot reassign sealed local: ", @name))
+                return 0
+            _em_load_rbp(@g, @off)              # rax = current
+            _em_push_rax(@g)
+            parse_expr(@g)                       # rax = rhs
+            _em_mov_rcx_rax(@g)                  # rcx = rhs
+            _em_pop_rax(@g)                      # rax = current
+            _emit_compound_op(@g, @opk)          # rax = rax OP rcx
+            _em_store_rbp(@g, @off)
+            return 0
         _expect(@g, TK_ASSIGN, "expected '='")
         parse_expr(@g)
         @off = _local_slot(@g, @name)
+        if _local_is_sealed(@g, @name) == 1
+            _die(@g, str_concat("cannot reassign sealed local: ", @name))
+            return 0
         _em_store_rbp(@g, @off)
         return 0
 
@@ -2755,9 +3053,116 @@ fn parse_import(@g: Gen) -> int
         _advance(@g)
     return 0
 
-# Parse a `const NAME: type = <int-literal>` at module level. Records
-# the (name, value) pair so references in expressions can be folded
-# into immediates. Supports optional unary '-' prefix.
+# Parse a const-expression: integer literal, other const reference,
+# or a small arithmetic/bitwise expression over those.
+# Grammar (precedence-climbing, very small):
+#   cexpr  := cand ('|' cand)*
+#   cand   := cxor ('^' cxor)*
+#   cxor   := cand_and ('&' cand_and)*
+#   cand_and := cshift (('<<' | '>>') cshift)*
+#   cshift := cadd ...      # same precedence as runtime
+#   cadd   := cmul (('+' | '-') cmul)*
+#   cmul   := cunary (('*' | '/' | '%') cunary)*
+#   cunary := ('-' | '~')? cprimary
+#   cprimary := INT | `(` cexpr `)` | NAME
+fn _const_eval_primary(@g: Gen) -> int
+    @k = _peek_kind(@g)
+    if @k == TK_INT
+        @v = _peek_iv(@g)
+        _advance(@g)
+        return @v
+    if @k == TK_LPAREN
+        _advance(@g)
+        @v = _const_eval_expr(@g)
+        if _peek_kind(@g) == TK_RPAREN
+            _advance(@g)
+        return @v
+    if @k == TK_IDENT
+        @name = _tok_substr(@g, @g.pos)
+        _advance(@g)
+        @out = vec_new()
+        if _const_lookup(@g, @name, @out) == 1
+            return vec_get(@out, 0)
+        return 0
+    return 0
+
+fn _const_eval_unary(@g: Gen) -> int
+    if _peek_kind(@g) == TK_MINUS
+        _advance(@g)
+        return 0 - _const_eval_unary(@g)
+    if _peek_kind(@g) == TK_TILDE
+        _advance(@g)
+        return ~_const_eval_unary(@g)
+    return _const_eval_primary(@g)
+
+fn _const_eval_mul(@g: Gen) -> int
+    @v = _const_eval_unary(@g)
+    while 1
+        @k = _peek_kind(@g)
+        if @k == TK_STAR
+            _advance(@g)
+            @v = @v * _const_eval_unary(@g)
+        elif @k == TK_SLASH
+            _advance(@g)
+            @v = @v / _const_eval_unary(@g)
+        elif @k == TK_PERCENT
+            _advance(@g)
+            @v = @v % _const_eval_unary(@g)
+        else
+            break
+    return @v
+
+fn _const_eval_add(@g: Gen) -> int
+    @v = _const_eval_mul(@g)
+    while 1
+        @k = _peek_kind(@g)
+        if @k == TK_PLUS
+            _advance(@g)
+            @v = @v + _const_eval_mul(@g)
+        elif @k == TK_MINUS
+            _advance(@g)
+            @v = @v - _const_eval_mul(@g)
+        else
+            break
+    return @v
+
+fn _const_eval_shift(@g: Gen) -> int
+    @v = _const_eval_add(@g)
+    while 1
+        @k = _peek_kind(@g)
+        if @k == TK_SHL
+            _advance(@g)
+            @v = @v << _const_eval_add(@g)
+        elif @k == TK_SHR
+            _advance(@g)
+            @v = @v >> _const_eval_add(@g)
+        else
+            break
+    return @v
+
+fn _const_eval_band(@g: Gen) -> int
+    @v = _const_eval_shift(@g)
+    while _peek_kind(@g) == TK_AMP
+        _advance(@g)
+        @v = @v & _const_eval_shift(@g)
+    return @v
+
+fn _const_eval_bxor(@g: Gen) -> int
+    @v = _const_eval_band(@g)
+    while _peek_kind(@g) == TK_CARET
+        _advance(@g)
+        @v = @v ^ _const_eval_band(@g)
+    return @v
+
+fn _const_eval_expr(@g: Gen) -> int
+    @v = _const_eval_bxor(@g)
+    while _peek_kind(@g) == TK_PIPE
+        _advance(@g)
+        @v = @v | _const_eval_bxor(@g)
+    return @v
+
+# Parse `const NAME: type = <const-expr>` at module level. Records the
+# (name, value) pair for compile-time substitution at use sites.
 fn parse_const_decl(@g: Gen) -> int
     _advance(@g)                           # consume 'const'
     @cname = ""
@@ -2766,20 +3171,12 @@ fn parse_const_decl(@g: Gen) -> int
         _advance(@g)
     if _peek_kind(@g) == TK_COLON
         _advance(@g)
-        if _peek_kind(@g) == TK_IDENT
-            _advance(@g)
+        # Skip the (primitive) type annotation — we don't use it.
+        @_ty = _parse_type(@g)
     @cval = 0
     if _peek_kind(@g) == TK_ASSIGN
         _advance(@g)
-        @neg = 0
-        if _peek_kind(@g) == TK_MINUS
-            @neg = 1
-            _advance(@g)
-        if _peek_kind(@g) == TK_INT
-            @cval = _peek_iv(@g)
-            _advance(@g)
-        if @neg == 1
-            @cval = 0 - @cval
+        @cval = _const_eval_expr(@g)
     if str_eq(@cname, "") == 0
         vec_push(@g.const_names, @cname)
         vec_push(@g.const_values, @cval)

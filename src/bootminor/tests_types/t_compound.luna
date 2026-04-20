@@ -1,0 +1,27 @@
+fn main() -> int
+    meow @x: int = 10
+    @x += 5
+    shine_int(@x)
+    @x -= 3
+    shine_int(@x)
+    @x *= 4
+    shine_int(@x)
+    @x /= 2
+    shine_int(@x)
+    @x %= 7
+    shine_int(@x)
+
+    meow @b: int = 0xFF
+    @b &= 0x0F
+    shine_int(@b)
+    @b |= 0xA0
+    shine_int(@b)
+    @b ^= 0xFF
+    shine_int(@b)
+
+    meow @s: int = 1
+    @s <<= 10
+    shine_int(@s)
+    @s >>= 3
+    shine_int(@s)
+    return 0

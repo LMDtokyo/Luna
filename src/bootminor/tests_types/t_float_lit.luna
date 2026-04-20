@@ -1,0 +1,20 @@
+fn main() -> int
+    # Integer part only, then decimal, then scientific.
+    @pi = 3.14159
+    @r = 5.0
+    @area = f64_mul(@pi, f64_mul(@r, @r))
+    shine_int(f64_to_int(@area))
+
+    @half = 0.5
+    @doubled = f64_mul(@half, f64_from_int(8))
+    shine_int(f64_to_int(@doubled))
+
+    @kilo = 1e3
+    shine_int(f64_to_int(@kilo))
+
+    @milli = 1.5e-3
+    shine_int(f64_to_int(f64_mul(@milli, f64_from_int(1000))))
+
+    @neg = 0.0
+    shine_int(f64_lt(@neg, @pi))
+    return 0

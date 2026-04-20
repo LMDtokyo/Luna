@@ -1,0 +1,20 @@
+struct Point
+    x: int
+    y: int
+
+fn main() -> int
+    meow @v: int = 10
+    seal @p: *mut int = &@v
+    *@p = 99
+    shine_int(@v)
+    shine_int(*@p)
+
+    # Address-of struct field
+    let @pt: Point = Point { x: 7, y: 11 }
+    let @px: *mut int = &@pt.x
+    let @py: *mut int = &@pt.y
+    *@px = 100
+    *@py = 200
+    shine_int(@pt.x)
+    shine_int(@pt.y)
+    return 0

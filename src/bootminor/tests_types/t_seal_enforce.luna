@@ -1,0 +1,10 @@
+fn main() -> int
+    # `seal` bindings are read-only post-init.
+    # Re-assigning would produce a compile error. We exercise
+    # the success path here; the error path is manually verified.
+    seal @locked: int = 42
+    meow @mut:    int = 10
+    @mut = @mut * 2
+    shine_int(@locked)
+    shine_int(@mut)
+    return 0
