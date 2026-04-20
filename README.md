@@ -20,19 +20,24 @@
 
 ## Status
 
-Luna is under active development. The current milestone is **self-hosting
-via a C99 bootstrap compiler**:
+Luna is **self-hosted** as of 2026-04-20 for a C-substitute subset:
 
 | Component | State |
 |---|---|
-| Bootstrap compiler (`bootstrap/luna_bootstrap.c`) | ~3.7 KLOC C99, x86-64 codegen |
-| Targets | Linux ELF64 + native Windows PE64, one source → two binaries |
-| Core modules compiled through bootstrap | 19 / 19 (both targets) |
-| Working runtime: `shine`, `print`, `print_int`, `exit` | ✓ both targets |
-| Arrays: `[a, b, c]` / `[v; N]`, index read/write | ✓ both targets |
-| Structs: declaration, literals, field read/write | ✓ both targets |
-| Self-hosted compiler (compile Luna with Luna) | in progress |
+| C bootstrap compiler (`bootstrap/luna_bootstrap.c`) | ~5.9 KLOC C99, x86-64 codegen |
+| Self-hosted compiler (`src/bootminor/`) | Luna-in-Luna, compiles itself byte-identically |
+| Targets | Linux ELF64 + Windows PE64 (bootstrap), Linux ELF64 (bootminor) |
+| Bit-identical fixed point | ✓ `luna-mini3 == luna-mini4` (115 889 B ELF64) |
+| Self-host test suite | 18 / 18 PASS (fib, FizzBuzz, factorial, structs, recursion) |
+| Working runtime: `shine`, `print`, `print_int`, `exit` | ✓ both compilers |
+| Arrays, structs, strings, bitwise, `if/while/break/continue` | ✓ both compilers |
+| User-defined fns up to N args (SysV + stack spill) | ✓ both compilers |
 | VS Code extension | [editors/vscode](editors/vscode) — v0.1.4 |
+
+The language no longer structurally needs the C bootstrap — the shipped
+`src/bootminor/luna-mini.elf` binary re-compiles itself from
+`src/bootminor/*.luna` to a byte-identical binary. The C step is now
+only for first-time setup on a fresh machine.
 
 Real programs that build and run on both platforms today:
 
@@ -53,6 +58,30 @@ Run the full test suite:
 
 ```sh
 make -C bootstrap test-stdlib
+```
+
+## Self-hosted rebuild
+
+The shipped `src/bootminor/luna-mini.elf` is a 115 889-byte Linux ELF64
+binary produced by `bootminor` compiling its own source. To rebuild it
+without a C compiler (requires WSL Ubuntu on Windows, or native Linux):
+
+```sh
+bash src/bootminor/selfhost_build.sh
+```
+
+That script runs the shipped `luna-mini.elf` against the current
+`bootminor_prelude.luna + lex.luna + gen.luna + main2.luna` monolith,
+checks the result is a fixed point, and reports whether the rebuilt
+binary matches the shipped copy.
+
+To verify the full three-stage chain (`bootstrap → luna-mini2 →
+luna-mini3 → luna-mini4`, then `cmp`):
+
+```sh
+bash src/bootminor/run_tests_m3.sh
+# expected: [fixed-point] PASS — luna-mini3 = luna-mini4 byte-identical
+# expected: suite 18 PASS, 0 FAIL
 ```
 
 ## Cosmic syntax
