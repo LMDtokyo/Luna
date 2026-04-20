@@ -39,6 +39,22 @@ Real programs that build and run on both platforms today:
 - [examples/stats.luna](examples/stats.luna) — struct-based count / sum / min / max / mean
 - [examples/binary_search.luna](examples/binary_search.luna) — classic bsearch over a sorted array
 
+Pure-Luna stdlib modules that compile through the bootstrap ([src/stdlib_new/](src/stdlib_new)):
+
+- `base64` — RFC 4648 encode/decode
+- `csv` — RFC 4180 parser + encoder
+- `sha512` — FIPS 180-4 SHA-512 + RFC 4231 HMAC-SHA-512
+- `chacha20` — RFC 7539 stream cipher
+- `cli` — GNU-style argument parser (`--flag`, `--k=v`, `-xvf`, `--`)
+- `logger` — DEBUG/INFO/WARN/ERROR with ISO timestamps
+- `websocket` — RFC 6455 frame codec + handshake (uses `base64`)
+
+Run the full test suite:
+
+```sh
+make -C bootstrap test-stdlib
+```
+
 ## Cosmic syntax
 
 Luna uses a deliberately distinct keyword set so programs look like

@@ -1,0 +1,171 @@
+# Test ChaCha20 against RFC 7539 §2.4.2 test vector.
+# key    = 00 01 02 ... 1f (32 bytes)
+# nonce  = 00 00 00 00 00 00 00 4a 00 00 00 00 (12 bytes)
+# counter= 1
+# pt     = "Ladies and Gentlemen of the class of '99: If I could offer you
+#           only one tip for the future, sunscreen would be it."
+
+fn _cc_build_plaintext() -> int
+    @s = new_str(114)
+    # Byte-by-byte to stay within the language subset.
+    str_set_byte(@s, 0, 76)    # L
+    str_set_byte(@s, 1, 97)    # a
+    str_set_byte(@s, 2, 100)   # d
+    str_set_byte(@s, 3, 105)   # i
+    str_set_byte(@s, 4, 101)   # e
+    str_set_byte(@s, 5, 115)   # s
+    str_set_byte(@s, 6, 32)    # space
+    str_set_byte(@s, 7, 97)    # a
+    str_set_byte(@s, 8, 110)   # n
+    str_set_byte(@s, 9, 100)   # d
+    str_set_byte(@s, 10, 32)
+    str_set_byte(@s, 11, 71)   # G
+    str_set_byte(@s, 12, 101)
+    str_set_byte(@s, 13, 110)
+    str_set_byte(@s, 14, 116)
+    str_set_byte(@s, 15, 108)
+    str_set_byte(@s, 16, 101)
+    str_set_byte(@s, 17, 109)
+    str_set_byte(@s, 18, 101)
+    str_set_byte(@s, 19, 110)
+    str_set_byte(@s, 20, 32)
+    str_set_byte(@s, 21, 111)  # o
+    str_set_byte(@s, 22, 102)  # f
+    str_set_byte(@s, 23, 32)
+    str_set_byte(@s, 24, 116)  # t
+    str_set_byte(@s, 25, 104)  # h
+    str_set_byte(@s, 26, 101)  # e
+    str_set_byte(@s, 27, 32)
+    str_set_byte(@s, 28, 99)   # c
+    str_set_byte(@s, 29, 108)  # l
+    str_set_byte(@s, 30, 97)   # a
+    str_set_byte(@s, 31, 115)  # s
+    str_set_byte(@s, 32, 115)  # s
+    str_set_byte(@s, 33, 32)
+    str_set_byte(@s, 34, 111)  # o
+    str_set_byte(@s, 35, 102)  # f
+    str_set_byte(@s, 36, 32)
+    str_set_byte(@s, 37, 39)   # '
+    str_set_byte(@s, 38, 57)   # 9
+    str_set_byte(@s, 39, 57)   # 9
+    str_set_byte(@s, 40, 58)   # :
+    str_set_byte(@s, 41, 32)
+    str_set_byte(@s, 42, 73)   # I
+    str_set_byte(@s, 43, 102)  # f
+    str_set_byte(@s, 44, 32)
+    str_set_byte(@s, 45, 73)   # I
+    str_set_byte(@s, 46, 32)
+    str_set_byte(@s, 47, 99)   # c
+    str_set_byte(@s, 48, 111)  # o
+    str_set_byte(@s, 49, 117)  # u
+    str_set_byte(@s, 50, 108)  # l
+    str_set_byte(@s, 51, 100)  # d
+    str_set_byte(@s, 52, 32)
+    str_set_byte(@s, 53, 111)  # o
+    str_set_byte(@s, 54, 102)  # f
+    str_set_byte(@s, 55, 102)  # f
+    str_set_byte(@s, 56, 101)  # e
+    str_set_byte(@s, 57, 114)  # r
+    str_set_byte(@s, 58, 32)
+    str_set_byte(@s, 59, 121)  # y
+    str_set_byte(@s, 60, 111)  # o
+    str_set_byte(@s, 61, 117)  # u
+    str_set_byte(@s, 62, 32)
+    str_set_byte(@s, 63, 111)  # o
+    str_set_byte(@s, 64, 110)  # n
+    str_set_byte(@s, 65, 108)  # l
+    str_set_byte(@s, 66, 121)  # y
+    str_set_byte(@s, 67, 32)
+    str_set_byte(@s, 68, 111)  # o
+    str_set_byte(@s, 69, 110)  # n
+    str_set_byte(@s, 70, 101)  # e
+    str_set_byte(@s, 71, 32)
+    str_set_byte(@s, 72, 116)  # t
+    str_set_byte(@s, 73, 105)  # i
+    str_set_byte(@s, 74, 112)  # p
+    str_set_byte(@s, 75, 32)
+    str_set_byte(@s, 76, 102)  # f
+    str_set_byte(@s, 77, 111)  # o
+    str_set_byte(@s, 78, 114)  # r
+    str_set_byte(@s, 79, 32)
+    str_set_byte(@s, 80, 116)  # t
+    str_set_byte(@s, 81, 104)  # h
+    str_set_byte(@s, 82, 101)  # e
+    str_set_byte(@s, 83, 32)
+    str_set_byte(@s, 84, 102)  # f
+    str_set_byte(@s, 85, 117)  # u
+    str_set_byte(@s, 86, 116)  # t
+    str_set_byte(@s, 87, 117)  # u
+    str_set_byte(@s, 88, 114)  # r
+    str_set_byte(@s, 89, 101)  # e
+    str_set_byte(@s, 90, 44)   # ,
+    str_set_byte(@s, 91, 32)
+    str_set_byte(@s, 92, 115)  # s
+    str_set_byte(@s, 93, 117)  # u
+    str_set_byte(@s, 94, 110)  # n
+    str_set_byte(@s, 95, 115)  # s
+    str_set_byte(@s, 96, 99)   # c
+    str_set_byte(@s, 97, 114)  # r
+    str_set_byte(@s, 98, 101)  # e
+    str_set_byte(@s, 99, 101)  # e
+    str_set_byte(@s, 100, 110) # n
+    str_set_byte(@s, 101, 32)
+    str_set_byte(@s, 102, 119) # w
+    str_set_byte(@s, 103, 111) # o
+    str_set_byte(@s, 104, 117) # u
+    str_set_byte(@s, 105, 108) # l
+    str_set_byte(@s, 106, 100) # d
+    str_set_byte(@s, 107, 32)
+    str_set_byte(@s, 108, 98)  # b
+    str_set_byte(@s, 109, 101) # e
+    str_set_byte(@s, 110, 32)
+    str_set_byte(@s, 111, 105) # i
+    str_set_byte(@s, 112, 116) # t
+    str_set_byte(@s, 113, 46)  # .
+    return @s
+
+fn _cc_build_key() -> int
+    @k = new_str(32)
+    @i = 0
+    while @i < 32
+        str_set_byte(@k, @i, @i)
+        @i = @i + 1
+    return @k
+
+fn _cc_build_nonce() -> int
+    @n = new_str(12)
+    # All zero except byte 7 = 0x4a.
+    @i = 0
+    while @i < 12
+        str_set_byte(@n, @i, 0)
+        @i = @i + 1
+    str_set_byte(@n, 7, 74)   # 0x4a
+    return @n
+
+fn main() -> int
+    @key = _cc_build_key()
+    @nonce = _cc_build_nonce()
+    @pt = _cc_build_plaintext()
+
+    @ct = chacha20_xor(@key, @nonce, 1, @pt)
+    @got = hex_encode(@ct)
+    @expected = "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d"
+
+    if str_eq(@got, @expected) == 1
+        shine("PASS: ChaCha20 RFC 7539 §2.4.2 test vector")
+    else
+        shine("FAIL: ChaCha20 RFC 7539 §2.4.2 test vector")
+        shine("expected:")
+        shine(@expected)
+        shine("got:")
+        shine(@got)
+
+    # Round-trip: decrypt ciphertext back to plaintext.
+    @rt = chacha20_xor(@key, @nonce, 1, @ct)
+    if str_eq(@rt, @pt) == 1
+        shine("PASS: ChaCha20 round-trip")
+    else
+        shine("FAIL: ChaCha20 round-trip")
+    return 0
+
+main()

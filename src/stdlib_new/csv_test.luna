@@ -1,0 +1,82 @@
+# Tests for csv.luna — RFC 4180 subset.
+
+fn _check(@label: int, @got: int, @want: int) -> int
+    if str_eq(@got, @want) == 1
+        shine(str_concat(@label, " PASS"))
+    else
+        shine(str_concat(@label, " FAIL"))
+        shine(str_concat("  got : ", @got))
+        shine(str_concat("  want: ", @want))
+    return 0
+
+fn _check_int(@label: int, @got: int, @want: int) -> int
+    if @got == @want
+        shine(str_concat(@label, " PASS"))
+    else
+        shine(str_concat(@label, " FAIL"))
+        shine(str_concat("  got : ", int_to_str(@got)))
+        shine(str_concat("  want: ", int_to_str(@want)))
+    return 0
+
+fn main() -> int
+    # 1) Simple: "a,b,c\n1,2,3\n" -> 2 rows x 3 cols.
+    @in1 = "a,b,c\n1,2,3\n"
+    @t1 = csv_parse(@in1)
+    _check_int("simple rowcount", csv_row_count(@t1), 2)
+    _check("simple [0,0]", csv_cell(@t1, 0, 0), "a")
+    _check("simple [0,1]", csv_cell(@t1, 0, 1), "b")
+    _check("simple [0,2]", csv_cell(@t1, 0, 2), "c")
+    _check("simple [1,0]", csv_cell(@t1, 1, 0), "1")
+    _check("simple [1,1]", csv_cell(@t1, 1, 1), "2")
+    _check("simple [1,2]", csv_cell(@t1, 1, 2), "3")
+
+    # 2) Quoted field containing a comma.
+    @in2 = "\"hello, world\",plain\n"
+    @t2 = csv_parse(@in2)
+    _check_int("quoted rowcount", csv_row_count(@t2), 1)
+    _check("quoted [0,0]", csv_cell(@t2, 0, 0), "hello, world")
+    _check("quoted [0,1]", csv_cell(@t2, 0, 1), "plain")
+
+    # 3) Escaped quotes: "say ""hi""" -> say "hi"
+    @in3 = "\"say \"\"hi\"\"\",x\n"
+    @t3 = csv_parse(@in3)
+    @want3 = "say \"hi\""
+    _check("escaped [0,0]", csv_cell(@t3, 0, 0), @want3)
+    _check("escaped [0,1]", csv_cell(@t3, 0, 1), "x")
+
+    # 4) Empty fields: ",,\n" -> three empty cells.
+    @in4 = ",,\n"
+    @t4 = csv_parse(@in4)
+    _check_int("empty rowcount", csv_row_count(@t4), 1)
+    _check("empty [0,0]", csv_cell(@t4, 0, 0), "")
+    _check("empty [0,1]", csv_cell(@t4, 0, 1), "")
+    _check("empty [0,2]", csv_cell(@t4, 0, 2), "")
+
+    # 5) Roundtrip: parse -> encode should match the original input
+    #    (the original already ends with '\n', so encode's terminator matches).
+    @enc1 = csv_encode(@t1)
+    _check("roundtrip simple", @enc1, @in1)
+
+    @enc2 = csv_encode(@t2)
+    _check("roundtrip quoted", @enc2, @in2)
+
+    @enc3 = csv_encode(@t3)
+    _check("roundtrip escaped", @enc3, @in3)
+
+    @enc4 = csv_encode(@t4)
+    _check("roundtrip empty", @enc4, @in4)
+
+    # 6) CRLF record terminator should parse identically.
+    @in5 = "a,b\r\nc,d\r\n"
+    @t5 = csv_parse(@in5)
+    _check_int("crlf rowcount", csv_row_count(@t5), 2)
+    _check("crlf [0,0]", csv_cell(@t5, 0, 0), "a")
+    _check("crlf [1,1]", csv_cell(@t5, 1, 1), "d")
+
+    # 7) No trailing newline is still parsed.
+    @in6 = "x,y,z"
+    @t6 = csv_parse(@in6)
+    _check_int("no-nl rowcount", csv_row_count(@t6), 1)
+    _check("no-nl [0,2]", csv_cell(@t6, 0, 2), "z")
+
+    return 0

@@ -1,0 +1,112 @@
+# =====================================================================
+# SHA-512 / HMAC-SHA-512 test vectors
+#   - NIST sample vectors for SHA-512 ("" and "abc")
+#   - RFC 4231 test case 1 for HMAC-SHA-512
+# =====================================================================
+
+
+# Build the literal ASCII string "abc" as a 3-byte buffer.
+fn _make_abc() -> int
+    @s = new_str(3)
+    str_set_byte(@s, 0, 97)   # 'a'
+    str_set_byte(@s, 1, 98)   # 'b'
+    str_set_byte(@s, 2, 99)   # 'c'
+    return @s
+
+# "Hi There" — 8-byte ASCII data for HMAC test 1.
+fn _make_hi_there() -> int
+    @s = new_str(8)
+    str_set_byte(@s, 0, 72)   # 'H'
+    str_set_byte(@s, 1, 105)  # 'i'
+    str_set_byte(@s, 2, 32)   # ' '
+    str_set_byte(@s, 3, 84)   # 'T'
+    str_set_byte(@s, 4, 104)  # 'h'
+    str_set_byte(@s, 5, 101)  # 'e'
+    str_set_byte(@s, 6, 114)  # 'r'
+    str_set_byte(@s, 7, 101)  # 'e'
+    return @s
+
+# 20-byte key of 0x0b bytes for HMAC-SHA-512 test 1.
+fn _make_hmac_key1() -> int
+    @s = new_str(20)
+    @i = 0
+    while @i < 20
+        str_set_byte(@s, @i, 11)
+        @i = @i + 1
+    return @s
+
+
+# Build the three NIST / RFC expected hex outputs as byte buffers.
+fn _make_expected_empty() -> int
+    @hex = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    @n   = 128
+    @out = new_str(@n)
+    @i   = 0
+    while @i < @n
+        str_set_byte(@out, @i, str_byte(@hex, @i))
+        @i = @i + 1
+    return @out
+
+fn _make_expected_abc() -> int
+    @hex = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    @n   = 128
+    @out = new_str(@n)
+    @i   = 0
+    while @i < @n
+        str_set_byte(@out, @i, str_byte(@hex, @i))
+        @i = @i + 1
+    return @out
+
+fn _make_expected_hmac1() -> int
+    @hex = "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"
+    @n   = 128
+    @out = new_str(@n)
+    @i   = 0
+    while @i < @n
+        str_set_byte(@out, @i, str_byte(@hex, @i))
+        @i = @i + 1
+    return @out
+
+
+fn main() -> int
+    # --- Test 1: SHA-512 of the empty string -------------------------
+    @empty = new_str(0)
+    @got1  = sha512_hex(@empty)
+    @exp1  = _make_expected_empty()
+    shine("sha512(\"\"):")
+    shine(@got1)
+    shine("expected:")
+    shine(@exp1)
+    if str_eq(@got1, @exp1) == 1
+        shine("  PASS")
+    else
+        shine("  FAIL")
+
+    # --- Test 2: SHA-512("abc") --------------------------------------
+    @abc  = _make_abc()
+    @got2 = sha512_hex(@abc)
+    @exp2 = _make_expected_abc()
+    shine("sha512(\"abc\"):")
+    shine(@got2)
+    shine("expected:")
+    shine(@exp2)
+    if str_eq(@got2, @exp2) == 1
+        shine("  PASS")
+    else
+        shine("  FAIL")
+
+    # --- Test 3: HMAC-SHA-512 (RFC 4231 test case 1) -----------------
+    @key  = _make_hmac_key1()
+    @data = _make_hi_there()
+    @got3 = hmac_sha512_hex(@key, @data)
+    @exp3 = _make_expected_hmac1()
+    shine("hmac_sha512(0x0b*20, \"Hi There\"):")
+    shine(@got3)
+    shine("expected:")
+    shine(@exp3)
+    if str_eq(@got3, @exp3) == 1
+        shine("  PASS")
+    else
+        shine("  FAIL")
+
+    return 0

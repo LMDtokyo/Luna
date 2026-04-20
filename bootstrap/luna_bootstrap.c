@@ -3157,6 +3157,7 @@ static const char *winapi_dll(const char *name, int len)
         { "_rmdir",    "msvcrt.dll" }, { "_access",  "msvcrt.dll" },
         { "_stat64",   "msvcrt.dll" }, { "_sleep",   "msvcrt.dll" },
         { "srand",     "msvcrt.dll" }, { "rand",     "msvcrt.dll" },
+        { "_putenv",   "msvcrt.dll" }, { "setenv",   "msvcrt.dll" },
         { "__getmainargs", "msvcrt.dll" },
         /* user32 — windowing                                         */
         { "MessageBoxA", "USER32.DLL" },

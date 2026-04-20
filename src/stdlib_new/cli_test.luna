@@ -1,0 +1,64 @@
+# Tests for cli.luna
+# Build a synthetic argv Vec and exercise cli_parse + accessors.
+
+fn _check_str(@label: int, @got: int, @want: int) -> int
+    if str_eq(@got, @want) == 1
+        shine(str_concat(@label, " PASS"))
+    else
+        shine(str_concat(@label, " FAIL"))
+        print("  got:  ")
+        shine(@got)
+        print("  want: ")
+        shine(@want)
+    return 0
+
+fn _check_int(@label: int, @got: int, @want: int) -> int
+    if @got == @want
+        shine(str_concat(@label, " PASS"))
+    else
+        shine(str_concat(@label, " FAIL"))
+        print("  got:  ")
+        println_int(@got)
+        print("  want: ")
+        println_int(@want)
+    return 0
+
+fn main() -> int
+    @av = vec_new()
+    vec_push(@av, "--name=Alice")
+    vec_push(@av, "--verbose")
+    vec_push(@av, "--port")
+    vec_push(@av, "8080")
+    vec_push(@av, "--")
+    vec_push(@av, "input.txt")
+    vec_push(@av, "output.txt")
+
+    @c = cli_new()
+    cli_parse(@c, @av)
+
+    _check_str("cli_opt name", cli_opt(@c, "name"), "Alice")
+    _check_int("cli_flag verbose", cli_flag(@c, "verbose"), 1)
+    _check_int("cli_opt_int port", cli_opt_int(@c, "port", 0), 8080)
+    _check_int("cli_positional_count", cli_positional_count(@c), 2)
+    _check_str("cli_positional 0", cli_positional(@c, 0), "input.txt")
+    _check_str("cli_positional 1", cli_positional(@c, 1), "output.txt")
+
+    # Extra sanity checks
+    _check_int("cli_flag missing", cli_flag(@c, "quiet"), 0)
+    _check_str("cli_opt_or default", cli_opt_or(@c, "missing", "def"), "def")
+    _check_int("cli_opt_int default", cli_opt_int(@c, "missing", 42), 42)
+    _check_str("cli_opt missing -> empty", cli_opt(@c, "missing"), "")
+    _check_str("cli_positional OOB", cli_positional(@c, 9), "")
+
+    # Short-flag cluster: "-xvf" => x=1, v=1, f=1
+    @av2 = vec_new()
+    vec_push(@av2, "-xvf")
+    vec_push(@av2, "file.tar")
+    @c2 = cli_new()
+    cli_parse(@c2, @av2)
+    _check_int("short x", cli_flag(@c2, "x"), 1)
+    _check_int("short v", cli_flag(@c2, "v"), 1)
+    _check_int("short f", cli_flag(@c2, "f"), 1)
+    _check_str("short positional", cli_positional(@c2, 0), "file.tar")
+
+    return 0

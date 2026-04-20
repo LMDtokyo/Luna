@@ -1,0 +1,215 @@
+# =====================================================================
+# SHA-512  (FIPS 180-4) + HMAC-SHA-512 (RFC 4231)
+# Pure-Luna implementation — mirrors the style of sha256 in the prelude.
+#
+# Exports:
+#   sha512_raw(msg)          -> 64-byte digest
+#   sha512_hex(msg)          -> 128-char hex string
+#   hmac_sha512_hex(key,msg) -> 128-char hex HMAC
+#
+# Notes on signed/unsigned:
+#   Luna `int` is 64-bit signed, but two's-complement wrap makes +, -, *,
+#   &, |, ^ and << identical to unsigned.  The `>>` operator in the
+#   bootstrap lowers to `shr rax, cl` which is a LOGICAL right shift, so
+#   top bits are zero-filled just like an unsigned >>.  That means we can
+#   do 64-bit SHA-512 without any masking.
+# =====================================================================
+
+
+fn _sha512_rotr(@x: int, @n: int) -> int
+    return (@x >> @n) | (@x << (64 - @n))
+
+fn _sha512_ch(@x: int, @y: int, @z: int) -> int
+    return (@x & @y) ^ ((~@x) & @z)
+
+fn _sha512_maj(@x: int, @y: int, @z: int) -> int
+    return (@x & @y) ^ (@x & @z) ^ (@y & @z)
+
+fn _sha512_bsig0(@x: int) -> int
+    return _sha512_rotr(@x, 28) ^ _sha512_rotr(@x, 34) ^ _sha512_rotr(@x, 39)
+
+fn _sha512_bsig1(@x: int) -> int
+    return _sha512_rotr(@x, 14) ^ _sha512_rotr(@x, 18) ^ _sha512_rotr(@x, 41)
+
+fn _sha512_ssig0(@x: int) -> int
+    return _sha512_rotr(@x, 1) ^ _sha512_rotr(@x, 8) ^ (@x >> 7)
+
+fn _sha512_ssig1(@x: int) -> int
+    return _sha512_rotr(@x, 19) ^ _sha512_rotr(@x, 61) ^ (@x >> 6)
+
+fn _sha512_be64(@buf: int, @off: int) -> int
+    @v = 0
+    @i = 0
+    while @i < 8
+        @v = (@v << 8) | str_byte(@buf, @off + @i)
+        @i = @i + 1
+    return @v
+
+# SHA-512 uses 128-byte blocks.  Padding: append 0x80, then zeros so that
+# the total is 112 mod 128, then a 128-bit big-endian bit length (the top
+# 64 bits are zero for any practical Luna input; the bottom 64 hold the
+# message bit-length).
+fn _sha512_pad(@msg: int) -> int
+    @len = str_len(@msg)
+    @pad_len = 128 - ((@len + 17) % 128)
+    if @pad_len == 128
+        @pad_len = 0
+    @total = @len + 1 + @pad_len + 16
+    @padded = new_str(@total)
+    @i = 0
+    while @i < @len
+        str_set_byte(@padded, @i, str_byte(@msg, @i))
+        @i = @i + 1
+    str_set_byte(@padded, @len, 128)
+    # Upper 64 bits of length are already zero from new_str.  Write the
+    # lower 64 bits (bit-length) big-endian into the final 8 bytes.
+    @bit_len = @len * 8
+    @j = 0
+    while @j < 8
+        str_set_byte(@padded, @total - 8 + @j, (@bit_len >> ((7 - @j) * 8)) & 255)
+        @j = @j + 1
+    return @padded
+
+fn sha512_raw(@msg: int) -> int
+    @padded = _sha512_pad(@msg)
+    @total = str_len(@padded)
+    @nblocks = @total / 128
+
+    # Initial hash value H (FIPS 180-4 sec 5.3.5).  Hex literals store
+    # the exact 64-bit bit pattern regardless of two's-complement sign.
+    @H = [0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1, 0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179]
+
+    # 80 round constants K (FIPS 180-4 sec 4.2.3).
+    @K = [0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc, 0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118, 0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2, 0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694, 0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65, 0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5, 0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4, 0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70, 0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df, 0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b, 0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30, 0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8, 0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8, 0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3, 0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec, 0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b, 0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178, 0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b, 0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c, 0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817]
+
+    @blk = 0
+    while @blk < @nblocks
+        # Message schedule W[0..80], 80 * 8 bytes.
+        @W = new_str(80 * 8)
+        @t = 0
+        while @t < 16
+            u64_set(@W, @t, _sha512_be64(@padded, @blk * 128 + @t * 8))
+            @t = @t + 1
+        while @t < 80
+            @w1 = u64_get(@W, @t - 2)
+            @w2 = u64_get(@W, @t - 7)
+            @w3 = u64_get(@W, @t - 15)
+            @w4 = u64_get(@W, @t - 16)
+            @nw = _sha512_ssig1(@w1) + @w2 + _sha512_ssig0(@w3) + @w4
+            u64_set(@W, @t, @nw)
+            @t = @t + 1
+
+        @a = @H[0]
+        @b = @H[1]
+        @c = @H[2]
+        @d = @H[3]
+        @e = @H[4]
+        @f = @H[5]
+        @g = @H[6]
+        @hh = @H[7]
+
+        @t = 0
+        while @t < 80
+            @wt = u64_get(@W, @t)
+            @T1 = @hh + _sha512_bsig1(@e) + _sha512_ch(@e, @f, @g) + @K[@t] + @wt
+            @T2 = _sha512_bsig0(@a) + _sha512_maj(@a, @b, @c)
+            @hh = @g
+            @g = @f
+            @f = @e
+            @e = @d + @T1
+            @d = @c
+            @c = @b
+            @b = @a
+            @a = @T1 + @T2
+            @t = @t + 1
+
+        @H[0] = @H[0] + @a
+        @H[1] = @H[1] + @b
+        @H[2] = @H[2] + @c
+        @H[3] = @H[3] + @d
+        @H[4] = @H[4] + @e
+        @H[5] = @H[5] + @f
+        @H[6] = @H[6] + @g
+        @H[7] = @H[7] + @hh
+        @blk = @blk + 1
+
+    # Serialize final state big-endian into a 64-byte digest.
+    @out = new_str(64)
+    @i = 0
+    while @i < 8
+        @hv = @H[@i]
+        str_set_byte(@out, @i * 8,     (@hv >> 56) & 255)
+        str_set_byte(@out, @i * 8 + 1, (@hv >> 48) & 255)
+        str_set_byte(@out, @i * 8 + 2, (@hv >> 40) & 255)
+        str_set_byte(@out, @i * 8 + 3, (@hv >> 32) & 255)
+        str_set_byte(@out, @i * 8 + 4, (@hv >> 24) & 255)
+        str_set_byte(@out, @i * 8 + 5, (@hv >> 16) & 255)
+        str_set_byte(@out, @i * 8 + 6, (@hv >> 8)  & 255)
+        str_set_byte(@out, @i * 8 + 7, @hv         & 255)
+        @i = @i + 1
+    return @out
+
+fn sha512_hex(@msg: int) -> int
+    return hex_encode(sha512_raw(@msg))
+
+
+# ---------------------------------------------------------------------
+# HMAC-SHA-512  (RFC 4231 / FIPS 198-1)
+# block size B = 128 bytes, output L = 64 bytes
+# ---------------------------------------------------------------------
+
+fn _sha512_concat(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    @out = new_str(@la + @lb)
+    @i = 0
+    while @i < @la
+        str_set_byte(@out, @i, str_byte(@a, @i))
+        @i = @i + 1
+    @j = 0
+    while @j < @lb
+        str_set_byte(@out, @la + @j, str_byte(@b, @j))
+        @j = @j + 1
+    return @out
+
+# Produce the 128-byte block-sized key K0 per RFC 2104 sec 2:
+#   if len(key) > B:  K0 = SHA-512(key) || zeros(64)
+#   if len(key) < B:  K0 = key          || zeros(B - len(key))
+#   else:             K0 = key
+fn _hmac_sha512_prepare_key(@key: int) -> int
+    @B = 128
+    @klen = str_len(@key)
+    @src = @key
+    @slen = @klen
+    if @klen > @B
+        @src = sha512_raw(@key)
+        @slen = 64
+    @out = new_str(@B)
+    @i = 0
+    while @i < @slen
+        str_set_byte(@out, @i, str_byte(@src, @i))
+        @i = @i + 1
+    # Remaining bytes are already zero from new_str.
+    return @out
+
+fn hmac_sha512_hex(@key: int, @msg: int) -> int
+    @B = 128
+    @K0 = _hmac_sha512_prepare_key(@key)
+
+    # ipad / opad blocks — K0 XOR 0x36 and K0 XOR 0x5c respectively.
+    @ipad = new_str(@B)
+    @opad = new_str(@B)
+    @i = 0
+    while @i < @B
+        @kb = str_byte(@K0, @i)
+        str_set_byte(@ipad, @i, @kb ^ 54)
+        str_set_byte(@opad, @i, @kb ^ 92)
+        @i = @i + 1
+
+    # inner  = SHA-512(ipad || msg)
+    # outer  = SHA-512(opad || inner)
+    @inner_in = _sha512_concat(@ipad, @msg)
+    @inner    = sha512_raw(@inner_in)
+    @outer_in = _sha512_concat(@opad, @inner)
+    @outer    = sha512_raw(@outer_in)
+    return hex_encode(@outer)

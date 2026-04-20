@@ -1,0 +1,298 @@
+# WebSocket (RFC 6455) frame codec + handshake helper, pure Luna.
+#
+# This module is frame-level only: it does not open sockets. A higher layer
+# (typically sitting on top of the existing HTTP server primitives) reads
+# bytes into a buffer and hands them to `ws_decode_frame`, and writes the
+# output of `ws_encode_frame` / `ws_encode_text` back to the peer.
+#
+# Dependencies expected to be linked alongside this file:
+#   - bootstrap/prelude.luna  (new_str, str_*, vec_*, u64_*)
+#   - src/stdlib_new/base64.luna  (base64_encode)
+#
+# The RFC 6455 handshake requires SHA-1 (not SHA-256). A self-contained
+# SHA-1 implementation (`_ws_sha1_raw`) is provided below per FIPS 180-4
+# §6.1, with private `_ws_*` helpers so it cannot collide with anything
+# else that might also ship a SHA-1.
+
+# --- private bit helpers --------------------------------------------------
+
+fn _ws_rotl32(@x: int, @n: int) -> int
+    @mask = 4294967295
+    @x = @x & @mask
+    return (((@x << @n) & @mask) | (@x >> (32 - @n))) & @mask
+
+# big-endian 32-bit load from a byte buffer
+fn _ws_be32_load(@buf: int, @off: int) -> int
+    @b0 = str_byte(@buf, @off)
+    @b1 = str_byte(@buf, @off + 1)
+    @b2 = str_byte(@buf, @off + 2)
+    @b3 = str_byte(@buf, @off + 3)
+    return ((@b0 << 24) | (@b1 << 16) | (@b2 << 8) | @b3) & 4294967295
+
+# big-endian 32-bit store into a byte buffer
+fn _ws_be32_store(@buf: int, @off: int, @v: int) -> int
+    str_set_byte(@buf, @off,     (@v >> 24) & 255)
+    str_set_byte(@buf, @off + 1, (@v >> 16) & 255)
+    str_set_byte(@buf, @off + 2, (@v >>  8) & 255)
+    str_set_byte(@buf, @off + 3,  @v        & 255)
+    return 0
+
+# --- private SHA-1 (FIPS 180-4 §6.1) --------------------------------------
+
+# Pad per SHA-1: append 0x80, then zeros, then 64-bit big-endian bit-length
+# so that total length is a multiple of 64 bytes.
+fn _ws_sha1_pad(@msg: int) -> int
+    @len = str_len(@msg)
+    @pad_len = 64 - ((@len + 9) % 64)
+    if @pad_len == 64
+        @pad_len = 0
+    @total = @len + 1 + @pad_len + 8
+    @padded = new_str(@total)
+    @i = 0
+    while @i < @len
+        str_set_byte(@padded, @i, str_byte(@msg, @i))
+        @i = @i + 1
+    str_set_byte(@padded, @len, 128)
+    @bit_len = @len * 8
+    @j = 0
+    while @j < 8
+        str_set_byte(@padded, @total - 8 + @j, (@bit_len >> ((7 - @j) * 8)) & 255)
+        @j = @j + 1
+    return @padded
+
+# Self-contained SHA-1; returns 20 raw bytes.
+fn _ws_sha1_raw(@msg: int) -> int
+    @padded = _ws_sha1_pad(@msg)
+    @total = str_len(@padded)
+    @nblocks = @total / 64
+
+    @h0 = 1732584193
+    @h1 = 4023233417
+    @h2 = 2562383102
+    @h3 = 271733878
+    @h4 = 3285377520
+
+    @mask = 4294967295
+
+    # message-schedule buffer: 80 words * 8 bytes/slot (we store one 32-bit
+    # word per 8-byte slot via u64_set/u64_get, matching prelude convention)
+    @W = new_str(80 * 8)
+
+    @blk = 0
+    while @blk < @nblocks
+        @t = 0
+        while @t < 16
+            u64_set(@W, @t, _ws_be32_load(@padded, @blk * 64 + @t * 4))
+            @t = @t + 1
+        while @t < 80
+            @w1 = u64_get(@W, @t - 3)
+            @w2 = u64_get(@W, @t - 8)
+            @w3 = u64_get(@W, @t - 14)
+            @w4 = u64_get(@W, @t - 16)
+            u64_set(@W, @t, _ws_rotl32(@w1 ^ @w2 ^ @w3 ^ @w4, 1))
+            @t = @t + 1
+
+        @a = @h0
+        @b = @h1
+        @c = @h2
+        @d = @h3
+        @e = @h4
+
+        @t = 0
+        while @t < 80
+            if @t < 20
+                @f = (@b & @c) | ((~@b) & @d)
+                @k = 1518500249
+            if @t >= 20
+                if @t < 40
+                    @f = @b ^ @c ^ @d
+                    @k = 1859775393
+            if @t >= 40
+                if @t < 60
+                    @f = (@b & @c) | (@b & @d) | (@c & @d)
+                    @k = 2400959708
+            if @t >= 60
+                @f = @b ^ @c ^ @d
+                @k = 3395469782
+            @tmp = (_ws_rotl32(@a, 5) + @f + @e + @k + u64_get(@W, @t)) & @mask
+            @e = @d
+            @d = @c
+            @c = _ws_rotl32(@b, 30)
+            @b = @a
+            @a = @tmp
+            @t = @t + 1
+
+        @h0 = (@h0 + @a) & @mask
+        @h1 = (@h1 + @b) & @mask
+        @h2 = (@h2 + @c) & @mask
+        @h3 = (@h3 + @d) & @mask
+        @h4 = (@h4 + @e) & @mask
+        @blk = @blk + 1
+
+    @out = new_str(20)
+    _ws_be32_store(@out, 0,  @h0)
+    _ws_be32_store(@out, 4,  @h1)
+    _ws_be32_store(@out, 8,  @h2)
+    _ws_be32_store(@out, 12, @h3)
+    _ws_be32_store(@out, 16, @h4)
+    return @out
+
+# --- handshake ------------------------------------------------------------
+
+# RFC 6455 §4.2.2: Sec-WebSocket-Accept = base64(sha1(client_key || GUID))
+# where GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11".
+fn ws_accept_key(@client_key: int) -> int
+    @magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    @combined = str_concat(@client_key, @magic)
+    @digest = _ws_sha1_raw(@combined)
+    return base64_encode(@digest)
+
+# Build the full HTTP/1.1 101 response body that completes the handshake.
+# Caller is responsible for writing this to the socket verbatim.
+fn ws_handshake_response(@client_key: int) -> int
+    @accept = ws_accept_key(@client_key)
+    @r = "HTTP/1.1 101 Switching Protocols\r\n"
+    @r = str_concat(@r, "Upgrade: websocket\r\n")
+    @r = str_concat(@r, "Connection: Upgrade\r\n")
+    @r = str_concat(@r, "Sec-WebSocket-Accept: ")
+    @r = str_concat(@r, @accept)
+    @r = str_concat(@r, "\r\n\r\n")
+    return @r
+
+# --- frame encoder (server -> client, unmasked) ---------------------------
+
+# RFC 6455 §5.2 server-to-client frames MUST NOT be masked.
+# We always set FIN=1 (single-frame message). `@opcode` is the 4-bit opcode
+# (0x1=text, 0x2=binary, 0x8=close, 0x9=ping, 0xA=pong).
+fn ws_encode_frame(@opcode: int, @payload: int) -> int
+    @plen = str_len(@payload)
+
+    # figure out the length encoding and total frame size
+    @hdr_extra = 0
+    @len7 = 0
+    if @plen <= 125
+        @len7 = @plen
+        @hdr_extra = 0
+    else
+        if @plen <= 65535
+            @len7 = 126
+            @hdr_extra = 2
+        else
+            @len7 = 127
+            @hdr_extra = 8
+
+    @total = 2 + @hdr_extra + @plen
+    @frame = new_str(@total)
+
+    # byte 0: FIN=1, RSV=0, opcode
+    str_set_byte(@frame, 0, (128 | (@opcode & 15)) & 255)
+
+    # byte 1: MASK=0 (server->client), len7
+    str_set_byte(@frame, 1, @len7 & 255)
+
+    @off = 2
+    if @hdr_extra == 2
+        # 16-bit big-endian extended length
+        str_set_byte(@frame, @off,     (@plen >> 8) & 255)
+        str_set_byte(@frame, @off + 1,  @plen       & 255)
+        @off = @off + 2
+    if @hdr_extra == 8
+        # 64-bit big-endian extended length
+        @k = 0
+        while @k < 8
+            str_set_byte(@frame, @off + @k, (@plen >> ((7 - @k) * 8)) & 255)
+            @k = @k + 1
+        @off = @off + 8
+
+    # payload, unmasked
+    @i = 0
+    while @i < @plen
+        str_set_byte(@frame, @off + @i, str_byte(@payload, @i))
+        @i = @i + 1
+
+    return @frame
+
+# Convenience: text frame (opcode 0x1).
+fn ws_encode_text(@text: int) -> int
+    return ws_encode_frame(1, @text)
+
+# --- frame decoder --------------------------------------------------------
+
+# Decode one frame from @buf starting at @off. Returns a Vec of three
+# entries: [opcode, payload_str, next_off]. If the buffer does not yet
+# contain a full frame, returns the sentinel [-1, "", 0] so the caller
+# can read more bytes and try again.
+#
+# If MASK=1 (client->server, as RFC 6455 §5.1 requires), the payload is
+# unmasked in place into a freshly allocated string.
+fn ws_decode_frame(@buf: int, @off: int) -> Vec
+    @buflen = str_len(@buf)
+
+    @short = vec_new()
+    vec_push(@short, -1)
+    vec_push(@short, "")
+    vec_push(@short, 0)
+
+    if @buflen - @off < 2
+        return @short
+
+    @b0 = str_byte(@buf, @off)
+    @b1 = str_byte(@buf, @off + 1)
+
+    @opcode = @b0 & 15
+    @masked = (@b1 >> 7) & 1
+    @len7   = @b1 & 127
+
+    @hdr = 2
+
+    @plen = 0
+    if @len7 <= 125
+        @plen = @len7
+    else
+        if @len7 == 126
+            if @buflen - @off < @hdr + 2
+                return @short
+            @p0 = str_byte(@buf, @off + @hdr)
+            @p1 = str_byte(@buf, @off + @hdr + 1)
+            @plen = (@p0 << 8) | @p1
+            @hdr = @hdr + 2
+        else
+            # len7 == 127: 8-byte big-endian length
+            if @buflen - @off < @hdr + 8
+                return @short
+            @plen = 0
+            @k = 0
+            while @k < 8
+                @plen = (@plen << 8) | str_byte(@buf, @off + @hdr + @k)
+                @k = @k + 1
+            @hdr = @hdr + 8
+
+    @mask_off = @off + @hdr
+    if @masked == 1
+        if @buflen - @off < @hdr + 4
+            return @short
+        @hdr = @hdr + 4
+
+    @payload_off = @off + @hdr
+
+    if @buflen - @off < @hdr + @plen
+        return @short
+
+    @payload = new_str(@plen)
+    if @masked == 1
+        @i = 0
+        while @i < @plen
+            @m = str_byte(@buf, @mask_off + (@i & 3))
+            str_set_byte(@payload, @i, str_byte(@buf, @payload_off + @i) ^ @m)
+            @i = @i + 1
+    else
+        @i = 0
+        while @i < @plen
+            str_set_byte(@payload, @i, str_byte(@buf, @payload_off + @i))
+            @i = @i + 1
+
+    @out = vec_new()
+    vec_push(@out, @opcode)
+    vec_push(@out, @payload)
+    vec_push(@out, @payload_off + @plen)
+    return @out

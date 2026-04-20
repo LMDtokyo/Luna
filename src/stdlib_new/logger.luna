@@ -1,0 +1,81 @@
+# Pure-Luna logger: levels, ISO timestamps, optional file output.
+# Levels: DEBUG=0 < INFO=1 < WARN=2 < ERROR=3
+#
+# No module-level mutable state (bootstrap doesn't support it). The
+# active min level is read from env var LUNA_LOG on every log call:
+#   DEBUG / INFO / WARN / ERROR  (case-insensitive)
+# If unset or unknown, minimum is INFO(1). To change it programmatically,
+# call log_set_env(level_name) which updates LUNA_LOG via _putenv/setenv.
+
+extern "C" fn _putenv(@kv: int) -> int
+
+fn _log_min() -> int
+    @raw = env_get("LUNA_LOG")
+    if str_eq(@raw, "") == 1
+        return 1
+    @u = str_to_upper(@raw)
+    if str_eq(@u, "DEBUG") == 1
+        return 0
+    if str_eq(@u, "INFO") == 1
+        return 1
+    if str_eq(@u, "WARN") == 1
+        return 2
+    if str_eq(@u, "ERROR") == 1
+        return 3
+    return 1
+
+fn log_set_level(@lvl: int) -> int
+    @name = "INFO"
+    if @lvl == 0
+        @name = "DEBUG"
+    if @lvl == 2
+        @name = "WARN"
+    if @lvl == 3
+        @name = "ERROR"
+    @kv = str_concat("LUNA_LOG=", @name)
+    _putenv(@kv)
+    return 0
+
+fn _log_name(@lvl: int) -> int
+    if @lvl == 0
+        return "DEBUG"
+    if @lvl == 1
+        return "INFO "
+    if @lvl == 2
+        return "WARN "
+    return "ERROR"
+
+fn log_at(@lvl: int, @msg: int) -> int
+    if @lvl < _log_min()
+        return 0
+    @line = iso_timestamp()
+    @line = str_concat(@line, " [")
+    @line = str_concat(@line, _log_name(@lvl))
+    @line = str_concat(@line, "] ")
+    @line = str_concat(@line, @msg)
+    shine(@line)
+    return 0
+
+fn log_debug(@msg: int) -> int
+    return log_at(0, @msg)
+
+fn log_info(@msg: int) -> int
+    return log_at(1, @msg)
+
+fn log_warn(@msg: int) -> int
+    return log_at(2, @msg)
+
+fn log_error(@msg: int) -> int
+    return log_at(3, @msg)
+
+fn log_to_file(@path: int, @msg: int) -> int
+    @prev = read_file(@path)
+    if @prev == 0
+        @prev = ""
+    @line = iso_timestamp()
+    @line = str_concat(@line, " ")
+    @line = str_concat(@line, @msg)
+    @line = str_concat(@line, "\n")
+    @out = str_concat(@prev, @line)
+    write_file(@path, @out)
+    return 0

@@ -1,0 +1,129 @@
+# Tests for src/stdlib_new/websocket.luna.
+#
+# Run by passing all three files to the bootstrap compiler, e.g.:
+#   luna_bootstrap src/stdlib_new/base64.luna \
+#                  src/stdlib_new/websocket.luna \
+#                  src/stdlib_new/websocket_test.luna
+# The bootstrap compiles all files on its command line together, so we
+# assume base64_encode and the ws_* functions are already linked.
+
+# --- helpers --------------------------------------------------------------
+
+# Decode one ASCII hex digit. Returns -1 on non-hex (callers are expected
+# to pass clean input).
+fn _hex_nib(@c: int) -> int
+    if @c >= 48
+        if @c <= 57
+            return @c - 48
+    if @c >= 97
+        if @c <= 102
+            return @c - 97 + 10
+    if @c >= 65
+        if @c <= 70
+            return @c - 65 + 10
+    return -1
+
+# Convert a hex string (e.g. "81 85 37fa213d") to a raw byte buffer.
+# Whitespace (spaces / tabs / newlines) is skipped so test vectors can
+# be pasted in any convenient format.
+fn _hex_to_bytes(@hex: int) -> int
+    @n = str_len(@hex)
+
+    # first pass: count hex digits
+    @digits = 0
+    @i = 0
+    while @i < @n
+        @c = str_byte(@hex, @i)
+        if _hex_nib(@c) >= 0
+            @digits = @digits + 1
+        @i = @i + 1
+
+    @out_len = @digits / 2
+    @out = new_str(@out_len)
+
+    # second pass: pack
+    @i = 0
+    @o = 0
+    @have = 0
+    @hi = 0
+    while @i < @n
+        @c = str_byte(@hex, @i)
+        @v = _hex_nib(@c)
+        if @v >= 0
+            if @have == 0
+                @hi = @v
+                @have = 1
+            else
+                str_set_byte(@out, @o, ((@hi << 4) | @v) & 255)
+                @o = @o + 1
+                @have = 0
+        @i = @i + 1
+    return @out
+
+fn _expect_str(@label: int, @got: int, @want: int) -> int
+    if str_eq(@got, @want) == 1
+        shine(str_concat(@label, " PASS"))
+    else
+        shine(str_concat(@label, " FAIL"))
+        shine(str_concat("  got:  ", @got))
+        shine(str_concat("  want: ", @want))
+    return 0
+
+fn _expect_int(@label: int, @got: int, @want: int) -> int
+    if @got == @want
+        shine(str_concat(@label, " PASS"))
+    else
+        shine(str_concat(@label, " FAIL"))
+    return 0
+
+fn _bytes_eq(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    if @la != @lb
+        return 0
+    @i = 0
+    while @i < @la
+        if str_byte(@a, @i) != str_byte(@b, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+fn _expect_bytes(@label: int, @got: int, @want: int) -> int
+    if _bytes_eq(@got, @want) == 1
+        shine(str_concat(@label, " PASS"))
+    else
+        shine(str_concat(@label, " FAIL"))
+    return 0
+
+# --- tests ----------------------------------------------------------------
+
+fn main() -> int
+    # Test 1: RFC 6455 §1.3 handshake accept-key vector.
+    #   client key  = "dGhlIHNhbXBsZSBub25jZQ=="
+    #   expected    = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    @client_key = "dGhlIHNhbXBsZSBub25jZQ=="
+    @want_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    @got_accept = ws_accept_key(@client_key)
+    _expect_str("handshake accept key", @got_accept, @want_accept)
+
+    # Test 2: encode text frame "Hello".
+    #   Expected bytes: 81 05 48 65 6c 6c 6f
+    @text = "Hello"
+    @frame = ws_encode_text(@text)
+    @want_frame = _hex_to_bytes("81 05 48 65 6c 6c 6f")
+    _expect_bytes("encode text 'Hello'", @frame, @want_frame)
+
+    # Test 3: decode masked client frame.
+    #   Raw bytes: 81 85 37 fa 21 3d 7f 9f 4d 51 58
+    #   FIN=1, opcode=1, MASK=1, len=5, key=37fa213d,
+    #   masked payload = 7f9f4d5158 XOR 37fa213d37 -> 48 65 6c 6c 6f  ("Hello")
+    @raw = _hex_to_bytes("81 85 37 fa 21 3d 7f 9f 4d 51 58")
+    @decoded = ws_decode_frame(@raw, 0)
+    @op      = vec_get(@decoded, 0)
+    @payload = vec_get(@decoded, 1)
+    @next    = vec_get(@decoded, 2)
+    _expect_int("decode masked opcode", @op, 1)
+    _expect_str("decode masked payload", @payload, "Hello")
+    _expect_int("decode masked next_off", @next, 11)
+
+    return 0

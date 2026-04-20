@@ -1,0 +1,241 @@
+# ChaCha20 stream cipher per RFC 7539.
+# All arithmetic on u32 words; we mask with 0xFFFFFFFF (4294967295) after
+# every add/rotate to simulate 32-bit unsigned wrap on top of 64-bit ints.
+# Key = 32 bytes, nonce = 12 bytes, counter = u32. Keystream in 64-byte blocks.
+
+fn _cc_rotl32(@x: int, @n: int) -> int
+    return (((@x << @n) & 4294967295) | ((@x & 4294967295) >> (32 - @n))) & 4294967295
+
+fn _cc_u32_le(@buf: int, @off: int) -> int
+    return str_byte(@buf, @off) | (str_byte(@buf, @off + 1) << 8) | (str_byte(@buf, @off + 2) << 16) | (str_byte(@buf, @off + 3) << 24)
+
+fn _cc_block(@state: int, @out: int) -> int
+    @mask = 4294967295
+    # Working copy of state
+    @x0  = @state[0]
+    @x1  = @state[1]
+    @x2  = @state[2]
+    @x3  = @state[3]
+    @x4  = @state[4]
+    @x5  = @state[5]
+    @x6  = @state[6]
+    @x7  = @state[7]
+    @x8  = @state[8]
+    @x9  = @state[9]
+    @x10 = @state[10]
+    @x11 = @state[11]
+    @x12 = @state[12]
+    @x13 = @state[13]
+    @x14 = @state[14]
+    @x15 = @state[15]
+
+    @r = 0
+    while @r < 10
+        # Column round: QR(0,4,8,12)
+        @x0 = (@x0 + @x4) & @mask
+        @x12 = _cc_rotl32(@x12 ^ @x0, 16)
+        @x8 = (@x8 + @x12) & @mask
+        @x4 = _cc_rotl32(@x4 ^ @x8, 12)
+        @x0 = (@x0 + @x4) & @mask
+        @x12 = _cc_rotl32(@x12 ^ @x0, 8)
+        @x8 = (@x8 + @x12) & @mask
+        @x4 = _cc_rotl32(@x4 ^ @x8, 7)
+
+        # QR(1,5,9,13)
+        @x1 = (@x1 + @x5) & @mask
+        @x13 = _cc_rotl32(@x13 ^ @x1, 16)
+        @x9 = (@x9 + @x13) & @mask
+        @x5 = _cc_rotl32(@x5 ^ @x9, 12)
+        @x1 = (@x1 + @x5) & @mask
+        @x13 = _cc_rotl32(@x13 ^ @x1, 8)
+        @x9 = (@x9 + @x13) & @mask
+        @x5 = _cc_rotl32(@x5 ^ @x9, 7)
+
+        # QR(2,6,10,14)
+        @x2 = (@x2 + @x6) & @mask
+        @x14 = _cc_rotl32(@x14 ^ @x2, 16)
+        @x10 = (@x10 + @x14) & @mask
+        @x6 = _cc_rotl32(@x6 ^ @x10, 12)
+        @x2 = (@x2 + @x6) & @mask
+        @x14 = _cc_rotl32(@x14 ^ @x2, 8)
+        @x10 = (@x10 + @x14) & @mask
+        @x6 = _cc_rotl32(@x6 ^ @x10, 7)
+
+        # QR(3,7,11,15)
+        @x3 = (@x3 + @x7) & @mask
+        @x15 = _cc_rotl32(@x15 ^ @x3, 16)
+        @x11 = (@x11 + @x15) & @mask
+        @x7 = _cc_rotl32(@x7 ^ @x11, 12)
+        @x3 = (@x3 + @x7) & @mask
+        @x15 = _cc_rotl32(@x15 ^ @x3, 8)
+        @x11 = (@x11 + @x15) & @mask
+        @x7 = _cc_rotl32(@x7 ^ @x11, 7)
+
+        # Diagonal round: QR(0,5,10,15)
+        @x0 = (@x0 + @x5) & @mask
+        @x15 = _cc_rotl32(@x15 ^ @x0, 16)
+        @x10 = (@x10 + @x15) & @mask
+        @x5 = _cc_rotl32(@x5 ^ @x10, 12)
+        @x0 = (@x0 + @x5) & @mask
+        @x15 = _cc_rotl32(@x15 ^ @x0, 8)
+        @x10 = (@x10 + @x15) & @mask
+        @x5 = _cc_rotl32(@x5 ^ @x10, 7)
+
+        # QR(1,6,11,12)
+        @x1 = (@x1 + @x6) & @mask
+        @x12 = _cc_rotl32(@x12 ^ @x1, 16)
+        @x11 = (@x11 + @x12) & @mask
+        @x6 = _cc_rotl32(@x6 ^ @x11, 12)
+        @x1 = (@x1 + @x6) & @mask
+        @x12 = _cc_rotl32(@x12 ^ @x1, 8)
+        @x11 = (@x11 + @x12) & @mask
+        @x6 = _cc_rotl32(@x6 ^ @x11, 7)
+
+        # QR(2,7,8,13)
+        @x2 = (@x2 + @x7) & @mask
+        @x13 = _cc_rotl32(@x13 ^ @x2, 16)
+        @x8 = (@x8 + @x13) & @mask
+        @x7 = _cc_rotl32(@x7 ^ @x8, 12)
+        @x2 = (@x2 + @x7) & @mask
+        @x13 = _cc_rotl32(@x13 ^ @x2, 8)
+        @x8 = (@x8 + @x13) & @mask
+        @x7 = _cc_rotl32(@x7 ^ @x8, 7)
+
+        # QR(3,4,9,14)
+        @x3 = (@x3 + @x4) & @mask
+        @x14 = _cc_rotl32(@x14 ^ @x3, 16)
+        @x9 = (@x9 + @x14) & @mask
+        @x4 = _cc_rotl32(@x4 ^ @x9, 12)
+        @x3 = (@x3 + @x4) & @mask
+        @x14 = _cc_rotl32(@x14 ^ @x3, 8)
+        @x9 = (@x9 + @x14) & @mask
+        @x4 = _cc_rotl32(@x4 ^ @x9, 7)
+
+        @r = @r + 1
+
+    # Add working state to original state word-wise (mod 2^32)
+    @w0  = (@x0  + @state[0])  & @mask
+    @w1  = (@x1  + @state[1])  & @mask
+    @w2  = (@x2  + @state[2])  & @mask
+    @w3  = (@x3  + @state[3])  & @mask
+    @w4  = (@x4  + @state[4])  & @mask
+    @w5  = (@x5  + @state[5])  & @mask
+    @w6  = (@x6  + @state[6])  & @mask
+    @w7  = (@x7  + @state[7])  & @mask
+    @w8  = (@x8  + @state[8])  & @mask
+    @w9  = (@x9  + @state[9])  & @mask
+    @w10 = (@x10 + @state[10]) & @mask
+    @w11 = (@x11 + @state[11]) & @mask
+    @w12 = (@x12 + @state[12]) & @mask
+    @w13 = (@x13 + @state[13]) & @mask
+    @w14 = (@x14 + @state[14]) & @mask
+    @w15 = (@x15 + @state[15]) & @mask
+
+    # Serialise 16 u32 words little-endian into @out (64 bytes).
+    str_set_byte(@out, 0,  @w0 & 255)
+    str_set_byte(@out, 1,  (@w0 >> 8) & 255)
+    str_set_byte(@out, 2,  (@w0 >> 16) & 255)
+    str_set_byte(@out, 3,  (@w0 >> 24) & 255)
+    str_set_byte(@out, 4,  @w1 & 255)
+    str_set_byte(@out, 5,  (@w1 >> 8) & 255)
+    str_set_byte(@out, 6,  (@w1 >> 16) & 255)
+    str_set_byte(@out, 7,  (@w1 >> 24) & 255)
+    str_set_byte(@out, 8,  @w2 & 255)
+    str_set_byte(@out, 9,  (@w2 >> 8) & 255)
+    str_set_byte(@out, 10, (@w2 >> 16) & 255)
+    str_set_byte(@out, 11, (@w2 >> 24) & 255)
+    str_set_byte(@out, 12, @w3 & 255)
+    str_set_byte(@out, 13, (@w3 >> 8) & 255)
+    str_set_byte(@out, 14, (@w3 >> 16) & 255)
+    str_set_byte(@out, 15, (@w3 >> 24) & 255)
+    str_set_byte(@out, 16, @w4 & 255)
+    str_set_byte(@out, 17, (@w4 >> 8) & 255)
+    str_set_byte(@out, 18, (@w4 >> 16) & 255)
+    str_set_byte(@out, 19, (@w4 >> 24) & 255)
+    str_set_byte(@out, 20, @w5 & 255)
+    str_set_byte(@out, 21, (@w5 >> 8) & 255)
+    str_set_byte(@out, 22, (@w5 >> 16) & 255)
+    str_set_byte(@out, 23, (@w5 >> 24) & 255)
+    str_set_byte(@out, 24, @w6 & 255)
+    str_set_byte(@out, 25, (@w6 >> 8) & 255)
+    str_set_byte(@out, 26, (@w6 >> 16) & 255)
+    str_set_byte(@out, 27, (@w6 >> 24) & 255)
+    str_set_byte(@out, 28, @w7 & 255)
+    str_set_byte(@out, 29, (@w7 >> 8) & 255)
+    str_set_byte(@out, 30, (@w7 >> 16) & 255)
+    str_set_byte(@out, 31, (@w7 >> 24) & 255)
+    str_set_byte(@out, 32, @w8 & 255)
+    str_set_byte(@out, 33, (@w8 >> 8) & 255)
+    str_set_byte(@out, 34, (@w8 >> 16) & 255)
+    str_set_byte(@out, 35, (@w8 >> 24) & 255)
+    str_set_byte(@out, 36, @w9 & 255)
+    str_set_byte(@out, 37, (@w9 >> 8) & 255)
+    str_set_byte(@out, 38, (@w9 >> 16) & 255)
+    str_set_byte(@out, 39, (@w9 >> 24) & 255)
+    str_set_byte(@out, 40, @w10 & 255)
+    str_set_byte(@out, 41, (@w10 >> 8) & 255)
+    str_set_byte(@out, 42, (@w10 >> 16) & 255)
+    str_set_byte(@out, 43, (@w10 >> 24) & 255)
+    str_set_byte(@out, 44, @w11 & 255)
+    str_set_byte(@out, 45, (@w11 >> 8) & 255)
+    str_set_byte(@out, 46, (@w11 >> 16) & 255)
+    str_set_byte(@out, 47, (@w11 >> 24) & 255)
+    str_set_byte(@out, 48, @w12 & 255)
+    str_set_byte(@out, 49, (@w12 >> 8) & 255)
+    str_set_byte(@out, 50, (@w12 >> 16) & 255)
+    str_set_byte(@out, 51, (@w12 >> 24) & 255)
+    str_set_byte(@out, 52, @w13 & 255)
+    str_set_byte(@out, 53, (@w13 >> 8) & 255)
+    str_set_byte(@out, 54, (@w13 >> 16) & 255)
+    str_set_byte(@out, 55, (@w13 >> 24) & 255)
+    str_set_byte(@out, 56, @w14 & 255)
+    str_set_byte(@out, 57, (@w14 >> 8) & 255)
+    str_set_byte(@out, 58, (@w14 >> 16) & 255)
+    str_set_byte(@out, 59, (@w14 >> 24) & 255)
+    str_set_byte(@out, 60, @w15 & 255)
+    str_set_byte(@out, 61, (@w15 >> 8) & 255)
+    str_set_byte(@out, 62, (@w15 >> 16) & 255)
+    str_set_byte(@out, 63, (@w15 >> 24) & 255)
+    return 0
+
+fn chacha20_xor(@key: int, @nonce: int, @counter: int, @data: int) -> int
+    @mask = 4294967295
+    @n = str_len(@data)
+    @out = new_str(@n)
+
+    # Initialise state. Constants "expand 32-byte k".
+    @state = [0; 16]
+    @state[0] = 1634760805
+    @state[1] = 857760878
+    @state[2] = 2036477234
+    @state[3] = 1797285236
+    @state[4]  = _cc_u32_le(@key, 0)
+    @state[5]  = _cc_u32_le(@key, 4)
+    @state[6]  = _cc_u32_le(@key, 8)
+    @state[7]  = _cc_u32_le(@key, 12)
+    @state[8]  = _cc_u32_le(@key, 16)
+    @state[9]  = _cc_u32_le(@key, 20)
+    @state[10] = _cc_u32_le(@key, 24)
+    @state[11] = _cc_u32_le(@key, 28)
+    @state[12] = @counter & @mask
+    @state[13] = _cc_u32_le(@nonce, 0)
+    @state[14] = _cc_u32_le(@nonce, 4)
+    @state[15] = _cc_u32_le(@nonce, 8)
+
+    @ks = new_str(64)
+    @off = 0
+    while @off < @n
+        _cc_block(@state, @ks)
+        @remaining = @n - @off
+        @take = 64
+        if @remaining < 64
+            @take = @remaining
+        @j = 0
+        while @j < @take
+            @pb = str_byte(@data, @off + @j)
+            @kb = str_byte(@ks, @j)
+            str_set_byte(@out, @off + @j, (@pb ^ @kb) & 255)
+            @j = @j + 1
+        @state[12] = (@state[12] + 1) & @mask
+        @off = @off + 64
+    return @out

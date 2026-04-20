@@ -1,0 +1,16 @@
+# Smoke test for logger.luna. No strict asserts: eyeball stdout + log file.
+
+fn main() -> int
+    # Default min level is INFO, so this should be suppressed.
+    log_debug("dbg-should-not-show")
+
+    log_info("info1")
+    log_warn("warn1")
+    log_error("err1")
+
+    # Lower the bar and verify DEBUG now emits.
+    log_set_level(0)
+    log_debug("dbg-now-shown")
+
+    shine("logger smoke done")
+    return 0

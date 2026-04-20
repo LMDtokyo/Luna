@@ -1,0 +1,70 @@
+# RFC 4648 test vectors for base64_encode / base64_decode
+# Vectors: "" "" | "f" "Zg==" | "fo" "Zm8=" | "foo" "Zm9v"
+#          "foob" "Zm9vYg==" | "fooba" "Zm9vYmE=" | "foobar" "Zm9vYmFy"
+
+fn _check(@label: int, @got: int, @want: int) -> int
+    shine(@got)
+    if str_eq(@got, @want) == 1
+        shine(str_concat(@label, " PASS"))
+    else
+        shine(str_concat(@label, " FAIL"))
+    return 0
+
+fn main() -> int
+    # "" <-> ""
+    @in0 = ""
+    @ex0 = ""
+    @enc0 = base64_encode(@in0)
+    _check("encode empty", @enc0, @ex0)
+    @dec0 = base64_decode(@ex0)
+    _check("decode empty", @dec0, @in0)
+
+    # "f" <-> "Zg=="
+    @in1 = "f"
+    @ex1 = "Zg=="
+    @enc1 = base64_encode(@in1)
+    _check("encode f", @enc1, @ex1)
+    @dec1 = base64_decode(@ex1)
+    _check("decode Zg==", @dec1, @in1)
+
+    # "fo" <-> "Zm8="
+    @in2 = "fo"
+    @ex2 = "Zm8="
+    @enc2 = base64_encode(@in2)
+    _check("encode fo", @enc2, @ex2)
+    @dec2 = base64_decode(@ex2)
+    _check("decode Zm8=", @dec2, @in2)
+
+    # "foo" <-> "Zm9v"
+    @in3 = "foo"
+    @ex3 = "Zm9v"
+    @enc3 = base64_encode(@in3)
+    _check("encode foo", @enc3, @ex3)
+    @dec3 = base64_decode(@ex3)
+    _check("decode Zm9v", @dec3, @in3)
+
+    # "foob" <-> "Zm9vYg=="
+    @in4 = "foob"
+    @ex4 = "Zm9vYg=="
+    @enc4 = base64_encode(@in4)
+    _check("encode foob", @enc4, @ex4)
+    @dec4 = base64_decode(@ex4)
+    _check("decode Zm9vYg==", @dec4, @in4)
+
+    # "fooba" <-> "Zm9vYmE="
+    @in5 = "fooba"
+    @ex5 = "Zm9vYmE="
+    @enc5 = base64_encode(@in5)
+    _check("encode fooba", @enc5, @ex5)
+    @dec5 = base64_decode(@ex5)
+    _check("decode Zm9vYmE=", @dec5, @in5)
+
+    # "foobar" <-> "Zm9vYmFy"
+    @in6 = "foobar"
+    @ex6 = "Zm9vYmFy"
+    @enc6 = base64_encode(@in6)
+    _check("encode foobar", @enc6, @ex6)
+    @dec6 = base64_decode(@ex6)
+    _check("decode Zm9vYmFy", @dec6, @in6)
+
+    return 0
