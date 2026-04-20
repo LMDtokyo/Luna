@@ -1,0 +1,23 @@
+# M3-ADT test 05: match nested inside a while loop.
+# `make(n)` returns None for 0 and Some(n) otherwise. The loop
+# 0..=5 prints "none" once then 1..5 in turn.
+
+enum Option
+    Some(int)
+    None
+
+fn make(@n: int) -> Option
+    if @n == 0
+        return None
+    return Some(@n)
+
+fn main() -> int
+    meow @i: int = 0
+    while @i <= 5
+        match make(@i)
+            Some(@v)
+                shine_int(@v)
+            None
+                shine("none")
+        @i = @i + 1
+    return 0

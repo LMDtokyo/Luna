@@ -63,10 +63,15 @@ struct Gen
     hot_pool_off:   int  # data offset of name pool (concatenated NUL names)
     hot_meta_off:   int  # data offset of hotswap metadata (3 u64 values)
     hotmeta_patches: int # Vec of (code_disp32_off, meta_byte_off) pairs
+    enum_names:      int # Vec<str>: declared enum type names
+    variant_enum:    int # Vec<str>: for each variant, parent enum name
+    variant_name:    int # Vec<str>: variant identifier
+    variant_tag:     int # Vec<int>: tag (0..N-1 within enum)
+    variant_payload: int # Vec<int>: 1 if variant carries a payload, else 0
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
-    let @g: Gen = new_str(272)
+    let @g: Gen = new_str(320)
     @g.code        = strbuf_new()
     @g.data        = strbuf_new()
     @g.kind        = @kind
@@ -99,6 +104,11 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.hot_pool_off     = 0
     @g.hot_meta_off     = 8
     @g.hotmeta_patches  = vec_new()
+    @g.enum_names       = vec_new()
+    @g.variant_enum     = vec_new()
+    @g.variant_name     = vec_new()
+    @g.variant_tag      = vec_new()
+    @g.variant_payload  = vec_new()
     # Reserve 40 bytes at the very start of the data section:
     #   [0..8)   heap_top (runtime bump pointer)
     #   [8..16)  hotswap slots vaddr       (patched by main2)
@@ -1468,6 +1478,52 @@ fn parse_primary(@g: Gen) -> int
             _e32(@g, @field_off)
             return 0
         return 0
+    # Variant constructor: VariantName  or  VariantName(expr)
+    # Emits a 16-byte enum value: [tag: u64][payload: u64].
+    if @k == TK_IDENT
+        @vname_chk = _tok_substr(@g, @g.pos)
+        @vi = _variant_index(@g, @vname_chk)
+        if @vi >= 0
+            _advance(@g)
+            @tag  = vec_get(@g.variant_tag,     @vi)
+            @hasp = vec_get(@g.variant_payload, @vi)
+            # Evaluate payload first (if any) and save it. Otherwise
+            # use 0 as payload.
+            if @hasp == 1
+                _expect(@g, TK_LPAREN, "expected '(' for variant payload")
+                parse_expr(@g)
+                _expect(@g, TK_RPAREN, "expected ')' after variant payload")
+                _em_push_rax(@g)
+            else
+                # Allow the optional-paren form `None()` too, but treat
+                # an absent-paren as zero-arg. We don't consume any ( ).
+                _em_mov_eax_imm(@g, 0)
+                _em_push_rax(@g)
+            # Allocate 2-slot heap block for {tag, payload}.
+            _em_mov_eax_imm(@g, 2)
+            _inline_new_arr(@g)               # rax = new ptr
+            # mov r8, rax                     ; r8 = enum ptr
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 192)
+            # Pop payload → [r8 + 8]
+            _em_pop_rax(@g)
+            # mov [r8 + 8], rax ; 49 89 40 08
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 64)
+            _eb(@g, 8)
+            # Write tag immediate into [r8 + 0]. Use an r8-relative
+            # store with imm32: 49 c7 00 <imm32>.
+            _eb(@g, 73)
+            _eb(@g, 199)
+            _eb(@g, 0)
+            _e32(@g, @tag)
+            # rax = r8
+            _eb(@g, 76)
+            _eb(@g, 137)
+            _eb(@g, 192)
+            return 0
     # Struct literal: Name { field1: v1, field2: v2, ... }
     if @k == TK_IDENT
         # Look ahead: is this `Name {`? Distinguish from fn call `name(`
@@ -2634,6 +2690,14 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
         parse_while(@g, @patches)
         return 0
 
+    if @k == TK_KW_MATCH
+        parse_match(@g, @patches)
+        return 0
+
+    if @k == TK_KW_PHASE
+        parse_match(@g, @patches)
+        return 0
+
     if @k == TK_KW_BREAK
         _advance(@g)
         @top = vec_len(@g.loop_breaks) - 1
@@ -2876,6 +2940,87 @@ fn parse_if(@g: Gen, @patches: Vec) -> int
         else
             break
     # Patch all end-jmps to here.
+    @np = vec_len(@end_patches)
+    @i = 0
+    while @i < @np
+        _patch_here(@g, vec_get(@end_patches, @i))
+        @i = @i + 1
+    return 0
+
+
+fn parse_match(@g: Gen, @patches: Vec) -> int
+    _advance(@g)                                # consume match / phase
+    # Evaluate scrutinee and stash it in a fresh local slot so every
+    # arm can re-read the pointer (we trample rax inside bodies).
+    parse_expr(@g)
+    @scrut_off = _local_slot(@g, "_match_scrut")
+    _em_store_rbp(@g, @scrut_off)
+    _expect(@g, TK_NEWLINE, "newline after match")
+    _expect(@g, TK_INDENT, "indented match arms")
+    # end_patches accumulates jmp offsets that each arm emits to skip
+    # past the rest of the chain once it executes.
+    @end_patches = vec_new()
+    while 1
+        _skip_newlines(@g)
+        @k = _peek_kind(@g)
+        if @k == TK_DEDENT
+            _advance(@g)
+            break
+        if @k == TK_EOF
+            break
+        if @k != TK_IDENT
+            _die(@g, "expected variant name in match arm")
+            return 0
+        @vname = _tok_substr(@g, @g.pos)
+        @vi = _variant_index(@g, @vname)
+        if @vi < 0
+            _die(@g, str_concat("unknown variant in match: ", @vname))
+            _advance(@g)
+            return 0
+        _advance(@g)
+        @tag  = vec_get(@g.variant_tag,     @vi)
+        @hasp = vec_get(@g.variant_payload, @vi)
+        # Optional `(@bind)` payload binding.
+        @bind_name = ""
+        if _peek_kind(@g) == TK_LPAREN
+            _advance(@g)
+            if _peek_kind(@g) == TK_ATIDENT
+                @bind_name = _tok_substr(@g, @g.pos)
+                _advance(@g)
+            _expect(@g, TK_RPAREN, "expected ')' in match pattern")
+        _expect(@g, TK_NEWLINE, "newline after match arm pattern")
+        _expect(@g, TK_INDENT, "indented match arm body")
+        # Compare tag: mov rax, [rbp+scrut] ; mov rax, [rax] ; cmp rax, tag ; jne next
+        _em_load_rbp(@g, @scrut_off)
+        _eb(@g, 72)                             # mov rax, [rax]  ; 48 8b 00
+        _eb(@g, 139)
+        _eb(@g, 0)
+        # cmp rax, imm32: 48 3d <imm32>
+        _eb(@g, 72)
+        _eb(@g, 61)
+        _e32(@g, @tag)
+        # jne next (jnz rel32 = 0f 85)
+        _eb(@g, 15)
+        _eb(@g, 133)
+        @jne_at = _code_len(@g)
+        _e32(@g, 0)
+        # If the arm binds a payload, load scrut.payload into the
+        # named local so the body can reference it.
+        if @hasp == 1
+            if str_eq(@bind_name, "") == 0
+                _em_load_rbp(@g, @scrut_off)
+                _eb(@g, 72)                     # mov rax, [rax + 8] ; 48 8b 40 08
+                _eb(@g, 139)
+                _eb(@g, 64)
+                _eb(@g, 8)
+                @bind_off = _local_slot(@g, @bind_name)
+                _em_store_rbp(@g, @bind_off)
+        parse_block(@g, @patches)
+        # After body, jmp past the rest of the chain.
+        vec_push(@end_patches, _em_jmp_placeholder(@g))
+        # Resolve the jne to here (next arm).
+        _patch_here(@g, @jne_at)
+    # Patch every end_patches jmp to current position.
     @np = vec_len(@end_patches)
     @i = 0
     while @i < @np
@@ -3291,6 +3436,61 @@ fn _const_lookup(@g: Gen, @name: int, @out: Vec) -> int
         @i = @i + 1
     return 0
 
+# Parse `enum Name <indent> V1 <newline> V2(int) <newline> ...` and
+# register variants so constructors and match arms can resolve names.
+fn parse_enum_decl(@g: Gen) -> int
+    _advance(@g)                              # consume 'enum'
+    if _peek_kind(@g) != TK_IDENT
+        _die(@g, "expected enum name")
+        return 1
+    @ename = _tok_substr(@g, @g.pos)
+    _advance(@g)
+    _expect(@g, TK_NEWLINE, "newline after enum name")
+    _expect(@g, TK_INDENT, "indented enum body")
+    vec_push(@g.enum_names, @ename)
+    @tag = 0
+    while 1
+        _skip_newlines(@g)
+        @k = _peek_kind(@g)
+        if @k == TK_DEDENT
+            _advance(@g)
+            break
+        if @k == TK_EOF
+            break
+        if @k != TK_IDENT
+            _die(@g, "expected variant name")
+            return 1
+        @vname = _tok_substr(@g, @g.pos)
+        _advance(@g)
+        @has_p = 0
+        if _peek_kind(@g) == TK_LPAREN
+            _advance(@g)
+            # Skip the payload type (one identifier); reject multi-arg for now.
+            if _peek_kind(@g) == TK_IDENT
+                _advance(@g)
+            _expect(@g, TK_RPAREN, "expected ')' after variant type")
+            @has_p = 1
+        vec_push(@g.variant_enum, @ename)
+        vec_push(@g.variant_name, @vname)
+        vec_push(@g.variant_tag, @tag)
+        vec_push(@g.variant_payload, @has_p)
+        @tag = @tag + 1
+    return 0
+
+
+# Look up a variant by NAME (scanning the flat variant table).
+# Returns index if found, -1 otherwise. Caller reads tag / payload /
+# enum from the parallel vecs.
+fn _variant_index(@g: Gen, @name: int) -> int
+    @n = vec_len(@g.variant_name)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.variant_name, @i), @name) == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
+
 # Parse a whole program = sequence of fn decls + struct decls + etc.
 fn parse_program(@g: Gen, @patches: Vec) -> int
     while 1
@@ -3302,6 +3502,8 @@ fn parse_program(@g: Gen, @patches: Vec) -> int
             parse_fn(@g, @patches)
         elif @k == TK_KW_STRUCT
             parse_struct_decl(@g)
+        elif @k == TK_KW_ENUM
+            parse_enum_decl(@g)
         elif @k == TK_KW_EXTERN
             parse_extern_decl(@g)
         elif @k == TK_KW_IMPORT
@@ -3309,7 +3511,7 @@ fn parse_program(@g: Gen, @patches: Vec) -> int
         elif @k == TK_KW_CONST
             parse_const_decl(@g)
         else
-            _die(@g, "expected fn/struct/extern/import/const at top level")
+            _die(@g, "expected fn/struct/enum/extern/import/const at top level")
             _advance(@g)
     return 0
 

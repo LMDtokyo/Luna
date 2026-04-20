@@ -75,6 +75,10 @@ const TK_KW_AS:       int = 69
 const TK_LBRACE:      int = 70
 const TK_RBRACE:      int = 71
 const TK_DOT:         int = 72
+const TK_KW_ENUM:     int = 90
+const TK_KW_MATCH:    int = 91
+const TK_KW_PHASE:    int = 92
+const TK_FATARROW:    int = 93
 
 # punctuation
 const TK_LPAREN:  int = 40
@@ -148,6 +152,12 @@ fn _kw_lookup(@src: int, @start: int, @len: int) -> int
         return TK_KW_SEAL
     if str_eq(@lit, "as") == 1
         return TK_KW_AS
+    if str_eq(@lit, "enum") == 1
+        return TK_KW_ENUM
+    if str_eq(@lit, "match") == 1
+        return TK_KW_MATCH
+    if str_eq(@lit, "phase") == 1
+        return TK_KW_PHASE
     return TK_IDENT
 
 
@@ -480,6 +490,11 @@ fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
             if @c == 45
                 if @c2 == 62
                     _emit(@kind, @start, @len, @iv, TK_ARROW, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 61
+                if @c2 == 62
+                    _emit(@kind, @start, @len, @iv, TK_FATARROW, @pos, 2, 0)
                     @pos = @pos + 2
                     continue
             if @c == 61

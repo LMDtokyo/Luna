@@ -95,6 +95,7 @@ run_one() {
 run_one "$SRC_DIR/tests_m2b"
 run_one "$SRC_DIR/tests_m2c"
 run_one "$SRC_DIR/tests_types"
+run_one "$SRC_DIR/tests_adt"
 
 echo
 echo "=== bootminor M3: fixed-point PASS, suite $pass PASS, $fail FAIL ==="

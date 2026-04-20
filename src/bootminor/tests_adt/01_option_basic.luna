@@ -1,0 +1,27 @@
+# M3-ADT test 01: basic Option enum construction and match.
+# Exercises: bare variant (None), payload variant (Some(int)),
+# match binding of the payload via Some(@v).
+
+enum Option
+    Some(int)
+    None
+
+fn main() -> int
+    seal @maybe:   Option = Some(42)
+    seal @nothing: Option = None
+
+    match @maybe
+        Some(@v)
+            shine("value is:")
+            shine_int(@v)
+        None
+            shine("unreachable")
+
+    match @nothing
+        Some(@v)
+            shine("unreachable")
+            shine_int(@v)
+        None
+            shine("nothing")
+
+    return 0

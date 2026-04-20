@@ -1,0 +1,39 @@
+# M3-ADT test 02: Result-returning helper + match per call-site.
+# Exercises: enum value flowing out of a fn, three sequential
+# matches, both Ok payload and Err bare-ish path (Err(0) sentinel).
+
+enum Result
+    Ok(int)
+    Err(int)
+
+fn divide(@a: int, @b: int) -> Result
+    if @b == 0
+        return Err(0)
+    return Ok(@a / @b)
+
+fn main() -> int
+    seal @r1: Result = divide(10, 2)
+    match @r1
+        Ok(@v)
+            shine("ok")
+            shine_int(@v)
+        Err(@e)
+            shine("err divide-by-zero")
+
+    seal @r2: Result = divide(7, 0)
+    match @r2
+        Ok(@v)
+            shine("ok")
+            shine_int(@v)
+        Err(@e)
+            shine("err divide-by-zero")
+
+    seal @r3: Result = divide(100, 5)
+    match @r3
+        Ok(@v)
+            shine("ok")
+            shine_int(@v)
+        Err(@e)
+            shine("err divide-by-zero")
+
+    return 0

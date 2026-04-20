@@ -1,0 +1,39 @@
+# M3-ADT test 06: enum as a struct field.
+# Shows that enum values (heap ptrs to [tag, payload]) compose
+# with existing struct slots without any new machinery on the
+# struct side — a `status: Result` field is just another qword.
+
+enum Result
+    Ok(int)
+    Err(int)
+
+struct Record
+    value:  int
+    status: Result
+
+
+fn make_rec(@v: int, @s: Result) -> Record
+    let @r: Record = new_str(16)
+    @r.value  = @v
+    @r.status = @s
+    return @r
+
+fn main() -> int
+    seal @r0: Record = make_rec(10, Ok(1))
+    seal @r1: Record = make_rec(20, Err(7))
+    seal @r2: Record = make_rec(30, Ok(3))
+
+    seal @recs: int = [@r0, @r1, @r2]
+    meow @i: int = 0
+    while @i < 3
+        let @rec: Record = @recs[@i]
+        shine_int(@rec.value)
+        match @rec.status
+            Ok(@v)
+                shine("ok")
+                shine_int(@v)
+            Err(@e)
+                shine("err")
+                shine_int(@e)
+        @i = @i + 1
+    return 0

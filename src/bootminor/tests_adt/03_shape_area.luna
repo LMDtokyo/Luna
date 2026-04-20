@@ -1,0 +1,28 @@
+# M3-ADT test 03: three-variant enum with match inside a helper fn.
+# Exercises: mixing payload and bare variants (Empty), match
+# living inside fn body, caller passing enum values as args.
+
+enum Shape
+    Circle(int)
+    Square(int)
+    Empty
+
+fn describe(@s: Shape) -> int
+    match @s
+        Circle(@r)
+            shine_int(@r * @r)
+        Square(@side)
+            shine_int(@side * @side)
+        Empty
+            shine_int(0)
+    return 0
+
+fn main() -> int
+    seal @c: Shape = Circle(10)
+    seal @q: Shape = Square(5)
+    seal @e: Shape = Empty
+
+    describe(@c)
+    describe(@q)
+    describe(@e)
+    return 0

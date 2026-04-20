@@ -1,0 +1,22 @@
+# M3-ADT test 04: array of enum pointers walked with match.
+# Each enum value is a heap pointer (2-slot [tag, payload]), so an
+# [Some(1), None, Some(3), None] literal is just an array of ptrs.
+# We sum Some payloads (1 + 3 = 4) and skip None.
+
+enum Option
+    Some(int)
+    None
+
+fn main() -> int
+    seal @opts: int = [Some(1), None, Some(3), None]
+    meow @total: int = 0
+    meow @i: int = 0
+    while @i < 4
+        match @opts[@i]
+            Some(@v)
+                @total = @total + @v
+            None
+                @total = @total + 0
+        @i = @i + 1
+    shine_int(@total)
+    return 0
