@@ -60,6 +60,9 @@ const TK_RPAREN:  int = 41
 const TK_COMMA:   int = 42
 const TK_COLON:   int = 43
 const TK_ARROW:   int = 44
+const TK_LBRACK:  int = 45
+const TK_RBRACK:  int = 46
+const TK_SEMI:    int = 47
 
 
 # --- Character classifiers -------------------------------------------
@@ -400,6 +403,18 @@ fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
             continue
         if @c == 58
             _emit(@kind, @start, @len, @iv, TK_COLON, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 91
+            _emit(@kind, @start, @len, @iv, TK_LBRACK, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 93
+            _emit(@kind, @start, @len, @iv, TK_RBRACK, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 59
+            _emit(@kind, @start, @len, @iv, TK_SEMI, @pos, 1, 0)
             @pos = @pos + 1
             continue
 

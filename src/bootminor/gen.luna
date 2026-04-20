@@ -565,6 +565,68 @@ fn _data_add_luna_str(@g: Gen, @src: int) -> int
     return @data_off
 
 
+# --- Inline new_arr(n): allocate array of n 8-byte slots. ------------
+#
+# Input:  rax = element count (N)
+# Output: rax = pointer to first slot; length prefix at ptr-8 = N
+# Layout: [8-byte N][N * 8 bytes of slots] — aligned alloc.
+
+fn _inline_new_arr(@g: Gen) -> int
+    # mov rcx, rax                ; save N
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 193)
+    # imul rax, rax, 8            ; rax = N*8  (use shift to avoid imul form)
+    # shl rax, 3
+    _eb(@g, 72)
+    _eb(@g, 193)
+    _eb(@g, 224)
+    _eb(@g, 3)
+    # add rax, 16
+    _eb(@g, 72)
+    _eb(@g, 131)
+    _eb(@g, 192)
+    _eb(@g, 16)
+    # and rax, -8
+    _eb(@g, 72)
+    _eb(@g, 131)
+    _eb(@g, 224)
+    _eb(@g, 248)
+    # mov r11, rax
+    _eb(@g, 73)
+    _eb(@g, 137)
+    _eb(@g, 195)
+    # lea rax, [rip + heap_top]
+    _eb(@g, 72)
+    _eb(@g, 141)
+    _eb(@g, 5)
+    @lea_at = _code_len(@g)
+    _e32(@g, 0)
+    vec_push(@g.heap_patches, @lea_at)
+    # mov rsi, [rax]
+    _eb(@g, 72)
+    _eb(@g, 139)
+    _eb(@g, 48)
+    # add r11, rsi
+    _eb(@g, 73)
+    _eb(@g, 1)
+    _eb(@g, 243)
+    # mov [rax], r11
+    _eb(@g, 76)
+    _eb(@g, 137)
+    _eb(@g, 24)
+    # mov [rsi], rcx              ; store N as length prefix
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 14)
+    # lea rax, [rsi + 8]
+    _eb(@g, 72)
+    _eb(@g, 141)
+    _eb(@g, 70)
+    _eb(@g, 8)
+    return 0
+
+
 # --- _print_int runtime (122 bytes, verified via nasm+ld+run) --------
 
 fn _emit_print_int(@g: Gen) -> int
@@ -788,6 +850,125 @@ fn parse_primary(@g: Gen) -> int
         _advance(@g)
         @off = _local_slot(@g, @name)
         _em_load_rbp(@g, @off)
+        # If followed by `[`, it's indexed read: @arr[i]
+        if _peek_kind(@g) == TK_LBRACK
+            _advance(@g)
+            _em_push_rax(@g)                # save arr base
+            parse_expr(@g)                   # rax = i
+            _expect(@g, TK_RBRACK, "expected ']'")
+            # mov rcx, rax ; pop rax (arr) ; mov rax, [rax + rcx*8]
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            # mov rax, [rax + rcx*8]  ; 48 8b 04 c8
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 4)
+            _eb(@g, 200)
+        return 0
+    if @k == TK_LBRACK
+        _advance(@g)
+        # Two forms:
+        #   [v; N]       repeat form
+        #   [a, b, c]    list form (possibly empty)
+        if _peek_kind(@g) == TK_RBRACK
+            _advance(@g)
+            # empty array: new_arr(0) — inline
+            _em_mov_eax_imm(@g, 0)
+            _inline_new_arr(@g)
+            return 0
+        # Parse first element
+        parse_expr(@g)
+        if _peek_kind(@g) == TK_SEMI
+            _advance(@g)
+            _em_push_rax(@g)                 # save value
+            parse_expr(@g)                   # rax = count
+            _expect(@g, TK_RBRACK, "expected ']'")
+            # Allocate array, then fill with value in a loop.
+            # Keep count on stack for loop; rax = count will be used for alloc.
+            _em_push_rax(@g)                 # push count
+            _inline_new_arr(@g)              # rax = arr_ptr
+            _em_push_rax(@g)                 # push arr
+            # Now stack: [arr, count, value] top-to-bottom
+            # Fill loop: for i = 0 to count-1: arr[i] = value
+            # Pseudo: counter in r11, value in r10
+            # Load: pop arr; pop count; pop value → but we need them in order
+            # Actually reorganize. Stack top = arr, next = count, next = value.
+            _em_pop_rax(@g)                  # rax = arr
+            _eb(@g, 73)                      # mov r8, rax (arr base)
+            _eb(@g, 137)
+            _eb(@g, 192)
+            _em_pop_rax(@g)                  # rax = count
+            _eb(@g, 73)                      # mov r9, rax (count)
+            _eb(@g, 137)
+            _eb(@g, 193)
+            _em_pop_rax(@g)                  # rax = value
+            _eb(@g, 73)                      # mov r10, rax (value)
+            _eb(@g, 137)
+            _eb(@g, 194)
+            # rcx = 0 (loop counter)
+            _eb(@g, 185)                     # mov ecx, 0
+            _e32(@g, 0)
+            # loop_top:
+            @loop_top = _code_len(@g)
+            # cmp rcx, r9 ; 4c 39 c9
+            _eb(@g, 76)
+            _eb(@g, 57)
+            _eb(@g, 201)
+            # jge end (jnl) ; 7d rel8 — use jz_placeholder pattern
+            # Use jge rel32 = 0f 8d <rel32>
+            _eb(@g, 15)
+            _eb(@g, 141)
+            @jge_at = _code_len(@g)
+            _e32(@g, 0)
+            # mov [r8 + rcx*8], r10 ; 4d 89 14 c8
+            _eb(@g, 77)
+            _eb(@g, 137)
+            _eb(@g, 20)
+            _eb(@g, 200)
+            # inc rcx ; 48 ff c1
+            _eb(@g, 72)
+            _eb(@g, 255)
+            _eb(@g, 193)
+            # jmp loop_top
+            _em_jmp_to(@g, @loop_top)
+            _patch_here(@g, @jge_at)
+            # rax = r8 (array base)
+            _eb(@g, 76)
+            _eb(@g, 137)
+            _eb(@g, 192)                     # mov rax, r8
+            return 0
+        # List form: push first, then parse the rest
+        _em_push_rax(@g)
+        @n = 1
+        while _peek_kind(@g) == TK_COMMA
+            _advance(@g)
+            if _peek_kind(@g) == TK_RBRACK
+                break
+            parse_expr(@g)
+            _em_push_rax(@g)
+            @n = @n + 1
+        _expect(@g, TK_RBRACK, "expected ']'")
+        # Allocate array: rax = N, then inline new_arr
+        _em_mov_eax_imm(@g, @n)
+        _inline_new_arr(@g)                   # rax = arr ptr
+        # Store pushed values into arr[n-1], arr[n-2], ..., arr[0]
+        # Stack top has the last-pushed = elem_{n-1}. Pop order matches i=n-1 down.
+        _eb(@g, 73)                           # mov r8, rax (arr base)
+        _eb(@g, 137)
+        _eb(@g, 192)
+        @i = @n - 1
+        while @i >= 0
+            _em_pop_rax(@g)                   # rax = elem_i (from top of stack)
+            # mov [r8 + i*8], rax ; 49 89 80 <disp32>
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 128)
+            _e32(@g, @i * 8)
+            @i = @i - 1
+        # rax = r8 (array base)
+        _eb(@g, 76)
+        _eb(@g, 137)
+        _eb(@g, 192)
         return 0
     if @k == TK_LPAREN
         _advance(@g)
@@ -1028,6 +1209,34 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
     if @k == TK_ATIDENT
         @name = _tok_substr(@g, @g.pos)
         _advance(@g)
+        # Indexed write: @arr[i] = v
+        if _peek_kind(@g) == TK_LBRACK
+            _advance(@g)
+            # Load @arr base into rax, push.
+            @off = _local_slot(@g, @name)
+            _em_load_rbp(@g, @off)
+            _em_push_rax(@g)
+            # Eval index expression into rax, push.
+            parse_expr(@g)
+            _expect(@g, TK_RBRACK, "expected ']'")
+            _em_push_rax(@g)
+            _expect(@g, TK_ASSIGN, "expected '='")
+            # Eval value into rax.
+            parse_expr(@g)
+            # mov r8, rax  (value)
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 192)
+            # pop rcx (index)
+            _eb(@g, 89)
+            # pop rdx (arr base)
+            _eb(@g, 90)
+            # mov [rdx + rcx*8], r8  ; 4c 89 04 ca
+            _eb(@g, 76)
+            _eb(@g, 137)
+            _eb(@g, 4)
+            _eb(@g, 202)
+            return 0
         _expect(@g, TK_ASSIGN, "expected '='")
         parse_expr(@g)
         @off = _local_slot(@g, @name)
