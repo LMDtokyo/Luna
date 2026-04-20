@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# luna-hot — bash entry point for the Luna hot-swap CLI.
+# Delegates all real work to luna-hot.py. Keep this shim dependency-free
+# so the only install requirement is python3.
+set -u
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$script_dir/luna-hot.py" "$@"

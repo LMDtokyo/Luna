@@ -1,0 +1,77 @@
+# Description: Parse the ELF64 header of /proc/self/exe and print the
+# interesting fields. Exercises sys_open/sys_read + u8_at/u16_at/u32_at/
+# u64_get for raw byte-level structure decoding.
+
+fn print_hex_nibble(@n: int) -> int
+    if @n < 10
+        @s = new_str(1)
+        str_set_byte(@s, 0, 48 + @n)
+        print(@s)
+        return 0
+    @s2 = new_str(1)
+    str_set_byte(@s2, 0, 87 + @n)
+    print(@s2)
+    return 0
+
+fn print_hex_byte(@b: int) -> int
+    print_hex_nibble((@b >> 4) & 15)
+    print_hex_nibble(@b & 15)
+    return 0
+
+fn print_hex64(@v: int) -> int
+    print("0x")
+    @i = 7
+    while @i >= 0
+        print_hex_byte((@v >> (@i * 8)) & 255)
+        @i = @i - 1
+    return 0
+
+fn main() -> int
+    @fd = sys_open("/proc/self/exe", 0, 0)
+    if @fd < 0
+        shine("error: open /proc/self/exe failed")
+        return 1
+    @buf = new_str(64)
+    @n = sys_read(@fd, @buf, 64)
+    sys_close(@fd)
+    if @n < 64
+        shine("error: short read of ELF header")
+        return 1
+
+    # e_ident[0..3]: magic bytes 7F 45 4C 46
+    print("magic: ")
+    print_hex_byte(u8_at(@buf, 0))
+    print(" ")
+    print_hex_byte(u8_at(@buf, 1))
+    print(" ")
+    print_hex_byte(u8_at(@buf, 2))
+    print(" ")
+    print_hex_byte(u8_at(@buf, 3))
+    shine("")
+
+    # e_ident[4] = EI_CLASS   (2 = ELFCLASS64)
+    print("class: ")
+    shine_int(u8_at(@buf, 4))
+    # e_ident[5] = EI_DATA    (1 = little-endian)
+    print("data:  ")
+    shine_int(u8_at(@buf, 5))
+    # e_type @ offset 16 (u16)
+    print("type:  ")
+    shine_int(u16_at(@buf, 16))
+    # e_machine @ offset 18 (u16, 62 = x86-64)
+    print("machine: ")
+    shine_int(u16_at(@buf, 18))
+    # e_version @ offset 20 (u32)
+    print("version: ")
+    shine_int(u32_at(@buf, 20))
+    # e_entry @ offset 24 (u64)
+    print("entry:   ")
+    print_hex64(u64_get(@buf, 3))
+    shine("")
+    # e_phnum @ offset 56 (u16)
+    print("phnum:   ")
+    shine_int(u16_at(@buf, 56))
+    # e_shnum @ offset 60 (u16)
+    print("shnum:   ")
+    shine_int(u16_at(@buf, 60))
+    return 0

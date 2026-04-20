@@ -1,0 +1,62 @@
+# Description: Build a singly-linked list of the integers 1..10, then
+# walk it summing values. Demonstrates that bootminor's struct + raw-
+# pointer-as-int model is enough to build real heap data structures:
+# nodes are allocated via new_str(16), the `next` field stores the raw
+# heap pointer of the successor (or 0 for the tail), and we walk by
+# repeatedly loading u64_get(node, 1).
+
+struct Node
+    value: int
+    next:  int
+
+fn node_new(@value: int, @next: int) -> int
+    let @n: Node = Node { value: @value, next: @next }
+    return @n
+
+fn list_sum(@head: int) -> int
+    @sum = 0
+    @cur = @head
+    while @cur != 0
+        # Reading through the raw pointer: field #0 is value, #1 is next.
+        @sum = @sum + u64_get(@cur, 0)
+        @cur = u64_get(@cur, 1)
+    return @sum
+
+fn list_print(@head: int) -> int
+    @cur = @head
+    while @cur != 0
+        print_int(u64_get(@cur, 0))
+        @cur = u64_get(@cur, 1)
+        if @cur != 0
+            print(" -> ")
+    shine("")
+    return 0
+
+fn main() -> int
+    # Build list of 10,9,8,...,1 by prepending, so walking gives 1..10.
+    @head = 0
+    @i = 10
+    while @i >= 1
+        @head = node_new(@i, @head)
+        @i = @i - 1
+
+    shine("linked list 1..10:")
+    print("  ")
+    list_print(@head)
+
+    print("  sum = ")
+    shine_int(list_sum(@head))
+    shine("  expected = 55")
+
+    # Also demonstrate low-level raw construction: allocate two nodes
+    # with new_str(16) and wire them up by hand via u64_set. This is
+    # the pattern you'd use if you wanted a GC-free linked structure.
+    @raw_a = new_str(16)
+    @raw_b = new_str(16)
+    u64_set(@raw_a, 0, 100)
+    u64_set(@raw_a, 1, @raw_b)
+    u64_set(@raw_b, 0, 200)
+    u64_set(@raw_b, 1, 0)
+    print("  raw list sum (100,200) = ")
+    shine_int(list_sum(@raw_a))
+    return 0

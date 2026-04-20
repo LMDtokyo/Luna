@@ -180,6 +180,59 @@ fn main() -> int
         str_set_byte(@code_bytes, @pat_off + 3, (@rel >> 24) & 255)
         @h = @h + 1
 
+    # Resolve hot-swap metadata loads. Each patch reads a u64 from
+    # data[meta_off .. meta_off+8) via `mov rax, [rip+disp32]`.
+    @nhm = vec_len(@g.hotmeta_patches)
+    @hm = 0
+    while @hm < @nhm
+        @mp_code = vec_get(@g.hotmeta_patches, @hm)
+        @mp_data = vec_get(@g.hotmeta_patches, @hm + 1)
+        @disp_m = (@data_off - @code_off) + @mp_data - (@mp_code + 4)
+        str_set_byte(@code_bytes, @mp_code + 0,  @disp_m        & 255)
+        str_set_byte(@code_bytes, @mp_code + 1, (@disp_m >> 8)  & 255)
+        str_set_byte(@code_bytes, @mp_code + 2, (@disp_m >> 16) & 255)
+        str_set_byte(@code_bytes, @mp_code + 3, (@disp_m >> 24) & 255)
+        @hm = @hm + 2
+
+    # Hot-swap dispatch table: fill the initial code_ptr for each fn
+    # slot and the fn_names ptr array. Also populate the metadata
+    # header at data[8..40) with absolute vaddrs the runtime reads.
+    @data_vaddr = _elf_vaddr() + @data_off
+    @nfn = vec_len(@g.fn_names)
+    @slots_vaddr = @data_vaddr + @g.hot_slots_off
+    @names_vaddr = @data_vaddr + @g.hot_names_off
+    @pool_vaddr  = @data_vaddr + @g.hot_pool_off
+    # Write metadata u64s at data[8, 16, 24, 32].
+    @mk = 0
+    while @mk < 8
+        str_set_byte(@data_bytes, 8  + @mk, (@slots_vaddr >> (@mk * 8)) & 255)
+        str_set_byte(@data_bytes, 16 + @mk, (@nfn         >> (@mk * 8)) & 255)
+        str_set_byte(@data_bytes, 24 + @mk, (@names_vaddr >> (@mk * 8)) & 255)
+        str_set_byte(@data_bytes, 32 + @mk, (@pool_vaddr  >> (@mk * 8)) & 255)
+        @mk = @mk + 1
+    # Fill each slot with its function's initial code vaddr, and each
+    # fn_names slot with a pointer to the function's name in the pool.
+    @name_cursor = @g.hot_pool_off
+    @fi = 0
+    while @fi < @nfn
+        @fn_code_vaddr = _elf_vaddr() + @code_off + vec_get(@g.fn_offsets, @fi)
+        @slot_off = @g.hot_slots_off + @fi * 8
+        @mn = 0
+        while @mn < 8
+            @sb = (@fn_code_vaddr >> (@mn * 8)) & 255
+            str_set_byte(@data_bytes, @slot_off + @mn, @sb)
+            @mn = @mn + 1
+        @name_vaddr = @data_vaddr + @name_cursor
+        @names_slot_off = @g.hot_names_off + @fi * 8
+        @mp = 0
+        while @mp < 8
+            @nb = (@name_vaddr >> (@mp * 8)) & 255
+            str_set_byte(@data_bytes, @names_slot_off + @mp, @nb)
+            @mp = @mp + 1
+        @nm = vec_get(@g.fn_names, @fi)
+        @name_cursor = @name_cursor + str_len(@nm) + 1
+        @fi = @fi + 1
+
     @mem_sz = @file_sz + @heap_size
 
     @buf = new_str(@file_sz)

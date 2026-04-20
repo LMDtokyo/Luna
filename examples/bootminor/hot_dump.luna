@@ -1,0 +1,29 @@
+fn _print_cstr(@p: int) -> int
+    @i = 0
+    while @i < 64
+        @b = u8_at(@p, @i)
+        if @b == 0
+            break
+        @i = @i + 1
+    @s = new_str(@i)
+    @k = 0
+    while @k < @i
+        str_set_byte(@s, @k, u8_at(@p, @k))
+        @k = @k + 1
+    shine(@s)
+    return 0
+
+fn main() -> int
+    @count  = hot_count()
+    @names  = hot_names_ptr()
+    @slots  = hot_slots_ptr()
+    shine(str_concat("count = ", int_to_str(@count)))
+    shine(str_concat("names ptr = ", int_to_str(@names)))
+    shine(str_concat("slots ptr = ", int_to_str(@slots)))
+    @i = 0
+    while @i < @count
+        @nm = u64_get(@names, @i)
+        print(str_concat("fn[", str_concat(int_to_str(@i), "] = ")))
+        _print_cstr(@nm)
+        @i = @i + 1
+    return 0

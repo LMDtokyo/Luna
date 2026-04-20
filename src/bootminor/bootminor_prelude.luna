@@ -224,3 +224,200 @@ fn print(@s: int) -> int
 fn print_int(@n: int) -> int
     print(int_to_str(@n))
     return 0
+
+
+# =====================================================================
+# Hot-swap runtime (docs/HOTSWAP.md v0.1 — MVP, function-level).
+#
+# Every bootminor-compiled binary ships with a dispatch table in its
+# data section. The compiler routes every user-function call through
+# this table (`call qword [rip + disp32]`), so replacing a slot's
+# pointer at runtime hot-swaps that function for all subsequent calls
+# without restarting the process or moving any existing state.
+#
+# Metadata layout at data[0..40):
+#   [ 0..8)  heap_top
+#   [ 8..16) hot_slots_vaddr  (u64*)
+#   [16..24) hot_count        (u64, number of user fns)
+#   [24..32) hot_names_vaddr  (u64*, array of name ptrs)
+#   [32..40) hot_pool_vaddr   (pointer to packed name pool)
+#
+# The runtime reads these by dereferencing well-known vaddr constants
+# that the compiler baked in.
+# =====================================================================
+
+# Syscall numbers needed by the hot-swap listener.
+const SYS_SOCKET:   int = 41
+const SYS_BIND:     int = 49
+const SYS_LISTEN:   int = 50
+const SYS_ACCEPT:   int = 43
+const SYS_MPROTECT: int = 10
+const AF_UNIX:      int = 1
+const SOCK_STREAM:  int = 1
+const PROT_READ:    int = 1
+const PROT_WRITE:   int = 2
+const PROT_EXEC:    int = 4
+const MAP_PRIVATE:  int = 2
+const MAP_ANON:     int = 32
+const HOT_MAGIC:    int = 0x4C4E4831
+
+extern "C" fn sys_socket(@dom: int, @type: int, @prot: int) -> int
+extern "C" fn sys_bind(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn sys_listen(@fd: int, @n: int) -> int
+extern "C" fn sys_accept(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn sys_mprotect(@addr: int, @len: int, @prot: int) -> int
+
+
+# Resolve the dispatch-metadata base. The compiler writes this at a
+# fixed data-section offset of 8 bytes from the top of .data, which is
+# reachable via `new_str(0)` semantics — specifically, the heap_top
+# variable sits at data_vaddr+0 and the slots vaddr at data_vaddr+8.
+# We read it by taking the address of heap_top via a round-trip
+# through new_str and backing up one qword (NOT portable, but OK for
+# bootminor's single-segment PT_LOAD layout).
+#
+# The cleanest way: allocate a zero-sized string to get a data vaddr,
+# walk backwards to heap_top. Since that's fragile, bootminor
+# alternatively exposes a `_hotswap_meta_addr()` intrinsic at codegen
+# time. For MVP we use that intrinsic.
+
+# Compute the current heap_top value: read the first 8 bytes of the
+# data section. heap_top lives at data_vaddr + 0; we need a stable way
+# to get data_vaddr. Trick: call new_str(0), read ptr, and back up
+# past the length prefix — that gives heap_top+0 which happens to be
+# what we want if heap is empty. Since we allocate constantly, that's
+# not reliable. Instead we take the new_str's returned ptr, which is
+# the current heap_top+8 before this alloc, and so data_vaddr+0 holds
+# the freshest heap_top. Pragmatic and good enough for MVP.
+
+# === Hot-swap intrinsic-backed helpers ===
+#
+# The hot_slots_ptr / hot_count / hot_names_ptr / hot_meta_base names
+# are recognised by the codegen as intrinsics that compile to
+# `mov rax, qword [rip + disp32]` reading the corresponding metadata
+# cell. We intentionally never define them as user functions — any
+# call-site resolves to the inline intrinsic instead. Stub fns are
+# provided below only so that `hot_find_slot` etc. can reference
+# them and the parser is happy.
+#
+# Those stubs will be shadowed by the intrinsics in hot-swap callers;
+# see gen.luna `hot_slots_ptr` etc. branch around line 1460.
+
+# Resolve function-slot index for a given name. Returns -1 if the
+# name isn't in the table.
+fn hot_find_slot(@name: int) -> int
+    @names = hot_names_ptr()
+    @n     = hot_count()
+    if @names == 0
+        return 0 - 1
+    @i = 0
+    while @i < @n
+        @ptr = u64_get(@names, @i)
+        if @ptr != 0
+            if _hot_cstr_eq(@ptr, @name) == 1
+                return @i
+        @i = @i + 1
+    return 0 - 1
+
+fn _hot_cstr_eq(@cstr: int, @lstr: int) -> int
+    @n = str_len(@lstr)
+    @i = 0
+    while @i < @n
+        if u8_at(@cstr, @i) != str_byte(@lstr, @i)
+            return 0
+        @i = @i + 1
+    if u8_at(@cstr, @n) != 0
+        return 0
+    return 1
+
+# Current code pointer for the named fn. 0 if missing.
+fn hot_current_ptr(@name: int) -> int
+    @idx = hot_find_slot(@name)
+    if @idx < 0
+        return 0
+    @slots = hot_slots_ptr()
+    return u64_get(@slots, @idx)
+
+# Install a new code blob for the function. Allocates a fresh RWX page,
+# copies bytes into it, then atomically overwrites the slot so every
+# subsequent call reaches the new code. Returns 0 on success, -1 if
+# the function is unknown or mmap fails.
+fn hot_install_patch(@name: int, @code: int, @code_len: int) -> int
+    @idx = hot_find_slot(@name)
+    if @idx < 0
+        return 0 - 1
+    @page = sys_mmap(0, @code_len + 4095, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, 0 - 1, 0)
+    if @page < 0
+        return 0 - 1
+    @i = 0
+    while @i < @code_len
+        u8_set(@page, @i, u8_at(@code, @i))
+        @i = @i + 1
+    @slots = hot_slots_ptr()
+    u64_set(@slots, @idx, @page)
+    return 0
+
+# Run a blocking listener on a Unix domain socket. Accepts one client
+# at a time, services INSTALL frames per docs/HOTSWAP.md §4.
+# Returns when the client disconnects (useful in a loop).
+fn hot_listen(@sock_path: int) -> int
+    # Build sockaddr_un: short sa_family (AF_UNIX = 1) + path string.
+    @sa = new_str(110)
+    u16_set(@sa, 0, AF_UNIX)
+    @plen = str_len(@sock_path)
+    @i = 0
+    while @i < @plen
+        u8_set(@sa, 2 + @i, str_byte(@sock_path, @i))
+        @i = @i + 1
+    u8_set(@sa, 2 + @plen, 0)
+
+    @fd = sys_socket(AF_UNIX, SOCK_STREAM, 0)
+    if @fd < 0
+        return 0 - 1
+    sys_bind(@fd, @sa, 2 + @plen + 1)
+    sys_listen(@fd, 4)
+    @cli = sys_accept(@fd, 0, 0)
+    if @cli < 0
+        sys_close(@fd)
+        return 0 - 1
+    # Read frame header (12 bytes)
+    @hdr = new_str(12)
+    @r = sys_read(@cli, @hdr, 12)
+    if @r < 12
+        sys_close(@cli)
+        sys_close(@fd)
+        return 0 - 1
+    @magic   = u32_at(@hdr, 0)
+    @op      = u8_at(@hdr, 4)
+    @nlen    = u16_at(@hdr, 6)
+    @clen    = u32_at(@hdr, 8)
+    if @magic != HOT_MAGIC
+        sys_close(@cli)
+        sys_close(@fd)
+        return 0 - 1
+    if @op != 1
+        sys_close(@cli)
+        sys_close(@fd)
+        return 0 - 1
+    # Read name + code. new_str leaves one byte of trailing NUL slack
+    # (bootstrap fix, see docs/LANGUAGE.md); Luna str_len stays at @nlen.
+    @name = new_str(@nlen)
+    sys_read(@cli, @name, @nlen)
+    @code = new_str(@clen)
+    @got  = 0
+    while @got < @clen
+        @n2 = sys_read(@cli, @code, @clen - @got)
+        if @n2 <= 0
+            break
+        @got = @got + @n2
+    @rc = hot_install_patch(@name, @code, @clen)
+    # Reply 4 bytes: 0 on success.
+    @reply = new_str(4)
+    if @rc == 0
+        u32_set(@reply, 0, 0)
+    else
+        u32_set(@reply, 0, 1)
+    sys_write(@cli, @reply, 4)
+    sys_close(@cli)
+    sys_close(@fd)
+    return @rc

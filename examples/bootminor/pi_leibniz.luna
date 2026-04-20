@@ -1,0 +1,34 @@
+# Description: Compute π via the Leibniz series
+#     π/4 = 1 − 1/3 + 1/5 − 1/7 + 1/9 − ...
+# Sums 1,000,000 terms in IEEE-754 double precision using the f64_*
+# intrinsics (SSE scalar ops). Prints the truncated micro-π value so
+# the output is deterministic.  Expected: 3141591 (truncated).
+
+fn main() -> int
+    seal @iters: int = 1000000
+
+    @zero  = f64_from_int(0)
+    @one   = f64_from_int(1)
+    @two   = f64_from_int(2)
+    @four  = f64_from_int(4)
+    @million = f64_from_int(1000000)
+
+    @sum  = @zero
+    @sign = @one
+    @denom = @one
+
+    @k = 0
+    while @k < @iters
+        @term = f64_div(@sign, @denom)
+        @sum  = f64_add(@sum, @term)
+        @sign = f64_sub(@zero, @sign)   # flip sign: 1 → -1 → 1 ...
+        @denom = f64_add(@denom, @two)
+        @k = @k + 1
+
+    @pi = f64_mul(@sum, @four)
+
+    shine("Leibniz pi after 1,000,000 terms:")
+    print("  pi * 1_000_000 (truncated) = ")
+    shine_int(f64_to_int(f64_mul(@pi, @million)))
+    shine("  expected (approx)          = 3141591")
+    return 0

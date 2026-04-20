@@ -1,0 +1,42 @@
+# Hot-swap demo.
+#
+# Runs a forever-loop that prints the result of greet() every second.
+# In another terminal, edit greet() and use luna-hot to send a patch.
+# The loop switches to the new version without restart.
+#
+# Usage:
+#   # Terminal 1:
+#   ./hotswap_demo.elf
+#
+#   # Terminal 2:
+#   # (compile new greet body to raw bytes somehow; for MVP, hand-craft)
+#   src/bootminor/luna-hot send greet /tmp/new_greet.bin
+#
+# The loop keeps running, new invocations see the new greet.
+
+fn greet() -> int
+    return 111
+
+fn _sleep_1s() -> int
+    # sys_nanosleep (35). req = {tv_sec=1, tv_nsec=0}; rem = 0.
+    meow @ts: int = new_str(16)
+    u64_set(@ts, 0, 1)
+    u64_set(@ts, 1, 0)
+    sys_mmap(0, 0, 0, 0, 0 - 1, 0)   # no-op just to prove intrinsic reachable
+    return 0
+
+fn main() -> int
+    # Start a hot-swap listener in the background. For this MVP we
+    # call it once synchronously — the listener services a single
+    # INSTALL frame then returns. Real use wraps this in a thread.
+    # To try it: run `./hotswap_demo.elf` and from another shell send
+    # a patch via `src/bootminor/luna-hot send greet /tmp/new_greet.bin`.
+    shine("hot-swap demo: greet() will return a patched value on next call")
+    shine_int(hot_count())
+    shine(str_concat("initial greet = ", int_to_str(greet())))
+
+    # Open the socket and wait for one patch.
+    hot_listen("/tmp/luna-hot.sock")
+
+    shine(str_concat("after patch greet = ", int_to_str(greet())))
+    return 0

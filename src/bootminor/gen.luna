@@ -58,10 +58,15 @@ struct Gen
     const_names:    int  # Vec<str>: module-level const names
     const_values:   int  # Vec<int>: parallel — their integer values
     local_sealed:   int  # Vec<int>: 1 if local was bound via `seal`, else 0
+    hot_slots_off:  int  # data offset of hotswap fn-slots array (8 bytes each)
+    hot_names_off:  int  # data offset of fn-name-ptr array (8 bytes each)
+    hot_pool_off:   int  # data offset of name pool (concatenated NUL names)
+    hot_meta_off:   int  # data offset of hotswap metadata (3 u64 values)
+    hotmeta_patches: int # Vec of (code_disp32_off, meta_byte_off) pairs
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
-    let @g: Gen = new_str(224)
+    let @g: Gen = new_str(272)
     @g.code        = strbuf_new()
     @g.data        = strbuf_new()
     @g.kind        = @kind
@@ -89,12 +94,19 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.const_names   = vec_new()
     @g.const_values  = vec_new()
     @g.local_sealed  = vec_new()
-    # Reserve 8 bytes at the very start of the data section for the
-    # heap_top variable. Its initial value (data_vaddr + heap_top_off + 8,
-    # i.e. the byte right after itself) is patched in by the driver at
-    # the end once the layout is known.
+    @g.hot_slots_off    = 0
+    @g.hot_names_off    = 0
+    @g.hot_pool_off     = 0
+    @g.hot_meta_off     = 8
+    @g.hotmeta_patches  = vec_new()
+    # Reserve 40 bytes at the very start of the data section:
+    #   [0..8)   heap_top (runtime bump pointer)
+    #   [8..16)  hotswap slots vaddr       (patched by main2)
+    #   [16..24) hotswap fn count          (patched by main2)
+    #   [24..32) hotswap names vaddr       (patched by main2)
+    #   [32..40) hotswap name pool vaddr   (patched by main2)
     @i = 0
-    while @i < 8
+    while @i < 40
         strbuf_add_byte(@g.data, 0)
         @i = @i + 1
     return @g
@@ -581,6 +593,30 @@ fn _em_call_placeholder(@g: Gen) -> int
     @at = _code_len(@g)
     _e32(@g, 0)
     return @at
+
+# Emit `call qword [rip + disp32]` (6 bytes, ff 15) with a zero
+# placeholder. Used for user-fn calls in hot-swap mode so every
+# call goes through the dispatch table. Returns the offset of the
+# disp32 bytes.
+fn _em_call_indirect_placeholder(@g: Gen) -> int
+    _eb(@g, 255)                              # FF
+    _eb(@g, 21)                               # /2 (near call via r/m64, RIP-rel)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    return @at
+
+# Emit `mov rax, qword [rip + disp32]` (7 bytes). Used by hot-swap
+# metadata intrinsics. Records a patch pairing (code_disp32_off,
+# meta_byte_off) so the driver knows which metadata cell to target.
+fn _emit_hotmeta_load(@g: Gen, @meta_off: int) -> int
+    _eb(@g, 72)                               # REX.W
+    _eb(@g, 139)                              # 8B
+    _eb(@g, 5)                                # /0 mod=00 rm=101 (RIP-rel)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    vec_push(@g.hotmeta_patches, @at)
+    vec_push(@g.hotmeta_patches, @meta_off)
+    return 0
 
 # mov <arg-reg>, rax for first-6 SysV arg registers.
 # i=0 → rdi, 1 → rsi, 2 → rdx, 3 → rcx, 4 → r8, 5 → r9
@@ -1759,6 +1795,63 @@ fn parse_primary(@g: Gen) -> int
             _advance(@g)
             _emit_syscall_intrinsic(@g, 3, 318)
             return 0
+        # --- Socket / memory-protect syscalls (for hot-swap listener) ---
+        if str_eq(@name, "sys_socket") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 41)
+            return 0
+        if str_eq(@name, "sys_bind") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 49)
+            return 0
+        if str_eq(@name, "sys_listen") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 2, 50)
+            return 0
+        if str_eq(@name, "sys_accept") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 43)
+            return 0
+        if str_eq(@name, "sys_connect") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 42)
+            return 0
+        if str_eq(@name, "sys_mprotect") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 10)
+            return 0
+        if str_eq(@name, "sys_nanosleep") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 2, 35)
+            return 0
+        # --- Hot-swap metadata accessors ---
+        # Each emits `mov rax, qword [rip + disp32]` reading the u64
+        # stored at the corresponding data-section metadata offset.
+        # The disp32 is patched by main2.luna after layout is known.
+        if str_eq(@name, "hot_slots_ptr") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after hot_slots_ptr")
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_hotmeta_load(@g, 8)
+            return 0
+        if str_eq(@name, "hot_count") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after hot_count")
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_hotmeta_load(@g, 16)
+            return 0
+        if str_eq(@name, "hot_names_ptr") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after hot_names_ptr")
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_hotmeta_load(@g, 24)
+            return 0
+        if str_eq(@name, "hot_meta_base") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after hot_meta_base")
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_hotmeta_load(@g, 32)
+            return 0
         # --- f64 math (via SSE xmm0/xmm1) ---
         # Inputs/outputs pass through rax as the raw 64-bit bit pattern
         # of the IEEE-754 double. Callers use `f64_lit(0x400921FB...)`
@@ -2363,14 +2456,15 @@ fn parse_primary(@g: Gen) -> int
             # padding if any. Call site must see 16-aligned rsp, so the
             # stack-arg count must be even; caller adds a pad dword if
             # needed. For now we assume even stack-arg count.
-        # Emit call. Forward refs patched later.
-        @tgt = _fn_lookup(@g, @name)
-        if @tgt >= 0
-            _em_call_to(@g, @tgt)
-        else
-            @ph = _em_call_placeholder(@g)
-            vec_push(@g.fn_patches, @ph)
-            vec_push(@g.fn_patches, @name)
+        # Always emit an indirect call through the hot-swap dispatch
+        # table: `call qword [rip + disp32]`. disp32 is patched to the
+        # offset of the callee's slot inside the fn-slots array, which
+        # is emitted at the end of the data section.  Initial slot
+        # values point at the in-binary code, so behaviour is identical
+        # to a direct call until `hot_install_patch` replaces the slot.
+        @ph = _em_call_indirect_placeholder(@g)
+        vec_push(@g.fn_patches, @ph)
+        vec_push(@g.fn_patches, @name)
         # Clean up stack: if nargs <= 6, we did `sub rsp, alloc` and
         # never rolled it back, so `add rsp, alloc` restores. For
         # nargs > 6 we already added 48 above; now free the remaining
@@ -3233,7 +3327,52 @@ fn compile_to_gen(@src: int) -> Gen
     _emit_print_int(@g)
     # Parse all fn decls; str_patches is filled on the go via parse_shine.
     parse_program(@g, @g.str_patches)
-    # Resolve forward function-call patches against the fn table.
+
+    # Emit the hot-swap function table at the end of the data section.
+    # Layout (all u64, little-endian):
+    #   fn_slots[N]  — absolute code vaddr of each user fn (mutable at
+    #                  runtime; filled with initial values by main2)
+    #   fn_names[N]  — absolute vaddr of each fn's name in the pool
+    #                  (filled by main2)
+    #   name pool    — NUL-terminated fn names, concatenated
+    @nfn = vec_len(@g.fn_names)
+    @g.hot_slots_off = _sb_len(@g.data)
+    @zi = 0
+    while @zi < @nfn * 8
+        strbuf_add_byte(@g.data, 0)
+        @zi = @zi + 1
+    @g.hot_names_off = _sb_len(@g.data)
+    @zi = 0
+    while @zi < @nfn * 8
+        strbuf_add_byte(@g.data, 0)
+        @zi = @zi + 1
+    @g.hot_pool_off  = _sb_len(@g.data)
+    @pi = 0
+    while @pi < @nfn
+        @nm = vec_get(@g.fn_names, @pi)
+        @nl = str_len(@nm)
+        @ci = 0
+        while @ci < @nl
+            strbuf_add_byte(@g.data, str_byte(@nm, @ci))
+            @ci = @ci + 1
+        strbuf_add_byte(@g.data, 0)
+        @pi = @pi + 1
+
+    # Resolve forward fn-call patches. Every user-fn call emits an
+    # indirect `call qword [rip+disp32]` whose disp32 points to the
+    # callee's slot in fn_slots. Both call site and slot live in the
+    # same PT_LOAD segment, and since the ELF writes data right after
+    # code in the file image, we compute the delta in file coordinates.
+    #
+    # Layout when the patch fires:
+    #   code section at file offset 0         ... ends at code_len
+    #   data section at file offset code_len  ... slot i at
+    #                                          code_len + hot_slots_off + i*8
+    #
+    # RIP at the call instruction = file offset (call_site + 4).
+    # disp = slot_file_off - (call_site + 4)
+    #      = (code_len + hot_slots_off + i*8) - (call_site + 4)
+    @code_len_snap = _code_len(@g)
     @nfp = vec_len(@g.fn_patches)
     @i = 0
     while @i < @nfp
@@ -3244,9 +3383,20 @@ fn compile_to_gen(@src: int) -> Gen
             print("bootminor: undefined fn: ")
             shine(@cname)
         else
-            # rel = target - (call_site + 4). call_site is the offset of
-            # the rel32 bytes (instruction is 1 byte opcode + 4 byte rel).
-            @rel = @tgt - (@call_site + 4)
-            _patch32(@g, @call_site, @rel)
+            @slot_idx = _fn_name_index(@g, @cname)
+            @slot_file_off = @code_len_snap + @g.hot_slots_off + @slot_idx * 8
+            @disp = @slot_file_off - (@call_site + 4)
+            _patch32(@g, @call_site, @disp)
         @i = @i + 2
     return @g
+
+# Lookup a function's index in fn_names (== its slot index in the
+# hot-swap table). -1 if not found.
+fn _fn_name_index(@g: Gen, @name: int) -> int
+    @n = vec_len(@g.fn_names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.fn_names, @i), @name) == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
