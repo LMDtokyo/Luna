@@ -1,0 +1,9 @@
+fn fib(@n: int) -> int
+    if @n < 2
+        return @n
+    return fib(@n - 1) + fib(@n - 2)
+
+fn main() -> int
+    shine_int(fib(10))
+    shine_int(fib(20))
+    return 0

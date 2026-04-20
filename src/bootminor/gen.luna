@@ -31,34 +31,46 @@
 # --- Struct ----------------------------------------------------------
 
 struct Gen
-    code:    int
-    data:    int
-    kind:    int
-    start:   int
-    tlen:    int
-    iv:      int
-    pos:     int
-    src:     int
-    names:   int
-    offs:    int
-    frame:   int
-    pi_off:  int
+    code:        int
+    data:        int
+    kind:        int
+    start:       int
+    tlen:        int
+    iv:          int
+    pos:         int
+    src:         int
+    names:       int     # locals of current fn being parsed (names)
+    offs:        int     # locals of current fn (stack offsets)
+    frame:       int     # current frame size
+    pi_off:      int     # print_int helper code offset
+    fn_names:    int     # global fn table: name ptrs
+    fn_offsets:  int     # global fn table: code offsets
+    fn_patches:  int     # forward-call patches: [call_site_off, name_ptr]*
+    str_patches: int     # LEA str patches: [code_off, data_off]*
+    is_main:     int     # 1 while parsing `main`, 0 otherwise
+    main_off:    int     # code offset where main starts
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
-    let @g: Gen = new_str(96)
-    @g.code   = strbuf_new()
-    @g.data   = strbuf_new()
-    @g.kind   = @kind
-    @g.start  = @start
-    @g.tlen   = @tlen
-    @g.iv     = @iv
-    @g.pos    = 0
-    @g.src    = @src
-    @g.names  = vec_new()
-    @g.offs   = vec_new()
-    @g.frame  = 0
-    @g.pi_off = 0
+    let @g: Gen = new_str(144)
+    @g.code        = strbuf_new()
+    @g.data        = strbuf_new()
+    @g.kind        = @kind
+    @g.start       = @start
+    @g.tlen        = @tlen
+    @g.iv          = @iv
+    @g.pos         = 0
+    @g.src         = @src
+    @g.names       = vec_new()
+    @g.offs        = vec_new()
+    @g.frame       = 0
+    @g.pi_off      = 0
+    @g.fn_names    = vec_new()
+    @g.fn_offsets  = vec_new()
+    @g.fn_patches  = vec_new()
+    @g.str_patches = vec_new()
+    @g.is_main     = 0
+    @g.main_off    = 0
     return @g
 
 
@@ -130,6 +142,29 @@ fn _local_slot(@g: Gen, @name: int) -> int
     vec_push(@g.names, @name)
     vec_push(@g.offs, @off)
     return @off
+
+# Reset locals between functions. Called at start of each fn decl.
+fn _reset_locals(@g: Gen) -> int
+    @g.names = vec_new()
+    @g.offs  = vec_new()
+    @g.frame = 0
+    return 0
+
+# Look up a fn's code offset by name. Returns -1 if not yet defined.
+fn _fn_lookup(@g: Gen, @name: int) -> int
+    @n = vec_len(@g.fn_names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.fn_names, @i), @name) == 1
+            return vec_get(@g.fn_offsets, @i)
+        @i = @i + 1
+    return 0 - 1
+
+# Register a fn definition in the table.
+fn _fn_register(@g: Gen, @name: int, @offset: int) -> int
+    vec_push(@g.fn_names, @name)
+    vec_push(@g.fn_offsets, @offset)
+    return 0
 
 
 # --- Byte emission ---------------------------------------------------
@@ -332,6 +367,73 @@ fn _em_call_to(@g: Gen, @target: int) -> int
     _e32(@g, @rel)
     return 0
 
+# Emit `call rel32` with a zero placeholder. Returns the offset of the
+# rel32 bytes so the caller can register a patch for the target name.
+fn _em_call_placeholder(@g: Gen) -> int
+    _eb(@g, 232)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    return @at
+
+# mov <arg-reg>, rax for first-6 SysV arg registers.
+# i=0 → rdi, 1 → rsi, 2 → rdx, 3 → rcx, 4 → r8, 5 → r9
+fn _em_mov_argreg_rax(@g: Gen, @i: int) -> int
+    if @i == 0
+        _eb(@g, 72)
+        _eb(@g, 137)
+        _eb(@g, 199)                 # mov rdi, rax
+        return 0
+    if @i == 1
+        _eb(@g, 72)
+        _eb(@g, 137)
+        _eb(@g, 198)                 # mov rsi, rax
+        return 0
+    if @i == 2
+        _eb(@g, 72)
+        _eb(@g, 137)
+        _eb(@g, 194)                 # mov rdx, rax
+        return 0
+    if @i == 3
+        _eb(@g, 72)
+        _eb(@g, 137)
+        _eb(@g, 193)                 # mov rcx, rax
+        return 0
+    if @i == 4
+        _eb(@g, 73)                  # REX.WB
+        _eb(@g, 137)
+        _eb(@g, 192)                 # mov r8, rax
+        return 0
+    if @i == 5
+        _eb(@g, 73)
+        _eb(@g, 137)
+        _eb(@g, 193)                 # mov r9, rax
+        return 0
+    return 0
+
+# pop <arg-reg>  (for i=0..5 SysV arg regs)
+fn _em_pop_argreg(@g: Gen, @i: int) -> int
+    if @i == 0
+        _eb(@g, 95)                  # pop rdi
+        return 0
+    if @i == 1
+        _eb(@g, 94)                  # pop rsi
+        return 0
+    if @i == 2
+        _eb(@g, 90)                  # pop rdx
+        return 0
+    if @i == 3
+        _eb(@g, 89)                  # pop rcx
+        return 0
+    if @i == 4
+        _eb(@g, 65)                  # REX.B
+        _eb(@g, 88)                  # pop r8
+        return 0
+    if @i == 5
+        _eb(@g, 65)
+        _eb(@g, 89)                  # pop r9
+        return 0
+    return 0
+
 fn _em_syscall(@g: Gen) -> int
     _eb(@g, 15)
     _eb(@g, 5)
@@ -375,6 +477,36 @@ fn _em_lea_rsi_rip_ph(@g: Gen) -> int
     @at = _code_len(@g)
     _e32(@g, 0)
     return @at
+
+# lea rax, [rip + disp32] — placeholder, used for string-literal
+# values that appear in expressions (not just inside shine).
+# Encoding: 48 8d 05 <disp32>.
+fn _em_lea_rax_rip_ph(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 141)
+    _eb(@g, 5)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    return @at
+
+# Append a Luna-style length-prefixed string to the data section.
+# Layout: 8-byte little-endian length, then N data bytes. Returns the
+# data offset of the FIRST DATA BYTE (i.e. past the length prefix), so
+# the caller can LEA to that address and str_len(@s) can read the 8
+# bytes right before.
+fn _data_add_luna_str(@g: Gen, @src: int) -> int
+    @n = str_len(@src)
+    # Write 8-byte LE length header.
+    @i = 0
+    while @i < 8
+        strbuf_add_byte(@g.data, (@n >> (@i * 8)) & 255)
+        @i = @i + 1
+    @data_off = _sb_len(@g.data)
+    @j = 0
+    while @j < @n
+        strbuf_add_byte(@g.data, str_byte(@src, @j))
+        @j = @j + 1
+    return @data_off
 
 
 # --- _print_int runtime (122 bytes, verified via nasm+ld+run) --------
@@ -525,6 +657,16 @@ fn parse_primary(@g: Gen) -> int
                 return 0
         _em_mov_rax_imm64(@g, @v)
         return 0
+    if @k == TK_STR
+        @str_ptr = _peek_iv(@g)
+        _advance(@g)
+        # Store the literal with an 8-byte length prefix so runtime
+        # str_len([ptr-8]) works.
+        @data_off = _data_add_luna_str(@g, @str_ptr)
+        @lea_at = _em_lea_rax_rip_ph(@g)
+        vec_push(@g.str_patches, @lea_at)
+        vec_push(@g.str_patches, @data_off)
+        return 0
     if @k == TK_ATIDENT
         @name = _tok_substr(@g, @g.pos)
         _advance(@g)
@@ -535,6 +677,80 @@ fn parse_primary(@g: Gen) -> int
         _advance(@g)
         parse_expr(@g)
         _expect(@g, TK_RPAREN, "expected ')'")
+        return 0
+    # Function-call expression: `name(arg1, arg2, ...)`
+    if @k == TK_IDENT
+        @name = _tok_substr(@g, @g.pos)
+        # shine_int is parsed as a call but emits inline code via helper.
+        if str_eq(@name, "shine_int") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after shine_int")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _em_mov_rdi_rax(@g)
+            _em_call_to(@g, @g.pi_off)
+            return 0
+        # str_len(s) — inline: rax = ptr, then rax = [rax - 8]
+        if str_eq(@name, "str_len") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after str_len")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov rax, [rax - 8]  ; 48 8b 40 f8
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 64)
+            _eb(@g, 248)
+            return 0
+        # str_byte(s, i) — inline: rax = s, rcx = i, rax = byte at [s + i]
+        if str_eq(@name, "str_byte") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after str_byte")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' in str_byte")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)           # rcx = i
+            _em_pop_rax(@g)               # rax = s
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # movzx rax, byte [rax + rcx]  ; 48 0f b6 04 08
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 182)
+            _eb(@g, 4)
+            _eb(@g, 8)
+            return 0
+        _advance(@g)
+        _expect(@g, TK_LPAREN, "expected '(' after call name")
+        # Evaluate args left-to-right, push each. Up to 6.
+        @nargs = 0
+        if _peek_kind(@g) != TK_RPAREN
+            parse_expr(@g)
+            _em_push_rax(@g)
+            @nargs = 1
+            while _peek_kind(@g) == TK_COMMA
+                _advance(@g)
+                parse_expr(@g)
+                _em_push_rax(@g)
+                @nargs = @nargs + 1
+        _expect(@g, TK_RPAREN, "expected ')' after call args")
+        if @nargs > 6
+            _die(@g, "more than 6 call args not supported")
+            return 0
+        # Pop in reverse so arg_i ends up in sysv_arg_reg[i].
+        @i = @nargs - 1
+        while @i >= 0
+            _em_pop_argreg(@g, @i)
+            @i = @i - 1
+        # Emit call. If target known (already-defined), use direct rel32.
+        # Otherwise emit placeholder and record a patch.
+        @tgt = _fn_lookup(@g, @name)
+        if @tgt >= 0
+            _em_call_to(@g, @tgt)
+            return 0
+        @ph = _em_call_placeholder(@g)
+        vec_push(@g.fn_patches, @ph)
+        vec_push(@g.fn_patches, @name)
         return 0
     _die(@g, "expected primary expression")
     _advance(@g)
@@ -566,9 +782,14 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
     if @k == TK_RETURN
         _advance(@g)
         parse_expr(@g)
-        _em_mov_rdi_rax(@g)
-        _em_mov_eax_imm(@g, 60)
-        _em_syscall(@g)
+        if @g.is_main == 1
+            # main's return becomes process exit syscall.
+            _em_mov_rdi_rax(@g)
+            _em_mov_eax_imm(@g, 60)
+            _em_syscall(@g)
+        else
+            # Normal fn return: mov rsp, rbp; pop rbp; ret
+            _em_epilogue(@g)
         return 0
 
     if @k == TK_IF
@@ -589,16 +810,18 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
         return 0
 
     if @k == TK_IDENT
-        # Only shine / shine_int are recognised.
         @name = _tok_substr(@g, @g.pos)
-        _advance(@g)
         if str_eq(@name, "shine") == 1
+            _advance(@g)
             parse_shine(@g, @patches)
             return 0
         if str_eq(@name, "shine_int") == 1
+            _advance(@g)
             parse_shine_int(@g)
             return 0
-        _die(@g, str_concat("unknown call: ", @name))
+        # General call-statement: reuse parse_primary's call path, which
+        # leaves result in rax (discarded).
+        parse_primary(@g)
         return 0
 
     _die(@g, "expected statement")
@@ -608,31 +831,45 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
 
 fn parse_shine(@g: Gen, @patches: Vec) -> int
     _expect(@g, TK_LPAREN, "expected '(' after shine")
-    if _peek_kind(@g) != TK_STR
-        _die(@g, "shine expects a string literal")
-        return 1
-    @str_ptr = _peek_iv(@g)
-    _advance(@g)
+    # Parse an arbitrary expression; result (string pointer) lands in rax.
+    parse_expr(@g)
     _expect(@g, TK_RPAREN, "expected ')'")
-    # Append literal + '\n' to data section
-    @data_off = _sb_len(@g.data)
-    @slen = str_len(@str_ptr)
-    @i = 0
-    while @i < @slen
-        strbuf_add_byte(@g.data, str_byte(@str_ptr, @i))
-        @i = @i + 1
-    strbuf_add_byte(@g.data, 10)
-    @total_len = @slen + 1
-    # Emit write-syscall block: mov eax,1; mov edi,1; lea rsi,[rip+disp];
-    # mov edx, len; syscall.
+    # Emit a syscall write(1, rax, len) where len is read from the
+    # 8-byte length prefix at [rax-8]. Then write a newline from stack.
+    # mov rsi, rax  ; 48 89 c6
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 198)
+    # mov rdx, [rax - 8]  ; 48 8b 50 f8
+    _eb(@g, 72)
+    _eb(@g, 139)
+    _eb(@g, 80)
+    _eb(@g, 248)
+    # mov eax, 1; mov edi, 1; syscall
     _em_mov_eax_imm(@g, 1)
     _em_mov_edi_imm(@g, 1)
-    @lea_at = _em_lea_rsi_rip_ph(@g)
-    _em_mov_edx_imm(@g, @total_len)
     _em_syscall(@g)
-    # Record patch so driver can fill the disp once data-section vaddr is known.
-    vec_push(@patches, @lea_at)
-    vec_push(@patches, @data_off)
+    # Write a newline via stack. sub rsp, 16; mov byte [rsp], 10;
+    # mov eax,1; mov edi,1; mov rsi,rsp; mov edx,1; syscall; add rsp,16
+    _eb(@g, 72)                # sub rsp, 16  ; 48 83 ec 10
+    _eb(@g, 131)
+    _eb(@g, 236)
+    _eb(@g, 16)
+    _eb(@g, 198)               # mov byte [rsp], 10  ; c6 04 24 0a
+    _eb(@g, 4)
+    _eb(@g, 36)
+    _eb(@g, 10)
+    _em_mov_eax_imm(@g, 1)
+    _em_mov_edi_imm(@g, 1)
+    _eb(@g, 72)                # mov rsi, rsp  ; 48 89 e6
+    _eb(@g, 137)
+    _eb(@g, 230)
+    _em_mov_edx_imm(@g, 1)
+    _em_syscall(@g)
+    _eb(@g, 72)                # add rsp, 16  ; 48 83 c4 10
+    _eb(@g, 131)
+    _eb(@g, 196)
+    _eb(@g, 16)
     return 0
 
 
@@ -719,39 +956,150 @@ fn parse_block(@g: Gen, @patches: Vec) -> int
     return 0
 
 
-# Parse `fn main() -> int\n    ...` and emit its body.
-fn parse_fn_main(@g: Gen, @patches: Vec) -> int
+# Parse one `fn name(params) -> type` declaration and emit its code.
+fn parse_fn(@g: Gen, @patches: Vec) -> int
     _skip_newlines(@g)
     _expect(@g, TK_FN, "expected 'fn'")
-    # skip function name (we assume 'main')
-    if _peek_kind(@g) == TK_IDENT
+    if _peek_kind(@g) != TK_IDENT
+        _die(@g, "expected function name after 'fn'")
+        return 1
+    @fn_name = _tok_substr(@g, @g.pos)
+    _advance(@g)
+
+    # Register fn NAME at current code offset (before prologue).
+    @fn_off = _code_len(@g)
+    _fn_register(@g, @fn_name, @fn_off)
+    if str_eq(@fn_name, "main") == 1
+        @g.is_main  = 1
+        @g.main_off = @fn_off
+    else
+        @g.is_main = 0
+
+    _expect(@g, TK_LPAREN, "expected '(' in fn decl")
+    # Reset per-function locals.
+    _reset_locals(@g)
+
+    # Collect param names. For each, allocate a local slot (rbp-8, -16, ...).
+    # We'll emit code right after prologue to spill args from regs to slots.
+    @param_names = vec_new()
+    if _peek_kind(@g) != TK_RPAREN
+        if _peek_kind(@g) != TK_ATIDENT
+            _die(@g, "expected parameter (@name)")
+            return 1
+        vec_push(@param_names, _tok_substr(@g, @g.pos))
         _advance(@g)
-    _expect(@g, TK_LPAREN, "expected '('")
-    _expect(@g, TK_RPAREN, "expected ')'")
-    # Optional `-> int`
+        # optional `: type`
+        if _peek_kind(@g) == TK_COLON
+            _advance(@g)
+            if _peek_kind(@g) == TK_IDENT
+                _advance(@g)
+        while _peek_kind(@g) == TK_COMMA
+            _advance(@g)
+            if _peek_kind(@g) != TK_ATIDENT
+                _die(@g, "expected parameter (@name)")
+                return 1
+            vec_push(@param_names, _tok_substr(@g, @g.pos))
+            _advance(@g)
+            if _peek_kind(@g) == TK_COLON
+                _advance(@g)
+                if _peek_kind(@g) == TK_IDENT
+                    _advance(@g)
+    _expect(@g, TK_RPAREN, "expected ')' in fn decl")
+
+    # Optional `-> type`
     if _peek_kind(@g) == TK_ARROW
         _advance(@g)
         if _peek_kind(@g) == TK_IDENT
             _advance(@g)
+
     _expect(@g, TK_NEWLINE, "newline after fn signature")
     _expect(@g, TK_INDENT, "indented fn body")
+
     # Emit prologue (frame size patched later).
     @prol_at = _em_prologue(@g)
+
+    # Spill argument registers into newly allocated local slots.
+    @nparams = vec_len(@param_names)
+    if @nparams > 6
+        _die(@g, "more than 6 params not supported")
+        return 1
+    @pi = 0
+    while @pi < @nparams
+        @pname = vec_get(@param_names, @pi)
+        @poff  = _local_slot(@g, @pname)
+        # mov rax, <sysv_arg_reg[pi]> ; mov [rbp+poff], rax
+        _em_mov_rax_argreg(@g, @pi)
+        _em_store_rbp(@g, @poff)
+        @pi = @pi + 1
+
     parse_block(@g, @patches)
-    # If the last statement wasn't a return, add an implicit exit(0).
-    _em_mov_edi_imm(@g, 0)
-    _em_mov_eax_imm(@g, 60)
-    _em_syscall(@g)
-    # Patch frame size: round up to 16 for alignment. Always at least 16.
+
+    # Implicit return: main exits with 0, other fns do `return 0`.
+    if @g.is_main == 1
+        _em_mov_edi_imm(@g, 0)
+        _em_mov_eax_imm(@g, 60)
+        _em_syscall(@g)
+    else
+        _em_mov_eax_imm(@g, 0)
+        _em_epilogue(@g)
+
+    # Patch frame size.
     @sz = @g.frame
     if @sz < 16
         @sz = 16
-    # Keep stack 16-aligned: rbp points to saved rbp (8-byte aligned).
-    # rsp after sub = rbp - sz. Needs to be 16-aligned at call sites; we
-    # don't make calls beyond syscall + print_int so 16 is safe.
     if (@sz % 16) != 0
         @sz = @sz + (16 - (@sz % 16))
     _patch32(@g, @prol_at, @sz)
+    return 0
+
+
+# mov rax, <sysv_arg_reg[i]>  — inverse of _em_mov_argreg_rax.
+fn _em_mov_rax_argreg(@g: Gen, @i: int) -> int
+    if @i == 0
+        _eb(@g, 72)                  # mov rax, rdi  ; 48 89 f8
+        _eb(@g, 137)
+        _eb(@g, 248)
+        return 0
+    if @i == 1
+        _eb(@g, 72)                  # mov rax, rsi  ; 48 89 f0
+        _eb(@g, 137)
+        _eb(@g, 240)
+        return 0
+    if @i == 2
+        _eb(@g, 72)                  # mov rax, rdx  ; 48 89 d0
+        _eb(@g, 137)
+        _eb(@g, 208)
+        return 0
+    if @i == 3
+        _eb(@g, 72)                  # mov rax, rcx  ; 48 89 c8
+        _eb(@g, 137)
+        _eb(@g, 200)
+        return 0
+    if @i == 4
+        _eb(@g, 76)                  # mov rax, r8   ; 4c 89 c0
+        _eb(@g, 137)
+        _eb(@g, 192)
+        return 0
+    if @i == 5
+        _eb(@g, 76)                  # mov rax, r9   ; 4c 89 c8
+        _eb(@g, 137)
+        _eb(@g, 200)
+        return 0
+    return 0
+
+
+# Parse a whole program = sequence of fn decls. Returns after last fn.
+fn parse_program(@g: Gen, @patches: Vec) -> int
+    while 1
+        _skip_newlines(@g)
+        @k = _peek_kind(@g)
+        if @k == TK_EOF
+            return 0
+        if @k == TK_FN
+            parse_fn(@g, @patches)
+        else
+            _die(@g, "expected fn declaration at top level")
+            _advance(@g)
     return 0
 
 
@@ -766,13 +1114,22 @@ fn compile_to_gen(@src: int) -> Gen
     let @g: Gen = gen_new(@src, @kind, @start, @tlen, @iv)
     # Emit print_int runtime first so shine_int can call it.
     _emit_print_int(@g)
-    @patches = vec_new()
-    parse_fn_main(@g, @patches)
-    # Patch LEA instructions: each patch is (code_off_of_rel32, data_off).
-    # The absolute data vaddr will be computed by main driver; here we
-    # stash (code_off | (data_off << 32)) layout but since we have two
-    # Vecs we keep them separate. The driver needs to apply:
-    #   disp = (DATA_VADDR + data_off) - (ENTRY_VADDR + code_off_of_rel32 + 4)
-    # Since Gen doesn't know the vaddrs, we expose the patch list.
-    @g.names = @patches    # REUSE unused names vec to pass patches out
+    # Parse all fn decls; str_patches is filled on the go via parse_shine.
+    parse_program(@g, @g.str_patches)
+    # Resolve forward function-call patches against the fn table.
+    @nfp = vec_len(@g.fn_patches)
+    @i = 0
+    while @i < @nfp
+        @call_site = vec_get(@g.fn_patches, @i)
+        @cname     = vec_get(@g.fn_patches, @i + 1)
+        @tgt = _fn_lookup(@g, @cname)
+        if @tgt < 0
+            print("bootminor: undefined fn: ")
+            shine(@cname)
+        else
+            # rel = target - (call_site + 4). call_site is the offset of
+            # the rel32 bytes (instruction is 1 byte opcode + 4 byte rel).
+            @rel = @tgt - (@call_site + 4)
+            _patch32(@g, @call_site, @rel)
+        @i = @i + 2
     return @g

@@ -1,0 +1,9 @@
+fn square(@x: int) -> int
+    return @x * @x
+
+fn cube(@x: int) -> int
+    return @x * square(@x)
+
+fn main() -> int
+    shine_int(cube(4))
+    return 0

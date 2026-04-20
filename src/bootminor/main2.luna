@@ -111,18 +111,14 @@ fn main() -> int
         return 1
 
     let @g: Gen = compile_to_gen(@src)
-    # compile_to_gen stashed the patch list in @g.names (reused).
-    @patches = @g.names
+    @patches = @g.str_patches
     @code_bytes = strbuf_done(@g.code)
     @data_bytes = strbuf_done(@g.data)
     @code_len = str_len(@code_bytes)
     @data_len = str_len(@data_bytes)
 
-    # After print_int runtime at the start of code, entry point is just
-    # past it, at @g.pi_off + 122. That's where `main` begins.
-    # NOTE: ELF e_entry = vaddr + entry_off in file. Entry in the file
-    # is offset _elf_prelude() + @g.pi_off + 122.
-    @entry_off = _elf_prelude() + @g.pi_off + 122
+    # Entry point = main's code offset inside the code section.
+    @entry_off = _elf_prelude() + @g.main_off
 
     @code_off = _elf_prelude()
     @data_off = @code_off + @code_len

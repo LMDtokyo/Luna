@@ -1,0 +1,6 @@
+fn sum6(@a: int, @b: int, @c: int, @d: int, @e: int, @f: int) -> int
+    return @a + @b + @c + @d + @e + @f
+
+fn main() -> int
+    shine_int(sum6(1, 2, 3, 4, 5, 6))
+    return 0

@@ -1,0 +1,9 @@
+fn countdown(@n: int) -> int
+    if @n <= 0
+        return 0
+    shine_int(@n)
+    return countdown(@n - 1)
+
+fn main() -> int
+    countdown(5)
+    return 0

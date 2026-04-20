@@ -1,0 +1,13 @@
+fn sign(@n: int) -> int
+    if @n < 0
+        return 0 - 1
+    elif @n == 0
+        return 0
+    else
+        return 1
+
+fn main() -> int
+    shine_int(sign(0 - 5))
+    shine_int(sign(0))
+    shine_int(sign(7))
+    return 0

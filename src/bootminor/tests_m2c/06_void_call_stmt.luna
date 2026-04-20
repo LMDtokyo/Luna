@@ -1,0 +1,8 @@
+fn greet() -> int
+    shine("hello")
+    return 0
+
+fn main() -> int
+    greet()
+    greet()
+    return 0
