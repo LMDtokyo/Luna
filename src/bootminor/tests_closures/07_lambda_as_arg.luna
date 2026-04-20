@@ -1,0 +1,9 @@
+fn apply(@op: int, @a: int, @b: int) -> int
+    @f = @op
+    return @f(@a, @b)
+
+fn main() -> int
+    shine_int(apply(fn(@a: int, @b: int) -> int
+        return @a + @b
+    , 30, 12))
+    return 0

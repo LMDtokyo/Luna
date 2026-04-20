@@ -68,6 +68,8 @@ struct Gen
     variant_name:    int # Vec<str>: variant identifier
     variant_tag:     int # Vec<int>: tag (0..N-1 within enum)
     variant_payload: int # Vec<int>: 1 if variant carries a payload, else 0
+    lambda_names:    int # Vec<str>: synthetic names for deferred lambdas
+    lambda_starts:   int # Vec<int>: token pos where each lambda header begins
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
@@ -109,6 +111,8 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.variant_name     = vec_new()
     @g.variant_tag      = vec_new()
     @g.variant_payload  = vec_new()
+    @g.lambda_names     = vec_new()
+    @g.lambda_starts    = vec_new()
     # Reserve 40 bytes at the very start of the data section:
     #   [0..8)   heap_top (runtime bump pointer)
     #   [8..16)  hotswap slots vaddr       (patched by main2)
@@ -1332,6 +1336,49 @@ fn _parse_cast_suffix(@g: Gen) -> int
 
 fn parse_primary(@g: Gen) -> int
     @k = _peek_kind(@g)
+    # Lambda expression: `fn(params) -> T body`. Record the token
+    # position and synth name, skip the whole `fn(...) \n INDENT...DEDENT`
+    # span, and emit a fnptr-load against the synth slot. The body is
+    # re-parsed and emitted as a synthetic top-level fn after
+    # parse_program completes (see _emit_deferred_lambdas).
+    if @k == TK_FN
+        @lam_start = @g.pos
+        @lam_idx = vec_len(@g.lambda_names)
+        @synth = str_concat("__lambda_", int_to_str(@lam_idx))
+        vec_push(@g.lambda_names,  @synth)
+        vec_push(@g.lambda_starts, @lam_start)
+        _advance(@g)                          # consume 'fn'
+        _swallow_generic_params(@g)
+        _expect(@g, TK_LPAREN, "expected '(' in lambda params")
+        @pdepth = 1
+        while @pdepth > 0
+            @ptk = _peek_kind(@g)
+            if @ptk == TK_LPAREN
+                @pdepth = @pdepth + 1
+            elif @ptk == TK_RPAREN
+                @pdepth = @pdepth - 1
+            elif @ptk == TK_EOF
+                break
+            _advance(@g)
+        if _peek_kind(@g) == TK_ARROW
+            _advance(@g)
+            @_lt = _parse_type(@g)
+        _expect(@g, TK_NEWLINE, "newline after lambda signature")
+        _expect(@g, TK_INDENT, "indented lambda body")
+        @bdepth = 1
+        while @bdepth > 0
+            @btk = _peek_kind(@g)
+            if @btk == TK_INDENT
+                @bdepth = @bdepth + 1
+            elif @btk == TK_DEDENT
+                @bdepth = @bdepth - 1
+            elif @btk == TK_EOF
+                break
+            _advance(@g)
+        @lph = _em_fnptr_load_placeholder(@g)
+        vec_push(@g.fn_patches, @lph)
+        vec_push(@g.fn_patches, @synth)
+        return 0
     if @k == TK_INT
         @v = _peek_iv(@g)
         _advance(@g)
@@ -3586,6 +3633,94 @@ fn _variant_index(@g: Gen, @name: int) -> int
     return 0 - 1
 
 
+# Re-enter the token stream at a recorded lambda position and emit the
+# lambda body as a synthetic top-level fn under @syn. Mirrors parse_fn
+# except it doesn't read a fn name from source — the caller supplies it.
+fn _parse_lambda_body(@g: Gen, @syn: int, @patches: Vec) -> int
+    _expect(@g, TK_FN, "expected 'fn' at lambda start")
+    _swallow_generic_params(@g)
+    @fn_off = _code_len(@g)
+    _fn_register(@g, @syn, @fn_off)
+    @g.is_main = 0
+    _expect(@g, TK_LPAREN, "expected '(' in lambda decl")
+    _reset_locals(@g)
+    @param_names = vec_new()
+    @param_types = vec_new()
+    if _peek_kind(@g) != TK_RPAREN
+        if _peek_kind(@g) != TK_ATIDENT
+            _die(@g, "expected lambda parameter (@name)")
+            return 1
+        vec_push(@param_names, _tok_substr(@g, @g.pos))
+        _advance(@g)
+        @pty = ""
+        if _peek_kind(@g) == TK_COLON
+            _advance(@g)
+            @pty = _parse_type(@g)
+        vec_push(@param_types, @pty)
+        while _peek_kind(@g) == TK_COMMA
+            _advance(@g)
+            if _peek_kind(@g) != TK_ATIDENT
+                _die(@g, "expected lambda parameter (@name)")
+                return 1
+            vec_push(@param_names, _tok_substr(@g, @g.pos))
+            _advance(@g)
+            @pty2 = ""
+            if _peek_kind(@g) == TK_COLON
+                _advance(@g)
+                @pty2 = _parse_type(@g)
+            vec_push(@param_types, @pty2)
+    _expect(@g, TK_RPAREN, "expected ')' in lambda decl")
+    if _peek_kind(@g) == TK_ARROW
+        _advance(@g)
+        @_lt = _parse_type(@g)
+    _expect(@g, TK_NEWLINE, "newline after lambda signature")
+    _expect(@g, TK_INDENT, "indented lambda body")
+    @prol_at = _em_prologue(@g)
+    @nparams = vec_len(@param_names)
+    @pi = 0
+    while @pi < @nparams
+        @pname = vec_get(@param_names, @pi)
+        @ptype = vec_get(@param_types, @pi)
+        @poff  = _local_slot(@g, @pname)
+        if str_eq(@ptype, "") == 0
+            _set_local_type(@g, @pname, @ptype)
+        if @pi < 6
+            _em_mov_rax_argreg(@g, @pi)
+        else
+            @src_disp = 16 + (@pi - 6) * 8
+            _em_load_rbp(@g, @src_disp)
+        _em_store_rbp(@g, @poff)
+        @pi = @pi + 1
+    parse_block(@g, @patches)
+    _em_mov_eax_imm(@g, 0)
+    _em_epilogue(@g)
+    @sz = @g.frame
+    if @sz < 16
+        @sz = 16
+    if (@sz % 16) != 0
+        @sz = @sz + (16 - (@sz % 16))
+    _patch32(@g, @prol_at, @sz)
+    return 0
+
+
+# Iterate over every lambda recorded during parse_program and emit its
+# body as a synthetic top-level fn. Called after parse_program finishes
+# so that real fns are laid out first and the lambdas extend the code
+# section before the hot-swap table is appended to data.
+fn _emit_deferred_lambdas(@g: Gen, @patches: Vec) -> int
+    @nlam = vec_len(@g.lambda_names)
+    @li = 0
+    while @li < @nlam
+        @ln = vec_get(@g.lambda_names,  @li)
+        @lp = vec_get(@g.lambda_starts, @li)
+        @saved = @g.pos
+        @g.pos = @lp
+        _parse_lambda_body(@g, @ln, @patches)
+        @g.pos = @saved
+        @li = @li + 1
+    return 0
+
+
 # Parse a whole program = sequence of fn decls + struct decls + etc.
 fn parse_program(@g: Gen, @patches: Vec) -> int
     while 1
@@ -3624,6 +3759,10 @@ fn compile_to_gen(@src: int) -> Gen
     _emit_print_int(@g)
     # Parse all fn decls; str_patches is filled on the go via parse_shine.
     parse_program(@g, @g.str_patches)
+
+    # Emit any deferred lambda bodies now, extending the code section
+    # before the hot-swap table gets appended to data.
+    _emit_deferred_lambdas(@g, @g.str_patches)
 
     # Emit the hot-swap function table at the end of the data section.
     # Layout (all u64, little-endian):

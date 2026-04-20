@@ -1,0 +1,8 @@
+fn main() -> int
+    @inc = fn(@x: int) -> int
+        return @x + 1
+    @sq = fn(@x: int) -> int
+        return @x * @x
+    shine_int(@inc(@sq(6)))
+    shine_int(@sq(@inc(6)))
+    return 0
