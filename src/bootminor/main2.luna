@@ -120,8 +120,10 @@ fn main() -> int
     # Entry point = main's code offset inside the code section.
     @entry_off = _elf_prelude() + @g.main_off
 
-    # Reserve 1 MB of extra memsz beyond filesz for the bump heap.
-    @heap_size = 1048576
+    # Reserve 64 MB of extra memsz beyond filesz for the bump heap.
+    # The self-compile case pushes Vec/StrBuf hard (tokens, AST-shaped
+    # patches, data/code buffers) and 1 MB is not enough.
+    @heap_size = 67108864
 
     @code_off = _elf_prelude()
     @data_off = @code_off + @code_len
