@@ -51,7 +51,7 @@ fn _put64(@buf: int, @at: int, @v: int) -> int
     return 0
 
 
-fn _emit_elf(@buf: int, @file_sz: int, @entry_off: int) -> int
+fn _emit_elf(@buf: int, @file_sz: int, @mem_sz: int, @entry_off: int) -> int
     _put8(@buf, 0, 127)
     _put8(@buf, 1, 69)
     _put8(@buf, 2, 76)
@@ -74,12 +74,12 @@ fn _emit_elf(@buf: int, @file_sz: int, @entry_off: int) -> int
     _put16(@buf, 62, 0)
     @p = _elf_hdr()
     _put32(@buf, @p + 0,  1)
-    _put32(@buf, @p + 4,  5)
+    _put32(@buf, @p + 4,  7)                  # PF_R|PF_W|PF_X (writable heap)
     _put64(@buf, @p + 8,  0)
     _put64(@buf, @p + 16, _elf_vaddr())
     _put64(@buf, @p + 24, _elf_vaddr())
     _put64(@buf, @p + 32, @file_sz)
-    _put64(@buf, @p + 40, @file_sz)
+    _put64(@buf, @p + 40, @mem_sz)            # memsz > filesz → zeroed heap
     _put64(@buf, @p + 48, 4096)
     return 0
 
@@ -120,6 +120,9 @@ fn main() -> int
     # Entry point = main's code offset inside the code section.
     @entry_off = _elf_prelude() + @g.main_off
 
+    # Reserve 1 MB of extra memsz beyond filesz for the bump heap.
+    @heap_size = 1048576
+
     @code_off = _elf_prelude()
     @data_off = @code_off + @code_len
     @file_sz  = @data_off + @data_len
@@ -152,8 +155,33 @@ fn main() -> int
         str_set_byte(@code_bytes, @pat_code_off + 3, (@disp >> 24) & 255)
         @i = @i + 2
 
+    # Initialize heap_top (first 8 bytes of data section) to the vaddr
+    # right AFTER file_sz, i.e. the start of the zeroed BSS-like region.
+    @heap_start_vaddr = _elf_vaddr() + @file_sz
+    @k = 0
+    while @k < 8
+        str_set_byte(@data_bytes, @k, (@heap_start_vaddr >> (@k * 8)) & 255)
+        @k = @k + 1
+
+    # Patch every heap_top LEA in code. heap_top variable lives at
+    # (data_off + 0) in the file → vaddr elf_vaddr + data_off.
+    @nh = vec_len(@g.heap_patches)
+    @h = 0
+    @heap_top_vaddr = _elf_vaddr() + @data_off
+    while @h < @nh
+        @pat_off = vec_get(@g.heap_patches, @h)
+        # rel = heap_top_vaddr - (elf_vaddr + code_off + pat_off + 4)
+        @rel = @heap_top_vaddr - (_elf_vaddr() + @code_off + @pat_off + 4)
+        str_set_byte(@code_bytes, @pat_off + 0,  @rel        & 255)
+        str_set_byte(@code_bytes, @pat_off + 1, (@rel >> 8)  & 255)
+        str_set_byte(@code_bytes, @pat_off + 2, (@rel >> 16) & 255)
+        str_set_byte(@code_bytes, @pat_off + 3, (@rel >> 24) & 255)
+        @h = @h + 1
+
+    @mem_sz = @file_sz + @heap_size
+
     @buf = new_str(@file_sz)
-    _emit_elf(@buf, @file_sz, @entry_off)
+    _emit_elf(@buf, @file_sz, @mem_sz, @entry_off)
 
     # Copy code into [code_off..code_off+code_len)
     @k = 0

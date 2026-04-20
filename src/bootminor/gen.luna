@@ -49,10 +49,11 @@ struct Gen
     str_patches: int     # LEA str patches: [code_off, data_off]*
     is_main:     int     # 1 while parsing `main`, 0 otherwise
     main_off:    int     # code offset where main starts
+    heap_patches: int    # LEA heap_top patches: [code_off]*
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
-    let @g: Gen = new_str(144)
+    let @g: Gen = new_str(160)
     @g.code        = strbuf_new()
     @g.data        = strbuf_new()
     @g.kind        = @kind
@@ -69,8 +70,17 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.fn_offsets  = vec_new()
     @g.fn_patches  = vec_new()
     @g.str_patches = vec_new()
-    @g.is_main     = 0
-    @g.main_off    = 0
+    @g.is_main      = 0
+    @g.main_off     = 0
+    @g.heap_patches = vec_new()
+    # Reserve 8 bytes at the very start of the data section for the
+    # heap_top variable. Its initial value (data_vaddr + heap_top_off + 8,
+    # i.e. the byte right after itself) is patched in by the driver at
+    # the end once the layout is known.
+    @i = 0
+    while @i < 8
+        strbuf_add_byte(@g.data, 0)
+        @i = @i + 1
     return @g
 
 
@@ -719,6 +729,94 @@ fn parse_primary(@g: Gen) -> int
             _eb(@g, 182)
             _eb(@g, 4)
             _eb(@g, 8)
+            return 0
+        # new_str(n) — bump allocate from heap_top; returns pointer past
+        # the 8-byte length prefix. Inlines ~37 bytes of x86-64.
+        if str_eq(@name, "new_str") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after new_str")
+            parse_expr(@g)                # rax = n (requested length)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov rcx, rax                ; save n
+            _eb(@g, 72)
+            _eb(@g, 137)
+            _eb(@g, 193)
+            # add rax, 16
+            _eb(@g, 72)
+            _eb(@g, 131)
+            _eb(@g, 192)
+            _eb(@g, 16)
+            # and rax, -8                  ; rax = aligned alloc size
+            _eb(@g, 72)
+            _eb(@g, 131)
+            _eb(@g, 224)
+            _eb(@g, 248)
+            # mov r11, rax                 ; r11 = alloc size
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 195)
+            # lea rax, [rip + heap_top_disp32]  ; patched later
+            _eb(@g, 72)
+            _eb(@g, 141)
+            _eb(@g, 5)
+            @lea_at = _code_len(@g)
+            _e32(@g, 0)
+            vec_push(@g.heap_patches, @lea_at)
+            # mov rsi, [rax]               ; rsi = current heap_top
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 48)
+            # add r11, rsi                 ; r11 = new heap_top
+            _eb(@g, 73)
+            _eb(@g, 1)
+            _eb(@g, 243)
+            # mov [rax], r11               ; store new heap_top
+            _eb(@g, 76)
+            _eb(@g, 137)
+            _eb(@g, 24)
+            # mov [rsi], rcx               ; write length prefix at old top
+            _eb(@g, 72)
+            _eb(@g, 137)
+            _eb(@g, 14)
+            # lea rax, [rsi + 8]           ; return pointer
+            _eb(@g, 72)
+            _eb(@g, 141)
+            _eb(@g, 70)
+            _eb(@g, 8)
+            return 0
+        # str_set_byte(s, i, v) — writes byte v at s+i, returns 0.
+        if str_eq(@name, "str_set_byte") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after str_set_byte")
+            parse_expr(@g)                 # s
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)                 # i
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)                 # v  (rax)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # pop rcx (i)   — but we pushed s, then i, then v is in rax.
+            # Stack top is i (last push), below is s.
+            # Actually re-examine: we push s, push i, then v in rax.
+            # Stack (top→bottom): i, s. rax = v.
+            # We want: s in rdx, i in rcx, v in al.
+            # mov r8, rax (v)
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 192)
+            # pop rcx (i)
+            _eb(@g, 89)
+            # pop rdx (s)
+            _eb(@g, 90)
+            # mov [rdx + rcx], r8b  ; 44 88 04 0a
+            _eb(@g, 68)
+            _eb(@g, 136)
+            _eb(@g, 4)
+            _eb(@g, 10)
+            # xor eax, eax (return 0)
+            _eb(@g, 49)
+            _eb(@g, 192)
             return 0
         _advance(@g)
         _expect(@g, TK_LPAREN, "expected '(' after call name")
