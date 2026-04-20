@@ -1,0 +1,7 @@
+fn main() -> int
+    @base = 100
+    let @add: closure = fn(@x: int) -> int
+        return @base + @x
+    shine_int(@add(5))
+    shine_int(@add(42))
+    return 0

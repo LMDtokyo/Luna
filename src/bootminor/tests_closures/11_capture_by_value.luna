@@ -1,0 +1,8 @@
+fn main() -> int
+    @base = 1
+    let @read_base: closure = fn() -> int
+        return @base
+    shine_int(@read_base())
+    @base = 999
+    shine_int(@read_base())
+    return 0

@@ -1,0 +1,12 @@
+fn make_adder(@n: int) -> int
+    let @f: closure = fn(@x: int) -> int
+        return @n + @x
+    return @f
+
+fn main() -> int
+    let @add10: closure = make_adder(10)
+    let @add100: closure = make_adder(100)
+    shine_int(@add10(5))
+    shine_int(@add100(5))
+    shine_int(@add10(@add100(1)))
+    return 0

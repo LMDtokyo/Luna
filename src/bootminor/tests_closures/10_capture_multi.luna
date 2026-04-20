@@ -1,0 +1,9 @@
+fn main() -> int
+    @a = 10
+    @b = 3
+    @c = 7
+    let @f: closure = fn(@x: int) -> int
+        return (@a + @b + @c) * @x
+    shine_int(@f(2))
+    shine_int(@f(10))
+    return 0

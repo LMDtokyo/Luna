@@ -70,10 +70,11 @@ struct Gen
     variant_payload: int # Vec<int>: 1 if variant carries a payload, else 0
     lambda_names:    int # Vec<str>: synthetic names for deferred lambdas
     lambda_starts:   int # Vec<int>: token pos where each lambda header begins
+    lambda_captures: int # Vec<Vec<str>>: captured var names per lambda (by-value)
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
-    let @g: Gen = new_str(320)
+    let @g: Gen = new_str(384)
     @g.code        = strbuf_new()
     @g.data        = strbuf_new()
     @g.kind        = @kind
@@ -113,6 +114,7 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.variant_payload  = vec_new()
     @g.lambda_names     = vec_new()
     @g.lambda_starts    = vec_new()
+    @g.lambda_captures  = vec_new()
     # Reserve 40 bytes at the very start of the data section:
     #   [0..8)   heap_top (runtime bump pointer)
     #   [8..16)  hotswap slots vaddr       (patched by main2)
@@ -1338,18 +1340,21 @@ fn parse_primary(@g: Gen) -> int
     @k = _peek_kind(@g)
     # Lambda expression: `fn(params) -> T body`. Record the token
     # position and synth name, skip the whole `fn(...) \n INDENT...DEDENT`
-    # span, and emit a fnptr-load against the synth slot. The body is
-    # re-parsed and emitted as a synthetic top-level fn after
-    # parse_program completes (see _emit_deferred_lambdas).
+    # span (noting captures along the way), and emit either a fnptr-load
+    # (no captures) or a heap block {fn_ptr, cap0, cap1, ...} that acts
+    # as the closure value. The body is re-parsed and emitted as a
+    # synthetic top-level fn after parse_program completes — see
+    # _emit_deferred_lambdas / _parse_lambda_body.
     if @k == TK_FN
         @lam_start = @g.pos
         @lam_idx = vec_len(@g.lambda_names)
         @synth = str_concat("__lambda_", int_to_str(@lam_idx))
-        vec_push(@g.lambda_names,  @synth)
-        vec_push(@g.lambda_starts, @lam_start)
         _advance(@g)                          # consume 'fn'
         _swallow_generic_params(@g)
         _expect(@g, TK_LPAREN, "expected '(' in lambda params")
+        # Collect lambda's own parameter names at depth 1 so we can tell
+        # them apart from captures when scanning the body.
+        @lam_params = vec_new()
         @pdepth = 1
         while @pdepth > 0
             @ptk = _peek_kind(@g)
@@ -1357,6 +1362,12 @@ fn parse_primary(@g: Gen) -> int
                 @pdepth = @pdepth + 1
             elif @ptk == TK_RPAREN
                 @pdepth = @pdepth - 1
+                if @pdepth == 0
+                    _advance(@g)
+                    break
+            elif @ptk == TK_ATIDENT
+                if @pdepth == 1
+                    vec_push(@lam_params, _tok_substr(@g, @g.pos))
             elif @ptk == TK_EOF
                 break
             _advance(@g)
@@ -1365,6 +1376,7 @@ fn parse_primary(@g: Gen) -> int
             @_lt = _parse_type(@g)
         _expect(@g, TK_NEWLINE, "newline after lambda signature")
         _expect(@g, TK_INDENT, "indented lambda body")
+        @lam_captures = vec_new()
         @bdepth = 1
         while @bdepth > 0
             @btk = _peek_kind(@g)
@@ -1372,12 +1384,90 @@ fn parse_primary(@g: Gen) -> int
                 @bdepth = @bdepth + 1
             elif @btk == TK_DEDENT
                 @bdepth = @bdepth - 1
+                if @bdepth == 0
+                    _advance(@g)
+                    break
+            elif @btk == TK_ATIDENT
+                @refname = _tok_substr(@g, @g.pos)
+                # Not a capture if it's one of the lambda's own params.
+                @is_param = 0
+                @ppi = 0
+                @ppn = vec_len(@lam_params)
+                while @ppi < @ppn
+                    if str_eq(vec_get(@lam_params, @ppi), @refname) == 1
+                        @is_param = 1
+                        break
+                    @ppi = @ppi + 1
+                if @is_param == 0
+                    # Capture only when the name binds to a local in the
+                    # enclosing fn's current scope.
+                    @is_outer = 0
+                    @on = vec_len(@g.names)
+                    @oi = 0
+                    while @oi < @on
+                        if str_eq(vec_get(@g.names, @oi), @refname) == 1
+                            @is_outer = 1
+                            break
+                        @oi = @oi + 1
+                    if @is_outer == 1
+                        @exists = 0
+                        @cci = 0
+                        @ccn = vec_len(@lam_captures)
+                        while @cci < @ccn
+                            if str_eq(vec_get(@lam_captures, @cci), @refname) == 1
+                                @exists = 1
+                                break
+                            @cci = @cci + 1
+                        if @exists == 0
+                            vec_push(@lam_captures, @refname)
             elif @btk == TK_EOF
                 break
             _advance(@g)
-        @lph = _em_fnptr_load_placeholder(@g)
-        vec_push(@g.fn_patches, @lph)
+        vec_push(@g.lambda_names,    @synth)
+        vec_push(@g.lambda_starts,   @lam_start)
+        vec_push(@g.lambda_captures, @lam_captures)
+        @ncaps = vec_len(@lam_captures)
+        if @ncaps == 0
+            # No captures → bare fn pointer, same as M11b.
+            @lph = _em_fnptr_load_placeholder(@g)
+            vec_push(@g.fn_patches, @lph)
+            vec_push(@g.fn_patches, @synth)
+            return 0
+        # Build closure block: new_arr(1 + ncaps), then write fn_ptr at
+        # [0] and each captured outer value at [1+i]. Save block ptr on
+        # the stack across fills so rax is free for intermediate loads.
+        _em_mov_eax_imm(@g, @ncaps + 1)
+        _inline_new_arr(@g)                    # rax = block ptr
+        _em_push_rax(@g)                       # save block ptr
+        @lph2 = _em_fnptr_load_placeholder(@g) # rax = fn_ptr
+        vec_push(@g.fn_patches, @lph2)
         vec_push(@g.fn_patches, @synth)
+        # mov rcx, [rsp]  (peek block ptr)
+        _eb(@g, 72)
+        _eb(@g, 139)
+        _eb(@g, 12)
+        _eb(@g, 36)
+        # mov [rcx + 0], rax
+        _eb(@g, 72)
+        _eb(@g, 137)
+        _eb(@g, 1)
+        @cii = 0
+        while @cii < @ncaps
+            @cname = vec_get(@lam_captures, @cii)
+            @coff = _local_slot(@g, @cname)
+            _em_load_rbp(@g, @coff)            # rax = captured value
+            # mov rcx, [rsp]
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 12)
+            _eb(@g, 36)
+            # mov [rcx + 8*(1+cii)], rax ; 48 89 81 <disp32>
+            _eb(@g, 72)
+            _eb(@g, 137)
+            _eb(@g, 129)
+            _e32(@g, (1 + @cii) * 8)
+            @cii = @cii + 1
+        _em_pop_rax(@g)                        # rax = block ptr (result)
         return 0
     if @k == TK_INT
         @v = _peek_iv(@g)
@@ -1507,6 +1597,63 @@ fn parse_primary(@g: Gen) -> int
         _advance(@g)
         @off = _local_slot(@g, @name)
         _em_load_rbp(@g, @off)
+        # Closure-call: @f annotated `let @f: closure` holds a pointer
+        # to a heap block {fn_ptr, cap0, cap1, ...}. Pass the block
+        # itself as rdi (hidden env), user args in rsi..r9 (up to 5),
+        # then call [rax + 0].
+        if _peek_kind(@g) == TK_LPAREN
+            @cl_type = _local_type(@g, @name)
+            if str_eq(@cl_type, "closure") == 1
+                _advance(@g)
+                _em_push_rax(@g)                     # save env (block ptr)
+                _eb(@g, 72)
+                _eb(@g, 129)
+                _eb(@g, 236)
+                @cl_sub_at = _code_len(@g)
+                _e32(@g, 0)                          # sub rsp, <alloc>
+                @cnargs = 0
+                if _peek_kind(@g) != TK_RPAREN
+                    parse_expr(@g)
+                    _eb(@g, 72)
+                    _eb(@g, 137)
+                    _eb(@g, 4)
+                    _eb(@g, 36)                      # mov [rsp], rax
+                    @cnargs = 1
+                    while _peek_kind(@g) == TK_COMMA
+                        _advance(@g)
+                        parse_expr(@g)
+                        _eb(@g, 72)
+                        _eb(@g, 137)
+                        _eb(@g, 132)
+                        _eb(@g, 36)
+                        _e32(@g, @cnargs * 8)        # mov [rsp+i*8], rax
+                        @cnargs = @cnargs + 1
+                _expect(@g, TK_RPAREN, "expected ')' after closure args")
+                @calloc = @cnargs * 8
+                if (@calloc % 16) == 0
+                    @calloc = @calloc + 8
+                _patch32(@g, @cl_sub_at, @calloc)
+                # Load user args into argreg[1..5] (env takes argreg[0]).
+                @clreg = @cnargs
+                if @clreg > 5
+                    @clreg = 5
+                @cli = 0
+                while @cli < @clreg
+                    _em_load_argreg_stack(@g, @cli + 1, @cli * 8)
+                    @cli = @cli + 1
+                # add rsp, calloc
+                _eb(@g, 72)
+                _eb(@g, 129)
+                _eb(@g, 196)
+                _e32(@g, @calloc)
+                # pop rdi (env = block ptr)  ; 5F
+                _eb(@g, 95)
+                # mov rax, [rdi]  ; 48 8b 07
+                _eb(@g, 72)
+                _eb(@g, 139)
+                _eb(@g, 7)
+                _em_call_rax(@g)
+                return 0
         # Indirect call through fn pointer: @f(args)
         # @f's value is already in rax; push it so arg-evaluation can
         # clobber rax, then pop back into rax right before `call rax`.
@@ -3636,7 +3783,24 @@ fn _variant_index(@g: Gen, @name: int) -> int
 # Re-enter the token stream at a recorded lambda position and emit the
 # lambda body as a synthetic top-level fn under @syn. Mirrors parse_fn
 # except it doesn't read a fn name from source — the caller supplies it.
+# When captures exist for this lambda, rdi holds the env block so we
+# prepend a hidden __env param and load each captured value from env
+# into a local before the user body runs.
 fn _parse_lambda_body(@g: Gen, @syn: int, @patches: Vec) -> int
+    # Look up captures recorded for this lambda at expression time.
+    @lami = 0 - 1
+    @lan  = vec_len(@g.lambda_names)
+    @lii  = 0
+    while @lii < @lan
+        if str_eq(vec_get(@g.lambda_names, @lii), @syn) == 1
+            @lami = @lii
+            break
+        @lii = @lii + 1
+    @caps = vec_new()
+    @ncaps = 0
+    if @lami >= 0
+        @caps = vec_get(@g.lambda_captures, @lami)
+        @ncaps = vec_len(@caps)
     _expect(@g, TK_FN, "expected 'fn' at lambda start")
     _swallow_generic_params(@g)
     @fn_off = _code_len(@g)
@@ -3646,6 +3810,10 @@ fn _parse_lambda_body(@g: Gen, @syn: int, @patches: Vec) -> int
     _reset_locals(@g)
     @param_names = vec_new()
     @param_types = vec_new()
+    # Prepend hidden __env as first arg if this lambda captures anything.
+    if @ncaps > 0
+        vec_push(@param_names, "__env")
+        vec_push(@param_types, "")
     if _peek_kind(@g) != TK_RPAREN
         if _peek_kind(@g) != TK_ATIDENT
             _die(@g, "expected lambda parameter (@name)")
@@ -3691,6 +3859,21 @@ fn _parse_lambda_body(@g: Gen, @syn: int, @patches: Vec) -> int
             _em_load_rbp(@g, @src_disp)
         _em_store_rbp(@g, @poff)
         @pi = @pi + 1
+    # Materialise captured values from the env block into named locals.
+    if @ncaps > 0
+        @env_off = _local_slot(@g, "__env")
+        @lci = 0
+        while @lci < @ncaps
+            @cname = vec_get(@caps, @lci)
+            @coff  = _local_slot(@g, @cname)    # fresh local
+            _em_load_rbp(@g, @env_off)          # rax = env block
+            # mov rax, [rax + 8*(1+lci)] ; 48 8b 80 <disp32>
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 128)
+            _e32(@g, (1 + @lci) * 8)
+            _em_store_rbp(@g, @coff)
+            @lci = @lci + 1
     parse_block(@g, @patches)
     _em_mov_eax_imm(@g, 0)
     _em_epilogue(@g)
