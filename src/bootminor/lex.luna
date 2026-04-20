@@ -55,6 +55,9 @@ const TK_KW_BREAK:    int = 60
 const TK_KW_CONTINUE: int = 61
 const TK_KW_STRUCT:   int = 62
 const TK_KW_LET:      int = 63
+const TK_KW_EXTERN:   int = 64
+const TK_KW_IMPORT:   int = 65
+const TK_KW_CONST:    int = 66
 const TK_LBRACE:      int = 70
 const TK_RBRACE:      int = 71
 const TK_DOT:         int = 72
@@ -119,6 +122,12 @@ fn _kw_lookup(@src: int, @start: int, @len: int) -> int
         return TK_KW_STRUCT
     if str_eq(@lit, "let") == 1
         return TK_KW_LET
+    if str_eq(@lit, "extern") == 1
+        return TK_KW_EXTERN
+    if str_eq(@lit, "import") == 1
+        return TK_KW_IMPORT
+    if str_eq(@lit, "const") == 1
+        return TK_KW_CONST
     return TK_IDENT
 
 

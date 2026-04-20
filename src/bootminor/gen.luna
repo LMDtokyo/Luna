@@ -622,6 +622,56 @@ fn _data_add_luna_str(@g: Gen, @src: int) -> int
     return @data_off
 
 
+# --- Linux syscall intrinsic helper ----------------------------------
+#
+# Evaluates @nargs expressions (currently at @g's token cursor, inside
+# enclosing `(...)` punctuation), pushes each, then pops into the
+# Linux syscall arg registers: rdi, rsi, rdx, r10, r8, r9. Finally
+# sets rax to @syscall_num and emits `syscall`.
+#
+# The result (rax after syscall) is left in rax so the call can be
+# used as an expression.
+
+fn _emit_syscall_intrinsic(@g: Gen, @nargs: int, @syscall_num: int) -> int
+    _expect(@g, TK_LPAREN, "expected '(' in syscall")
+    @k = 0
+    if _peek_kind(@g) != TK_RPAREN
+        parse_expr(@g)
+        _em_push_rax(@g)
+        @k = 1
+        while _peek_kind(@g) == TK_COMMA
+            _advance(@g)
+            parse_expr(@g)
+            _em_push_rax(@g)
+            @k = @k + 1
+    _expect(@g, TK_RPAREN, "expected ')' in syscall")
+    # Pop in reverse so arg0 ends up in rdi, arg1 in rsi, etc. Note the
+    # Linux convention uses r10 (not rcx) for arg 3.
+    @i = @k - 1
+    while @i >= 0
+        if @i == 0
+            _eb(@g, 95)                   # pop rdi
+        elif @i == 1
+            _eb(@g, 94)                   # pop rsi
+        elif @i == 2
+            _eb(@g, 90)                   # pop rdx
+        elif @i == 3
+            # pop r10 ; 41 5a
+            _eb(@g, 65)
+            _eb(@g, 90)
+        elif @i == 4
+            _eb(@g, 65)                   # pop r8
+            _eb(@g, 88)
+        elif @i == 5
+            _eb(@g, 65)                   # pop r9
+            _eb(@g, 89)
+        @i = @i - 1
+    # mov eax, syscall_num
+    _em_mov_eax_imm(@g, @syscall_num)
+    _em_syscall(@g)
+    return 0
+
+
 # --- Inline new_arr(n): allocate array of n 8-byte slots. ------------
 #
 # Input:  rax = element count (N)
@@ -1203,6 +1253,40 @@ fn parse_primary(@g: Gen) -> int
             _eb(@g, 70)
             _eb(@g, 8)
             return 0
+        # Linux syscall intrinsics. Each evaluates args left-to-right,
+        # pushes, then pops into the syscall argument registers before
+        # setting rax to the syscall number and emitting `syscall`.
+        #
+        # The Linux syscall ABI for integer args: rdi, rsi, rdx, r10,
+        # r8, r9 — slightly different from SysV (r10 instead of rcx).
+        if str_eq(@name, "sys_read") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 0)
+            return 0
+        if str_eq(@name, "sys_write") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 1)
+            return 0
+        if str_eq(@name, "sys_open") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 2)
+            return 0
+        if str_eq(@name, "sys_close") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 1, 3)
+            return 0
+        if str_eq(@name, "sys_lseek") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 8)
+            return 0
+        if str_eq(@name, "sys_exit") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 1, 60)
+            return 0
+        if str_eq(@name, "sys_creat") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 2, 85)
+            return 0
         # str_set_byte(s, i, v) — writes byte v at s+i, returns 0.
         if str_eq(@name, "str_set_byte") == 1
             _advance(@g)
@@ -1772,7 +1856,74 @@ fn parse_struct_decl(@g: Gen) -> int
     return 0
 
 
-# Parse a whole program = sequence of fn decls + struct decls.
+# Skip an `extern "C" fn name(...) -> type` declaration. We do not
+# emit code; the name is registered as a known external that triggers
+# syscall intrinsics when called.
+fn parse_extern_decl(@g: Gen) -> int
+    _advance(@g)                          # consume 'extern'
+    if _peek_kind(@g) == TK_STR
+        _advance(@g)                       # consume "C"
+    if _peek_kind(@g) == TK_FN
+        _advance(@g)
+    if _peek_kind(@g) == TK_IDENT
+        _advance(@g)                       # consume name
+    # Skip params up to ')'
+    if _peek_kind(@g) == TK_LPAREN
+        @depth = 1
+        _advance(@g)
+        while @depth > 0
+            @k = _peek_kind(@g)
+            if @k == TK_LPAREN
+                @depth = @depth + 1
+            elif @k == TK_RPAREN
+                @depth = @depth - 1
+            elif @k == TK_EOF
+                break
+            _advance(@g)
+    # Optional return type
+    if _peek_kind(@g) == TK_ARROW
+        _advance(@g)
+        if _peek_kind(@g) == TK_IDENT
+            _advance(@g)
+    # Consume trailing newline
+    while _peek_kind(@g) == TK_NEWLINE
+        _advance(@g)
+    return 0
+
+# Skip an `import modname` line. No-op since we compile concatenated
+# source monoliths.
+fn parse_import(@g: Gen) -> int
+    _advance(@g)
+    if _peek_kind(@g) == TK_IDENT
+        _advance(@g)
+    while _peek_kind(@g) == TK_NEWLINE
+        _advance(@g)
+    return 0
+
+# Skip a `const NAME: type = value` at module level. We DO NOT model
+# compile-time constants; the initializer expression is irrelevant for
+# bootminor's present subset. A best-effort skip lets prelude-style
+# constant tables pass through.
+fn parse_const_decl(@g: Gen) -> int
+    _advance(@g)                           # consume 'const'
+    if _peek_kind(@g) == TK_IDENT
+        _advance(@g)
+    if _peek_kind(@g) == TK_COLON
+        _advance(@g)
+        if _peek_kind(@g) == TK_IDENT
+            _advance(@g)
+    if _peek_kind(@g) == TK_ASSIGN
+        _advance(@g)
+        # Skip expression tokens up to newline.
+        while _peek_kind(@g) != TK_NEWLINE
+            if _peek_kind(@g) == TK_EOF
+                break
+            _advance(@g)
+    while _peek_kind(@g) == TK_NEWLINE
+        _advance(@g)
+    return 0
+
+# Parse a whole program = sequence of fn decls + struct decls + etc.
 fn parse_program(@g: Gen, @patches: Vec) -> int
     while 1
         _skip_newlines(@g)
@@ -1783,8 +1934,14 @@ fn parse_program(@g: Gen, @patches: Vec) -> int
             parse_fn(@g, @patches)
         elif @k == TK_KW_STRUCT
             parse_struct_decl(@g)
+        elif @k == TK_KW_EXTERN
+            parse_extern_decl(@g)
+        elif @k == TK_KW_IMPORT
+            parse_import(@g)
+        elif @k == TK_KW_CONST
+            parse_const_decl(@g)
         else
-            _die(@g, "expected fn or struct at top level")
+            _die(@g, "expected fn/struct/extern/import/const at top level")
             _advance(@g)
     return 0
 
