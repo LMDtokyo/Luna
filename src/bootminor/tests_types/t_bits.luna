@@ -1,0 +1,10 @@
+fn main() -> int
+    shine_int(bswap64(0x1122334455667788))
+    shine_int(bswap32(0x11223344))
+    shine_int(popcount(0xFF))
+    shine_int(popcount(0))
+    shine_int(clz(1))
+    shine_int(ctz(0x80))
+    shine_int(rotl(1, 8))
+    shine_int(rotr(0x100, 8))
+    return 0

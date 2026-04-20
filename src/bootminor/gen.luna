@@ -731,6 +731,90 @@ fn _emit_syscall_intrinsic(@g: Gen, @nargs: int, @syscall_num: int) -> int
     return 0
 
 
+# --- SSE double binary op: rax = rax OP rcx (as f64 bit patterns) ----
+#
+# opcode_byte is the third byte of the SSE opcode sequence:
+#   addsd = f2 0f 58, subsd = f2 0f 5c, mulsd = f2 0f 59, divsd = f2 0f 5e.
+# Encodes: movq xmm0, rax; movq xmm1, rcx; <OP> xmm0, xmm1; movq rax, xmm0
+
+fn _emit_f64_binop(@g: Gen, @op3: int) -> int
+    # movq xmm0, rax  ; 66 48 0f 6e c0
+    _eb(@g, 102)
+    _eb(@g, 72)
+    _eb(@g, 15)
+    _eb(@g, 110)
+    _eb(@g, 192)
+    # movq xmm1, rcx  ; 66 48 0f 6e c9
+    _eb(@g, 102)
+    _eb(@g, 72)
+    _eb(@g, 15)
+    _eb(@g, 110)
+    _eb(@g, 201)
+    # <OP>sd xmm0, xmm1 ; f2 0f <op3> c1
+    _eb(@g, 242)
+    _eb(@g, 15)
+    _eb(@g, @op3)
+    _eb(@g, 193)
+    # movq rax, xmm0  ; 66 48 0f 7e c0
+    _eb(@g, 102)
+    _eb(@g, 72)
+    _eb(@g, 15)
+    _eb(@g, 126)
+    _eb(@g, 192)
+    return 0
+
+# SSE double compare: rax holds result bits of `a`, rcx holds `b`.
+# Emits ucomisd xmm0, xmm1 then set<setcc_opcode> al + movzx rax, al.
+# Meaning of flags after ucomisd xmm0, xmm1:
+#   unordered or equal → ZF=1
+#   a > b              → ZF=0, CF=0
+#   a < b              → ZF=0, CF=1
+# setcc_opcode examples: 148 (sete), 151 (seta, i.e. CF=0 & ZF=0).
+
+fn _emit_f64_cmp(@g: Gen, @setcc: int) -> int
+    # movq xmm0, rax (a)
+    _eb(@g, 102)
+    _eb(@g, 72)
+    _eb(@g, 15)
+    _eb(@g, 110)
+    _eb(@g, 192)
+    # movq xmm1, rcx (b)
+    _eb(@g, 102)
+    _eb(@g, 72)
+    _eb(@g, 15)
+    _eb(@g, 110)
+    _eb(@g, 201)
+    # ucomisd xmm0, xmm1  ; 66 0f 2e c1
+    _eb(@g, 102)
+    _eb(@g, 15)
+    _eb(@g, 46)
+    _eb(@g, 193)
+    _em_set_cond(@g, @setcc)
+    return 0
+
+# Swap operands: useful for a>b variant via ucomisd b,a.
+fn _emit_f64_cmp_swap(@g: Gen, @setcc: int) -> int
+    # movq xmm0, rcx (b)
+    _eb(@g, 102)
+    _eb(@g, 72)
+    _eb(@g, 15)
+    _eb(@g, 110)
+    _eb(@g, 193)
+    # movq xmm1, rax (a)
+    _eb(@g, 102)
+    _eb(@g, 72)
+    _eb(@g, 15)
+    _eb(@g, 110)
+    _eb(@g, 200)
+    # ucomisd xmm0, xmm1
+    _eb(@g, 102)
+    _eb(@g, 15)
+    _eb(@g, 46)
+    _eb(@g, 193)
+    _em_set_cond(@g, @setcc)
+    return 0
+
+
 # --- Inline new_arr(n): allocate array of n 8-byte slots. ------------
 #
 # Input:  rax = element count (N)
@@ -974,18 +1058,95 @@ fn parse_mul(@g: Gen) -> int
             break
     return 0
 
+# Emit cast of rax to target primitive type (mask or sign-extend).
+fn _emit_cast(@g: Gen, @tname: int) -> int
+    if str_eq(@tname, "u8") == 1
+        # and rax, 0xff
+        _eb(@g, 72)
+        _eb(@g, 37)                          # 48 25 <imm32>
+        _e32(@g, 255)
+        return 0
+    if str_eq(@tname, "bool") == 1
+        # !!x: non-zero becomes 1.  cmp rax, 0; setne al; movzx rax, al
+        _eb(@g, 72)
+        _eb(@g, 131)
+        _eb(@g, 248)
+        _eb(@g, 0)                           # 48 83 f8 00  cmp rax, 0
+        _em_set_cond(@g, 149)                # setne
+        return 0
+    if str_eq(@tname, "u16") == 1
+        _eb(@g, 72)
+        _eb(@g, 37)
+        _e32(@g, 65535)
+        return 0
+    if str_eq(@tname, "u32") == 1
+        # mov eax, eax — zeroes top 32 bits.
+        _eb(@g, 137)
+        _eb(@g, 192)                         # 89 c0
+        return 0
+    if str_eq(@tname, "i8") == 1
+        # movsx rax, al  ; 48 0f be c0
+        _eb(@g, 72)
+        _eb(@g, 15)
+        _eb(@g, 190)
+        _eb(@g, 192)
+        return 0
+    if str_eq(@tname, "i16") == 1
+        # movsx rax, ax  ; 48 0f bf c0
+        _eb(@g, 72)
+        _eb(@g, 15)
+        _eb(@g, 191)
+        _eb(@g, 192)
+        return 0
+    if str_eq(@tname, "i32") == 1
+        # movsxd rax, eax  ; 48 63 c0
+        _eb(@g, 72)
+        _eb(@g, 99)
+        _eb(@g, 192)
+        return 0
+    # Default (u64 / i64 / usize / isize / pointer / struct) — no-op.
+    return 0
+
 fn parse_unary(@g: Gen) -> int
     if _peek_kind(@g) == TK_MINUS
         _advance(@g)
-        parse_primary(@g)
+        parse_unary(@g)
         _em_neg_rax(@g)
-        return 0
+        return _parse_cast_suffix(@g)
     if _peek_kind(@g) == TK_TILDE
         _advance(@g)
-        parse_primary(@g)
+        parse_unary(@g)
         _em_not_rax(@g)
-        return 0
+        return _parse_cast_suffix(@g)
+    # Address-of a local: &@name  →  lea rax, [rbp + local_off]
+    if _peek_kind(@g) == TK_AMP
+        if vec_get(@g.kind, @g.pos + 1) == TK_ATIDENT
+            _advance(@g)
+            @name = _tok_substr(@g, @g.pos)
+            _advance(@g)
+            @off = _local_slot(@g, @name)
+            _eb(@g, 72)
+            _eb(@g, 141)
+            _eb(@g, 133)
+            _e32(@g, @off)
+            return _parse_cast_suffix(@g)
+    # Dereference: *expr
+    if _peek_kind(@g) == TK_STAR
+        _advance(@g)
+        parse_unary(@g)
+        _eb(@g, 72)
+        _eb(@g, 139)
+        _eb(@g, 0)
+        return _parse_cast_suffix(@g)
     parse_primary(@g)
+    return _parse_cast_suffix(@g)
+
+# After any primary, consume chained `as T` postfixes.
+fn _parse_cast_suffix(@g: Gen) -> int
+    while _peek_kind(@g) == TK_KW_AS
+        _advance(@g)
+        @tname = _parse_type(@g)
+        _emit_cast(@g, @tname)
     return 0
 
 fn parse_primary(@g: Gen) -> int
@@ -1358,6 +1519,187 @@ fn parse_primary(@g: Gen) -> int
             _advance(@g)
             _emit_syscall_intrinsic(@g, 2, 85)
             return 0
+        # mmap(addr, len, prot, flags, fd, offset) — 6 args, syscall 9
+        if str_eq(@name, "sys_mmap") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 6, 9)
+            return 0
+        if str_eq(@name, "sys_munmap") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 2, 11)
+            return 0
+        if str_eq(@name, "sys_brk") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 1, 12)
+            return 0
+        if str_eq(@name, "sys_getpid") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 0, 39)
+            return 0
+        if str_eq(@name, "sys_getrandom") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 318)
+            return 0
+        # --- f64 math (via SSE xmm0/xmm1) ---
+        # Inputs/outputs pass through rax as the raw 64-bit bit pattern
+        # of the IEEE-754 double. Callers use `f64_lit(0x400921FB...)`
+        # for literal constants and `f64_from_int(n)` to convert ints.
+        # f64_from_int(n): cvtsi2sd xmm0, rax; movq rax, xmm0
+        if str_eq(@name, "f64_from_int") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_from_int")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # cvtsi2sd xmm0, rax  ; f2 48 0f 2a c0
+            _eb(@g, 242)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 42)
+            _eb(@g, 192)
+            # movq rax, xmm0      ; 66 48 0f 7e c0
+            _eb(@g, 102)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 126)
+            _eb(@g, 192)
+            return 0
+        # f64_to_int(x): cvttsd2si rax, xmm0  (truncating int conversion)
+        if str_eq(@name, "f64_to_int") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_to_int")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # movq xmm0, rax      ; 66 48 0f 6e c0
+            _eb(@g, 102)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 110)
+            _eb(@g, 192)
+            # cvttsd2si rax, xmm0 ; f2 48 0f 2c c0
+            _eb(@g, 242)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 44)
+            _eb(@g, 192)
+            return 0
+        # f64_lit(bits): no-op — caller passed the raw u64 bit pattern.
+        if str_eq(@name, "f64_lit") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_lit")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            return 0
+        # Binary SSE ops: f64_add / sub / mul / div (a, b)
+        if str_eq(@name, "f64_add") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_add")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_f64_binop(@g, 88)          # addsd opcode byte (f2 0f 58)
+            return 0
+        if str_eq(@name, "f64_sub") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_sub")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_f64_binop(@g, 92)          # subsd (f2 0f 5c)
+            return 0
+        if str_eq(@name, "f64_mul") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_mul")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_f64_binop(@g, 89)          # mulsd (f2 0f 59)
+            return 0
+        if str_eq(@name, "f64_div") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_div")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_f64_binop(@g, 94)          # divsd (f2 0f 5e)
+            return 0
+        # f64_sqrt(x): sqrtsd xmm0, xmm0
+        if str_eq(@name, "f64_sqrt") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_sqrt")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # movq xmm0, rax  ;  66 48 0f 6e c0
+            _eb(@g, 102)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 110)
+            _eb(@g, 192)
+            # sqrtsd xmm0, xmm0  ; f2 0f 51 c0
+            _eb(@g, 242)
+            _eb(@g, 15)
+            _eb(@g, 81)
+            _eb(@g, 192)
+            # movq rax, xmm0  ; 66 48 0f 7e c0
+            _eb(@g, 102)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 126)
+            _eb(@g, 192)
+            return 0
+        # f64_lt(a, b): ucomisd xmm0(a), xmm1(b) → CF=1 when a<b → setb.
+        if str_eq(@name, "f64_lt") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_lt")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_f64_cmp(@g, 146)           # setb (CF=1)
+            return 0
+        # f64_gt(a, b): CF=0 && ZF=0 when a>b → seta.
+        if str_eq(@name, "f64_gt") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_gt")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_f64_cmp(@g, 151)           # seta (CF=0, ZF=0)
+            return 0
+        if str_eq(@name, "f64_eq") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after f64_eq")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_f64_cmp(@g, 148)           # sete
+            return 0
         # u64_get(buf, word_idx) — load 8 bytes at buf + word_idx*8
         if str_eq(@name, "u64_get") == 1
             _advance(@g)
@@ -1403,6 +1745,311 @@ fn parse_primary(@g: Gen) -> int
             # return 0
             _eb(@g, 49)
             _eb(@g, 192)
+            return 0
+        # --- Byte-level load/store (hacker toolkit, no length prefix) ---
+        # u8_at(ptr, off): movzx rax, byte [ptr + off]
+        if str_eq(@name, "u8_at") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after u8_at")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # movzx rax, byte [rax + rcx]  ; 48 0f b6 04 08
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 182)
+            _eb(@g, 4)
+            _eb(@g, 8)
+            return 0
+        # u16_at(ptr, off): movzx rax, word [ptr + off]
+        if str_eq(@name, "u16_at") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after u16_at")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # movzx rax, word [rax + rcx]  ; 48 0f b7 04 08
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 183)
+            _eb(@g, 4)
+            _eb(@g, 8)
+            return 0
+        # u32_at(ptr, off): mov eax, dword [ptr + off]   (zero-extends)
+        if str_eq(@name, "u32_at") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after u32_at")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov eax, [rax + rcx]  ; 8b 04 08  (REX omitted => 32-bit zero-extends)
+            _eb(@g, 139)
+            _eb(@g, 4)
+            _eb(@g, 8)
+            return 0
+        # u8_set(ptr, off, v): mov [ptr+off], v_low_byte; return 0
+        if str_eq(@name, "u8_set") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after u8_set")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov r8, rax (value) ; pop rcx (off) ; pop rdx (ptr)
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 192)
+            _eb(@g, 89)
+            _eb(@g, 90)
+            # mov [rdx + rcx], r8b  ; 44 88 04 0a
+            _eb(@g, 68)
+            _eb(@g, 136)
+            _eb(@g, 4)
+            _eb(@g, 10)
+            _eb(@g, 49)                    # xor eax, eax (return 0)
+            _eb(@g, 192)
+            return 0
+        # u16_set(ptr, off, v): mov [ptr+off], v_word; return 0
+        if str_eq(@name, "u16_set") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after u16_set")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _eb(@g, 73)                    # mov r8, rax
+            _eb(@g, 137)
+            _eb(@g, 192)
+            _eb(@g, 89)                    # pop rcx
+            _eb(@g, 90)                    # pop rdx
+            # mov [rdx + rcx], r8w  ; 66 44 89 04 0a  (16-bit operand-size prefix 66)
+            _eb(@g, 102)
+            _eb(@g, 68)
+            _eb(@g, 137)
+            _eb(@g, 4)
+            _eb(@g, 10)
+            _eb(@g, 49)
+            _eb(@g, 192)
+            return 0
+        # u32_set(ptr, off, v): mov [ptr+off], v_dword; return 0
+        if str_eq(@name, "u32_set") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after u32_set")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _eb(@g, 73)                    # mov r8, rax
+            _eb(@g, 137)
+            _eb(@g, 192)
+            _eb(@g, 89)                    # pop rcx
+            _eb(@g, 90)                    # pop rdx
+            # mov [rdx + rcx], r8d  ; 44 89 04 0a
+            _eb(@g, 68)
+            _eb(@g, 137)
+            _eb(@g, 4)
+            _eb(@g, 10)
+            _eb(@g, 49)
+            _eb(@g, 192)
+            return 0
+        # --- Bit tricks ---
+        # bswap64(x): BSWAP rax (reverses bytes in a 64-bit value)
+        if str_eq(@name, "bswap64") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after bswap64")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _eb(@g, 72)                    # 48 0f c8  ; bswap rax
+            _eb(@g, 15)
+            _eb(@g, 200)
+            return 0
+        # bswap32(x): BSWAP eax (for 32-bit values, zero-extends to rax)
+        if str_eq(@name, "bswap32") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after bswap32")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _eb(@g, 15)                    # 0f c8  ; bswap eax
+            _eb(@g, 200)
+            return 0
+        # popcount(x): POPCNT rax, rax
+        if str_eq(@name, "popcount") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after popcount")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # f3 48 0f b8 c0
+            _eb(@g, 243)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 184)
+            _eb(@g, 192)
+            return 0
+        # clz(x): count leading zeros in 64-bit. LZCNT rax, rax.
+        if str_eq(@name, "clz") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after clz")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # f3 48 0f bd c0
+            _eb(@g, 243)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 189)
+            _eb(@g, 192)
+            return 0
+        # ctz(x): count trailing zeros. TZCNT rax, rax.
+        if str_eq(@name, "ctz") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after ctz")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # f3 48 0f bc c0
+            _eb(@g, 243)
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 188)
+            _eb(@g, 192)
+            return 0
+        # rotl(x, n): rotate x left by n bits. rcx = n (only low 6 bits used).
+        if str_eq(@name, "rotl") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after rotl")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # rol rax, cl  ; 48 d3 c0
+            _eb(@g, 72)
+            _eb(@g, 211)
+            _eb(@g, 192)
+            return 0
+        # rotr(x, n): rotate right
+        if str_eq(@name, "rotr") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after rotr")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # ror rax, cl  ; 48 d3 c8
+            _eb(@g, 72)
+            _eb(@g, 211)
+            _eb(@g, 200)
+            return 0
+        # --- Memory ops ---
+        # memcpy(dst, src, n): byte-copy n bytes. dst,src,n ; returns dst.
+        if str_eq(@name, "memcpy") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after memcpy")
+            parse_expr(@g)                        # dst
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)                        # src
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)                        # n
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov rcx, rax (n) ; pop rsi (src) ; pop rdi (dst)
+            _em_mov_rcx_rax(@g)
+            _eb(@g, 94)                           # pop rsi
+            _eb(@g, 95)                           # pop rdi
+            # rep movsb (f3 a4)
+            _eb(@g, 243)
+            _eb(@g, 164)
+            # mov rax, rdi (return dst — but rdi has advanced, so reload from saved copy)
+            # For simplicity return 0. Callers who want dst keep it themselves.
+            _eb(@g, 49)
+            _eb(@g, 192)
+            return 0
+        # memset(ptr, byte, n): fill n bytes with byte. Returns 0.
+        if str_eq(@name, "memset") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after memset")
+            parse_expr(@g)                        # ptr
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)                        # byte
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)                        # n
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov rcx, rax (n)
+            _em_mov_rcx_rax(@g)
+            # pop rax (byte)
+            _em_pop_rax(@g)
+            # pop rdi (ptr)
+            _eb(@g, 95)
+            # rep stosb (f3 aa)
+            _eb(@g, 243)
+            _eb(@g, 170)
+            _eb(@g, 49)
+            _eb(@g, 192)
+            return 0
+        # sizeof intrinsic: returns 1/2/4/8 for primitive widths,
+        # nfields*8 for user struct. Value folded at compile time.
+        if str_eq(@name, "sizeof") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after sizeof")
+            if _peek_kind(@g) != TK_IDENT
+                _die(@g, "sizeof expects a type name")
+                return 0
+            @tname = _tok_substr(@g, @g.pos)
+            _advance(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            @sz = 8
+            if str_eq(@tname, "u8") == 1
+                @sz = 1
+            elif str_eq(@tname, "i8") == 1
+                @sz = 1
+            elif str_eq(@tname, "bool") == 1
+                @sz = 1
+            elif str_eq(@tname, "u16") == 1
+                @sz = 2
+            elif str_eq(@tname, "i16") == 1
+                @sz = 2
+            elif str_eq(@tname, "u32") == 1
+                @sz = 4
+            elif str_eq(@tname, "i32") == 1
+                @sz = 4
+            elif str_eq(@tname, "f32") == 1
+                @sz = 4
+            else
+                @s_idx = _struct_lookup(@g, @tname)
+                if @s_idx >= 0
+                    @fields = vec_get(@g.struct_fields, @s_idx)
+                    @sz = vec_len(@fields) * 8
+            _em_mov_eax_imm(@g, @sz)
             return 0
         # str_set_byte(s, i, v) — writes byte v at s+i, returns 0.
         if str_eq(@name, "str_set_byte") == 1
@@ -1540,6 +2187,54 @@ fn _record_str_patch(@g: Gen, @code_off: int, @data_off: int, @patches: Vec) -> 
     vec_push(@patches, @data_off)
     return 0
 
+# Parse a type expression starting at the current token. Returns a
+# string describing the type, or "" if no type recognised. Accepts:
+#   Ident                      e.g. int, u8, u32, Point, Gen
+#   * [mut|const] Ident        raw pointer (stored as "*Ident" marker)
+# Consumes the tokens forming the type.
+fn _parse_type(@g: Gen) -> int
+    @k = _peek_kind(@g)
+    if @k == TK_STAR
+        _advance(@g)
+        # Skip optional "mut" or "const" identifier after *
+        if _peek_kind(@g) == TK_IDENT
+            @maybe = _tok_substr(@g, @g.pos)
+            if str_eq(@maybe, "mut") == 1
+                _advance(@g)
+            elif str_eq(@maybe, "const") == 1
+                _advance(@g)
+        if _peek_kind(@g) == TK_IDENT
+            @inner = _tok_substr(@g, @g.pos)
+            _advance(@g)
+            return str_concat("*", @inner)
+        return "*"
+    if @k == TK_IDENT
+        @t = _tok_substr(@g, @g.pos)
+        _advance(@g)
+        return @t
+    return ""
+
+# Common impl for `let`/`meow`/`seal` bindings: consumes the binding
+# keyword, parses `@name [: type]? = expr`, stores into a fresh local.
+fn _parse_typed_binding(@g: Gen) -> int
+    _advance(@g)                                # consume let/meow/seal
+    if _peek_kind(@g) != TK_ATIDENT
+        _die(@g, "expected @name after binding keyword")
+        return 0
+    @lname = _tok_substr(@g, @g.pos)
+    _advance(@g)
+    @ltype = ""
+    if _peek_kind(@g) == TK_COLON
+        _advance(@g)
+        @ltype = _parse_type(@g)
+    _expect(@g, TK_ASSIGN, "expected '=' after binding")
+    parse_expr(@g)
+    @off = _local_slot(@g, @lname)
+    if str_eq(@ltype, "") == 0
+        _set_local_type(@g, @lname, @ltype)
+    _em_store_rbp(@g, @off)
+    return 0
+
 # Returns 0 on normal statement, 1 if end-of-block (DEDENT/EOF) reached.
 fn parse_stmt(@g: Gen, @patches: Vec) -> int
     _skip_newlines(@g)
@@ -1562,27 +2257,16 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
             _em_epilogue(@g)
         return 0
 
-    # let @x: T = expr — typed binding (propagates struct type)
+    # let / meow / seal binding forms (all typed-propagating to enable
+    # struct field access). Semantic difference (let=immutable vs meow=
+    # mutable vs seal=frozen-after-init) is not yet enforced; they all
+    # compile to the same slot-write. This matches Luna spec §1.3.
     if @k == TK_KW_LET
-        _advance(@g)
-        if _peek_kind(@g) != TK_ATIDENT
-            _die(@g, "expected @name after let")
-            return 0
-        @lname = _tok_substr(@g, @g.pos)
-        _advance(@g)
-        @ltype = ""
-        if _peek_kind(@g) == TK_COLON
-            _advance(@g)
-            if _peek_kind(@g) == TK_IDENT
-                @ltype = _tok_substr(@g, @g.pos)
-                _advance(@g)
-        _expect(@g, TK_ASSIGN, "expected '=' in let")
-        parse_expr(@g)
-        @off = _local_slot(@g, @lname)
-        if str_eq(@ltype, "") == 0
-            _set_local_type(@g, @lname, @ltype)
-        _em_store_rbp(@g, @off)
-        return 0
+        return _parse_typed_binding(@g)
+    if @k == TK_KW_MEOW
+        return _parse_typed_binding(@g)
+    if @k == TK_KW_SEAL
+        return _parse_typed_binding(@g)
 
     if @k == TK_IF
         parse_if(@g, @patches)

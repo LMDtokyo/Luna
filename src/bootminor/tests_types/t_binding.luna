@@ -1,0 +1,17 @@
+fn main() -> int
+    # Per Luna spec §1.3: let (immutable default), meow (mutable),
+    # seal (one-shot). Semantic enforcement will come later; for now
+    # all three are just slot-writes with type propagation.
+    let  @a: int = 10
+    meow @b: int = 20
+    seal @c: int = 30
+    shine_int(@a + @b + @c)
+
+    @b = @b * 2
+    shine_int(@b)
+
+    # Typed pointer as primitive — binding forms work with *mut T etc.
+    let  @buf: int = new_str(4)
+    u32_set(@buf, 0, 0xCAFEBABE)
+    shine_int(u32_at(@buf, 0))
+    return 0

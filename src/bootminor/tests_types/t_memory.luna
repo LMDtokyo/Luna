@@ -1,0 +1,38 @@
+fn main() -> int
+    # Byte-level access into a heap buffer (ELF/PE-parsing style).
+    meow @buf: int = new_str(32)
+    u8_set(@buf, 0, 0x7f)
+    u8_set(@buf, 1, 0x45)
+    u8_set(@buf, 2, 0x4c)
+    u8_set(@buf, 3, 0x46)
+    u32_set(@buf, 4, 0x0102034f)
+    u16_set(@buf, 8, 0xBEEF)
+
+    shine_int(u8_at(@buf, 0))
+    shine_int(u8_at(@buf, 1))
+    shine_int(u8_at(@buf, 3))
+    shine_int(u32_at(@buf, 4))
+    shine_int(u16_at(@buf, 8))
+
+    # Address-of + deref round-trip.
+    meow @v: int = 42
+    seal @p: int = &@v
+    shine_int(*@p)
+
+    # memset + memcpy
+    meow @a: int = new_str(16)
+    memset(@a, 0x41, 8)
+    shine_int(u8_at(@a, 0))
+    shine_int(u8_at(@a, 7))
+
+    meow @b: int = new_str(16)
+    memcpy(@b, @a, 8)
+    shine_int(u8_at(@b, 3))
+
+    # sizeof primitives.
+    shine_int(sizeof(u8))
+    shine_int(sizeof(u16))
+    shine_int(sizeof(u32))
+    shine_int(sizeof(u64))
+    shine_int(sizeof(bool))
+    return 0

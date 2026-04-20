@@ -1,0 +1,20 @@
+fn main() -> int
+    @big = 0x123456789abcdef0
+    shine_int(@big as u8)
+    shine_int(@big as u16)
+    shine_int(@big as u32)
+
+    @neg = 0 - 1
+    shine_int(@neg as u8)
+    shine_int(@neg as i8)
+    shine_int(@neg as i16)
+    shine_int(@neg as i32)
+
+    @byte = 128
+    shine_int(@byte as i8)
+
+    seal @flag: bool = 42 as bool
+    shine_int(@flag)
+    seal @zero: bool = 0 as bool
+    shine_int(@zero)
+    return 0

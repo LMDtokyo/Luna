@@ -1,0 +1,23 @@
+fn main() -> int
+    seal @pi: int = f64_lit(0x400921FB54442D18)
+    @r = f64_from_int(5)
+    @area = f64_mul(@pi, f64_mul(@r, @r))
+    shine_int(f64_to_int(@area))
+
+    shine_int(f64_to_int(f64_sqrt(f64_from_int(256))))
+    shine_int(f64_to_int(f64_sqrt(f64_from_int(10000))))
+
+    @three = f64_from_int(3)
+    @four  = f64_from_int(4)
+    shine_int(f64_lt(@three, @four))
+    shine_int(f64_gt(@three, @four))
+    shine_int(f64_eq(@three, @three))
+    shine_int(f64_lt(@four, @three))
+
+    @ten   = f64_from_int(10)
+    @res   = f64_div(@ten, @four)
+    shine_int(f64_to_int(@res))
+
+    @neg = f64_sub(@three, @ten)
+    shine_int(f64_to_int(@neg))
+    return 0
