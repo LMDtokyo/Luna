@@ -1,54 +1,39 @@
 # =====================================================================
-# bootminor: minimal self-hosted Luna compiler (M1).
+# bootminor: minimal self-hosted Luna compiler (M2a).
 #
-# Purpose: prove Luna compiles Luna. Compiled by `luna-boot` into a
-# native binary `luna-mini`, which then compiles a tiny Luna subset
-# into Linux ELF64 executables.
-#
-# Subset (M1):
+# Subset supported by THIS version:
 #   - A single `fn main() -> int` function
-#   - A single `shine("literal string")` call in the body
-#   - Exit 0 afterwards
+#   - Any number of `shine("literal")` calls, executed top-to-bottom
+#   - An optional `return <integer-literal>` that becomes the process
+#     exit code (default 0 if omitted)
 #
-# Output: Linux ELF64 with hard-coded vaddr 0x400000, single PT_LOAD
-# segment containing both code and data. ~200-byte executables.
+# Everything else in the input source is ignored. Comments, whitespace
+# and unrelated code are skipped — the compiler is a substring scanner,
+# not a full parser. Real lex + parse + codegen live in lex.luna /
+# future gen.luna and will replace this driver at M2b.
 #
-# Algorithm (M1):
-#   1. Read input file path from argv[1]; fall back to "Hello from bootminor"
-#      if the file has no recognisable `shine("…")` call.
-#   2. Find the first `shine("` token and extract the string up to the
-#      next unescaped double quote. That's the message to print.
-#   3. Emit the ELF64 with code: write(1, msg, len); exit(0).
-#   4. Write to output path from `-o <path>` arg or default "a.out".
-#
-# Why this is enough: once the bootstrap compiles *this* file, we have
-# a Luna program that produces running binaries. That is the definition
-# of self-hosting for the present subset. M2/M3 grow the subset.
+# Output: Linux ELF64, vaddr 0x400000, single PT_LOAD segment with all
+# code (one write-syscall per shine, then exit) followed by the string
+# data section containing each literal in source order.
 # =====================================================================
 
 
-# =====================================================================
-# ELF64 layout constants (System V ABI, x86-64).
-# Vaddr 0x400000 is the traditional text-segment base on Linux x86-64.
-# =====================================================================
+# --- ELF64 layout constants ------------------------------------------
 
 fn _elf_vaddr() -> int
     return 4194304        # 0x400000
 
 fn _elf_hdr_size() -> int
-    return 64             # sizeof(Elf64_Ehdr)
+    return 64
 
 fn _elf_phdr_size() -> int
-    return 56             # sizeof(Elf64_Phdr)
+    return 56
 
 fn _elf_prelude_size() -> int
-    return 120            # 64 + 56, file offset of first code byte
+    return 120            # header + program header
 
 
-# =====================================================================
-# Byte-buffer helpers — patch 1/2/4/8 bytes little-endian into buf
-# at offset `@at`.
-# =====================================================================
+# --- Byte patchers ----------------------------------------------------
 
 fn _put8(@buf: int, @at: int, @v: int) -> int
     str_set_byte(@buf, @at, @v & 255)
@@ -74,143 +59,307 @@ fn _put64(@buf: int, @at: int, @v: int) -> int
     return 0
 
 
-# =====================================================================
-# ELF64 header + program header writer.
-# Fills bytes [0..120) of `@buf`, assuming total file size `@file_sz`
-# and entry-point offset `@entry_off` (relative to file start, i.e. after
-# the 120-byte prelude, entry_off will be 120).
-# =====================================================================
+# --- ELF64 header emitter --------------------------------------------
 
 fn _emit_elf_headers(@buf: int, @file_sz: int, @entry_off: int) -> int
-    # ---- Elf64_Ehdr ----
-    # e_ident: [0x7F 'E' 'L' 'F'][ELFCLASS64=2][ELFDATA2LSB=1][EV_CURRENT=1]
-    #          [OSABI=0][ABIVER=0][padding 7 bytes]
-    _put8(@buf, 0, 127)     # 0x7F
-    _put8(@buf, 1, 69)      # 'E'
-    _put8(@buf, 2, 76)      # 'L'
-    _put8(@buf, 3, 70)      # 'F'
-    _put8(@buf, 4, 2)       # 64-bit
-    _put8(@buf, 5, 1)       # little-endian
-    _put8(@buf, 6, 1)       # version = EV_CURRENT
-    # bytes 7..15 already zero from new_str
-
-    _put16(@buf, 16, 2)               # e_type = ET_EXEC
-    _put16(@buf, 18, 62)              # e_machine = EM_X86_64
-    _put32(@buf, 20, 1)               # e_version = EV_CURRENT
-    _put64(@buf, 24, _elf_vaddr() + @entry_off)   # e_entry
-    _put64(@buf, 32, _elf_hdr_size())             # e_phoff = 64
-    _put64(@buf, 40, 0)                           # e_shoff = 0 (no sections)
-    _put32(@buf, 48, 0)                           # e_flags
-    _put16(@buf, 52, _elf_hdr_size())             # e_ehsize
-    _put16(@buf, 54, _elf_phdr_size())            # e_phentsize
-    _put16(@buf, 56, 1)                           # e_phnum
-    _put16(@buf, 58, 0)                           # e_shentsize
-    _put16(@buf, 60, 0)                           # e_shnum
-    _put16(@buf, 62, 0)                           # e_shstrndx
-
-    # ---- Elf64_Phdr (PT_LOAD over the whole file) ----
-    @p = _elf_hdr_size()          # 64
-    _put32(@buf, @p + 0,  1)      # p_type = PT_LOAD
-    _put32(@buf, @p + 4,  5)      # p_flags = PF_R | PF_X
-    _put64(@buf, @p + 8,  0)                  # p_offset = 0
-    _put64(@buf, @p + 16, _elf_vaddr())       # p_vaddr
-    _put64(@buf, @p + 24, _elf_vaddr())       # p_paddr
-    _put64(@buf, @p + 32, @file_sz)           # p_filesz
-    _put64(@buf, @p + 40, @file_sz)           # p_memsz
-    _put64(@buf, @p + 48, 4096)               # p_align
+    _put8(@buf, 0, 127)
+    _put8(@buf, 1, 69)
+    _put8(@buf, 2, 76)
+    _put8(@buf, 3, 70)
+    _put8(@buf, 4, 2)
+    _put8(@buf, 5, 1)
+    _put8(@buf, 6, 1)
+    _put16(@buf, 16, 2)
+    _put16(@buf, 18, 62)
+    _put32(@buf, 20, 1)
+    _put64(@buf, 24, _elf_vaddr() + @entry_off)
+    _put64(@buf, 32, _elf_hdr_size())
+    _put64(@buf, 40, 0)
+    _put32(@buf, 48, 0)
+    _put16(@buf, 52, _elf_hdr_size())
+    _put16(@buf, 54, _elf_phdr_size())
+    _put16(@buf, 56, 1)
+    _put16(@buf, 58, 0)
+    _put16(@buf, 60, 0)
+    _put16(@buf, 62, 0)
+    @p = _elf_hdr_size()
+    _put32(@buf, @p + 0,  1)
+    _put32(@buf, @p + 4,  5)
+    _put64(@buf, @p + 8,  0)
+    _put64(@buf, @p + 16, _elf_vaddr())
+    _put64(@buf, @p + 24, _elf_vaddr())
+    _put64(@buf, @p + 32, @file_sz)
+    _put64(@buf, @p + 40, @file_sz)
+    _put64(@buf, @p + 48, 4096)
     return 0
 
 
-# =====================================================================
-# x86-64 code emitter for the single `shine(LITERAL)` body.
-# Emits position-independent code that computes the message address via
-# LEA rip-relative, writes to stdout via syscall 1, then exits via
-# syscall 60.
-# =====================================================================
+# --- Per-shine code emitter (24 bytes) -------------------------------
+#
+# b8 01 00 00 00        mov eax, 1       ; sys_write
+# bf 01 00 00 00        mov edi, 1       ; fd = stdout
+# 48 8d 35 <rel32>      lea rsi, [rip+disp]
+# ba <len32>            mov edx, imm32
+# 0f 05                 syscall
 
-fn _emit_hello_code(@buf: int, @code_off: int, @msg_vaddr: int, @msg_len: int) -> int
-    # mov eax, 1           ; sys_write
-    # mov edi, 1           ; fd = stdout
-    # lea rsi, [rip + disp] ; rsi = msg address (RIP-relative, rel32)
-    # mov edx, <msg_len>   ; length
-    # syscall
-    # xor edi, edi         ; exit status 0
-    # mov eax, 60          ; sys_exit
-    # syscall
+fn _emit_shine(@buf: int, @code_off: int, @msg_vaddr: int, @msg_len: int) -> int
     @p = @code_off
-
-    # b8 01 00 00 00         mov eax, 1
     _put8(@buf, @p + 0, 184)
     _put32(@buf, @p + 1, 1)
-
-    # bf 01 00 00 00         mov edi, 1
     _put8(@buf, @p + 5, 191)
     _put32(@buf, @p + 6, 1)
-
-    # 48 8d 35 <rel32>       lea rsi, [rip + disp]
-    # 7-byte instruction starting at @p + 10; the RIP at resolve time is
-    # (@p + 10 + 7). disp = msg_vaddr - (entry_vaddr + code_off_of_inst + 7)
     @inst_off = @p + 10
     @rip_after = _elf_vaddr() + @inst_off + 7
     @disp = @msg_vaddr - @rip_after
-    _put8(@buf, @inst_off + 0, 72)        # REX.W
-    _put8(@buf, @inst_off + 1, 141)       # 0x8D  LEA
-    _put8(@buf, @inst_off + 2, 53)        # ModRM: rsi, [rip+disp32]
+    _put8(@buf, @inst_off + 0, 72)
+    _put8(@buf, @inst_off + 1, 141)
+    _put8(@buf, @inst_off + 2, 53)
     _put32(@buf, @inst_off + 3, @disp)
-
-    # ba <len32>             mov edx, imm32
     _put8(@buf, @p + 17, 186)
     _put32(@buf, @p + 18, @msg_len)
-
-    # 0f 05                  syscall
     _put8(@buf, @p + 22, 15)
     _put8(@buf, @p + 23, 5)
-
-    # 31 ff                  xor edi, edi
-    _put8(@buf, @p + 24, 49)
-    _put8(@buf, @p + 25, 255)
-
-    # b8 3c 00 00 00         mov eax, 60
-    _put8(@buf, @p + 26, 184)
-    _put32(@buf, @p + 27, 60)
-
-    # 0f 05                  syscall
-    _put8(@buf, @p + 31, 15)
-    _put8(@buf, @p + 32, 5)
-
-    return 33          # code size
+    return 24
 
 
-# =====================================================================
-# Extract the first `shine("…")` literal from source text, or return
-# the default message if none found. Handles a simple double-quote
-# terminator; no escape processing yet (M1 subset).
-# =====================================================================
+# --- Exit emitter (12 bytes) -----------------------------------------
+#
+# bf <code32>           mov edi, imm32     ; exit status
+# b8 3c 00 00 00        mov eax, 60        ; sys_exit
+# 0f 05                 syscall
 
-fn _extract_shine_literal(@src: int) -> int
-    @marker = "shine(\""
-    @pos = str_find(@src, @marker)
-    if @pos < 0
-        return "Hello from bootminor\n"
-    @start = @pos + str_len(@marker)
-    @end = @start
+fn _emit_exit(@buf: int, @code_off: int, @status: int) -> int
+    @p = @code_off
+    _put8(@buf, @p + 0, 191)
+    _put32(@buf, @p + 1, @status)
+    _put8(@buf, @p + 5, 184)
+    _put32(@buf, @p + 6, 60)
+    _put8(@buf, @p + 10, 15)
+    _put8(@buf, @p + 11, 5)
+    return 12
+
+
+# --- String-literal extraction, support \n, \t, \\, \" --------------
+#
+# Decodes a Luna string literal starting right after the opening ".
+# Writes the decoded bytes into the growing StrBuf. Returns the byte
+# offset in the source right after the closing quote.
+
+fn _decode_lit(@src: int, @pos: int, @out: StrBuf) -> int
     @slen = str_len(@src)
-    while @end < @slen
-        if str_byte(@src, @end) == 34        # ASCII '"'
-            return str_substr(@src, @start, @end - @start)
-        @end = @end + 1
-    return "Hello from bootminor\n"
+    while @pos < @slen
+        @c = str_byte(@src, @pos)
+        if @c == 34
+            return @pos + 1
+        if @c == 92
+            @pos = @pos + 1
+            if @pos >= @slen
+                return @pos
+            @e = str_byte(@src, @pos)
+            if @e == 110
+                strbuf_add_byte(@out, 10)
+            elif @e == 116
+                strbuf_add_byte(@out, 9)
+            elif @e == 114
+                strbuf_add_byte(@out, 13)
+            elif @e == 48
+                strbuf_add_byte(@out, 0)
+            elif @e == 92
+                strbuf_add_byte(@out, 92)
+            elif @e == 34
+                strbuf_add_byte(@out, 34)
+            else
+                strbuf_add_byte(@out, @e)
+            @pos = @pos + 1
+        else
+            strbuf_add_byte(@out, @c)
+            @pos = @pos + 1
+    return @pos
 
 
-# =====================================================================
-# Drive everything: read source, build the binary, write it out.
-# =====================================================================
+# --- Locate all `shine("...")` calls in the source -------------------
+#
+# Conservative scanner: walks the source byte-by-byte, skipping
+# comments (# to end of line) and string literals. When it sees the
+# identifier-free substring `shine(` followed by `"`, it treats the
+# next decoded literal as a shine target.
+#
+# For each shine, appends (data_offset, data_len) into the two output
+# Vecs. The decoded bytes are accumulated in @data_buf, in order.
 
-fn _arg_or(@i: int, @default: int) -> int
-    @v = arg(@i)
-    if str_eq(@v, "") == 1
-        return @default
-    return @v
+fn _is_id_char(@c: int) -> int
+    if @c >= 48
+        if @c <= 57
+            return 1
+    if @c >= 65
+        if @c <= 90
+            return 1
+    if @c >= 97
+        if @c <= 122
+            return 1
+    if @c == 95
+        return 1
+    return 0
+
+fn _collect_shines(@src: int, @data: StrBuf, @offs: Vec, @lens: Vec) -> int
+    @slen = str_len(@src)
+    @pos = 0
+    @data_cursor = 0
+    while @pos < @slen
+        @c = str_byte(@src, @pos)
+
+        # Skip line comments.
+        if @c == 35
+            while @pos < @slen
+                if str_byte(@src, @pos) == 10
+                    break
+                @pos = @pos + 1
+            continue
+
+        # Skip over unrelated string literals (so we don't match
+        # `shine` that sits inside a quoted string).
+        if @c == 34
+            @pos = @pos + 1
+            while @pos < @slen
+                @c2 = str_byte(@src, @pos)
+                if @c2 == 92
+                    @pos = @pos + 2
+                    continue
+                if @c2 == 34
+                    @pos = @pos + 1
+                    break
+                @pos = @pos + 1
+            continue
+
+        # Look for the shine token: preceded by non-ident-char (or
+        # start-of-file), followed by `(` and a `"`.
+        if @c == 115
+            @prev_ok = 0
+            if @pos == 0
+                @prev_ok = 1
+            else
+                if _is_id_char(str_byte(@src, @pos - 1)) == 0
+                    @prev_ok = 1
+            if @prev_ok == 1
+                if @pos + 7 < @slen
+                    @b1 = str_byte(@src, @pos + 1)
+                    @b2 = str_byte(@src, @pos + 2)
+                    @b3 = str_byte(@src, @pos + 3)
+                    @b4 = str_byte(@src, @pos + 4)
+                    @b5 = str_byte(@src, @pos + 5)
+                    if @b1 == 104
+                        if @b2 == 105
+                            if @b3 == 110
+                                if @b4 == 101
+                                    if @b5 == 40
+                                        # Skip any whitespace between '(' and '"'.
+                                        @after = @pos + 6
+                                        while @after < @slen
+                                            @ws = str_byte(@src, @after)
+                                            if @ws == 32
+                                                @after = @after + 1
+                                            elif @ws == 9
+                                                @after = @after + 1
+                                            else
+                                                break
+                                        if @after < @slen
+                                            if str_byte(@src, @after) == 34
+                                                @before_len = strbuf_len(@data)
+                                                @new_pos = _decode_lit(@src, @after + 1, @data)
+                                                # Append newline (shine auto-adds one).
+                                                strbuf_add_byte(@data, 10)
+                                                @after_len = strbuf_len(@data)
+                                                vec_push(@offs, @before_len)
+                                                vec_push(@lens, @after_len - @before_len)
+                                                @pos = @new_pos
+                                                continue
+        @pos = @pos + 1
+    return 0
+
+
+# --- Find first `return <int>` and extract the exit code --------------
+#
+# Accepts digits only; returns 0 if no return statement found or the
+# number can't be parsed.
+
+fn _find_return(@src: int) -> int
+    @slen = str_len(@src)
+    @pos = 0
+    while @pos < @slen
+        @c = str_byte(@src, @pos)
+
+        # Skip comments.
+        if @c == 35
+            while @pos < @slen
+                if str_byte(@src, @pos) == 10
+                    break
+                @pos = @pos + 1
+            continue
+
+        # Skip strings.
+        if @c == 34
+            @pos = @pos + 1
+            while @pos < @slen
+                @c2 = str_byte(@src, @pos)
+                if @c2 == 92
+                    @pos = @pos + 2
+                    continue
+                if @c2 == 34
+                    @pos = @pos + 1
+                    break
+                @pos = @pos + 1
+            continue
+
+        # Match the word `return`.
+        if @c == 114
+            @prev_ok = 0
+            if @pos == 0
+                @prev_ok = 1
+            else
+                if _is_id_char(str_byte(@src, @pos - 1)) == 0
+                    @prev_ok = 1
+            if @prev_ok == 1
+                if @pos + 6 < @slen
+                    if str_byte(@src, @pos + 1) == 101
+                        if str_byte(@src, @pos + 2) == 116
+                            if str_byte(@src, @pos + 3) == 117
+                                if str_byte(@src, @pos + 4) == 114
+                                    if str_byte(@src, @pos + 5) == 110
+                                        if _is_id_char(str_byte(@src, @pos + 6)) == 0
+                                            @after = @pos + 6
+                                            while @after < @slen
+                                                @ws = str_byte(@src, @after)
+                                                if @ws == 32
+                                                    @after = @after + 1
+                                                elif @ws == 9
+                                                    @after = @after + 1
+                                                else
+                                                    break
+                                            @val = 0
+                                            @seen = 0
+                                            while @after < @slen
+                                                @d = str_byte(@src, @after)
+                                                if @d < 48
+                                                    break
+                                                if @d > 57
+                                                    break
+                                                @val = @val * 10 + (@d - 48)
+                                                @seen = 1
+                                                @after = @after + 1
+                                            if @seen == 1
+                                                return @val
+                                            return 0
+        @pos = @pos + 1
+    return 0
+
+
+# --- strbuf_len helper (prelude doesn't export length getter) ---------
+
+fn strbuf_len(@b: StrBuf) -> int
+    return @b.len
+
+
+# --- CLI argument helpers --------------------------------------------
 
 fn _parse_output(@argc: int) -> int
     @i = 1
@@ -221,11 +370,13 @@ fn _parse_output(@argc: int) -> int
         @i = @i + 1
     return "a.out"
 
+
+# --- Driver ----------------------------------------------------------
+
 fn main() -> int
     @argc = 0
     while str_eq(arg(@argc), "") == 0
         @argc = @argc + 1
-
     if @argc < 2
         shine("usage: luna-mini <source.luna> [-o <output>]")
         return 1
@@ -238,36 +389,50 @@ fn main() -> int
         shine(str_concat("luna-mini: cannot read ", @src_path))
         return 1
 
-    @raw_msg = _extract_shine_literal(@src)
-    if str_len(@raw_msg) == 0
-        @raw_msg = "Hello from bootminor"
-    # `shine` appends a newline, mirror that.
-    @msg = str_concat(@raw_msg, "\n")
-    @msg_len = str_len(@msg)
+    @data = strbuf_new()
+    @offs = vec_new()
+    @lens = vec_new()
+    _collect_shines(@src, @data, @offs, @lens)
 
-    # Layout: [0..120) headers, [120..120+code_sz) code, [120+code_sz..) data
+    @exit_code = _find_return(@src)
+
+    # If no shine statements found, still produce a valid exit binary.
+    @n_shines = vec_len(@offs)
+    @code_size = 24 * @n_shines + 12
+
     @code_off = _elf_prelude_size()
-    @code_sz  = 33
-    @data_off = @code_off + @code_sz
-    @file_sz  = @data_off + @msg_len
+    @data_off = @code_off + @code_size
+    @data_bytes = strbuf_done(@data)
+    @data_len = str_len(@data_bytes)
+    @file_sz = @data_off + @data_len
 
     @buf = new_str(@file_sz)
 
     _emit_elf_headers(@buf, @file_sz, @code_off)
 
-    @msg_vaddr = _elf_vaddr() + @data_off
-    _emit_hello_code(@buf, @code_off, @msg_vaddr, @msg_len)
-
-    # Copy message bytes into the data area.
+    # Emit one shine write per literal, referencing its absolute vaddr.
+    @data_vaddr = _elf_vaddr() + @data_off
+    @cur_off = @code_off
     @i = 0
-    while @i < @msg_len
-        str_set_byte(@buf, @data_off + @i, str_byte(@msg, @i))
+    while @i < @n_shines
+        @off = vec_get(@offs, @i)
+        @ln  = vec_get(@lens, @i)
+        _emit_shine(@buf, @cur_off, @data_vaddr + @off, @ln)
+        @cur_off = @cur_off + 24
         @i = @i + 1
+
+    _emit_exit(@buf, @cur_off, @exit_code)
+
+    # Copy the string data into the data section.
+    @k = 0
+    while @k < @data_len
+        str_set_byte(@buf, @data_off + @k, str_byte(@data_bytes, @k))
+        @k = @k + 1
 
     @n = write_file(@out_path, @buf)
     if @n < 0
         shine(str_concat("luna-mini: cannot write ", @out_path))
         return 1
 
-    shine(str_concat(str_concat("luna-mini: wrote ", @out_path), " (ELF64)"))
+    shine(str_concat(str_concat(str_concat(str_concat("luna-mini: wrote ", @out_path), " ("), int_to_str(@n_shines)), " shines)"))
     return 0

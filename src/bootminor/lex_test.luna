@@ -1,0 +1,84 @@
+# Lexer smoke test: tokenize a small program and print tokens.
+
+fn _kind_name(@k: int) -> int
+    if @k == TK_EOF
+        return "EOF"
+    if @k == TK_INT
+        return "INT"
+    if @k == TK_IDENT
+        return "IDENT"
+    if @k == TK_ATIDENT
+        return "ATID"
+    if @k == TK_STR
+        return "STR"
+    if @k == TK_NEWLINE
+        return "NL"
+    if @k == TK_INDENT
+        return "IND"
+    if @k == TK_DEDENT
+        return "DED"
+    if @k == TK_FN
+        return "FN"
+    if @k == TK_IF
+        return "IF"
+    if @k == TK_ELSE
+        return "ELSE"
+    if @k == TK_WHILE
+        return "WHILE"
+    if @k == TK_RETURN
+        return "RET"
+    if @k == TK_PLUS
+        return "+"
+    if @k == TK_MINUS
+        return "-"
+    if @k == TK_STAR
+        return "*"
+    if @k == TK_SLASH
+        return "/"
+    if @k == TK_PERCENT
+        return "%"
+    if @k == TK_ASSIGN
+        return "="
+    if @k == TK_EQ
+        return "=="
+    if @k == TK_NEQ
+        return "!="
+    if @k == TK_LT
+        return "<"
+    if @k == TK_LE
+        return "<="
+    if @k == TK_GT
+        return ">"
+    if @k == TK_GE
+        return ">="
+    if @k == TK_LPAREN
+        return "("
+    if @k == TK_RPAREN
+        return ")"
+    if @k == TK_COMMA
+        return ","
+    if @k == TK_COLON
+        return ":"
+    if @k == TK_ARROW
+        return "->"
+    return "?"
+
+fn main() -> int
+    @src = "# top comment\nfn main() -> int\n    @x = 42\n    if @x >= 10\n        shine(\"big\")\n    return 0\n"
+    @kind = vec_new()
+    @start = vec_new()
+    @len = vec_new()
+    @iv = vec_new()
+    lex(@src, @kind, @start, @len, @iv)
+
+    @n = vec_len(@kind)
+    @i = 0
+    while @i < @n
+        @k = vec_get(@kind, @i)
+        print(_kind_name(@k))
+        print(" ")
+        @i = @i + 1
+    shine("")
+    print_int(@n)
+    shine(" tokens")
+    return 0

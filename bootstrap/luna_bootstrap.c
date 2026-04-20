@@ -3817,8 +3817,15 @@ static void lower_call(int node)
         if (c->slen == 7 && memcmp(c->s, "new_str", 7) == 0 && n->nkids >= 2) {
             lower_expr(n->kids[1]);                    /* rax = len      */
             emit_push_rax();                           /* save len       */
-            /* compute aligned alloc size: (len + 8 + 7) & ~7            */
-            emit_add_rax_imm32(8 + 7);
+            /* Compute aligned alloc size: (len + 8 + 7 + 1) & ~7.
+             * The extra +1 guarantees at least one trailing byte beyond
+             * the payload, always zero because the heap is BSS-based.
+             * Several prelude helpers (read_file, env_get) pass Luna
+             * strings directly to C-side syscalls that expect a NUL-
+             * terminated C string. Without the slack byte, any path of
+             * length 8·k (k≥1) would read past the string into the next
+             * allocation, which may have a non-zero length prefix.   */
+            emit_add_rax_imm32(8 + 7 + 1);
             /* and rax, -8 -> 48 83 e0 f8                                */
             { uint8_t b[] = { 0x48, 0x83, 0xe0, 0xf8 }; code_emit_bytes(b, 4); }
             emit_mov_rcx_rax2();                       /* rcx = alloc sz */

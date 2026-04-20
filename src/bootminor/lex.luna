@@ -1,0 +1,376 @@
+# =====================================================================
+# bootminor lexer (M2).
+#
+# Splits a Luna source string into a flat token stream represented as
+# four parallel Vec<int>:
+#   tok_kind, tok_start, tok_len, tok_iv
+#
+# `tok_iv` holds the parsed integer for TK_INT, a pointer to the
+# decoded string for TK_STR, and 0 otherwise. The lexer owns the
+# decoded-string storage (str_substr copies out of the source).
+#
+# Tracks indentation as INDENT/DEDENT tokens so the parser doesn't
+# need to re-compute off-side-rule positions.
+# =====================================================================
+
+# --- Token kinds ------------------------------------------------------
+
+const TK_EOF:     int = 0
+const TK_INT:     int = 1
+const TK_IDENT:   int = 2
+const TK_ATIDENT: int = 3
+const TK_STR:     int = 4
+const TK_NEWLINE: int = 5
+const TK_INDENT:  int = 6
+const TK_DEDENT:  int = 7
+
+# keywords
+const TK_FN:      int = 10
+const TK_IF:      int = 11
+const TK_ELSE:    int = 12
+const TK_WHILE:   int = 13
+const TK_RETURN:  int = 14
+
+# operators
+const TK_PLUS:    int = 20
+const TK_MINUS:   int = 21
+const TK_STAR:    int = 22
+const TK_SLASH:   int = 23
+const TK_PERCENT: int = 24
+const TK_ASSIGN:  int = 30
+const TK_EQ:      int = 31
+const TK_NEQ:     int = 32
+const TK_LT:      int = 33
+const TK_LE:      int = 34
+const TK_GT:      int = 35
+const TK_GE:      int = 36
+
+# punctuation
+const TK_LPAREN:  int = 40
+const TK_RPAREN:  int = 41
+const TK_COMMA:   int = 42
+const TK_COLON:   int = 43
+const TK_ARROW:   int = 44
+
+
+# --- Character classifiers -------------------------------------------
+
+fn _is_digit(@c: int) -> int
+    if @c >= 48
+        if @c <= 57
+            return 1
+    return 0
+
+fn _is_alpha(@c: int) -> int
+    if @c >= 97
+        if @c <= 122
+            return 1
+    if @c >= 65
+        if @c <= 90
+            return 1
+    if @c == 95
+        return 1
+    return 0
+
+fn _is_alnum(@c: int) -> int
+    if _is_alpha(@c) == 1
+        return 1
+    return _is_digit(@c)
+
+
+# --- Keyword matching -------------------------------------------------
+
+fn _kw_lookup(@src: int, @start: int, @len: int) -> int
+    @lit = str_substr(@src, @start, @len)
+    if str_eq(@lit, "fn") == 1
+        return TK_FN
+    if str_eq(@lit, "if") == 1
+        return TK_IF
+    if str_eq(@lit, "else") == 1
+        return TK_ELSE
+    if str_eq(@lit, "while") == 1
+        return TK_WHILE
+    if str_eq(@lit, "return") == 1
+        return TK_RETURN
+    return TK_IDENT
+
+
+# --- Token emission helper -------------------------------------------
+
+fn _emit(@kind: Vec, @start: Vec, @len: Vec, @iv: Vec, @k: int, @s: int, @l: int, @v: int) -> int
+    vec_push(@kind, @k)
+    vec_push(@start, @s)
+    vec_push(@len, @l)
+    vec_push(@iv, @v)
+    return 0
+
+
+# --- String-literal parsing (supports \\n \\t \\" \\\\) --------------
+
+fn _parse_string(@src: int, @pos: int) -> int
+    # Called with @pos at the char right after the opening ".
+    # Returns pointer to a freshly allocated decoded string (owned).
+    @slen = str_len(@src)
+    @buf = strbuf_new()
+    while @pos < @slen
+        @c = str_byte(@src, @pos)
+        if @c == 34
+            return strbuf_done(@buf)
+        if @c == 92
+            @pos = @pos + 1
+            if @pos >= @slen
+                return strbuf_done(@buf)
+            @e = str_byte(@src, @pos)
+            if @e == 110
+                strbuf_add_byte(@buf, 10)
+            elif @e == 116
+                strbuf_add_byte(@buf, 9)
+            elif @e == 114
+                strbuf_add_byte(@buf, 13)
+            elif @e == 48
+                strbuf_add_byte(@buf, 0)
+            elif @e == 92
+                strbuf_add_byte(@buf, 92)
+            elif @e == 34
+                strbuf_add_byte(@buf, 34)
+            else
+                strbuf_add_byte(@buf, @e)
+            @pos = @pos + 1
+        else
+            strbuf_add_byte(@buf, @c)
+            @pos = @pos + 1
+    return strbuf_done(@buf)
+
+fn _skip_string(@src: int, @pos: int) -> int
+    # Returns the index of the byte AFTER the closing quote.
+    @slen = str_len(@src)
+    while @pos < @slen
+        @c = str_byte(@src, @pos)
+        if @c == 34
+            return @pos + 1
+        if @c == 92
+            @pos = @pos + 2
+        else
+            @pos = @pos + 1
+    return @pos
+
+
+# --- Main lexer entry -------------------------------------------------
+
+fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
+    # Fills the four parallel Vecs in order. Returns 0 on success.
+    @pos = 0
+    @slen = str_len(@src)
+
+    # Indentation stack (array of indent column numbers).
+    @ind_stack = [0; 64]
+    @ind_top = 0          # index of current top (= current indent level)
+    @ind_stack[0] = 0
+
+    @at_line_start = 1
+
+    while @pos < @slen
+        @c = str_byte(@src, @pos)
+
+        # --- Skip comment: # to end of line ---
+        if @c == 35
+            while @pos < @slen
+                if str_byte(@src, @pos) == 10
+                    break
+                @pos = @pos + 1
+            # fall through to newline handling
+            @c = 10
+            if @pos >= @slen
+                break
+
+        # --- Handle indentation at start of a logical line ---
+        if @at_line_start == 1
+            # Count leading spaces.
+            @col = 0
+            while @pos < @slen
+                @c2 = str_byte(@src, @pos)
+                if @c2 == 32
+                    @col = @col + 1
+                    @pos = @pos + 1
+                elif @c2 == 9
+                    @col = @col + 4
+                    @pos = @pos + 1
+                else
+                    break
+            if @pos >= @slen
+                break
+            @c = str_byte(@src, @pos)
+            # Blank line or comment-only: don't emit indent changes.
+            if @c == 10
+                @pos = @pos + 1
+                continue
+            if @c == 35
+                # comment: skip to newline and try again
+                while @pos < @slen
+                    if str_byte(@src, @pos) == 10
+                        break
+                    @pos = @pos + 1
+                if @pos < @slen
+                    @pos = @pos + 1
+                continue
+            # Compare @col to the top of the indent stack.
+            @cur = @ind_stack[@ind_top]
+            if @col > @cur
+                @ind_top = @ind_top + 1
+                @ind_stack[@ind_top] = @col
+                _emit(@kind, @start, @len, @iv, TK_INDENT, @pos, 0, 0)
+            else
+                while @col < @ind_stack[@ind_top]
+                    @ind_top = @ind_top - 1
+                    _emit(@kind, @start, @len, @iv, TK_DEDENT, @pos, 0, 0)
+            @at_line_start = 0
+
+        # --- Whitespace inside a line ---
+        if @c == 32
+            @pos = @pos + 1
+            continue
+        if @c == 9
+            @pos = @pos + 1
+            continue
+
+        # --- Newline ---
+        if @c == 10
+            _emit(@kind, @start, @len, @iv, TK_NEWLINE, @pos, 0, 0)
+            @pos = @pos + 1
+            @at_line_start = 1
+            continue
+
+        # --- Integer literal ---
+        if _is_digit(@c) == 1
+            @s0 = @pos
+            @val = 0
+            while @pos < @slen
+                @cc = str_byte(@src, @pos)
+                if _is_digit(@cc) == 0
+                    break
+                @val = @val * 10 + (@cc - 48)
+                @pos = @pos + 1
+            _emit(@kind, @start, @len, @iv, TK_INT, @s0, @pos - @s0, @val)
+            continue
+
+        # --- Identifier / keyword ---
+        if _is_alpha(@c) == 1
+            @s0 = @pos
+            while @pos < @slen
+                if _is_alnum(str_byte(@src, @pos)) == 0
+                    break
+                @pos = @pos + 1
+            @klen = @pos - @s0
+            @kk = _kw_lookup(@src, @s0, @klen)
+            _emit(@kind, @start, @len, @iv, @kk, @s0, @klen, 0)
+            continue
+
+        # --- @-prefixed identifier ---
+        if @c == 64
+            @s0 = @pos
+            @pos = @pos + 1
+            while @pos < @slen
+                if _is_alnum(str_byte(@src, @pos)) == 0
+                    break
+                @pos = @pos + 1
+            _emit(@kind, @start, @len, @iv, TK_ATIDENT, @s0, @pos - @s0, 0)
+            continue
+
+        # --- String literal ---
+        if @c == 34
+            @s0 = @pos
+            @decoded = _parse_string(@src, @pos + 1)
+            @next = _skip_string(@src, @pos + 1)
+            _emit(@kind, @start, @len, @iv, TK_STR, @s0, @next - @s0, @decoded)
+            @pos = @next
+            continue
+
+        # --- Two-char operators ---
+        if @pos + 1 < @slen
+            @c2 = str_byte(@src, @pos + 1)
+            if @c == 45
+                if @c2 == 62
+                    _emit(@kind, @start, @len, @iv, TK_ARROW, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 61
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_EQ, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 33
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_NEQ, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 60
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_LE, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+            if @c == 62
+                if @c2 == 61
+                    _emit(@kind, @start, @len, @iv, TK_GE, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+
+        # --- Single-char operators / punctuation ---
+        if @c == 43
+            _emit(@kind, @start, @len, @iv, TK_PLUS, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 45
+            _emit(@kind, @start, @len, @iv, TK_MINUS, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 42
+            _emit(@kind, @start, @len, @iv, TK_STAR, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 47
+            _emit(@kind, @start, @len, @iv, TK_SLASH, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 37
+            _emit(@kind, @start, @len, @iv, TK_PERCENT, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 61
+            _emit(@kind, @start, @len, @iv, TK_ASSIGN, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 60
+            _emit(@kind, @start, @len, @iv, TK_LT, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 62
+            _emit(@kind, @start, @len, @iv, TK_GT, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 40
+            _emit(@kind, @start, @len, @iv, TK_LPAREN, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 41
+            _emit(@kind, @start, @len, @iv, TK_RPAREN, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 44
+            _emit(@kind, @start, @len, @iv, TK_COMMA, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 58
+            _emit(@kind, @start, @len, @iv, TK_COLON, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+
+        # Unknown byte — skip to avoid infinite loop.
+        @pos = @pos + 1
+
+    # Close any remaining indentation.
+    while @ind_top > 0
+        _emit(@kind, @start, @len, @iv, TK_DEDENT, @pos, 0, 0)
+        @ind_top = @ind_top - 1
+
+    _emit(@kind, @start, @len, @iv, TK_EOF, @pos, 0, 0)
+    return 0
