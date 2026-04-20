@@ -1,0 +1,226 @@
+# =====================================================================
+# Minimal bootminor self-compile prelude.
+#
+# Provides Vec/StrBuf/string helpers that bootminor's own sources
+# (lex.luna + gen.luna + main2.luna) use. Written in the bootminor
+# subset itself so the final monolith is self-contained.
+#
+# Prepend this to the 3-file bootminor source to let bootminor
+# compile its own sources without relying on bootstrap/prelude.luna.
+# =====================================================================
+
+
+struct Vec
+    data: int
+    len:  int
+    cap:  int
+
+
+fn vec_new() -> Vec
+    let @v: Vec = new_str(24)
+    @v.data = new_str(64)
+    @v.len  = 0
+    @v.cap  = 8
+    return @v
+
+fn _vec_grow(@v: Vec) -> int
+    @new_cap = @v.cap * 2
+    @new_data = new_str(@new_cap * 8)
+    @i = 0
+    while @i < @v.len
+        u64_set(@new_data, @i, u64_get(@v.data, @i))
+        @i = @i + 1
+    @v.data = @new_data
+    @v.cap  = @new_cap
+    return 0
+
+fn vec_len(@v: Vec) -> int
+    return @v.len
+
+fn vec_push(@v: Vec, @x: int) -> int
+    if @v.len >= @v.cap
+        _vec_grow(@v)
+    u64_set(@v.data, @v.len, @x)
+    @v.len = @v.len + 1
+    return 0
+
+fn vec_get(@v: Vec, @i: int) -> int
+    return u64_get(@v.data, @i)
+
+fn vec_set(@v: Vec, @i: int, @x: int) -> int
+    u64_set(@v.data, @i, @x)
+    return 0
+
+fn vec_pop(@v: Vec) -> int
+    if @v.len <= 0
+        return 0
+    @v.len = @v.len - 1
+    return u64_get(@v.data, @v.len)
+
+
+struct StrBuf
+    buf: int
+    len: int
+    cap: int
+
+
+fn strbuf_new() -> StrBuf
+    let @b: StrBuf = new_str(24)
+    @b.buf = new_str(64)
+    @b.len = 0
+    @b.cap = 64
+    return @b
+
+fn _strbuf_grow(@b: StrBuf, @need: int) -> int
+    @new_cap = @b.cap * 2
+    while @new_cap < @b.len + @need
+        @new_cap = @new_cap * 2
+    @new_buf = new_str(@new_cap)
+    @i = 0
+    while @i < @b.len
+        str_set_byte(@new_buf, @i, str_byte(@b.buf, @i))
+        @i = @i + 1
+    @b.buf = @new_buf
+    @b.cap = @new_cap
+    return 0
+
+fn strbuf_add_byte(@b: StrBuf, @x: int) -> int
+    if @b.len + 1 > @b.cap
+        _strbuf_grow(@b, 1)
+    str_set_byte(@b.buf, @b.len, @x)
+    @b.len = @b.len + 1
+    return 0
+
+fn strbuf_add_str(@b: StrBuf, @s: int) -> int
+    @n = str_len(@s)
+    if @b.len + @n > @b.cap
+        _strbuf_grow(@b, @n)
+    @i = 0
+    while @i < @n
+        str_set_byte(@b.buf, @b.len + @i, str_byte(@s, @i))
+        @i = @i + 1
+    @b.len = @b.len + @n
+    return 0
+
+fn strbuf_done(@b: StrBuf) -> int
+    return str_substr(@b.buf, 0, @b.len)
+
+
+fn str_eq(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    if @la != @lb
+        return 0
+    @i = 0
+    while @i < @la
+        if str_byte(@a, @i) != str_byte(@b, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+fn str_concat(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    @out = new_str(@la + @lb)
+    @i = 0
+    while @i < @la
+        str_set_byte(@out, @i, str_byte(@a, @i))
+        @i = @i + 1
+    @j = 0
+    while @j < @lb
+        str_set_byte(@out, @la + @j, str_byte(@b, @j))
+        @j = @j + 1
+    return @out
+
+fn str_substr(@s: int, @start: int, @n: int) -> int
+    @out = new_str(@n)
+    @i = 0
+    while @i < @n
+        str_set_byte(@out, @i, str_byte(@s, @start + @i))
+        @i = @i + 1
+    return @out
+
+fn int_to_str(@n: int) -> int
+    if @n == 0
+        @s0 = new_str(1)
+        str_set_byte(@s0, 0, 48)
+        return @s0
+    @neg = 0
+    if @n < 0
+        @neg = 1
+        @n = 0 - @n
+    @cnt = 0
+    @t = @n
+    while @t > 0
+        @cnt = @cnt + 1
+        @t = @t / 10
+    @total = @cnt
+    if @neg == 1
+        @total = @total + 1
+    @s = new_str(@total)
+    @pos = @total - 1
+    while @n > 0
+        str_set_byte(@s, @pos, 48 + @n % 10)
+        @pos = @pos - 1
+        @n = @n / 10
+    if @neg == 1
+        str_set_byte(@s, 0, 45)
+    return @s
+
+fn read_file(@path: int) -> int
+    @fd = sys_open(@path, 0, 0)
+    if @fd < 0
+        return 0
+    @size = sys_lseek(@fd, 0, 2)
+    sys_lseek(@fd, 0, 0)
+    @buf = new_str(@size)
+    sys_read(@fd, @buf, @size)
+    sys_close(@fd)
+    return @buf
+
+fn write_file(@path: int, @content: int) -> int
+    @fd = sys_creat(@path, 420)
+    if @fd < 0
+        return 0 - 1
+    @n = str_len(@content)
+    sys_write(@fd, @content, @n)
+    sys_close(@fd)
+    return @n
+
+# argv handling — bootminor reads argv from /proc/self/cmdline.
+# /proc files report size 0 via lseek, so we allocate a 16 KB buffer
+# and read until EOF. The result is a sequence of NUL-terminated
+# strings; we split on NUL and return the @i'th.
+fn arg(@i: int) -> int
+    @fd = sys_open("/proc/self/cmdline", 0, 0)
+    if @fd < 0
+        return ""
+    @cap = 16384
+    @buf = new_str(@cap)
+    @total = 0
+    while 1
+        @r = sys_read(@fd, @buf, @cap - @total)
+        if @r <= 0
+            break
+        @total = @total + @r
+    sys_close(@fd)
+    @start = 0
+    @k = 0
+    @pos = 0
+    while @pos < @total
+        if str_byte(@buf, @pos) == 0
+            if @k == @i
+                return str_substr(@buf, @start, @pos - @start)
+            @k = @k + 1
+            @start = @pos + 1
+        @pos = @pos + 1
+    return ""
+
+fn print(@s: int) -> int
+    sys_write(1, @s, str_len(@s))
+    return 0
+
+# print_int without trailing newline (unlike shine_int).
+fn print_int(@n: int) -> int
+    print(int_to_str(@n))
+    return 0

@@ -675,6 +675,9 @@ fn _data_add_luna_str(@g: Gen, @src: int) -> int
     while @j < @n
         strbuf_add_byte(@g.data, str_byte(@src, @j))
         @j = @j + 1
+    # Trailing NUL so Luna strings passed to C-side syscalls (sys_open
+    # etc.) read as valid NUL-terminated C strings.
+    strbuf_add_byte(@g.data, 0)
     return @data_off
 
 
@@ -1354,6 +1357,52 @@ fn parse_primary(@g: Gen) -> int
         if str_eq(@name, "sys_creat") == 1
             _advance(@g)
             _emit_syscall_intrinsic(@g, 2, 85)
+            return 0
+        # u64_get(buf, word_idx) — load 8 bytes at buf + word_idx*8
+        if str_eq(@name, "u64_get") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after u64_get")
+            parse_expr(@g)                   # rax = buf
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)                   # rax = idx
+            _em_mov_rcx_rax(@g)              # rcx = idx
+            _em_pop_rax(@g)                  # rax = buf
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov rax, [rax + rcx*8]   ; 48 8b 04 c8
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 4)
+            _eb(@g, 200)
+            return 0
+        # u64_set(buf, word_idx, val) — store val at buf + word_idx*8
+        if str_eq(@name, "u64_set") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after u64_set")
+            parse_expr(@g)                   # buf
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)                   # idx
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ','")
+            parse_expr(@g)                   # val (rax)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov r8, rax (val)
+            _eb(@g, 73)
+            _eb(@g, 137)
+            _eb(@g, 192)
+            # pop rcx (idx)
+            _eb(@g, 89)
+            # pop rdx (buf)
+            _eb(@g, 90)
+            # mov [rdx + rcx*8], r8  ; 4c 89 04 ca
+            _eb(@g, 76)
+            _eb(@g, 137)
+            _eb(@g, 4)
+            _eb(@g, 202)
+            # return 0
+            _eb(@g, 49)
+            _eb(@g, 192)
             return 0
         # str_set_byte(s, i, v) — writes byte v at s+i, returns 0.
         if str_eq(@name, "str_set_byte") == 1
