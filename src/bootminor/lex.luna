@@ -53,6 +53,11 @@ const TK_SHL:     int = 54
 const TK_SHR:     int = 55
 const TK_KW_BREAK:    int = 60
 const TK_KW_CONTINUE: int = 61
+const TK_KW_STRUCT:   int = 62
+const TK_KW_LET:      int = 63
+const TK_LBRACE:      int = 70
+const TK_RBRACE:      int = 71
+const TK_DOT:         int = 72
 
 # punctuation
 const TK_LPAREN:  int = 40
@@ -110,6 +115,10 @@ fn _kw_lookup(@src: int, @start: int, @len: int) -> int
         return TK_KW_BREAK
     if str_eq(@lit, "continue") == 1
         return TK_KW_CONTINUE
+    if str_eq(@lit, "struct") == 1
+        return TK_KW_STRUCT
+    if str_eq(@lit, "let") == 1
+        return TK_KW_LET
     return TK_IDENT
 
 
@@ -415,6 +424,18 @@ fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
             continue
         if @c == 59
             _emit(@kind, @start, @len, @iv, TK_SEMI, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 123
+            _emit(@kind, @start, @len, @iv, TK_LBRACE, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 125
+            _emit(@kind, @start, @len, @iv, TK_RBRACE, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 46
+            _emit(@kind, @start, @len, @iv, TK_DOT, @pos, 1, 0)
             @pos = @pos + 1
             continue
 

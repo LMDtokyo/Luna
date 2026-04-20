@@ -52,10 +52,13 @@ struct Gen
     heap_patches: int    # LEA heap_top patches: [code_off]*
     loop_cont:   int     # Vec<int>: stack of continue targets (loop starts)
     loop_breaks: int     # Vec<int>: stack of break-patches-vec pointers
+    struct_names:   int  # Vec<str>: declared struct names
+    struct_fields:  int  # Vec<Vec>: parallel — each struct's field name list
+    local_types:    int  # Vec<str>: type name for each local (or "" if untyped)
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
-    let @g: Gen = new_str(176)
+    let @g: Gen = new_str(200)
     @g.code        = strbuf_new()
     @g.data        = strbuf_new()
     @g.kind        = @kind
@@ -77,6 +80,9 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.heap_patches = vec_new()
     @g.loop_cont    = vec_new()
     @g.loop_breaks  = vec_new()
+    @g.struct_names  = vec_new()
+    @g.struct_fields = vec_new()
+    @g.local_types   = vec_new()
     # Reserve 8 bytes at the very start of the data section for the
     # heap_top variable. Its initial value (data_vaddr + heap_top_off + 8,
     # i.e. the byte right after itself) is patched in by the driver at
@@ -155,13 +161,37 @@ fn _local_slot(@g: Gen, @name: int) -> int
     @off = 0 - @g.frame
     vec_push(@g.names, @name)
     vec_push(@g.offs, @off)
+    vec_push(@g.local_types, "")
     return @off
+
+# Set the type name for an existing local. Used by `let @x: T = ...`
+# and function parameters with explicit type.
+fn _set_local_type(@g: Gen, @name: int, @type: int) -> int
+    @n = vec_len(@g.names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.names, @i), @name) == 1
+            vec_set(@g.local_types, @i, @type)
+            return 0
+        @i = @i + 1
+    return 0
+
+# Get local's recorded type name, or "" if none.
+fn _local_type(@g: Gen, @name: int) -> int
+    @n = vec_len(@g.names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.names, @i), @name) == 1
+            return vec_get(@g.local_types, @i)
+        @i = @i + 1
+    return ""
 
 # Reset locals between functions. Called at start of each fn decl.
 fn _reset_locals(@g: Gen) -> int
-    @g.names = vec_new()
-    @g.offs  = vec_new()
-    @g.frame = 0
+    @g.names       = vec_new()
+    @g.offs        = vec_new()
+    @g.local_types = vec_new()
+    @g.frame       = 0
     return 0
 
 # Look up a fn's code offset by name. Returns -1 if not yet defined.
@@ -179,6 +209,33 @@ fn _fn_register(@g: Gen, @name: int, @offset: int) -> int
     vec_push(@g.fn_names, @name)
     vec_push(@g.fn_offsets, @offset)
     return 0
+
+# Register a struct declaration.
+fn _struct_register(@g: Gen, @name: int, @fields: Vec) -> int
+    vec_push(@g.struct_names, @name)
+    vec_push(@g.struct_fields, @fields)
+    return 0
+
+# Find a struct by name; returns -1 if not found.
+fn _struct_lookup(@g: Gen, @name: int) -> int
+    @n = vec_len(@g.struct_names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.struct_names, @i), @name) == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
+# Given a struct index and field name, return field index or -1.
+fn _field_index(@g: Gen, @s_idx: int, @fname: int) -> int
+    @fields = vec_get(@g.struct_fields, @s_idx)
+    @n = vec_len(@fields)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@fields, @i), @fname) == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
 
 
 # --- Byte emission ---------------------------------------------------
@@ -850,21 +907,96 @@ fn parse_primary(@g: Gen) -> int
         _advance(@g)
         @off = _local_slot(@g, @name)
         _em_load_rbp(@g, @off)
-        # If followed by `[`, it's indexed read: @arr[i]
+        # Array index read: @arr[i]
         if _peek_kind(@g) == TK_LBRACK
             _advance(@g)
-            _em_push_rax(@g)                # save arr base
-            parse_expr(@g)                   # rax = i
+            _em_push_rax(@g)
+            parse_expr(@g)
             _expect(@g, TK_RBRACK, "expected ']'")
-            # mov rcx, rax ; pop rax (arr) ; mov rax, [rax + rcx*8]
             _em_mov_rcx_rax(@g)
             _em_pop_rax(@g)
-            # mov rax, [rax + rcx*8]  ; 48 8b 04 c8
             _eb(@g, 72)
             _eb(@g, 139)
             _eb(@g, 4)
             _eb(@g, 200)
+            return 0
+        # Struct field read: @obj.field
+        if _peek_kind(@g) == TK_DOT
+            _advance(@g)
+            if _peek_kind(@g) != TK_IDENT
+                _die(@g, "expected field name after '.'")
+                return 0
+            @fname = _tok_substr(@g, @g.pos)
+            _advance(@g)
+            @tname = _local_type(@g, @name)
+            @field_off = 0
+            if str_eq(@tname, "") == 0
+                @s_idx = _struct_lookup(@g, @tname)
+                if @s_idx >= 0
+                    @fi = _field_index(@g, @s_idx, @fname)
+                    if @fi >= 0
+                        @field_off = @fi * 8
+            # mov rax, [rax + field_off]
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 128)
+            _e32(@g, @field_off)
+            return 0
         return 0
+    # Struct literal: Name { field1: v1, field2: v2, ... }
+    if @k == TK_IDENT
+        # Look ahead: is this `Name {`? Distinguish from fn call `name(`
+        @name = _tok_substr(@g, @g.pos)
+        @s_idx = _struct_lookup(@g, @name)
+        if @s_idx >= 0
+            _advance(@g)
+            if _peek_kind(@g) == TK_LBRACE
+                _advance(@g)
+                @fields = vec_get(@g.struct_fields, @s_idx)
+                @nfields = vec_len(@fields)
+                # Parse field inits in any order; track seen offsets.
+                # For simplicity, we require they come in the same order
+                # as the struct decl. Stack them, then alloc + fill.
+                @count = 0
+                while _peek_kind(@g) != TK_RBRACE
+                    if _peek_kind(@g) != TK_IDENT
+                        _die(@g, "expected field name in struct lit")
+                        return 0
+                    _advance(@g)                  # consume name
+                    _expect(@g, TK_COLON, "expected ':' in struct lit")
+                    parse_expr(@g)
+                    _em_push_rax(@g)
+                    @count = @count + 1
+                    if _peek_kind(@g) == TK_COMMA
+                        _advance(@g)
+                    elif _peek_kind(@g) == TK_NEWLINE
+                        _skip_newlines(@g)
+                _expect(@g, TK_RBRACE, "expected '}' after struct lit")
+                # Allocate struct as N-slot array.
+                _em_mov_eax_imm(@g, @nfields)
+                _inline_new_arr(@g)                # rax = struct ptr
+                # mov r8, rax
+                _eb(@g, 73)
+                _eb(@g, 137)
+                _eb(@g, 192)
+                # Pop values into fields in reverse push order.
+                @i = @count - 1
+                while @i >= 0
+                    _em_pop_rax(@g)               # rax = last-pushed value
+                    # mov [r8 + i*8], rax  ; 49 89 80 <disp32>
+                    _eb(@g, 73)
+                    _eb(@g, 137)
+                    _eb(@g, 128)
+                    _e32(@g, @i * 8)
+                    @i = @i - 1
+                # rax = r8
+                _eb(@g, 76)
+                _eb(@g, 137)
+                _eb(@g, 192)
+                return 0
+            # Not a struct literal — fall through to function-call path.
+            # But we already advanced past the ident; un-advance by rewinding.
+            @g.pos = @g.pos - 1
     if @k == TK_LBRACK
         _advance(@g)
         # Two forms:
@@ -1177,6 +1309,28 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
             _em_epilogue(@g)
         return 0
 
+    # let @x: T = expr — typed binding (propagates struct type)
+    if @k == TK_KW_LET
+        _advance(@g)
+        if _peek_kind(@g) != TK_ATIDENT
+            _die(@g, "expected @name after let")
+            return 0
+        @lname = _tok_substr(@g, @g.pos)
+        _advance(@g)
+        @ltype = ""
+        if _peek_kind(@g) == TK_COLON
+            _advance(@g)
+            if _peek_kind(@g) == TK_IDENT
+                @ltype = _tok_substr(@g, @g.pos)
+                _advance(@g)
+        _expect(@g, TK_ASSIGN, "expected '=' in let")
+        parse_expr(@g)
+        @off = _local_slot(@g, @lname)
+        if str_eq(@ltype, "") == 0
+            _set_local_type(@g, @lname, @ltype)
+        _em_store_rbp(@g, @off)
+        return 0
+
     if @k == TK_IF
         parse_if(@g, @patches)
         return 0
@@ -1212,30 +1366,69 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
         # Indexed write: @arr[i] = v
         if _peek_kind(@g) == TK_LBRACK
             _advance(@g)
-            # Load @arr base into rax, push.
             @off = _local_slot(@g, @name)
             _em_load_rbp(@g, @off)
             _em_push_rax(@g)
-            # Eval index expression into rax, push.
             parse_expr(@g)
             _expect(@g, TK_RBRACK, "expected ']'")
             _em_push_rax(@g)
             _expect(@g, TK_ASSIGN, "expected '='")
-            # Eval value into rax.
             parse_expr(@g)
-            # mov r8, rax  (value)
             _eb(@g, 73)
             _eb(@g, 137)
             _eb(@g, 192)
-            # pop rcx (index)
             _eb(@g, 89)
-            # pop rdx (arr base)
             _eb(@g, 90)
-            # mov [rdx + rcx*8], r8  ; 4c 89 04 ca
             _eb(@g, 76)
             _eb(@g, 137)
             _eb(@g, 4)
             _eb(@g, 202)
+            return 0
+        # Field write: @obj.field = v
+        if _peek_kind(@g) == TK_DOT
+            _advance(@g)
+            if _peek_kind(@g) != TK_IDENT
+                _die(@g, "expected field name after '.'")
+                return 0
+            @fname = _tok_substr(@g, @g.pos)
+            _advance(@g)
+            _expect(@g, TK_ASSIGN, "expected '='")
+            # Resolve field offset via owner's type.
+            @tname = _local_type(@g, @name)
+            @field_off = 0
+            if str_eq(@tname, "") == 0
+                @s_idx = _struct_lookup(@g, @tname)
+                if @s_idx >= 0
+                    @fi = _field_index(@g, @s_idx, @fname)
+                    if @fi >= 0
+                        @field_off = @fi * 8
+            # Evaluate RHS into rax, save.
+            parse_expr(@g)
+            _em_push_rax(@g)
+            # Load owner base into rax.
+            @off = _local_slot(@g, @name)
+            _em_load_rbp(@g, @off)
+            _em_mov_rcx_rax(@g)                 # rcx = obj ptr
+            _em_pop_rax(@g)                     # rax = value
+            # mov [rcx + field_off], rax  ; 48 89 81 <disp32>
+            _eb(@g, 72)
+            _eb(@g, 137)
+            _eb(@g, 129)
+            _e32(@g, @field_off)
+            return 0
+        # Explicit type annotation: @x: T = expr
+        if _peek_kind(@g) == TK_COLON
+            _advance(@g)
+            @ltype = ""
+            if _peek_kind(@g) == TK_IDENT
+                @ltype = _tok_substr(@g, @g.pos)
+                _advance(@g)
+            _expect(@g, TK_ASSIGN, "expected '=' after type ann")
+            parse_expr(@g)
+            @off = _local_slot(@g, @name)
+            if str_eq(@ltype, "") == 0
+                _set_local_type(@g, @name, @ltype)
+            _em_store_rbp(@g, @off)
             return 0
         _expect(@g, TK_ASSIGN, "expected '='")
         parse_expr(@g)
@@ -1427,20 +1620,23 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
     # Reset per-function locals.
     _reset_locals(@g)
 
-    # Collect param names. For each, allocate a local slot (rbp-8, -16, ...).
-    # We'll emit code right after prologue to spill args from regs to slots.
+    # Collect param names + types. Types (if present) become the local's
+    # type so field accesses in the body resolve correctly.
     @param_names = vec_new()
+    @param_types = vec_new()
     if _peek_kind(@g) != TK_RPAREN
         if _peek_kind(@g) != TK_ATIDENT
             _die(@g, "expected parameter (@name)")
             return 1
         vec_push(@param_names, _tok_substr(@g, @g.pos))
         _advance(@g)
-        # optional `: type`
+        @pty = ""
         if _peek_kind(@g) == TK_COLON
             _advance(@g)
             if _peek_kind(@g) == TK_IDENT
+                @pty = _tok_substr(@g, @g.pos)
                 _advance(@g)
+        vec_push(@param_types, @pty)
         while _peek_kind(@g) == TK_COMMA
             _advance(@g)
             if _peek_kind(@g) != TK_ATIDENT
@@ -1448,10 +1644,13 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
                 return 1
             vec_push(@param_names, _tok_substr(@g, @g.pos))
             _advance(@g)
+            @pty2 = ""
             if _peek_kind(@g) == TK_COLON
                 _advance(@g)
                 if _peek_kind(@g) == TK_IDENT
+                    @pty2 = _tok_substr(@g, @g.pos)
                     _advance(@g)
+            vec_push(@param_types, @pty2)
     _expect(@g, TK_RPAREN, "expected ')' in fn decl")
 
     # Optional `-> type`
@@ -1474,7 +1673,10 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
     @pi = 0
     while @pi < @nparams
         @pname = vec_get(@param_names, @pi)
+        @ptype = vec_get(@param_types, @pi)
         @poff  = _local_slot(@g, @pname)
+        if str_eq(@ptype, "") == 0
+            _set_local_type(@g, @pname, @ptype)
         # mov rax, <sysv_arg_reg[pi]> ; mov [rbp+poff], rax
         _em_mov_rax_argreg(@g, @pi)
         _em_store_rbp(@g, @poff)
@@ -1536,7 +1738,41 @@ fn _em_mov_rax_argreg(@g: Gen, @i: int) -> int
     return 0
 
 
-# Parse a whole program = sequence of fn decls. Returns after last fn.
+# Parse `struct Name <indent> field1: type <newline> field2: type ...`
+fn parse_struct_decl(@g: Gen) -> int
+    _advance(@g)                          # consume 'struct'
+    if _peek_kind(@g) != TK_IDENT
+        _die(@g, "expected struct name")
+        return 1
+    @sname = _tok_substr(@g, @g.pos)
+    _advance(@g)
+    _expect(@g, TK_NEWLINE, "newline after struct name")
+    _expect(@g, TK_INDENT, "indented struct fields")
+    @fields = vec_new()
+    while 1
+        _skip_newlines(@g)
+        @k = _peek_kind(@g)
+        if @k == TK_DEDENT
+            _advance(@g)
+            break
+        if @k == TK_EOF
+            break
+        if @k != TK_IDENT
+            _die(@g, "expected field name")
+            return 1
+        @fname = _tok_substr(@g, @g.pos)
+        _advance(@g)
+        if _peek_kind(@g) == TK_COLON
+            _advance(@g)
+            # Skip the type name (ident possibly followed by more tokens)
+            if _peek_kind(@g) == TK_IDENT
+                _advance(@g)
+        vec_push(@fields, @fname)
+    _struct_register(@g, @sname, @fields)
+    return 0
+
+
+# Parse a whole program = sequence of fn decls + struct decls.
 fn parse_program(@g: Gen, @patches: Vec) -> int
     while 1
         _skip_newlines(@g)
@@ -1545,8 +1781,10 @@ fn parse_program(@g: Gen, @patches: Vec) -> int
             return 0
         if @k == TK_FN
             parse_fn(@g, @patches)
+        elif @k == TK_KW_STRUCT
+            parse_struct_decl(@g)
         else
-            _die(@g, "expected fn declaration at top level")
+            _die(@g, "expected fn or struct at top level")
             _advance(@g)
     return 0
 
