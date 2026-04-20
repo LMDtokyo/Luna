@@ -615,6 +615,24 @@ fn _em_call_indirect_placeholder(@g: Gen) -> int
     _e32(@g, 0)
     return @at
 
+# Emit `mov rax, qword [rip + disp32]` (7 bytes) — same RIP-relative
+# addressing as _em_call_indirect_placeholder. Used to materialise a
+# fn pointer value from the hot-swap slot so `@f = fn_name; @f(args)`
+# calls the currently-installed body. Returns offset of disp32 bytes.
+fn _em_fnptr_load_placeholder(@g: Gen) -> int
+    _eb(@g, 72)                               # REX.W
+    _eb(@g, 139)                              # 8B
+    _eb(@g, 5)                                # /0 mod=00 rm=101 (RIP-rel)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    return @at
+
+# call rax  ; FF D0 — indirect call through rax.
+fn _em_call_rax(@g: Gen) -> int
+    _eb(@g, 255)
+    _eb(@g, 208)
+    return 0
+
 # Emit `mov rax, qword [rip + disp32]` (7 bytes). Used by hot-swap
 # metadata intrinsics. Records a patch pairing (code_disp32_off,
 # meta_byte_off) so the driver knows which metadata cell to target.
@@ -1442,6 +1460,61 @@ fn parse_primary(@g: Gen) -> int
         _advance(@g)
         @off = _local_slot(@g, @name)
         _em_load_rbp(@g, @off)
+        # Indirect call through fn pointer: @f(args)
+        # @f's value is already in rax; push it so arg-evaluation can
+        # clobber rax, then pop back into rax right before `call rax`.
+        # Supports up to 6 args (stack-arg support not needed yet).
+        if _peek_kind(@g) == TK_LPAREN
+            _advance(@g)
+            _em_push_rax(@g)                      # save callee
+            # sub rsp, <alloc> — alloc is patched to (nargs*8 aligned so
+            # that rsp stays mod 16 = 8 at call time, matching SysV).
+            _eb(@g, 72)
+            _eb(@g, 129)
+            _eb(@g, 236)
+            @sub_imm_at = _code_len(@g)
+            _e32(@g, 0)
+            @inargs = 0
+            if _peek_kind(@g) != TK_RPAREN
+                parse_expr(@g)
+                _eb(@g, 72)
+                _eb(@g, 137)
+                _eb(@g, 4)
+                _eb(@g, 36)                       # mov [rsp], rax
+                @inargs = 1
+                while _peek_kind(@g) == TK_COMMA
+                    _advance(@g)
+                    parse_expr(@g)
+                    _eb(@g, 72)
+                    _eb(@g, 137)
+                    _eb(@g, 132)
+                    _eb(@g, 36)
+                    _e32(@g, @inargs * 8)        # mov [rsp+i*8], rax
+                    @inargs = @inargs + 1
+            _expect(@g, TK_RPAREN, "expected ')' after indirect call args")
+            @ialloc = @inargs * 8
+            # Callee was pushed (8 bytes), so total shift is ialloc+8. We
+            # want that %16 == 0 ⇒ ialloc %16 == 8 ⇒ if ialloc %16 == 0,
+            # pad with 8.
+            if (@ialloc % 16) == 0
+                @ialloc = @ialloc + 8
+            _patch32(@g, @sub_imm_at, @ialloc)
+            # Load arg regs from stack slots (indirect calls limited to 6 args).
+            @inreg = @inargs
+            if @inreg > 6
+                @inreg = 6
+            @ii = 0
+            while @ii < @inreg
+                _em_load_argreg_stack(@g, @ii, @ii * 8)
+                @ii = @ii + 1
+            # Restore stack to the point right above the saved callee.
+            _eb(@g, 72)
+            _eb(@g, 129)
+            _eb(@g, 196)
+            _e32(@g, @ialloc)                    # add rsp, ialloc
+            _em_pop_rax(@g)                      # rax = callee
+            _em_call_rax(@g)
+            return 0
         # Array index read: @arr[i]
         if _peek_kind(@g) == TK_LBRACK
             _advance(@g)
@@ -1707,6 +1780,19 @@ fn parse_primary(@g: Gen) -> int
                     return 0
             _em_mov_rax_imm64(@g, @cv)
             return 0
+        # Fn pointer value: bare fn name not followed by `(` or `<` (a
+        # generic arg list leads into a call). Emits `mov rax, [rip+disp32]`
+        # pulling the current fn address from its hot-swap slot, so indirect
+        # calls through the pointer still honour live patches.
+        if _fn_name_index(@g, @name) >= 0
+            @fp_nxt = vec_get(@g.kind, @g.pos + 1)
+            if @fp_nxt != TK_LPAREN
+                if @fp_nxt != TK_LT
+                    _advance(@g)
+                    @fph = _em_fnptr_load_placeholder(@g)
+                    vec_push(@g.fn_patches, @fph)
+                    vec_push(@g.fn_patches, @name)
+                    return 0
         # shine_int is parsed as a call but emits inline code via helper.
         if str_eq(@name, "shine_int") == 1
             _advance(@g)

@@ -1,0 +1,7 @@
+fn forty_two() -> int
+    return 42
+
+fn main() -> int
+    @f = forty_two
+    shine_int(@f())
+    return 0
