@@ -1,0 +1,26 @@
+struct Point
+    x: int
+    y: int
+
+# In Luna's 8-byte uniform value model, a Vec<T> at runtime is
+# identical to Vec<int> — every element is an 8-byte slot. The
+# T parameter exists for documentation / future type-checking.
+# Arrays store pointers to Points; the user casts back at read time.
+
+fn main() -> int
+    let @a: Point = Point { x: 10, y: 20 }
+    let @b: Point = Point { x: 30, y: 40 }
+    let @c: Point = Point { x: 50, y: 60 }
+    let @points: [Point] = [@a, @b, @c]
+    @i = 0
+    @sum_x = 0
+    @sum_y = 0
+    while @i < str_len(@points)
+        let @p: Point = @points[@i]
+        @sum_x = @sum_x + @p.x
+        @sum_y = @sum_y + @p.y
+        @i = @i + 1
+    shine_int(@sum_x)
+    shine_int(@sum_y)
+    shine_int(@sum_x + @sum_y)
+    return 0

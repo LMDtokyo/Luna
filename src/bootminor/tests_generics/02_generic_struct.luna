@@ -1,0 +1,19 @@
+struct Pair<A, B>
+    first:  int
+    second: int
+
+struct Point
+    x: int
+    y: int
+
+fn make_pair<A, B>(@a: int, @b: int) -> Pair<A, B>
+    let @p: Pair<A, B> = Pair<A, B> { first: @a, second: @b }
+    return @p
+
+fn main() -> int
+    let @pt: Point = Point { x: 3, y: 4 }
+    let @pair: Pair<int, int> = make_pair<int, int>(@pt.x, @pt.y)
+    shine_int(@pair.first)
+    shine_int(@pair.second)
+    shine_int(@pair.first + @pair.second)
+    return 0

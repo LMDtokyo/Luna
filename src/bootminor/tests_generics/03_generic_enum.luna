@@ -1,0 +1,35 @@
+enum Option<T>
+    Some(int)
+    None
+
+enum Result<T, E>
+    Ok(int)
+    Err(int)
+
+fn checked_div<T, E>(@a: int, @b: int) -> Result<T, E>
+    if @b == 0
+        return Err(1)
+    return Ok(@a / @b)
+
+fn main() -> int
+    match checked_div<int, int>(20, 4)
+        Ok(@v)
+            shine("ok")
+            shine_int(@v)
+        Err(@e)
+            shine("err")
+            shine_int(@e)
+    match checked_div<int, int>(7, 0)
+        Ok(@v)
+            shine("ok")
+            shine_int(@v)
+        Err(@e)
+            shine("err")
+            shine_int(@e)
+
+    match Some<int>(99)
+        Some(@x)
+            shine_int(@x)
+        None
+            shine("none")
+    return 0

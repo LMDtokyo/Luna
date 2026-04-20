@@ -1485,6 +1485,8 @@ fn parse_primary(@g: Gen) -> int
         @vi = _variant_index(@g, @vname_chk)
         if @vi >= 0
             _advance(@g)
+            # Swallow `Some<int>(42)` style type args.
+            _swallow_generic_params(@g)
             @tag  = vec_get(@g.variant_tag,     @vi)
             @hasp = vec_get(@g.variant_payload, @vi)
             # Evaluate payload first (if any) and save it. Otherwise
@@ -1531,6 +1533,8 @@ fn parse_primary(@g: Gen) -> int
         @s_idx = _struct_lookup(@g, @name)
         if @s_idx >= 0
             _advance(@g)
+            # Swallow optional generic args `Pair<A, B> { ... }`.
+            _swallow_generic_params(@g)
             if _peek_kind(@g) == TK_LBRACE
                 _advance(@g)
                 @fields = vec_get(@g.struct_fields, @s_idx)
@@ -2454,6 +2458,9 @@ fn parse_primary(@g: Gen) -> int
             _eb(@g, 192)
             return 0
         _advance(@g)
+        # Optional generic type arguments: `foo<int, Point>(x, y)`.
+        # Since all types are 8-byte-wide at runtime, we swallow them.
+        _swallow_generic_params(@g)
         _expect(@g, TK_LPAREN, "expected '(' after call name")
         # Evaluate args into fixed stack slots so we can load regs in
         # order and also support >6 args (SysV stack-args live past r9).
@@ -3081,6 +3088,12 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
     @fn_name = _tok_substr(@g, @g.pos)
     _advance(@g)
 
+    # Optional generic parameter list `<T, U: Trait>`. In Luna's
+    # 8-byte uniform value model every type is an 8-byte slot at
+    # runtime, so the parameters are purely documentation. We
+    # swallow tokens up to the matching `>` without interpreting.
+    _swallow_generic_params(@g)
+
     # Register fn NAME at current code offset (before prologue).
     @fn_off = _code_len(@g)
     _fn_register(@g, @fn_name, @fn_off)
@@ -3107,9 +3120,7 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
         @pty = ""
         if _peek_kind(@g) == TK_COLON
             _advance(@g)
-            if _peek_kind(@g) == TK_IDENT
-                @pty = _tok_substr(@g, @g.pos)
-                _advance(@g)
+            @pty = _parse_type(@g)
         vec_push(@param_types, @pty)
         while _peek_kind(@g) == TK_COMMA
             _advance(@g)
@@ -3121,17 +3132,15 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
             @pty2 = ""
             if _peek_kind(@g) == TK_COLON
                 _advance(@g)
-                if _peek_kind(@g) == TK_IDENT
-                    @pty2 = _tok_substr(@g, @g.pos)
-                    _advance(@g)
+                @pty2 = _parse_type(@g)
             vec_push(@param_types, @pty2)
     _expect(@g, TK_RPAREN, "expected ')' in fn decl")
 
-    # Optional `-> type`
+    # Optional `-> type` — use the full type parser to support
+    # generics, references, pointers, slices, etc.
     if _peek_kind(@g) == TK_ARROW
         _advance(@g)
-        if _peek_kind(@g) == TK_IDENT
-            _advance(@g)
+        @_ret_ty = _parse_type(@g)
 
     _expect(@g, TK_NEWLINE, "newline after fn signature")
     _expect(@g, TK_INDENT, "indented fn body")
@@ -3214,7 +3223,7 @@ fn _em_mov_rax_argreg(@g: Gen, @i: int) -> int
     return 0
 
 
-# Parse `struct Name <indent> field1: type <newline> field2: type ...`
+# Parse `struct Name[<T, U>] <indent> field1: type <newline> ...`
 fn parse_struct_decl(@g: Gen) -> int
     _advance(@g)                          # consume 'struct'
     if _peek_kind(@g) != TK_IDENT
@@ -3222,6 +3231,7 @@ fn parse_struct_decl(@g: Gen) -> int
         return 1
     @sname = _tok_substr(@g, @g.pos)
     _advance(@g)
+    _swallow_generic_params(@g)
     _expect(@g, TK_NEWLINE, "newline after struct name")
     _expect(@g, TK_INDENT, "indented struct fields")
     @fields = vec_new()
@@ -3240,9 +3250,7 @@ fn parse_struct_decl(@g: Gen) -> int
         _advance(@g)
         if _peek_kind(@g) == TK_COLON
             _advance(@g)
-            # Skip the type name (ident possibly followed by more tokens)
-            if _peek_kind(@g) == TK_IDENT
-                _advance(@g)
+            @_field_ty = _parse_type(@g)
         vec_push(@fields, @fname)
     _struct_register(@g, @sname, @fields)
     return 0
@@ -3445,6 +3453,7 @@ fn parse_enum_decl(@g: Gen) -> int
         return 1
     @ename = _tok_substr(@g, @g.pos)
     _advance(@g)
+    _swallow_generic_params(@g)
     _expect(@g, TK_NEWLINE, "newline after enum name")
     _expect(@g, TK_INDENT, "indented enum body")
     vec_push(@g.enum_names, @ename)
@@ -3591,6 +3600,31 @@ fn compile_to_gen(@src: int) -> Gen
             _patch32(@g, @call_site, @disp)
         @i = @i + 2
     return @g
+
+# Swallow `<T, U, V: Trait>` generic parameter list if present.
+# Luna compiles every type to an 8-byte slot so these parameters
+# don't affect codegen — they exist for documentation and future
+# type-check phases.
+fn _swallow_generic_params(@g: Gen) -> int
+    if _peek_kind(@g) != TK_LT
+        return 0
+    @depth = 1
+    _advance(@g)
+    while @depth > 0
+        @k = _peek_kind(@g)
+        if @k == TK_LT
+            @depth = @depth + 1
+        elif @k == TK_GT
+            @depth = @depth - 1
+        elif @k == TK_SHR
+            # `>>` as two closers (e.g. `Vec<Option<T>>`) — bootminor's
+            # lexer emits TK_SHR for consecutive `>>`, so treat it as
+            # two `>` tokens here.
+            @depth = @depth - 2
+        elif @k == TK_EOF
+            break
+        _advance(@g)
+    return 0
 
 # Lookup a function's index in fn_names (== its slot index in the
 # hot-swap table). -1 if not found.
