@@ -55,10 +55,12 @@ struct Gen
     struct_names:   int  # Vec<str>: declared struct names
     struct_fields:  int  # Vec<Vec>: parallel — each struct's field name list
     local_types:    int  # Vec<str>: type name for each local (or "" if untyped)
+    const_names:    int  # Vec<str>: module-level const names
+    const_values:   int  # Vec<int>: parallel — their integer values
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
-    let @g: Gen = new_str(200)
+    let @g: Gen = new_str(216)
     @g.code        = strbuf_new()
     @g.data        = strbuf_new()
     @g.kind        = @kind
@@ -83,6 +85,8 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.struct_names  = vec_new()
     @g.struct_fields = vec_new()
     @g.local_types   = vec_new()
+    @g.const_names   = vec_new()
+    @g.const_values  = vec_new()
     # Reserve 8 bytes at the very start of the data section for the
     # heap_top variable. Its initial value (data_vaddr + heap_top_off + 8,
     # i.e. the byte right after itself) is patched in by the driver at
@@ -520,6 +524,58 @@ fn _em_mov_argreg_rax(@g: Gen, @i: int) -> int
         _eb(@g, 73)
         _eb(@g, 137)
         _eb(@g, 193)                 # mov r9, rax
+        return 0
+    return 0
+
+# mov <arg-reg>, [rsp + disp32]  — for i=0..5 SysV arg regs.
+fn _em_load_argreg_stack(@g: Gen, @i: int, @disp: int) -> int
+    # mov rdi, [rsp + d]   ; 48 8b bc 24 <d>
+    # mov rsi, [rsp + d]   ; 48 8b b4 24 <d>
+    # mov rdx, [rsp + d]   ; 48 8b 94 24 <d>
+    # mov rcx, [rsp + d]   ; 48 8b 8c 24 <d>
+    # mov r8,  [rsp + d]   ; 4c 8b 84 24 <d>
+    # mov r9,  [rsp + d]   ; 4c 8b 8c 24 <d>
+    if @i == 0
+        _eb(@g, 72)
+        _eb(@g, 139)
+        _eb(@g, 188)
+        _eb(@g, 36)
+        _e32(@g, @disp)
+        return 0
+    if @i == 1
+        _eb(@g, 72)
+        _eb(@g, 139)
+        _eb(@g, 180)
+        _eb(@g, 36)
+        _e32(@g, @disp)
+        return 0
+    if @i == 2
+        _eb(@g, 72)
+        _eb(@g, 139)
+        _eb(@g, 148)
+        _eb(@g, 36)
+        _e32(@g, @disp)
+        return 0
+    if @i == 3
+        _eb(@g, 72)
+        _eb(@g, 139)
+        _eb(@g, 140)
+        _eb(@g, 36)
+        _e32(@g, @disp)
+        return 0
+    if @i == 4
+        _eb(@g, 76)
+        _eb(@g, 139)
+        _eb(@g, 132)
+        _eb(@g, 36)
+        _e32(@g, @disp)
+        return 0
+    if @i == 5
+        _eb(@g, 76)
+        _eb(@g, 139)
+        _eb(@g, 140)
+        _eb(@g, 36)
+        _e32(@g, @disp)
         return 0
     return 0
 
@@ -1160,6 +1216,18 @@ fn parse_primary(@g: Gen) -> int
     # Function-call expression: `name(arg1, arg2, ...)`
     if @k == TK_IDENT
         @name = _tok_substr(@g, @g.pos)
+        # Constant reference: if name is a known module-level const, emit
+        # its value as an immediate and advance.
+        @cout = vec_new()
+        if _const_lookup(@g, @name, @cout) == 1
+            _advance(@g)
+            @cv = vec_get(@cout, 0)
+            if @cv >= 0
+                if @cv < 2147483648
+                    _em_mov_eax_imm(@g, @cv)
+                    return 0
+            _em_mov_rax_imm64(@g, @cv)
+            return 0
         # shine_int is parsed as a call but emits inline code via helper.
         if str_eq(@name, "shine_int") == 1
             _advance(@g)
@@ -1323,35 +1391,87 @@ fn parse_primary(@g: Gen) -> int
             return 0
         _advance(@g)
         _expect(@g, TK_LPAREN, "expected '(' after call name")
-        # Evaluate args left-to-right, push each. Up to 6.
+        # Evaluate args into fixed stack slots so we can load regs in
+        # order and also support >6 args (SysV stack-args live past r9).
+        # Layout: rsp[0..N*8) after `sub rsp, N*8` holds arg[0..N-1].
         @nargs = 0
+        # Emit `sub rsp, 0` placeholder — patch later with N*8 aligned.
+        @sub_at = _code_len(@g)
+        # sub rsp, imm32 ; 48 81 ec <imm32>
+        _eb(@g, 72)
+        _eb(@g, 129)
+        _eb(@g, 236)
+        _e32(@g, 0)
+        @sub_imm_at = _code_len(@g) - 4
         if _peek_kind(@g) != TK_RPAREN
             parse_expr(@g)
-            _em_push_rax(@g)
+            # mov [rsp + 0], rax
+            _eb(@g, 72)
+            _eb(@g, 137)
+            _eb(@g, 4)
+            _eb(@g, 36)
             @nargs = 1
             while _peek_kind(@g) == TK_COMMA
                 _advance(@g)
                 parse_expr(@g)
-                _em_push_rax(@g)
+                # mov [rsp + nargs*8], rax  ; 48 89 84 24 <disp32>
+                _eb(@g, 72)
+                _eb(@g, 137)
+                _eb(@g, 132)
+                _eb(@g, 36)
+                _e32(@g, @nargs * 8)
                 @nargs = @nargs + 1
         _expect(@g, TK_RPAREN, "expected ')' after call args")
+        # Patch the sub-rsp imm32 to actual N*8 (aligned up to 16).
+        @alloc = @nargs * 8
+        if (@alloc % 16) != 0
+            @alloc = @alloc + 8
+        _patch32(@g, @sub_imm_at, @alloc)
+        # Load args 0..min(5, nargs-1) into sysv regs from slots.
+        @nreg = @nargs
+        if @nreg > 6
+            @nreg = 6
+        @i = 0
+        while @i < @nreg
+            # mov <argreg[i]>, [rsp + i*8]
+            _em_load_argreg_stack(@g, @i, @i * 8)
+            @i = @i + 1
+        # If nargs > 6: slide stack args down so arg6 is at [rsp+0].
+        # After `add rsp, 48` (reg arg slots freed), stack top has arg 6.
         if @nargs > 6
-            _die(@g, "more than 6 call args not supported")
-            return 0
-        # Pop in reverse so arg_i ends up in sysv_arg_reg[i].
-        @i = @nargs - 1
-        while @i >= 0
-            _em_pop_argreg(@g, @i)
-            @i = @i - 1
-        # Emit call. If target known (already-defined), use direct rel32.
-        # Otherwise emit placeholder and record a patch.
+            # add rsp, 48
+            _eb(@g, 72)
+            _eb(@g, 131)
+            _eb(@g, 196)
+            _eb(@g, 48)
+            # We still have (nargs-6)*8 bytes of args, plus the alignment
+            # padding if any. Call site must see 16-aligned rsp, so the
+            # stack-arg count must be even; caller adds a pad dword if
+            # needed. For now we assume even stack-arg count.
+        # Emit call. Forward refs patched later.
         @tgt = _fn_lookup(@g, @name)
         if @tgt >= 0
             _em_call_to(@g, @tgt)
-            return 0
-        @ph = _em_call_placeholder(@g)
-        vec_push(@g.fn_patches, @ph)
-        vec_push(@g.fn_patches, @name)
+        else
+            @ph = _em_call_placeholder(@g)
+            vec_push(@g.fn_patches, @ph)
+            vec_push(@g.fn_patches, @name)
+        # Clean up stack: if nargs <= 6, we did `sub rsp, alloc` and
+        # never rolled it back, so `add rsp, alloc` restores. For
+        # nargs > 6 we already added 48 above; now free the remaining
+        # (nargs-6)*8 bytes, which equals (alloc - 48).
+        if @nargs <= 6
+            # add rsp, alloc
+            _eb(@g, 72)
+            _eb(@g, 129)
+            _eb(@g, 196)
+            _e32(@g, @alloc)
+        else
+            @remaining = @alloc - 48
+            _eb(@g, 72)
+            _eb(@g, 129)
+            _eb(@g, 196)
+            _e32(@g, @remaining)
         return 0
     _die(@g, "expected primary expression")
     _advance(@g)
@@ -1749,11 +1869,8 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
     # Emit prologue (frame size patched later).
     @prol_at = _em_prologue(@g)
 
-    # Spill argument registers into newly allocated local slots.
+    # Spill register args 0..5 and load stack args 6..N-1 into local slots.
     @nparams = vec_len(@param_names)
-    if @nparams > 6
-        _die(@g, "more than 6 params not supported")
-        return 1
     @pi = 0
     while @pi < @nparams
         @pname = vec_get(@param_names, @pi)
@@ -1761,8 +1878,13 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
         @poff  = _local_slot(@g, @pname)
         if str_eq(@ptype, "") == 0
             _set_local_type(@g, @pname, @ptype)
-        # mov rax, <sysv_arg_reg[pi]> ; mov [rbp+poff], rax
-        _em_mov_rax_argreg(@g, @pi)
+        if @pi < 6
+            # mov rax, <sysv_arg_reg[pi]> ; mov [rbp+poff], rax
+            _em_mov_rax_argreg(@g, @pi)
+        else
+            # Stack-passed arg: at [rbp + 16 + (pi-6)*8]
+            @src_disp = 16 + (@pi - 6) * 8
+            _em_load_rbp(@g, @src_disp)
         _em_store_rbp(@g, @poff)
         @pi = @pi + 1
 
@@ -1900,27 +2022,49 @@ fn parse_import(@g: Gen) -> int
         _advance(@g)
     return 0
 
-# Skip a `const NAME: type = value` at module level. We DO NOT model
-# compile-time constants; the initializer expression is irrelevant for
-# bootminor's present subset. A best-effort skip lets prelude-style
-# constant tables pass through.
+# Parse a `const NAME: type = <int-literal>` at module level. Records
+# the (name, value) pair so references in expressions can be folded
+# into immediates. Supports optional unary '-' prefix.
 fn parse_const_decl(@g: Gen) -> int
     _advance(@g)                           # consume 'const'
+    @cname = ""
     if _peek_kind(@g) == TK_IDENT
+        @cname = _tok_substr(@g, @g.pos)
         _advance(@g)
     if _peek_kind(@g) == TK_COLON
         _advance(@g)
         if _peek_kind(@g) == TK_IDENT
             _advance(@g)
+    @cval = 0
     if _peek_kind(@g) == TK_ASSIGN
         _advance(@g)
-        # Skip expression tokens up to newline.
-        while _peek_kind(@g) != TK_NEWLINE
-            if _peek_kind(@g) == TK_EOF
-                break
+        @neg = 0
+        if _peek_kind(@g) == TK_MINUS
+            @neg = 1
             _advance(@g)
+        if _peek_kind(@g) == TK_INT
+            @cval = _peek_iv(@g)
+            _advance(@g)
+        if @neg == 1
+            @cval = 0 - @cval
+    if str_eq(@cname, "") == 0
+        vec_push(@g.const_names, @cname)
+        vec_push(@g.const_values, @cval)
     while _peek_kind(@g) == TK_NEWLINE
         _advance(@g)
+    return 0
+
+# Look up a const name; returns (1, value) if found, (0, 0) otherwise.
+# Encoded as: set @g.frame to... nope, we'll just return -1 for missing
+# and require caller to check via helper below.
+fn _const_lookup(@g: Gen, @name: int, @out: Vec) -> int
+    @n = vec_len(@g.const_names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.const_names, @i), @name) == 1
+            vec_push(@out, vec_get(@g.const_values, @i))
+            return 1
+        @i = @i + 1
     return 0
 
 # Parse a whole program = sequence of fn decls + struct decls + etc.

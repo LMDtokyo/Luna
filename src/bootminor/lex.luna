@@ -276,14 +276,78 @@ fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
             @at_line_start = 1
             continue
 
-        # --- Integer literal ---
+        # --- Integer literal (decimal, hex 0x..., binary 0b..., octal 0o...) ---
         if _is_digit(@c) == 1
             @s0 = @pos
             @val = 0
+            # Detect prefix
+            if @c == 48
+                if @pos + 1 < @slen
+                    @c2 = str_byte(@src, @pos + 1)
+                    if @c2 == 120
+                        @pos = @pos + 2
+                        while @pos < @slen
+                            @cc = str_byte(@src, @pos)
+                            @digit = 0 - 1
+                            if @cc >= 48
+                                if @cc <= 57
+                                    @digit = @cc - 48
+                            if @digit < 0
+                                if @cc >= 97
+                                    if @cc <= 102
+                                        @digit = @cc - 87
+                            if @digit < 0
+                                if @cc >= 65
+                                    if @cc <= 70
+                                        @digit = @cc - 55
+                            if @digit < 0
+                                if @cc == 95
+                                    @pos = @pos + 1
+                                    continue
+                                break
+                            @val = @val * 16 + @digit
+                            @pos = @pos + 1
+                        _emit(@kind, @start, @len, @iv, TK_INT, @s0, @pos - @s0, @val)
+                        continue
+                    if @c2 == 98
+                        @pos = @pos + 2
+                        while @pos < @slen
+                            @cc = str_byte(@src, @pos)
+                            if @cc == 48
+                                @val = @val * 2
+                            elif @cc == 49
+                                @val = @val * 2 + 1
+                            elif @cc == 95
+                                @pos = @pos + 1
+                                continue
+                            else
+                                break
+                            @pos = @pos + 1
+                        _emit(@kind, @start, @len, @iv, TK_INT, @s0, @pos - @s0, @val)
+                        continue
+                    if @c2 == 111
+                        @pos = @pos + 2
+                        while @pos < @slen
+                            @cc = str_byte(@src, @pos)
+                            if @cc >= 48
+                                if @cc <= 55
+                                    @val = @val * 8 + (@cc - 48)
+                                    @pos = @pos + 1
+                                    continue
+                            if @cc == 95
+                                @pos = @pos + 1
+                                continue
+                            break
+                        _emit(@kind, @start, @len, @iv, TK_INT, @s0, @pos - @s0, @val)
+                        continue
             while @pos < @slen
                 @cc = str_byte(@src, @pos)
                 if _is_digit(@cc) == 0
-                    break
+                    if @cc != 95
+                        break
+                if @cc == 95
+                    @pos = @pos + 1
+                    continue
                 @val = @val * 10 + (@cc - 48)
                 @pos = @pos + 1
             _emit(@kind, @start, @len, @iv, TK_INT, @s0, @pos - @s0, @val)
