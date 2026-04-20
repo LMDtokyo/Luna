@@ -45,6 +45,14 @@ const TK_LT:      int = 33
 const TK_LE:      int = 34
 const TK_GT:      int = 35
 const TK_GE:      int = 36
+const TK_AMP:     int = 50
+const TK_PIPE:    int = 51
+const TK_CARET:   int = 52
+const TK_TILDE:   int = 53
+const TK_SHL:     int = 54
+const TK_SHR:     int = 55
+const TK_KW_BREAK:    int = 60
+const TK_KW_CONTINUE: int = 61
 
 # punctuation
 const TK_LPAREN:  int = 40
@@ -95,6 +103,10 @@ fn _kw_lookup(@src: int, @start: int, @len: int) -> int
         return TK_RETURN
     if str_eq(@lit, "elif") == 1
         return TK_ELIF
+    if str_eq(@lit, "break") == 1
+        return TK_KW_BREAK
+    if str_eq(@lit, "continue") == 1
+        return TK_KW_CONTINUE
     return TK_IDENT
 
 
@@ -311,9 +323,17 @@ fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
                     _emit(@kind, @start, @len, @iv, TK_LE, @pos, 2, 0)
                     @pos = @pos + 2
                     continue
+                if @c2 == 60
+                    _emit(@kind, @start, @len, @iv, TK_SHL, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
             if @c == 62
                 if @c2 == 61
                     _emit(@kind, @start, @len, @iv, TK_GE, @pos, 2, 0)
+                    @pos = @pos + 2
+                    continue
+                if @c2 == 62
+                    _emit(@kind, @start, @len, @iv, TK_SHR, @pos, 2, 0)
                     @pos = @pos + 2
                     continue
 
@@ -336,6 +356,22 @@ fn lex(@src: int, @kind: Vec, @start: Vec, @len: Vec, @iv: Vec) -> int
             continue
         if @c == 37
             _emit(@kind, @start, @len, @iv, TK_PERCENT, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 38
+            _emit(@kind, @start, @len, @iv, TK_AMP, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 124
+            _emit(@kind, @start, @len, @iv, TK_PIPE, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 94
+            _emit(@kind, @start, @len, @iv, TK_CARET, @pos, 1, 0)
+            @pos = @pos + 1
+            continue
+        if @c == 126
+            _emit(@kind, @start, @len, @iv, TK_TILDE, @pos, 1, 0)
             @pos = @pos + 1
             continue
         if @c == 61

@@ -50,10 +50,12 @@ struct Gen
     is_main:     int     # 1 while parsing `main`, 0 otherwise
     main_off:    int     # code offset where main starts
     heap_patches: int    # LEA heap_top patches: [code_off]*
+    loop_cont:   int     # Vec<int>: stack of continue targets (loop starts)
+    loop_breaks: int     # Vec<int>: stack of break-patches-vec pointers
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
-    let @g: Gen = new_str(160)
+    let @g: Gen = new_str(176)
     @g.code        = strbuf_new()
     @g.data        = strbuf_new()
     @g.kind        = @kind
@@ -73,6 +75,8 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.is_main      = 0
     @g.main_off     = 0
     @g.heap_patches = vec_new()
+    @g.loop_cont    = vec_new()
+    @g.loop_breaks  = vec_new()
     # Reserve 8 bytes at the very start of the data section for the
     # heap_top variable. Its initial value (data_vaddr + heap_top_off + 8,
     # i.e. the byte right after itself) is patched in by the driver at
@@ -331,6 +335,48 @@ fn _em_cmp_rax_rcx(@g: Gen) -> int
     _eb(@g, 200)
     return 0
 
+# and rax, rcx ; 48 21 c8
+fn _em_and_rax_rcx(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 33)
+    _eb(@g, 200)
+    return 0
+
+# or rax, rcx ; 48 09 c8
+fn _em_or_rax_rcx(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 9)
+    _eb(@g, 200)
+    return 0
+
+# xor rax, rcx ; 48 31 c8
+fn _em_xor_rax_rcx(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 49)
+    _eb(@g, 200)
+    return 0
+
+# not rax ; 48 f7 d0
+fn _em_not_rax(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 247)
+    _eb(@g, 208)
+    return 0
+
+# shl rax, cl ; 48 d3 e0
+fn _em_shl_rax_cl(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 211)
+    _eb(@g, 224)
+    return 0
+
+# shr rax, cl ; 48 d3 e8 (logical right shift)
+fn _em_shr_rax_cl(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 211)
+    _eb(@g, 232)
+    return 0
+
 # setX al ; movzx rax, al  (produces 1 if condition true else 0)
 fn _em_set_cond(@g: Gen, @opcode2: int) -> int
     _eb(@g, 15)
@@ -534,17 +580,50 @@ fn _emit_print_int(@g: Gen) -> int
 # --- Expression parser (precedence-climbing) -------------------------
 
 fn parse_expr(@g: Gen) -> int
+    parse_bor(@g)
+    return 0
+
+fn parse_bor(@g: Gen) -> int
+    parse_bxor(@g)
+    while _peek_kind(@g) == TK_PIPE
+        _advance(@g)
+        _em_push_rax(@g)
+        parse_bxor(@g)
+        _em_mov_rcx_rax(@g)
+        _em_pop_rax(@g)
+        _em_or_rax_rcx(@g)
+    return 0
+
+fn parse_bxor(@g: Gen) -> int
+    parse_band(@g)
+    while _peek_kind(@g) == TK_CARET
+        _advance(@g)
+        _em_push_rax(@g)
+        parse_band(@g)
+        _em_mov_rcx_rax(@g)
+        _em_pop_rax(@g)
+        _em_xor_rax_rcx(@g)
+    return 0
+
+fn parse_band(@g: Gen) -> int
     parse_cmp(@g)
+    while _peek_kind(@g) == TK_AMP
+        _advance(@g)
+        _em_push_rax(@g)
+        parse_cmp(@g)
+        _em_mov_rcx_rax(@g)
+        _em_pop_rax(@g)
+        _em_and_rax_rcx(@g)
     return 0
 
 fn parse_cmp(@g: Gen) -> int
-    parse_add(@g)
+    parse_shift(@g)
     while 1
         @k = _peek_kind(@g)
         if @k == TK_EQ
             _advance(@g)
             _em_push_rax(@g)
-            parse_add(@g)
+            parse_shift(@g)
             _em_mov_rcx_rax(@g)
             _em_pop_rax(@g)
             _em_cmp_rax_rcx(@g)
@@ -552,7 +631,7 @@ fn parse_cmp(@g: Gen) -> int
         elif @k == TK_NEQ
             _advance(@g)
             _em_push_rax(@g)
-            parse_add(@g)
+            parse_shift(@g)
             _em_mov_rcx_rax(@g)
             _em_pop_rax(@g)
             _em_cmp_rax_rcx(@g)
@@ -560,7 +639,7 @@ fn parse_cmp(@g: Gen) -> int
         elif @k == TK_LT
             _advance(@g)
             _em_push_rax(@g)
-            parse_add(@g)
+            parse_shift(@g)
             _em_mov_rcx_rax(@g)
             _em_pop_rax(@g)
             _em_cmp_rax_rcx(@g)
@@ -568,7 +647,7 @@ fn parse_cmp(@g: Gen) -> int
         elif @k == TK_LE
             _advance(@g)
             _em_push_rax(@g)
-            parse_add(@g)
+            parse_shift(@g)
             _em_mov_rcx_rax(@g)
             _em_pop_rax(@g)
             _em_cmp_rax_rcx(@g)
@@ -576,7 +655,7 @@ fn parse_cmp(@g: Gen) -> int
         elif @k == TK_GT
             _advance(@g)
             _em_push_rax(@g)
-            parse_add(@g)
+            parse_shift(@g)
             _em_mov_rcx_rax(@g)
             _em_pop_rax(@g)
             _em_cmp_rax_rcx(@g)
@@ -584,11 +663,33 @@ fn parse_cmp(@g: Gen) -> int
         elif @k == TK_GE
             _advance(@g)
             _em_push_rax(@g)
-            parse_add(@g)
+            parse_shift(@g)
             _em_mov_rcx_rax(@g)
             _em_pop_rax(@g)
             _em_cmp_rax_rcx(@g)
             _em_set_cond(@g, 157)
+        else
+            break
+    return 0
+
+fn parse_shift(@g: Gen) -> int
+    parse_add(@g)
+    while 1
+        @k = _peek_kind(@g)
+        if @k == TK_SHL
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_add(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_shl_rax_cl(@g)
+        elif @k == TK_SHR
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_add(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_shr_rax_cl(@g)
         else
             break
     return 0
@@ -650,6 +751,11 @@ fn parse_unary(@g: Gen) -> int
         _advance(@g)
         parse_primary(@g)
         _em_neg_rax(@g)
+        return 0
+    if _peek_kind(@g) == TK_TILDE
+        _advance(@g)
+        parse_primary(@g)
+        _em_not_rax(@g)
         return 0
     parse_primary(@g)
     return 0
@@ -898,6 +1004,27 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
         parse_while(@g, @patches)
         return 0
 
+    if @k == TK_KW_BREAK
+        _advance(@g)
+        @top = vec_len(@g.loop_breaks) - 1
+        if @top < 0
+            _die(@g, "break outside loop")
+            return 0
+        @ph = _em_jmp_placeholder(@g)
+        @bv = vec_get(@g.loop_breaks, @top)
+        vec_push(@bv, @ph)
+        return 0
+
+    if @k == TK_KW_CONTINUE
+        _advance(@g)
+        @top = vec_len(@g.loop_cont) - 1
+        if @top < 0
+            _die(@g, "continue outside loop")
+            return 0
+        @tgt = vec_get(@g.loop_cont, @top)
+        _em_jmp_to(@g, @tgt)
+        return 0
+
     if @k == TK_ATIDENT
         @name = _tok_substr(@g, @g.pos)
         _advance(@g)
@@ -1029,6 +1156,10 @@ fn parse_if(@g: Gen, @patches: Vec) -> int
 fn parse_while(@g: Gen, @patches: Vec) -> int
     _advance(@g)                       # consume 'while'
     @loop_start = _code_len(@g)
+    # Push new loop frame: continue target = loop_start, fresh break-vec.
+    vec_push(@g.loop_cont, @loop_start)
+    @bvec = vec_new()
+    vec_push(@g.loop_breaks, @bvec)
     parse_expr(@g)
     _em_test_rax(@g)
     @jz_patch = _em_jz_placeholder(@g)
@@ -1037,6 +1168,16 @@ fn parse_while(@g: Gen, @patches: Vec) -> int
     parse_block(@g, @patches)
     _em_jmp_to(@g, @loop_start)
     _patch_here(@g, @jz_patch)
+    # Pop loop frame and patch any break jumps to current code position.
+    @top = vec_len(@g.loop_breaks) - 1
+    @bv = vec_get(@g.loop_breaks, @top)
+    @nb = vec_len(@bv)
+    @i = 0
+    while @i < @nb
+        _patch_here(@g, vec_get(@bv, @i))
+        @i = @i + 1
+    vec_pop(@g.loop_breaks)
+    vec_pop(@g.loop_cont)
     return 0
 
 
