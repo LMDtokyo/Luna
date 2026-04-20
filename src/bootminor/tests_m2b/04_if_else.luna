@@ -1,0 +1,12 @@
+fn main() -> int
+    @x = 7
+    if @x > 0
+        shine("pos")
+    else
+        shine("neg")
+    @y = 0 - 3
+    if @y > 0
+        shine("pos")
+    else
+        shine("neg")
+    return 0

@@ -1,0 +1,73 @@
+# _print_int runtime helper — verified 2026-04-20 via nasm+ld+run.
+#
+# ABI: call print_int; rdi = signed int64 to print.
+#      Output is decimal + '\n' to stdout.
+#      Preserves: rbx, r12-r15, rbp. Clobbers: rax, rdi, rsi, rdx, rcx, r8, r9.
+#
+# Tested cases (all correct):
+#   0, 42, -123, 9223372036854775807, -9223372036854775808
+#
+# Size: 122 bytes. Source in print_int.asm.
+
+BYTES = [
+    0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20,
+    0x45, 0x31, 0xc0, 0x48, 0x85, 0xff, 0x79, 0x06,
+    0x41, 0xb0, 0x01, 0x48, 0xf7, 0xdf, 0xc6, 0x45,
+    0xff, 0x0a, 0x48, 0x8d, 0x75, 0xff, 0xba, 0x01,
+    0x00, 0x00, 0x00, 0x48, 0x85, 0xff, 0x75, 0x0d,
+    0x48, 0x83, 0xee, 0x01, 0xc6, 0x06, 0x30, 0x48,
+    0x83, 0xc2, 0x01, 0xeb, 0x24, 0x48, 0x89, 0xf8,
+    0x31, 0xd2, 0xb9, 0x0a, 0x00, 0x00, 0x00, 0x48,
+    0xf7, 0xf1, 0x80, 0xc2, 0x30, 0x48, 0x83, 0xee,
+    0x01, 0x88, 0x16, 0x48, 0x89, 0xc7, 0x48, 0x85,
+    0xff, 0x75, 0xe2, 0x48, 0x89, 0xea, 0x48, 0x29,
+    0xf2, 0x45, 0x84, 0xc0, 0x74, 0x0b, 0x48, 0x83,
+    0xee, 0x01, 0xc6, 0x06, 0x2d, 0x48, 0x83, 0xc2,
+    0x01, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xbf, 0x01,
+    0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x89, 0xec,
+    0x5d, 0xc3
+]
+
+# annotated disassembly
+# 0000: 55                    push rbp
+# 0001: 48 89 e5              mov  rbp, rsp
+# 0004: 48 83 ec 20           sub  rsp, 0x20
+# 0008: 45 31 c0              xor  r8d, r8d
+# 000b: 48 85 ff              test rdi, rdi
+# 000e: 79 06                 jns  +6   (to 0016 .nonneg)
+# 0010: 41 b0 01              mov  r8b, 1           ; mark sign
+# 0013: 48 f7 df              neg  rdi
+# 0016: c6 45 ff 0a           mov  byte [rbp-1], 10  ; newline byte
+# 001a: 48 8d 75 ff           lea  rsi, [rbp-1]
+# 001e: ba 01 00 00 00        mov  edx, 1
+# 0023: 48 85 ff              test rdi, rdi
+# 0026: 75 0d                 jne  +13  (to 0035 .digitloop)
+# 0028: 48 83 ee 01           sub  rsi, 1
+# 002c: c6 06 30              mov  byte [rsi], '0'
+# 002f: 48 83 c2 01           add  rdx, 1
+# 0033: eb 24                 jmp  +36  (to 0059 .maybe_sign)
+# 0035: 48 89 f8              mov  rax, rdi
+# 0038: 31 d2                 xor  edx, edx
+# 003a: b9 0a 00 00 00        mov  ecx, 10
+# 003f: 48 f7 f1              div  rcx              ; rdx=rem, rax=quot
+# 0042: 80 c2 30              add  dl, '0'
+# 0045: 48 83 ee 01           sub  rsi, 1
+# 0049: 88 16                 mov  [rsi], dl
+# 004b: 48 89 c7              mov  rdi, rax
+# 004e: 48 85 ff              test rdi, rdi
+# 0051: 75 e2                 jne  -30  (to 0035 .digitloop)
+# 0053: 48 89 ea              mov  rdx, rbp
+# 0056: 48 29 f2              sub  rdx, rsi
+# 0059: 45 84 c0              test r8b, r8b         ; .maybe_sign
+# 005c: 74 0b                 je   +11  (to 0069 .write)
+# 005e: 48 83 ee 01           sub  rsi, 1
+# 0062: c6 06 2d               mov byte [rsi], '-'
+# 0065: 48 83 c2 01           add  rdx, 1
+# 0069: b8 01 00 00 00        mov  eax, 1           ; .write sys_write
+# 006e: bf 01 00 00 00        mov  edi, 1           ; stdout
+# 0073: 0f 05                 syscall
+# 0075: 48 89 ec              mov  rsp, rbp
+# 0078: 5d                    pop  rbp
+# 0079: c3                    ret
+#
+# total = 0x7a = 122 bytes

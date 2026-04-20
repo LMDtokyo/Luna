@@ -1,0 +1,179 @@
+# =====================================================================
+# bootminor M2b driver. Wires lex + gen + ELF64 writer.
+#
+# Pipeline:
+#   1. Read source from argv[1].
+#   2. Lex into four parallel Vecs.
+#   3. Compile into a Gen (emits machine code + data bytes + a list of
+#      LEA-rel32 patch sites that need a data-vaddr fixup).
+#   4. Lay out a minimal ELF64:
+#        [0..64)     Ehdr
+#        [64..120)   Phdr (PT_LOAD, PF_R|PF_X, vaddr 0x400000)
+#        [120..120+code_len)     code
+#        [after)     data
+#   5. Patch each LEA disp32 so it points at its data entry.
+#   6. Write to -o <path> or a.out.
+# =====================================================================
+
+
+# ELF64 constants
+fn _elf_vaddr() -> int
+    return 4194304      # 0x400000
+fn _elf_hdr() -> int
+    return 64
+fn _elf_phdr() -> int
+    return 56
+fn _elf_prelude() -> int
+    return 120
+
+
+fn _put8(@buf: int, @at: int, @v: int) -> int
+    str_set_byte(@buf, @at, @v & 255)
+    return 0
+
+fn _put16(@buf: int, @at: int, @v: int) -> int
+    str_set_byte(@buf, @at,     @v & 255)
+    str_set_byte(@buf, @at + 1, (@v >> 8) & 255)
+    return 0
+
+fn _put32(@buf: int, @at: int, @v: int) -> int
+    str_set_byte(@buf, @at,     @v & 255)
+    str_set_byte(@buf, @at + 1, (@v >> 8)  & 255)
+    str_set_byte(@buf, @at + 2, (@v >> 16) & 255)
+    str_set_byte(@buf, @at + 3, (@v >> 24) & 255)
+    return 0
+
+fn _put64(@buf: int, @at: int, @v: int) -> int
+    @i = 0
+    while @i < 8
+        str_set_byte(@buf, @at + @i, (@v >> (@i * 8)) & 255)
+        @i = @i + 1
+    return 0
+
+
+fn _emit_elf(@buf: int, @file_sz: int, @entry_off: int) -> int
+    _put8(@buf, 0, 127)
+    _put8(@buf, 1, 69)
+    _put8(@buf, 2, 76)
+    _put8(@buf, 3, 70)
+    _put8(@buf, 4, 2)
+    _put8(@buf, 5, 1)
+    _put8(@buf, 6, 1)
+    _put16(@buf, 16, 2)
+    _put16(@buf, 18, 62)
+    _put32(@buf, 20, 1)
+    _put64(@buf, 24, _elf_vaddr() + @entry_off)
+    _put64(@buf, 32, _elf_hdr())
+    _put64(@buf, 40, 0)
+    _put32(@buf, 48, 0)
+    _put16(@buf, 52, _elf_hdr())
+    _put16(@buf, 54, _elf_phdr())
+    _put16(@buf, 56, 1)
+    _put16(@buf, 58, 0)
+    _put16(@buf, 60, 0)
+    _put16(@buf, 62, 0)
+    @p = _elf_hdr()
+    _put32(@buf, @p + 0,  1)
+    _put32(@buf, @p + 4,  5)
+    _put64(@buf, @p + 8,  0)
+    _put64(@buf, @p + 16, _elf_vaddr())
+    _put64(@buf, @p + 24, _elf_vaddr())
+    _put64(@buf, @p + 32, @file_sz)
+    _put64(@buf, @p + 40, @file_sz)
+    _put64(@buf, @p + 48, 4096)
+    return 0
+
+
+fn _parse_output(@argc: int) -> int
+    @i = 1
+    while @i < @argc
+        @a = arg(@i)
+        if str_eq(@a, "-o") == 1
+            return arg(@i + 1)
+        @i = @i + 1
+    return "a.out"
+
+
+fn main() -> int
+    @argc = 0
+    while str_eq(arg(@argc), "") == 0
+        @argc = @argc + 1
+    if @argc < 2
+        shine("usage: luna-mini <source.luna> [-o <output>]")
+        return 1
+
+    @src_path = arg(1)
+    @out_path = _parse_output(@argc)
+
+    @src = read_file(@src_path)
+    if @src == 0
+        shine(str_concat("luna-mini: cannot read ", @src_path))
+        return 1
+
+    let @g: Gen = compile_to_gen(@src)
+    # compile_to_gen stashed the patch list in @g.names (reused).
+    @patches = @g.names
+    @code_bytes = strbuf_done(@g.code)
+    @data_bytes = strbuf_done(@g.data)
+    @code_len = str_len(@code_bytes)
+    @data_len = str_len(@data_bytes)
+
+    # After print_int runtime at the start of code, entry point is just
+    # past it, at @g.pi_off + 122. That's where `main` begins.
+    # NOTE: ELF e_entry = vaddr + entry_off in file. Entry in the file
+    # is offset _elf_prelude() + @g.pi_off + 122.
+    @entry_off = _elf_prelude() + @g.pi_off + 122
+
+    @code_off = _elf_prelude()
+    @data_off = @code_off + @code_len
+    @file_sz  = @data_off + @data_len
+
+    # Patch every LEA disp32:
+    #   disp = (DATA_VADDR + data_offset_in_section)
+    #        - (CODE_VADDR + (patch_at + 4))
+    # DATA_VADDR = elf_vaddr + data_off
+    # CODE_VADDR relative byte offset within the file is data_off - (_elf_prelude())
+    # Patch lives at CODE_START + patch_at (where CODE_START = 120 in the file).
+    @np = vec_len(@patches)
+    @i = 0
+    while @i < @np
+        @pat_code_off = vec_get(@patches, @i)
+        @data_entry   = vec_get(@patches, @i + 1)
+        # Rewrite the 4 bytes inside @code_bytes at offset @pat_code_off.
+        @disp = (@data_off + @data_entry) - (@pat_code_off + 4)
+        # But @pat_code_off is relative to start of code section.
+        # _em_lea_rsi_rip_ph returned _code_len(@g) at emit time, which is
+        # bytes-into-code-section. After code is concatenated after the
+        # 120-byte prelude in the file, the actual FILE offset of the
+        # patch is _elf_prelude() + @pat_code_off. Same logic for the
+        # rip-target; rip-relative offsets only care about the delta
+        # between the file byte and the data file byte, which is
+        # (data_off - code_off) + data_entry - (pat_code_off + 4).
+        @disp = (@data_off - @code_off) + @data_entry - (@pat_code_off + 4)
+        str_set_byte(@code_bytes, @pat_code_off + 0,  @disp        & 255)
+        str_set_byte(@code_bytes, @pat_code_off + 1, (@disp >> 8)  & 255)
+        str_set_byte(@code_bytes, @pat_code_off + 2, (@disp >> 16) & 255)
+        str_set_byte(@code_bytes, @pat_code_off + 3, (@disp >> 24) & 255)
+        @i = @i + 2
+
+    @buf = new_str(@file_sz)
+    _emit_elf(@buf, @file_sz, @entry_off)
+
+    # Copy code into [code_off..code_off+code_len)
+    @k = 0
+    while @k < @code_len
+        str_set_byte(@buf, @code_off + @k, str_byte(@code_bytes, @k))
+        @k = @k + 1
+    # Copy data
+    @k = 0
+    while @k < @data_len
+        str_set_byte(@buf, @data_off + @k, str_byte(@data_bytes, @k))
+        @k = @k + 1
+
+    @n = write_file(@out_path, @buf)
+    if @n < 0
+        shine(str_concat("luna-mini: cannot write ", @out_path))
+        return 1
+
+    shine(str_concat("luna-mini: wrote ", @out_path))
+    return 0

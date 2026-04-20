@@ -1,0 +1,778 @@
+# =====================================================================
+# bootminor M2b: single-pass parser + codegen.
+#
+# Consumes the token stream produced by lex.luna and emits x86-64
+# machine code directly into a StrBuf. No explicit AST.
+#
+# Subset:
+#   fn main() -> int
+#       @name = <expr>
+#       shine("literal")
+#       shine_int(<expr>)
+#       if <cond> / elif / else  (indented blocks)
+#       while <cond>
+#       return <expr>
+#
+# Expression grammar (precedence-climbing, lowest → highest):
+#   expr   := cmp
+#   cmp    := add ( ("==" | "!=" | "<" | "<=" | ">" | ">=") add )*
+#   add    := mul ( ("+" | "-") mul )*
+#   mul    := unary ( ("*" | "/" | "%") unary )*
+#   unary  := ("-")? primary
+#   primary:= INT | ATIDENT | "(" expr ")"
+#
+# Calling convention for binops: parse_X leaves the left operand in
+# rax, saves it on the stack, parses the right into rax, then moves
+# right into rcx, pops left into rax, and emits the operation so that
+# rax holds (left OP right). This matches the C/x86 convention.
+# =====================================================================
+
+
+# --- Struct ----------------------------------------------------------
+
+struct Gen
+    code:    int
+    data:    int
+    kind:    int
+    start:   int
+    tlen:    int
+    iv:      int
+    pos:     int
+    src:     int
+    names:   int
+    offs:    int
+    frame:   int
+    pi_off:  int
+
+
+fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
+    let @g: Gen = new_str(96)
+    @g.code   = strbuf_new()
+    @g.data   = strbuf_new()
+    @g.kind   = @kind
+    @g.start  = @start
+    @g.tlen   = @tlen
+    @g.iv     = @iv
+    @g.pos    = 0
+    @g.src    = @src
+    @g.names  = vec_new()
+    @g.offs   = vec_new()
+    @g.frame  = 0
+    @g.pi_off = 0
+    return @g
+
+
+# --- Token stream helpers --------------------------------------------
+
+fn _peek_kind(@g: Gen) -> int
+    return vec_get(@g.kind, @g.pos)
+
+fn _peek_iv(@g: Gen) -> int
+    return vec_get(@g.iv, @g.pos)
+
+fn _peek_start(@g: Gen) -> int
+    return vec_get(@g.start, @g.pos)
+
+fn _peek_tlen(@g: Gen) -> int
+    return vec_get(@g.tlen, @g.pos)
+
+fn _peek_at(@g: Gen) -> int
+    return vec_get(@g.kind, @g.pos)
+
+fn _advance(@g: Gen) -> int
+    @g.pos = @g.pos + 1
+    return 0
+
+fn _accept(@g: Gen, @k: int) -> int
+    if _peek_kind(@g) == @k
+        _advance(@g)
+        return 1
+    return 0
+
+fn _die(@g: Gen, @msg: int) -> int
+    print("bootminor: ")
+    shine(@msg)
+    print("  got token kind = ")
+    print_int(_peek_kind(@g))
+    shine("")
+    return 1
+
+fn _expect(@g: Gen, @k: int, @msg: int) -> int
+    if _peek_kind(@g) == @k
+        _advance(@g)
+        return 0
+    _die(@g, @msg)
+    return 1
+
+# Skip TK_NEWLINE tokens (multiple blank lines).
+fn _skip_newlines(@g: Gen) -> int
+    while _peek_kind(@g) == TK_NEWLINE
+        _advance(@g)
+    return 0
+
+
+# --- Local variable map ----------------------------------------------
+
+fn _tok_substr(@g: Gen, @i: int) -> int
+    @s = vec_get(@g.start, @i)
+    @l = vec_get(@g.tlen, @i)
+    return str_substr(@g.src, @s, @l)
+
+fn _local_slot(@g: Gen, @name: int) -> int
+    @n = vec_len(@g.names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@g.names, @i), @name) == 1
+            return vec_get(@g.offs, @i)
+        @i = @i + 1
+    @g.frame = @g.frame + 8
+    @off = 0 - @g.frame
+    vec_push(@g.names, @name)
+    vec_push(@g.offs, @off)
+    return @off
+
+
+# --- Byte emission ---------------------------------------------------
+
+fn _eb(@g: Gen, @v: int) -> int
+    strbuf_add_byte(@g.code, @v & 255)
+    return 0
+
+fn _e32(@g: Gen, @v: int) -> int
+    _eb(@g, @v & 255)
+    _eb(@g, (@v >> 8)  & 255)
+    _eb(@g, (@v >> 16) & 255)
+    _eb(@g, (@v >> 24) & 255)
+    return 0
+
+fn _sb_len(@b: StrBuf) -> int
+    return @b.len
+
+fn _sb_buf(@b: StrBuf) -> int
+    return @b.buf
+
+fn _code_len(@g: Gen) -> int
+    return _sb_len(@g.code)
+
+fn _patch32(@g: Gen, @off: int, @v: int) -> int
+    @cb = _sb_buf(@g.code)
+    str_set_byte(@cb, @off,     @v        & 255)
+    str_set_byte(@cb, @off + 1, (@v >> 8)  & 255)
+    str_set_byte(@cb, @off + 2, (@v >> 16) & 255)
+    str_set_byte(@cb, @off + 3, (@v >> 24) & 255)
+    return 0
+
+
+# --- Instruction emitters --------------------------------------------
+
+# mov eax, imm32 (zero-extended to rax) ; b8 <imm32>
+fn _em_mov_eax_imm(@g: Gen, @v: int) -> int
+    _eb(@g, 184)
+    _e32(@g, @v)
+    return 0
+
+# mov rax, imm64 ; 48 b8 <imm64>
+fn _em_mov_rax_imm64(@g: Gen, @v: int) -> int
+    _eb(@g, 72)
+    _eb(@g, 184)
+    @i = 0
+    while @i < 8
+        _eb(@g, (@v >> (@i * 8)) & 255)
+        @i = @i + 1
+    return 0
+
+# mov edi, imm32 ; bf <imm32>
+fn _em_mov_edi_imm(@g: Gen, @v: int) -> int
+    _eb(@g, 191)
+    _e32(@g, @v)
+    return 0
+
+# mov edx, imm32 ; ba <imm32>
+fn _em_mov_edx_imm(@g: Gen, @v: int) -> int
+    _eb(@g, 186)
+    _e32(@g, @v)
+    return 0
+
+# mov rdi, rax ; 48 89 c7
+fn _em_mov_rdi_rax(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 199)
+    return 0
+
+# mov rcx, rax ; 48 89 c1
+fn _em_mov_rcx_rax(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 193)
+    return 0
+
+# mov rax, rdx ; 48 89 d0  (for modulo: remainder is in rdx after idiv)
+fn _em_mov_rax_rdx(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 208)
+    return 0
+
+# push rax / pop rax / pop rcx
+fn _em_push_rax(@g: Gen) -> int
+    _eb(@g, 80)
+    return 0
+
+fn _em_pop_rax(@g: Gen) -> int
+    _eb(@g, 88)
+    return 0
+
+fn _em_pop_rcx(@g: Gen) -> int
+    _eb(@g, 89)
+    return 0
+
+# neg rax ; 48 f7 d8
+fn _em_neg_rax(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 247)
+    _eb(@g, 216)
+    return 0
+
+# mov rax, [rbp + disp32] ; 48 8b 85 disp32
+fn _em_load_rbp(@g: Gen, @disp: int) -> int
+    _eb(@g, 72)
+    _eb(@g, 139)
+    _eb(@g, 133)
+    _e32(@g, @disp)
+    return 0
+
+# mov [rbp + disp32], rax ; 48 89 85 disp32
+fn _em_store_rbp(@g: Gen, @disp: int) -> int
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 133)
+    _e32(@g, @disp)
+    return 0
+
+# Binary ops operate with left in rax, right in rcx (by convention of parse_X).
+fn _em_add_rax_rcx(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 1)
+    _eb(@g, 200)
+    return 0
+
+fn _em_sub_rax_rcx(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 41)
+    _eb(@g, 200)
+    return 0
+
+fn _em_imul_rax_rcx(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 15)
+    _eb(@g, 175)
+    _eb(@g, 193)
+    return 0
+
+# cqo + idiv rcx ; rdx:rax / rcx -> rax = quot, rdx = rem
+fn _em_idiv_rcx(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 153)       # cqo
+    _eb(@g, 72)
+    _eb(@g, 247)
+    _eb(@g, 249)       # idiv rcx
+    return 0
+
+# cmp rax, rcx ; 48 39 c8
+fn _em_cmp_rax_rcx(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 57)
+    _eb(@g, 200)
+    return 0
+
+# setX al ; movzx rax, al  (produces 1 if condition true else 0)
+fn _em_set_cond(@g: Gen, @opcode2: int) -> int
+    _eb(@g, 15)
+    _eb(@g, @opcode2)
+    _eb(@g, 192)
+    _eb(@g, 72)
+    _eb(@g, 15)
+    _eb(@g, 182)
+    _eb(@g, 192)
+    return 0
+
+# test rax, rax ; 48 85 c0
+fn _em_test_rax(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 133)
+    _eb(@g, 192)
+    return 0
+
+# jz rel32 ; placeholder, returns offset of rel32 bytes
+fn _em_jz_placeholder(@g: Gen) -> int
+    _eb(@g, 15)
+    _eb(@g, 132)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    return @at
+
+fn _em_jmp_placeholder(@g: Gen) -> int
+    _eb(@g, 233)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    return @at
+
+fn _em_jmp_to(@g: Gen, @target: int) -> int
+    @here = _code_len(@g)
+    @rel = @target - (@here + 5)
+    _eb(@g, 233)
+    _e32(@g, @rel)
+    return 0
+
+fn _em_call_to(@g: Gen, @target: int) -> int
+    @here = _code_len(@g)
+    @rel = @target - (@here + 5)
+    _eb(@g, 232)
+    _e32(@g, @rel)
+    return 0
+
+fn _em_syscall(@g: Gen) -> int
+    _eb(@g, 15)
+    _eb(@g, 5)
+    return 0
+
+# push rbp; mov rbp, rsp; sub rsp, imm32 (returns offset of imm32 for patch)
+fn _em_prologue(@g: Gen) -> int
+    _eb(@g, 85)
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 229)
+    _eb(@g, 72)
+    _eb(@g, 129)
+    _eb(@g, 236)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    return @at
+
+fn _em_epilogue(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 236)
+    _eb(@g, 93)
+    _eb(@g, 195)
+    return 0
+
+# Resolve a forward-jump rel32 whose target is the current code position.
+fn _patch_here(@g: Gen, @patch_at: int) -> int
+    @here = _code_len(@g)
+    @rel = @here - (@patch_at + 4)
+    _patch32(@g, @patch_at, @rel)
+    return 0
+
+# lea rsi, [rip + disp32] — placeholder; returns offset of the disp32
+# bytes for later patching once the string's absolute code-file
+# position is known.
+fn _em_lea_rsi_rip_ph(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 141)
+    _eb(@g, 53)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    return @at
+
+
+# --- _print_int runtime (122 bytes, verified via nasm+ld+run) --------
+
+fn _emit_print_int(@g: Gen) -> int
+    @b = [0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20, 0x45, 0x31, 0xc0, 0x48, 0x85, 0xff, 0x79, 0x06, 0x41, 0xb0, 0x01, 0x48, 0xf7, 0xdf, 0xc6, 0x45, 0xff, 0x0a, 0x48, 0x8d, 0x75, 0xff, 0xba, 0x01, 0x00, 0x00, 0x00, 0x48, 0x85, 0xff, 0x75, 0x0d, 0x48, 0x83, 0xee, 0x01, 0xc6, 0x06, 0x30, 0x48, 0x83, 0xc2, 0x01, 0xeb, 0x24, 0x48, 0x89, 0xf8, 0x31, 0xd2, 0xb9, 0x0a, 0x00, 0x00, 0x00, 0x48, 0xf7, 0xf1, 0x80, 0xc2, 0x30, 0x48, 0x83, 0xee, 0x01, 0x88, 0x16, 0x48, 0x89, 0xc7, 0x48, 0x85, 0xff, 0x75, 0xe2, 0x48, 0x89, 0xea, 0x48, 0x29, 0xf2, 0x45, 0x84, 0xc0, 0x74, 0x0b, 0x48, 0x83, 0xee, 0x01, 0xc6, 0x06, 0x2d, 0x48, 0x83, 0xc2, 0x01, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xbf, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x89, 0xec, 0x5d, 0xc3]
+    @g.pi_off = _code_len(@g)
+    @i = 0
+    while @i < 122
+        _eb(@g, @b[@i])
+        @i = @i + 1
+    return 0
+
+
+# --- Expression parser (precedence-climbing) -------------------------
+
+fn parse_expr(@g: Gen) -> int
+    parse_cmp(@g)
+    return 0
+
+fn parse_cmp(@g: Gen) -> int
+    parse_add(@g)
+    while 1
+        @k = _peek_kind(@g)
+        if @k == TK_EQ
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_add(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_cmp_rax_rcx(@g)
+            _em_set_cond(@g, 148)
+        elif @k == TK_NEQ
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_add(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_cmp_rax_rcx(@g)
+            _em_set_cond(@g, 149)
+        elif @k == TK_LT
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_add(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_cmp_rax_rcx(@g)
+            _em_set_cond(@g, 156)
+        elif @k == TK_LE
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_add(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_cmp_rax_rcx(@g)
+            _em_set_cond(@g, 158)
+        elif @k == TK_GT
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_add(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_cmp_rax_rcx(@g)
+            _em_set_cond(@g, 159)
+        elif @k == TK_GE
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_add(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_cmp_rax_rcx(@g)
+            _em_set_cond(@g, 157)
+        else
+            break
+    return 0
+
+fn parse_add(@g: Gen) -> int
+    parse_mul(@g)
+    while 1
+        @k = _peek_kind(@g)
+        if @k == TK_PLUS
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_mul(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_add_rax_rcx(@g)
+        elif @k == TK_MINUS
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_mul(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_sub_rax_rcx(@g)
+        else
+            break
+    return 0
+
+fn parse_mul(@g: Gen) -> int
+    parse_unary(@g)
+    while 1
+        @k = _peek_kind(@g)
+        if @k == TK_STAR
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_unary(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_imul_rax_rcx(@g)
+        elif @k == TK_SLASH
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_unary(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_idiv_rcx(@g)
+        elif @k == TK_PERCENT
+            _advance(@g)
+            _em_push_rax(@g)
+            parse_unary(@g)
+            _em_mov_rcx_rax(@g)
+            _em_pop_rax(@g)
+            _em_idiv_rcx(@g)
+            _em_mov_rax_rdx(@g)
+        else
+            break
+    return 0
+
+fn parse_unary(@g: Gen) -> int
+    if _peek_kind(@g) == TK_MINUS
+        _advance(@g)
+        parse_primary(@g)
+        _em_neg_rax(@g)
+        return 0
+    parse_primary(@g)
+    return 0
+
+fn parse_primary(@g: Gen) -> int
+    @k = _peek_kind(@g)
+    if @k == TK_INT
+        @v = _peek_iv(@g)
+        _advance(@g)
+        # mov eax, imm32 zero-extends: safe only for positive values
+        # that fit in unsigned 32-bit. Fall back to mov rax, imm64.
+        if @v >= 0
+            if @v < 2147483648
+                _em_mov_eax_imm(@g, @v)
+                return 0
+        _em_mov_rax_imm64(@g, @v)
+        return 0
+    if @k == TK_ATIDENT
+        @name = _tok_substr(@g, @g.pos)
+        _advance(@g)
+        @off = _local_slot(@g, @name)
+        _em_load_rbp(@g, @off)
+        return 0
+    if @k == TK_LPAREN
+        _advance(@g)
+        parse_expr(@g)
+        _expect(@g, TK_RPAREN, "expected ')'")
+        return 0
+    _die(@g, "expected primary expression")
+    _advance(@g)
+    return 0
+
+
+# --- Statement-level codegen -----------------------------------------
+#
+# Statements end with TK_NEWLINE. Blocks are delimited by
+# TK_INDENT / TK_DEDENT tokens (produced by lex.luna).
+
+# Record a forward patch into a data-string reference so we can resolve
+# the lea disp32 once the code-to-data offset is known. We keep two
+# parallel vecs: patch_code_off, patch_data_off.
+fn _record_str_patch(@g: Gen, @code_off: int, @data_off: int, @patches: Vec) -> int
+    vec_push(@patches, @code_off)
+    vec_push(@patches, @data_off)
+    return 0
+
+# Returns 0 on normal statement, 1 if end-of-block (DEDENT/EOF) reached.
+fn parse_stmt(@g: Gen, @patches: Vec) -> int
+    _skip_newlines(@g)
+    @k = _peek_kind(@g)
+    if @k == TK_DEDENT
+        return 1
+    if @k == TK_EOF
+        return 1
+
+    if @k == TK_RETURN
+        _advance(@g)
+        parse_expr(@g)
+        _em_mov_rdi_rax(@g)
+        _em_mov_eax_imm(@g, 60)
+        _em_syscall(@g)
+        return 0
+
+    if @k == TK_IF
+        parse_if(@g, @patches)
+        return 0
+
+    if @k == TK_WHILE
+        parse_while(@g, @patches)
+        return 0
+
+    if @k == TK_ATIDENT
+        @name = _tok_substr(@g, @g.pos)
+        _advance(@g)
+        _expect(@g, TK_ASSIGN, "expected '='")
+        parse_expr(@g)
+        @off = _local_slot(@g, @name)
+        _em_store_rbp(@g, @off)
+        return 0
+
+    if @k == TK_IDENT
+        # Only shine / shine_int are recognised.
+        @name = _tok_substr(@g, @g.pos)
+        _advance(@g)
+        if str_eq(@name, "shine") == 1
+            parse_shine(@g, @patches)
+            return 0
+        if str_eq(@name, "shine_int") == 1
+            parse_shine_int(@g)
+            return 0
+        _die(@g, str_concat("unknown call: ", @name))
+        return 0
+
+    _die(@g, "expected statement")
+    _advance(@g)
+    return 0
+
+
+fn parse_shine(@g: Gen, @patches: Vec) -> int
+    _expect(@g, TK_LPAREN, "expected '(' after shine")
+    if _peek_kind(@g) != TK_STR
+        _die(@g, "shine expects a string literal")
+        return 1
+    @str_ptr = _peek_iv(@g)
+    _advance(@g)
+    _expect(@g, TK_RPAREN, "expected ')'")
+    # Append literal + '\n' to data section
+    @data_off = _sb_len(@g.data)
+    @slen = str_len(@str_ptr)
+    @i = 0
+    while @i < @slen
+        strbuf_add_byte(@g.data, str_byte(@str_ptr, @i))
+        @i = @i + 1
+    strbuf_add_byte(@g.data, 10)
+    @total_len = @slen + 1
+    # Emit write-syscall block: mov eax,1; mov edi,1; lea rsi,[rip+disp];
+    # mov edx, len; syscall.
+    _em_mov_eax_imm(@g, 1)
+    _em_mov_edi_imm(@g, 1)
+    @lea_at = _em_lea_rsi_rip_ph(@g)
+    _em_mov_edx_imm(@g, @total_len)
+    _em_syscall(@g)
+    # Record patch so driver can fill the disp once data-section vaddr is known.
+    vec_push(@patches, @lea_at)
+    vec_push(@patches, @data_off)
+    return 0
+
+
+fn parse_shine_int(@g: Gen) -> int
+    _expect(@g, TK_LPAREN, "expected '(' after shine_int")
+    parse_expr(@g)
+    _expect(@g, TK_RPAREN, "expected ')'")
+    _em_mov_rdi_rax(@g)
+    _em_call_to(@g, @g.pi_off)
+    return 0
+
+
+fn parse_if(@g: Gen, @patches: Vec) -> int
+    _advance(@g)                       # consume 'if'
+    parse_expr(@g)                     # rax = cond
+    _em_test_rax(@g)
+    @jz_patch = _em_jz_placeholder(@g)
+    # then-body
+    _expect(@g, TK_NEWLINE, "newline after if")
+    _expect(@g, TK_INDENT, "indented block after if")
+    parse_block(@g, @patches)
+    # collect end-of-chain patches so each branch can jump past the whole
+    # if/elif/else chain.
+    @end_patches = vec_new()
+    vec_push(@end_patches, _em_jmp_placeholder(@g))
+    _patch_here(@g, @jz_patch)
+    # optional elif/else chain
+    _skip_newlines(@g)
+    while 1
+        @k = _peek_kind(@g)
+        if @k == TK_ELIF
+            _advance(@g)
+            parse_expr(@g)
+            _em_test_rax(@g)
+            @jz2 = _em_jz_placeholder(@g)
+            _expect(@g, TK_NEWLINE, "newline after elif")
+            _expect(@g, TK_INDENT, "indented block after elif")
+            parse_block(@g, @patches)
+            vec_push(@end_patches, _em_jmp_placeholder(@g))
+            _patch_here(@g, @jz2)
+            _skip_newlines(@g)
+        elif @k == TK_ELSE
+            _advance(@g)
+            _expect(@g, TK_NEWLINE, "newline after else")
+            _expect(@g, TK_INDENT, "indented block after else")
+            parse_block(@g, @patches)
+            break
+        else
+            break
+    # Patch all end-jmps to here.
+    @np = vec_len(@end_patches)
+    @i = 0
+    while @i < @np
+        _patch_here(@g, vec_get(@end_patches, @i))
+        @i = @i + 1
+    return 0
+
+
+fn parse_while(@g: Gen, @patches: Vec) -> int
+    _advance(@g)                       # consume 'while'
+    @loop_start = _code_len(@g)
+    parse_expr(@g)
+    _em_test_rax(@g)
+    @jz_patch = _em_jz_placeholder(@g)
+    _expect(@g, TK_NEWLINE, "newline after while")
+    _expect(@g, TK_INDENT, "indented block after while")
+    parse_block(@g, @patches)
+    _em_jmp_to(@g, @loop_start)
+    _patch_here(@g, @jz_patch)
+    return 0
+
+
+# Parse statements until a DEDENT closes the block.
+fn parse_block(@g: Gen, @patches: Vec) -> int
+    while 1
+        _skip_newlines(@g)
+        @k = _peek_kind(@g)
+        if @k == TK_DEDENT
+            _advance(@g)
+            return 0
+        if @k == TK_EOF
+            return 0
+        parse_stmt(@g, @patches)
+    return 0
+
+
+# Parse `fn main() -> int\n    ...` and emit its body.
+fn parse_fn_main(@g: Gen, @patches: Vec) -> int
+    _skip_newlines(@g)
+    _expect(@g, TK_FN, "expected 'fn'")
+    # skip function name (we assume 'main')
+    if _peek_kind(@g) == TK_IDENT
+        _advance(@g)
+    _expect(@g, TK_LPAREN, "expected '('")
+    _expect(@g, TK_RPAREN, "expected ')'")
+    # Optional `-> int`
+    if _peek_kind(@g) == TK_ARROW
+        _advance(@g)
+        if _peek_kind(@g) == TK_IDENT
+            _advance(@g)
+    _expect(@g, TK_NEWLINE, "newline after fn signature")
+    _expect(@g, TK_INDENT, "indented fn body")
+    # Emit prologue (frame size patched later).
+    @prol_at = _em_prologue(@g)
+    parse_block(@g, @patches)
+    # If the last statement wasn't a return, add an implicit exit(0).
+    _em_mov_edi_imm(@g, 0)
+    _em_mov_eax_imm(@g, 60)
+    _em_syscall(@g)
+    # Patch frame size: round up to 16 for alignment. Always at least 16.
+    @sz = @g.frame
+    if @sz < 16
+        @sz = 16
+    # Keep stack 16-aligned: rbp points to saved rbp (8-byte aligned).
+    # rsp after sub = rbp - sz. Needs to be 16-aligned at call sites; we
+    # don't make calls beyond syscall + print_int so 16 is safe.
+    if (@sz % 16) != 0
+        @sz = @sz + (16 - (@sz % 16))
+    _patch32(@g, @prol_at, @sz)
+    return 0
+
+
+# --- Top-level entry: compile source → (code_bytes, data_bytes) ------
+
+fn compile_to_gen(@src: int) -> Gen
+    @kind = vec_new()
+    @start = vec_new()
+    @tlen = vec_new()
+    @iv = vec_new()
+    lex(@src, @kind, @start, @tlen, @iv)
+    let @g: Gen = gen_new(@src, @kind, @start, @tlen, @iv)
+    # Emit print_int runtime first so shine_int can call it.
+    _emit_print_int(@g)
+    @patches = vec_new()
+    parse_fn_main(@g, @patches)
+    # Patch LEA instructions: each patch is (code_off_of_rel32, data_off).
+    # The absolute data vaddr will be computed by main driver; here we
+    # stash (code_off | (data_off << 32)) layout but since we have two
+    # Vecs we keep them separate. The driver needs to apply:
+    #   disp = (DATA_VADDR + data_off) - (ENTRY_VADDR + code_off_of_rel32 + 4)
+    # Since Gen doesn't know the vaddrs, we expose the patch list.
+    @g.names = @patches    # REUSE unused names vec to pass patches out
+    return @g

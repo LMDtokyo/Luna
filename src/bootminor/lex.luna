@@ -30,6 +30,7 @@ const TK_IF:      int = 11
 const TK_ELSE:    int = 12
 const TK_WHILE:   int = 13
 const TK_RETURN:  int = 14
+const TK_ELIF:    int = 15
 
 # operators
 const TK_PLUS:    int = 20
@@ -92,6 +93,8 @@ fn _kw_lookup(@src: int, @start: int, @len: int) -> int
         return TK_WHILE
     if str_eq(@lit, "return") == 1
         return TK_RETURN
+    if str_eq(@lit, "elif") == 1
+        return TK_ELIF
     return TK_IDENT
 
 

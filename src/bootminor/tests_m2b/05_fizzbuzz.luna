@@ -1,0 +1,13 @@
+fn main() -> int
+    @i = 1
+    while @i <= 15
+        if @i % 15 == 0
+            shine("FizzBuzz")
+        elif @i % 3 == 0
+            shine("Fizz")
+        elif @i % 5 == 0
+            shine("Buzz")
+        else
+            shine_int(@i)
+        @i = @i + 1
+    return 0

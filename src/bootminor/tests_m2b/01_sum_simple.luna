@@ -1,0 +1,5 @@
+fn main() -> int
+    @x = 10
+    @y = 32
+    shine_int(@x + @y)
+    return 0

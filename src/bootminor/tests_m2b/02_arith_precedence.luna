@@ -1,0 +1,7 @@
+fn main() -> int
+    shine_int(2 + 3 * 4)
+    shine_int(10 - 2 * 3)
+    shine_int(20 / 6)
+    shine_int(20 % 6)
+    shine_int(1 + 2 + 3 * 4 + 5)
+    return 0
