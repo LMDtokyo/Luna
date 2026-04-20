@@ -1,0 +1,273 @@
+# =====================================================================
+# bootminor: minimal self-hosted Luna compiler (M1).
+#
+# Purpose: prove Luna compiles Luna. Compiled by `luna-boot` into a
+# native binary `luna-mini`, which then compiles a tiny Luna subset
+# into Linux ELF64 executables.
+#
+# Subset (M1):
+#   - A single `fn main() -> int` function
+#   - A single `shine("literal string")` call in the body
+#   - Exit 0 afterwards
+#
+# Output: Linux ELF64 with hard-coded vaddr 0x400000, single PT_LOAD
+# segment containing both code and data. ~200-byte executables.
+#
+# Algorithm (M1):
+#   1. Read input file path from argv[1]; fall back to "Hello from bootminor"
+#      if the file has no recognisable `shine("…")` call.
+#   2. Find the first `shine("` token and extract the string up to the
+#      next unescaped double quote. That's the message to print.
+#   3. Emit the ELF64 with code: write(1, msg, len); exit(0).
+#   4. Write to output path from `-o <path>` arg or default "a.out".
+#
+# Why this is enough: once the bootstrap compiles *this* file, we have
+# a Luna program that produces running binaries. That is the definition
+# of self-hosting for the present subset. M2/M3 grow the subset.
+# =====================================================================
+
+
+# =====================================================================
+# ELF64 layout constants (System V ABI, x86-64).
+# Vaddr 0x400000 is the traditional text-segment base on Linux x86-64.
+# =====================================================================
+
+fn _elf_vaddr() -> int
+    return 4194304        # 0x400000
+
+fn _elf_hdr_size() -> int
+    return 64             # sizeof(Elf64_Ehdr)
+
+fn _elf_phdr_size() -> int
+    return 56             # sizeof(Elf64_Phdr)
+
+fn _elf_prelude_size() -> int
+    return 120            # 64 + 56, file offset of first code byte
+
+
+# =====================================================================
+# Byte-buffer helpers — patch 1/2/4/8 bytes little-endian into buf
+# at offset `@at`.
+# =====================================================================
+
+fn _put8(@buf: int, @at: int, @v: int) -> int
+    str_set_byte(@buf, @at, @v & 255)
+    return 0
+
+fn _put16(@buf: int, @at: int, @v: int) -> int
+    str_set_byte(@buf, @at,     @v & 255)
+    str_set_byte(@buf, @at + 1, (@v >> 8) & 255)
+    return 0
+
+fn _put32(@buf: int, @at: int, @v: int) -> int
+    str_set_byte(@buf, @at,     @v & 255)
+    str_set_byte(@buf, @at + 1, (@v >> 8)  & 255)
+    str_set_byte(@buf, @at + 2, (@v >> 16) & 255)
+    str_set_byte(@buf, @at + 3, (@v >> 24) & 255)
+    return 0
+
+fn _put64(@buf: int, @at: int, @v: int) -> int
+    @i = 0
+    while @i < 8
+        str_set_byte(@buf, @at + @i, (@v >> (@i * 8)) & 255)
+        @i = @i + 1
+    return 0
+
+
+# =====================================================================
+# ELF64 header + program header writer.
+# Fills bytes [0..120) of `@buf`, assuming total file size `@file_sz`
+# and entry-point offset `@entry_off` (relative to file start, i.e. after
+# the 120-byte prelude, entry_off will be 120).
+# =====================================================================
+
+fn _emit_elf_headers(@buf: int, @file_sz: int, @entry_off: int) -> int
+    # ---- Elf64_Ehdr ----
+    # e_ident: [0x7F 'E' 'L' 'F'][ELFCLASS64=2][ELFDATA2LSB=1][EV_CURRENT=1]
+    #          [OSABI=0][ABIVER=0][padding 7 bytes]
+    _put8(@buf, 0, 127)     # 0x7F
+    _put8(@buf, 1, 69)      # 'E'
+    _put8(@buf, 2, 76)      # 'L'
+    _put8(@buf, 3, 70)      # 'F'
+    _put8(@buf, 4, 2)       # 64-bit
+    _put8(@buf, 5, 1)       # little-endian
+    _put8(@buf, 6, 1)       # version = EV_CURRENT
+    # bytes 7..15 already zero from new_str
+
+    _put16(@buf, 16, 2)               # e_type = ET_EXEC
+    _put16(@buf, 18, 62)              # e_machine = EM_X86_64
+    _put32(@buf, 20, 1)               # e_version = EV_CURRENT
+    _put64(@buf, 24, _elf_vaddr() + @entry_off)   # e_entry
+    _put64(@buf, 32, _elf_hdr_size())             # e_phoff = 64
+    _put64(@buf, 40, 0)                           # e_shoff = 0 (no sections)
+    _put32(@buf, 48, 0)                           # e_flags
+    _put16(@buf, 52, _elf_hdr_size())             # e_ehsize
+    _put16(@buf, 54, _elf_phdr_size())            # e_phentsize
+    _put16(@buf, 56, 1)                           # e_phnum
+    _put16(@buf, 58, 0)                           # e_shentsize
+    _put16(@buf, 60, 0)                           # e_shnum
+    _put16(@buf, 62, 0)                           # e_shstrndx
+
+    # ---- Elf64_Phdr (PT_LOAD over the whole file) ----
+    @p = _elf_hdr_size()          # 64
+    _put32(@buf, @p + 0,  1)      # p_type = PT_LOAD
+    _put32(@buf, @p + 4,  5)      # p_flags = PF_R | PF_X
+    _put64(@buf, @p + 8,  0)                  # p_offset = 0
+    _put64(@buf, @p + 16, _elf_vaddr())       # p_vaddr
+    _put64(@buf, @p + 24, _elf_vaddr())       # p_paddr
+    _put64(@buf, @p + 32, @file_sz)           # p_filesz
+    _put64(@buf, @p + 40, @file_sz)           # p_memsz
+    _put64(@buf, @p + 48, 4096)               # p_align
+    return 0
+
+
+# =====================================================================
+# x86-64 code emitter for the single `shine(LITERAL)` body.
+# Emits position-independent code that computes the message address via
+# LEA rip-relative, writes to stdout via syscall 1, then exits via
+# syscall 60.
+# =====================================================================
+
+fn _emit_hello_code(@buf: int, @code_off: int, @msg_vaddr: int, @msg_len: int) -> int
+    # mov eax, 1           ; sys_write
+    # mov edi, 1           ; fd = stdout
+    # lea rsi, [rip + disp] ; rsi = msg address (RIP-relative, rel32)
+    # mov edx, <msg_len>   ; length
+    # syscall
+    # xor edi, edi         ; exit status 0
+    # mov eax, 60          ; sys_exit
+    # syscall
+    @p = @code_off
+
+    # b8 01 00 00 00         mov eax, 1
+    _put8(@buf, @p + 0, 184)
+    _put32(@buf, @p + 1, 1)
+
+    # bf 01 00 00 00         mov edi, 1
+    _put8(@buf, @p + 5, 191)
+    _put32(@buf, @p + 6, 1)
+
+    # 48 8d 35 <rel32>       lea rsi, [rip + disp]
+    # 7-byte instruction starting at @p + 10; the RIP at resolve time is
+    # (@p + 10 + 7). disp = msg_vaddr - (entry_vaddr + code_off_of_inst + 7)
+    @inst_off = @p + 10
+    @rip_after = _elf_vaddr() + @inst_off + 7
+    @disp = @msg_vaddr - @rip_after
+    _put8(@buf, @inst_off + 0, 72)        # REX.W
+    _put8(@buf, @inst_off + 1, 141)       # 0x8D  LEA
+    _put8(@buf, @inst_off + 2, 53)        # ModRM: rsi, [rip+disp32]
+    _put32(@buf, @inst_off + 3, @disp)
+
+    # ba <len32>             mov edx, imm32
+    _put8(@buf, @p + 17, 186)
+    _put32(@buf, @p + 18, @msg_len)
+
+    # 0f 05                  syscall
+    _put8(@buf, @p + 22, 15)
+    _put8(@buf, @p + 23, 5)
+
+    # 31 ff                  xor edi, edi
+    _put8(@buf, @p + 24, 49)
+    _put8(@buf, @p + 25, 255)
+
+    # b8 3c 00 00 00         mov eax, 60
+    _put8(@buf, @p + 26, 184)
+    _put32(@buf, @p + 27, 60)
+
+    # 0f 05                  syscall
+    _put8(@buf, @p + 31, 15)
+    _put8(@buf, @p + 32, 5)
+
+    return 33          # code size
+
+
+# =====================================================================
+# Extract the first `shine("…")` literal from source text, or return
+# the default message if none found. Handles a simple double-quote
+# terminator; no escape processing yet (M1 subset).
+# =====================================================================
+
+fn _extract_shine_literal(@src: int) -> int
+    @marker = "shine(\""
+    @pos = str_find(@src, @marker)
+    if @pos < 0
+        return "Hello from bootminor\n"
+    @start = @pos + str_len(@marker)
+    @end = @start
+    @slen = str_len(@src)
+    while @end < @slen
+        if str_byte(@src, @end) == 34        # ASCII '"'
+            return str_substr(@src, @start, @end - @start)
+        @end = @end + 1
+    return "Hello from bootminor\n"
+
+
+# =====================================================================
+# Drive everything: read source, build the binary, write it out.
+# =====================================================================
+
+fn _arg_or(@i: int, @default: int) -> int
+    @v = arg(@i)
+    if str_eq(@v, "") == 1
+        return @default
+    return @v
+
+fn _parse_output(@argc: int) -> int
+    @i = 1
+    while @i < @argc
+        @a = arg(@i)
+        if str_eq(@a, "-o") == 1
+            return arg(@i + 1)
+        @i = @i + 1
+    return "a.out"
+
+fn main() -> int
+    @argc = 0
+    while str_eq(arg(@argc), "") == 0
+        @argc = @argc + 1
+
+    if @argc < 2
+        shine("usage: luna-mini <source.luna> [-o <output>]")
+        return 1
+
+    @src_path = arg(1)
+    @out_path = _parse_output(@argc)
+
+    @src = read_file(@src_path)
+    if @src == 0
+        shine(str_concat("luna-mini: cannot read ", @src_path))
+        return 1
+
+    @raw_msg = _extract_shine_literal(@src)
+    if str_len(@raw_msg) == 0
+        @raw_msg = "Hello from bootminor"
+    # `shine` appends a newline, mirror that.
+    @msg = str_concat(@raw_msg, "\n")
+    @msg_len = str_len(@msg)
+
+    # Layout: [0..120) headers, [120..120+code_sz) code, [120+code_sz..) data
+    @code_off = _elf_prelude_size()
+    @code_sz  = 33
+    @data_off = @code_off + @code_sz
+    @file_sz  = @data_off + @msg_len
+
+    @buf = new_str(@file_sz)
+
+    _emit_elf_headers(@buf, @file_sz, @code_off)
+
+    @msg_vaddr = _elf_vaddr() + @data_off
+    _emit_hello_code(@buf, @code_off, @msg_vaddr, @msg_len)
+
+    # Copy message bytes into the data area.
+    @i = 0
+    while @i < @msg_len
+        str_set_byte(@buf, @data_off + @i, str_byte(@msg, @i))
+        @i = @i + 1
+
+    @n = write_file(@out_path, @buf)
+    if @n < 0
+        shine(str_concat("luna-mini: cannot write ", @out_path))
+        return 1
+
+    shine(str_concat(str_concat("luna-mini: wrote ", @out_path), " (ELF64)"))
+    return 0
