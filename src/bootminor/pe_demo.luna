@@ -1,0 +1,216 @@
+# PE64 proof-of-concept — session 1 of 3 on the Windows target.
+#
+# Emits a hello.exe that imports kernel32.dll!ExitProcess and exits
+# with code 42. This is purely an end-to-end check that our understanding
+# of the PE64 file format + import-table layout + RIP-relative IAT call
+# is correct. Once we trust this skeleton, session 2 wires it into
+# luna-mini as `--target windows`, and session 3 ports SysV→MS x64 and
+# replaces syscall intrinsics with DLL imports.
+#
+# Layout (SectionAlignment == FileAlignment == 0x200 keeps file offset
+# equal to RVA, which simplifies every disp32 we have to emit):
+#
+#   [0x000]  DOS stub             (64 bytes, MZ + e_lfanew=0x80)
+#   [0x080]  PE sig + COFF + Opt  (4 + 20 + 240 = 264 bytes)
+#   [0x188]  section table        (2 * 40 = 80 bytes)
+#   [0x200]  .text        RVA 0x200   — mov ecx,42 / sub rsp,40 / call [IAT]
+#   [0x400]  .idata       RVA 0x400   — import desc + ILT + IAT + names
+#
+# Run it on Linux (or WSL) with the bootminor luna-mini compiler and it
+# writes hello.exe next to itself. Then `./hello.exe` under Windows (or
+# via WSL interop) should exit with 42.
+
+
+fn _put8(@buf: int, @at: int, @v: int) -> int
+    str_set_byte(@buf, @at, @v & 255)
+    return 0
+
+fn _put16(@buf: int, @at: int, @v: int) -> int
+    str_set_byte(@buf, @at + 0,  @v       & 255)
+    str_set_byte(@buf, @at + 1, (@v >> 8) & 255)
+    return 0
+
+fn _put32(@buf: int, @at: int, @v: int) -> int
+    str_set_byte(@buf, @at + 0,  @v        & 255)
+    str_set_byte(@buf, @at + 1, (@v >>  8) & 255)
+    str_set_byte(@buf, @at + 2, (@v >> 16) & 255)
+    str_set_byte(@buf, @at + 3, (@v >> 24) & 255)
+    return 0
+
+fn _put64(@buf: int, @at: int, @v: int) -> int
+    @i = 0
+    while @i < 8
+        str_set_byte(@buf, @at + @i, (@v >> (@i * 8)) & 255)
+        @i = @i + 1
+    return 0
+
+fn _put_cstr(@buf: int, @at: int, @s: int) -> int
+    @n = str_len(@s)
+    @i = 0
+    while @i < @n
+        str_set_byte(@buf, @at + @i, str_byte(@s, @i))
+        @i = @i + 1
+    str_set_byte(@buf, @at + @n, 0)
+    return @n + 1
+
+
+fn main() -> int
+    # Total file size: three 0x200 pages.
+    @FILE_SIZE = 1536
+    @buf = new_str(@FILE_SIZE)
+
+    # ---- DOS stub ----
+    _put8(@buf, 0, 77)                # 'M'
+    _put8(@buf, 1, 90)                # 'Z'
+    _put32(@buf, 60, 128)             # e_lfanew → 0x80
+
+    # ---- PE signature ----
+    @pe = 128
+    _put8(@buf, @pe + 0, 80)          # 'P'
+    _put8(@buf, @pe + 1, 69)          # 'E'
+    _put8(@buf, @pe + 2, 0)
+    _put8(@buf, @pe + 3, 0)
+
+    # ---- COFF header (20 bytes at @pe + 4) ----
+    @coff = @pe + 4
+    _put16(@buf, @coff + 0,  34404)   # Machine = 0x8664 (x64)
+    _put16(@buf, @coff + 2,  2)       # NumberOfSections
+    _put32(@buf, @coff + 4,  0)       # TimeDateStamp
+    _put32(@buf, @coff + 8,  0)       # PointerToSymbolTable
+    _put32(@buf, @coff + 12, 0)       # NumberOfSymbols
+    _put16(@buf, @coff + 16, 240)     # SizeOfOptionalHeader (PE32+)
+    _put16(@buf, @coff + 18, 34)      # Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+    # ---- Optional header PE32+ (240 bytes at @opt) ----
+    @opt = @coff + 20                 # 128 + 4 + 20 = 152
+    _put16(@buf, @opt + 0,   523)     # Magic = 0x20B (PE32+)
+    _put8(@buf,  @opt + 2,   14)      # MajorLinkerVersion
+    _put8(@buf,  @opt + 3,   0)       # MinorLinkerVersion
+    _put32(@buf, @opt + 4,   512)     # SizeOfCode (.text raw size)
+    _put32(@buf, @opt + 8,   512)     # SizeOfInitializedData (.idata raw size)
+    _put32(@buf, @opt + 12,  0)       # SizeOfUninitializedData
+    _put32(@buf, @opt + 16,  512)     # AddressOfEntryPoint (RVA 0x200)
+    _put32(@buf, @opt + 20,  512)     # BaseOfCode (RVA of .text)
+    _put64(@buf, @opt + 24,  5368709120)  # ImageBase = 0x140000000
+    _put32(@buf, @opt + 32,  512)     # SectionAlignment = 0x200
+    _put32(@buf, @opt + 36,  512)     # FileAlignment    = 0x200
+    _put16(@buf, @opt + 40,  6)       # MajorOSVersion
+    _put16(@buf, @opt + 42,  0)       # MinorOSVersion
+    _put16(@buf, @opt + 44,  0)       # MajorImageVersion
+    _put16(@buf, @opt + 46,  0)       # MinorImageVersion
+    _put16(@buf, @opt + 48,  6)       # MajorSubsystemVersion
+    _put16(@buf, @opt + 50,  0)       # MinorSubsystemVersion
+    _put32(@buf, @opt + 52,  0)       # Win32VersionValue
+    _put32(@buf, @opt + 56,  1536)    # SizeOfImage = 3 * 0x200
+    _put32(@buf, @opt + 60,  512)     # SizeOfHeaders
+    _put32(@buf, @opt + 64,  0)       # CheckSum
+    _put16(@buf, @opt + 68,  3)       # Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI
+    _put16(@buf, @opt + 70,  0)       # DllCharacteristics
+    _put64(@buf, @opt + 72,  1048576) # SizeOfStackReserve = 1 MiB
+    _put64(@buf, @opt + 80,  4096)    # SizeOfStackCommit
+    _put64(@buf, @opt + 88,  1048576) # SizeOfHeapReserve
+    _put64(@buf, @opt + 96,  4096)    # SizeOfHeapCommit
+    _put32(@buf, @opt + 104, 0)       # LoaderFlags
+    _put32(@buf, @opt + 108, 16)      # NumberOfRvaAndSizes
+
+    # Data directories (16 * 8 bytes at @opt + 112). Only the Import
+    # entry [1] is non-zero; it points at the import descriptor at the
+    # start of .idata.
+    @dd = @opt + 112
+    _put32(@buf, @dd + 8,   1024)     # Import table RVA = 0x400
+    _put32(@buf, @dd + 12,  40)       # Import table size = 2 * 20
+
+    # ---- Section headers ----
+    @sec = @opt + 240                 # 128 + 4 + 20 + 240 = 392
+    # .text
+    _put8(@buf, @sec + 0, 46)         # '.'
+    _put8(@buf, @sec + 1, 116)        # 't'
+    _put8(@buf, @sec + 2, 101)        # 'e'
+    _put8(@buf, @sec + 3, 120)        # 'x'
+    _put8(@buf, @sec + 4, 116)        # 't'
+    _put32(@buf, @sec + 8,  512)      # VirtualSize
+    _put32(@buf, @sec + 12, 512)      # VirtualAddress
+    _put32(@buf, @sec + 16, 512)      # SizeOfRawData
+    _put32(@buf, @sec + 20, 512)      # PointerToRawData
+    _put32(@buf, @sec + 36, 1610612768)  # Chars: CODE | EXECUTE | READ = 0x60000020
+
+    # .idata
+    @sec2 = @sec + 40
+    _put8(@buf, @sec2 + 0, 46)        # '.'
+    _put8(@buf, @sec2 + 1, 105)       # 'i'
+    _put8(@buf, @sec2 + 2, 100)       # 'd'
+    _put8(@buf, @sec2 + 3, 97)        # 'a'
+    _put8(@buf, @sec2 + 4, 116)       # 't'
+    _put8(@buf, @sec2 + 5, 97)        # 'a'
+    _put32(@buf, @sec2 + 8,  512)     # VirtualSize
+    _put32(@buf, @sec2 + 12, 1024)    # VirtualAddress = 0x400
+    _put32(@buf, @sec2 + 16, 512)     # SizeOfRawData
+    _put32(@buf, @sec2 + 20, 1024)    # PointerToRawData = 0x400
+    _put32(@buf, @sec2 + 36, 3221225536) # Chars: INITIALIZED_DATA | READ | WRITE = 0xC0000040
+
+    # ---- .text (at file offset 0x200, RVA 0x200) ----
+    # mov ecx, 42           ; b9 2a 00 00 00
+    # sub rsp, 40           ; 48 83 ec 28
+    # call [rip + disp32]   ; ff 15 <disp32>
+    @text = 512
+    _put8(@buf, @text + 0, 185)       # b9
+    _put8(@buf, @text + 1, 42)        # 0x2a
+    _put8(@buf, @text + 2, 0)
+    _put8(@buf, @text + 3, 0)
+    _put8(@buf, @text + 4, 0)
+    _put8(@buf, @text + 5, 72)        # 48
+    _put8(@buf, @text + 6, 131)       # 83
+    _put8(@buf, @text + 7, 236)       # ec
+    _put8(@buf, @text + 8, 40)        # 0x28
+    _put8(@buf, @text + 9, 255)       # ff
+    _put8(@buf, @text + 10, 21)       # 15
+    # disp32 at file offset 0x20B.
+    # Call insn ends at RVA 0x20F. IAT entry lives at RVA 0x438 (see below).
+    # disp32 = 0x438 - 0x20F = 0x229
+    _put32(@buf, @text + 11, 553)     # 0x229
+
+    # ---- .idata (at file offset 0x400, RVA 0x400) ----
+    # [0x400] Import descriptor for kernel32.dll:
+    #     OriginalFirstThunk = 0x428 (ILT)
+    #     TimeDateStamp      = 0
+    #     ForwarderChain     = 0
+    #     Name               = 0x450 ("kernel32.dll")
+    #     FirstThunk         = 0x438 (IAT)
+    # [0x414] Zero descriptor (20 bytes of 0)
+    # [0x428] ILT[0] = 0x45D (RVA of IMAGE_IMPORT_BY_NAME for ExitProcess)
+    # [0x430] ILT[1] = 0
+    # [0x438] IAT[0] = 0x45D (same initial value, loader overwrites)
+    # [0x440] IAT[1] = 0
+    # [0x450] "kernel32.dll\0"
+    # [0x45D] hint(2) + "ExitProcess\0"
+    @id = 1024
+    _put32(@buf, @id + 0,  1064)      # OriginalFirstThunk = 0x428
+    _put32(@buf, @id + 4,  0)
+    _put32(@buf, @id + 8,  0)
+    _put32(@buf, @id + 12, 1104)      # Name = 0x450
+    _put32(@buf, @id + 16, 1080)      # FirstThunk = 0x438
+    # zero descriptor is already zero (buffer starts zero)
+
+    # ILT (two 8-byte entries)
+    @ilt = @id + 40                   # 0x428
+    _put64(@buf, @ilt + 0,  1117)     # RVA of hint+name = 0x45D
+    _put64(@buf, @ilt + 8,  0)        # terminator
+
+    # IAT (mirrors ILT initially)
+    @iat = @id + 56                   # 0x438
+    _put64(@buf, @iat + 0,  1117)     # RVA 0x45D
+    _put64(@buf, @iat + 8,  0)        # terminator
+
+    # DLL name: "kernel32.dll\0" at RVA 0x450
+    @dllname = @id + 80               # 0x450
+    _put_cstr(@buf, @dllname, "kernel32.dll")
+
+    # IMAGE_IMPORT_BY_NAME at RVA 0x45D: hint[2]=0,0 then name.
+    @ibn = @id + 93                   # 0x45D
+    _put16(@buf, @ibn + 0, 0)
+    _put_cstr(@buf, @ibn + 2, "ExitProcess")
+
+    # Write the file.
+    write_file("hello.exe", @buf)
+    shine("wrote hello.exe")
+    return 0
