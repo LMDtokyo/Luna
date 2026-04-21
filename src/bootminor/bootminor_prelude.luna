@@ -225,6 +225,20 @@ fn print_int(@n: int) -> int
     print(int_to_str(@n))
     return 0
 
+# stderr counterparts — for compile errors and diagnostic output.
+fn eprint(@s: int) -> int
+    sys_write(2, @s, str_len(@s))
+    return 0
+
+fn eprint_int(@n: int) -> int
+    eprint(int_to_str(@n))
+    return 0
+
+fn eshine(@s: int) -> int
+    eprint(@s)
+    eprint("\n")
+    return 0
+
 
 # =====================================================================
 # Hot-swap runtime (docs/HOTSWAP.md v0.1 — MVP, function-level).

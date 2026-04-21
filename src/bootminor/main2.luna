@@ -111,6 +111,8 @@ fn main() -> int
         return 1
 
     let @g: Gen = compile_to_gen(@src)
+    if @g.had_error == 1
+        return 1
     @patches = @g.str_patches
     @code_bytes = strbuf_done(@g.code)
     @data_bytes = strbuf_done(@g.data)
