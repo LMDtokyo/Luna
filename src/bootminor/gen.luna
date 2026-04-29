@@ -72,6 +72,8 @@ struct Gen
     lambda_starts:   int # Vec<int>: token pos where each lambda header begins
     lambda_captures: int # Vec<Vec<str>>: captured var names per lambda (by-value)
     had_error:       int # 1 once _die has fired (driver bails before writing)
+    target_os:       int # 0 = linux ELF64 (default), 1 = windows PE64
+    imp_patches:     int # Vec: [call_site_off, import_name_str]* for PE64
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
@@ -117,6 +119,8 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.lambda_starts    = vec_new()
     @g.lambda_captures  = vec_new()
     @g.had_error        = 0
+    @g.target_os        = 0
+    @g.imp_patches      = vec_new()
     # Reserve 40 bytes at the very start of the data section:
     #   [0..8)   heap_top (runtime bump pointer)
     #   [8..16)  hotswap slots vaddr       (patched by main2)
@@ -658,6 +662,38 @@ fn _em_fnptr_load_placeholder(@g: Gen) -> int
 fn _em_call_rax(@g: Gen) -> int
     _eb(@g, 255)
     _eb(@g, 208)
+    return 0
+
+# Emit `call qword [rip + disp32]` (6 bytes) targeting a DLL import.
+# Records (disp32_off, import_name) on imp_patches so main2's PE64
+# emitter can fix up the disp32 to the corresponding IAT entry.
+fn _em_call_import_placeholder(@g: Gen, @name: int) -> int
+    _eb(@g, 255)
+    _eb(@g, 21)
+    @at = _code_len(@g)
+    _e32(@g, 0)
+    vec_push(@g.imp_patches, @at)
+    vec_push(@g.imp_patches, @name)
+    return 0
+
+# Emit the process-exit sequence for main, branching on target_os.
+# Linux: mov rdi, rax ; mov eax, 60 ; syscall           (10 bytes)
+# Win:   mov ecx, eax ; sub rsp, 40 ; call [rip+IAT]    (12 bytes —
+#        MS x64 first-arg is rcx; sub rsp reserves 32-byte shadow
+#        space + 8 to keep rsp 16-aligned under `call`'s push.)
+fn _em_main_exit(@g: Gen) -> int
+    if @g.target_os == 1
+        _eb(@g, 137)
+        _eb(@g, 193)
+        _eb(@g, 72)
+        _eb(@g, 131)
+        _eb(@g, 236)
+        _eb(@g, 40)
+        _em_call_import_placeholder(@g, "ExitProcess")
+        return 0
+    _em_mov_rdi_rax(@g)
+    _em_mov_eax_imm(@g, 60)
+    _em_syscall(@g)
     return 0
 
 # Emit `mov rax, qword [rip + disp32]` (7 bytes). Used by hot-swap
@@ -3091,12 +3127,8 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
         _advance(@g)
         parse_expr(@g)
         if @g.is_main == 1
-            # main's return becomes process exit syscall.
-            _em_mov_rdi_rax(@g)
-            _em_mov_eax_imm(@g, 60)
-            _em_syscall(@g)
+            _em_main_exit(@g)
         else
-            # Normal fn return: mov rsp, rbp; pop rbp; ret
             _em_epilogue(@g)
         return 0
 
@@ -3593,9 +3625,8 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
 
     # Implicit return: main exits with 0, other fns do `return 0`.
     if @g.is_main == 1
-        _em_mov_edi_imm(@g, 0)
-        _em_mov_eax_imm(@g, 60)
-        _em_syscall(@g)
+        _em_mov_eax_imm(@g, 0)
+        _em_main_exit(@g)
     else
         _em_mov_eax_imm(@g, 0)
         _em_epilogue(@g)
@@ -4074,12 +4105,17 @@ fn parse_program(@g: Gen, @patches: Vec) -> int
 # --- Top-level entry: compile source → (code_bytes, data_bytes) ------
 
 fn compile_to_gen(@src: int) -> Gen
+    return compile_to_gen_target(@src, 0)
+
+# target_os: 0 = linux (ELF64), 1 = windows (PE64).
+fn compile_to_gen_target(@src: int, @target_os: int) -> Gen
     @kind = vec_new()
     @start = vec_new()
     @tlen = vec_new()
     @iv = vec_new()
     lex(@src, @kind, @start, @tlen, @iv)
     let @g: Gen = gen_new(@src, @kind, @start, @tlen, @iv)
+    @g.target_os = @target_os
     # Emit print_int runtime first so shine_int can call it.
     _emit_print_int(@g)
     # Parse all fn decls; str_patches is filled on the go via parse_shine.

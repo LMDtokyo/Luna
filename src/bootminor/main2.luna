@@ -93,6 +93,219 @@ fn _parse_output(@argc: int) -> int
         @i = @i + 1
     return "a.out"
 
+# Returns 1 if `--target windows` is present, else 0 (linux default).
+fn _parse_target(@argc: int) -> int
+    @i = 1
+    while @i < @argc
+        if str_eq(arg(@i), "--target") == 1
+            if str_eq(arg(@i + 1), "windows") == 1
+                return 1
+        @i = @i + 1
+    return 0
+
+
+fn _pe_align(@v: int, @a: int) -> int
+    return (@v + @a - 1) & (0 - @a)
+
+fn _pe_put_cstr(@buf: int, @at: int, @s: int) -> int
+    @n = str_len(@s)
+    @i = 0
+    while @i < @n
+        str_set_byte(@buf, @at + @i, str_byte(@s, @i))
+        @i = @i + 1
+    str_set_byte(@buf, @at + @n, 0)
+    return @n + 1
+
+# Collect unique import names from @g.imp_patches into @out_names.
+fn _pe_collect_imports(@g: Gen, @out_names: int) -> int
+    @n = vec_len(@g.imp_patches)
+    @i = 0
+    while @i < @n
+        @name = vec_get(@g.imp_patches, @i + 1)
+        @m = vec_len(@out_names)
+        @j = 0
+        @found = 0
+        while @j < @m
+            if str_eq(vec_get(@out_names, @j), @name) == 1
+                @found = 1
+                break
+            @j = @j + 1
+        if @found == 0
+            vec_push(@out_names, @name)
+        @i = @i + 2
+    return 0
+
+fn _pe_name_index(@names: int, @name: int) -> int
+    @n = vec_len(@names)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@names, @i), @name) == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
+
+# --- PE64 emitter (M14b, M14c WIP) -----------------------------------
+#
+# Minimum-viable Windows PE64 for Luna programs that only `return N`
+# from main. SectionAlignment == FileAlignment == 0x200 so file offset
+# equals RVA, keeping every disp32 calculation simple. Two sections:
+# .text and .idata. All imports go through kernel32.dll for now. No
+# hot-swap table, str literals, heap, etc. — those stay linux-only
+# until M14c ports the syscall intrinsics to DLL imports.
+
+fn _emit_pe64(@out_path: int, @code_bytes: int, @code_len: int, @entry_off: int, @g: Gen) -> int
+    @imp_names = vec_new()
+    _pe_collect_imports(@g, @imp_names)
+    @K = vec_len(@imp_names)
+
+    # .idata layout (offsets relative to idata RVA base):
+    #   [0x00] Import descriptor for kernel32.dll (20 B)
+    #   [0x14] Zero descriptor (20 B)
+    #   [0x28] ILT — (K+1) * 8
+    #   [0x28 + 8(K+1)] IAT — same size
+    #   [...]  "kernel32.dll\0"
+    #   [...]  per import: hint(2) + NUL-term name
+    @ilt_off = 40
+    @iat_off = @ilt_off + (@K + 1) * 8
+    @dll_off = @iat_off + (@K + 1) * 8
+    @names_base = @dll_off + 13
+
+    @ibn_offs = vec_new()
+    @cursor = @names_base
+    @i = 0
+    while @i < @K
+        vec_push(@ibn_offs, @cursor)
+        @nm = vec_get(@imp_names, @i)
+        @cursor = @cursor + 2 + str_len(@nm) + 1
+        @i = @i + 1
+    @idata_raw = @cursor
+
+    @text_raw  = _pe_align(@code_len, 512)
+    @idata_pad = _pe_align(@idata_raw, 512)
+    @text_rva  = 512
+    @idata_rva = @text_rva + @text_raw
+    @image_sz  = _pe_align(@idata_rva + @idata_pad, 512)
+    @file_sz   = 512 + @text_raw + @idata_pad
+
+    @buf = new_str(@file_sz)
+
+    # DOS stub.
+    str_set_byte(@buf, 0, 77)
+    str_set_byte(@buf, 1, 90)
+    _put32(@buf, 60, 128)
+
+    # PE sig + COFF.
+    @pe = 128
+    str_set_byte(@buf, @pe + 0, 80)
+    str_set_byte(@buf, @pe + 1, 69)
+    @coff = @pe + 4
+    _put16(@buf, @coff + 0,  34404)
+    _put16(@buf, @coff + 2,  2)
+    _put16(@buf, @coff + 16, 240)
+    _put16(@buf, @coff + 18, 34)
+
+    # Optional header (PE32+, 240 bytes).
+    @opt = @coff + 20
+    _put16(@buf, @opt + 0,   523)
+    str_set_byte(@buf, @opt + 2,  14)
+    _put32(@buf, @opt + 4,   @text_raw)
+    _put32(@buf, @opt + 8,   @idata_pad)
+    _put32(@buf, @opt + 16,  @text_rva + @entry_off)
+    _put32(@buf, @opt + 20,  @text_rva)
+    _put64(@buf, @opt + 24,  5368709120)
+    _put32(@buf, @opt + 32,  512)
+    _put32(@buf, @opt + 36,  512)
+    _put16(@buf, @opt + 40,  6)
+    _put16(@buf, @opt + 48,  6)
+    _put32(@buf, @opt + 56,  @image_sz)
+    _put32(@buf, @opt + 60,  512)
+    _put16(@buf, @opt + 68,  3)
+    _put64(@buf, @opt + 72,  1048576)
+    _put64(@buf, @opt + 80,  4096)
+    _put64(@buf, @opt + 88,  1048576)
+    _put64(@buf, @opt + 96,  4096)
+    _put32(@buf, @opt + 108, 16)
+    @dd = @opt + 112
+    _put32(@buf, @dd + 8,  @idata_rva)
+    _put32(@buf, @dd + 12, 40)
+
+    # Section headers.
+    @sec = @opt + 240
+    str_set_byte(@buf, @sec + 0, 46)
+    str_set_byte(@buf, @sec + 1, 116)
+    str_set_byte(@buf, @sec + 2, 101)
+    str_set_byte(@buf, @sec + 3, 120)
+    str_set_byte(@buf, @sec + 4, 116)
+    _put32(@buf, @sec + 8,  @code_len)
+    _put32(@buf, @sec + 12, @text_rva)
+    _put32(@buf, @sec + 16, @text_raw)
+    _put32(@buf, @sec + 20, @text_rva)
+    _put32(@buf, @sec + 36, 1610612768)
+    @sec2 = @sec + 40
+    str_set_byte(@buf, @sec2 + 0, 46)
+    str_set_byte(@buf, @sec2 + 1, 105)
+    str_set_byte(@buf, @sec2 + 2, 100)
+    str_set_byte(@buf, @sec2 + 3, 97)
+    str_set_byte(@buf, @sec2 + 4, 116)
+    str_set_byte(@buf, @sec2 + 5, 97)
+    _put32(@buf, @sec2 + 8,  @idata_raw)
+    _put32(@buf, @sec2 + 12, @idata_rva)
+    _put32(@buf, @sec2 + 16, @idata_pad)
+    _put32(@buf, @sec2 + 20, @idata_rva)
+    _put32(@buf, @sec2 + 36, 3221225536)
+
+    # Copy .text bytes into buf[text_rva ..].
+    @k = 0
+    while @k < @code_len
+        str_set_byte(@buf, @text_rva + @k, str_byte(@code_bytes, @k))
+        @k = @k + 1
+
+    # Build .idata.
+    @id_base = @idata_rva
+    _put32(@buf, @id_base + 0,  @idata_rva + @ilt_off)
+    _put32(@buf, @id_base + 12, @idata_rva + @dll_off)
+    _put32(@buf, @id_base + 16, @idata_rva + @iat_off)
+
+    @i = 0
+    while @i < @K
+        @ibn_rva = @idata_rva + vec_get(@ibn_offs, @i)
+        _put64(@buf, @id_base + @ilt_off + @i * 8, @ibn_rva)
+        _put64(@buf, @id_base + @iat_off + @i * 8, @ibn_rva)
+        @i = @i + 1
+
+    _pe_put_cstr(@buf, @id_base + @dll_off, "kernel32.dll")
+
+    @i = 0
+    while @i < @K
+        @off = @id_base + vec_get(@ibn_offs, @i)
+        _put16(@buf, @off, 0)
+        _pe_put_cstr(@buf, @off + 2, vec_get(@imp_names, @i))
+        @i = @i + 1
+
+    # Patch imp_patches disp32 values inside @buf[text_rva ..].
+    @np = vec_len(@g.imp_patches)
+    @j = 0
+    while @j < @np
+        @call_off = vec_get(@g.imp_patches, @j)
+        @imp_name = vec_get(@g.imp_patches, @j + 1)
+        @idx = _pe_name_index(@imp_names, @imp_name)
+        @iat_entry_rva = @idata_rva + @iat_off + @idx * 8
+        @call_rva = @text_rva + @call_off
+        @disp = @iat_entry_rva - (@call_rva + 4)
+        str_set_byte(@buf, @text_rva + @call_off + 0,  @disp        & 255)
+        str_set_byte(@buf, @text_rva + @call_off + 1, (@disp >> 8)  & 255)
+        str_set_byte(@buf, @text_rva + @call_off + 2, (@disp >> 16) & 255)
+        str_set_byte(@buf, @text_rva + @call_off + 3, (@disp >> 24) & 255)
+        @j = @j + 2
+
+    @n = write_file(@out_path, @buf)
+    if @n < 0
+        eshine(str_concat("luna-mini: cannot write ", @out_path))
+        return 1
+    shine(str_concat("luna-mini: wrote ", @out_path))
+    return 0
+
 
 fn main() -> int
     @argc = 0
@@ -104,13 +317,14 @@ fn main() -> int
 
     @src_path = arg(1)
     @out_path = _parse_output(@argc)
+    @target   = _parse_target(@argc)
 
     @src = read_file(@src_path)
     if @src == 0
         shine(str_concat("luna-mini: cannot read ", @src_path))
         return 1
 
-    let @g: Gen = compile_to_gen(@src)
+    let @g: Gen = compile_to_gen_target(@src, @target)
     if @g.had_error == 1
         return 1
     @patches = @g.str_patches
@@ -118,6 +332,11 @@ fn main() -> int
     @data_bytes = strbuf_done(@g.data)
     @code_len = str_len(@code_bytes)
     @data_len = str_len(@data_bytes)
+
+    # Windows PE64 path — M14b: `return N`-only programs. Full syscall→
+    # DLL import coverage (shine, print, heap, etc.) arrives in M14c.
+    if @target == 1
+        return _emit_pe64(@out_path, @code_bytes, @code_len, @g.main_off, @g)
 
     # Entry point = main's code offset inside the code section.
     @entry_off = _elf_prelude() + @g.main_off
