@@ -1,0 +1,168 @@
+# Tests for std/std/pool — generic TCP connection pool.
+#
+# We need a real TCP peer to connect to. The simplest reliable setup
+# is to open a listening socket on a high local port in the same
+# process, then have pool_acquire connect to it. The kernel completes
+# the SYN/SYN-ACK handshake against the listen socket's backlog
+# without needing accept() to run synchronously, so connect() returns
+# while the server fd is parked in the backlog queue. We never call
+# accept() — closing the listener at the end RSTs the half-open
+# connections cleanly, which is what we want.
+
+import pool
+import tcp
+import test
+
+
+const TEST_PORT: int = 18765
+
+
+fn run_pool_tests(@p: int, @f: int) -> int
+    @r = 0
+    @host = "127.0.0.1"
+
+    @srv = tcp_listen(TEST_PORT)
+    @r = assert_true("listen succeeds", @srv >= 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    if @srv < 0
+        test_summary("pool", @p, @f)
+        return 1
+
+    # 1) pool_new returns a valid handle.
+    @pool = pool_new(@host, TEST_PORT, 4)
+    @r = assert_true("pool_new handle", @pool > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) acquire 4 distinct fds up to max_conns.
+    @fd1 = pool_acquire(@pool)
+    @fd2 = pool_acquire(@pool)
+    @fd3 = pool_acquire(@pool)
+    @fd4 = pool_acquire(@pool)
+    @r = assert_true("fd1 valid", @fd1 > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("fd2 valid", @fd2 > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("fd3 valid", @fd3 > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("fd4 valid", @fd4 > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("fd1 != fd2", @fd1 != @fd2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("fd2 != fd3", @fd2 != @fd3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("fd3 != fd4", @fd3 != @fd4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # active_count == 4, idle == 0
+    @r = assert_eq_int("active=4", pool_active(@pool), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("idle=0", pool_idle(@pool), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) 5th acquire returns -1 (exhausted, non-blocking).
+    @fd5 = pool_acquire(@pool)
+    @r = assert_eq_int("exhausted", @fd5, -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3b) acquire_wait with tiny timeout also fails fast.
+    @fd5b = pool_acquire_wait(@pool, 2)
+    @r = assert_eq_int("wait timeout", @fd5b, -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) release one, then acquire reuses the same fd (LIFO stack).
+    pool_release(@pool, @fd4)
+    @r = assert_eq_int("active=3", pool_active(@pool), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("idle=1", pool_idle(@pool), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @fd_reused = pool_acquire(@pool)
+    @r = assert_eq_int("LIFO reuse", @fd_reused, @fd4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("active back to 4", pool_active(@pool), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("idle=0 after reuse", pool_idle(@pool), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) invalidate — fd is closed, active_count decremented, NOT pooled.
+    pool_invalidate(@pool, @fd_reused)
+    @r = assert_eq_int("active after invalidate", pool_active(@pool), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("idle after invalidate", pool_idle(@pool), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    # Slot is free again — fresh connect should succeed. The kernel
+    # may legitimately recycle the just-closed fd number; we only
+    # check validity, not identity.
+    @fd_new = pool_acquire(@pool)
+    @r = assert_true("re-open after invalidate", @fd_new > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("active=4 after re-open", pool_active(@pool), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) release everything, then close — idle stack drains, closed=1.
+    pool_release(@pool, @fd1)
+    pool_release(@pool, @fd2)
+    pool_release(@pool, @fd3)
+    pool_release(@pool, @fd_new)
+    @r = assert_eq_int("idle=4 before close", pool_idle(@pool), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("active=0 before close", pool_active(@pool), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    pool_close(@pool)
+    @r = assert_eq_int("idle=0 after close", pool_idle(@pool), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7) acquire on a closed pool returns -1.
+    @fd_closed = pool_acquire(@pool)
+    @r = assert_eq_int("closed pool blocks acquire", @fd_closed, -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @fd_closed2 = pool_acquire_wait(@pool, 5)
+    @r = assert_eq_int("closed pool blocks acquire_wait", @fd_closed2, -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8) sanity: pool_new with max_conns <= 0 fails.
+    @bad = pool_new(@host, TEST_PORT, 0)
+    @r = assert_eq_int("max_conns=0 rejected", @bad, -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Closing the listener RSTs any pending half-open connections in
+    # the backlog. We don't accept them — sys_accept here would block.
+    sys_close(@srv)
+
+    test_summary("pool", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_pool_tests(0, 0)

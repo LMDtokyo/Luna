@@ -1,0 +1,42 @@
+# Tests for std/ext/websocket — RFC 6455 handshake key vector + frame
+# round-trips.
+
+import websocket
+import test
+
+
+fn run_ws_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    @r = assert_eq_str("RFC 6455 accept key", ws_accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @resp = ws_handshake_response("dGhlIHNhbXBsZSBub25jZQ==")
+    @rlen = str_len(@resp)
+    @r = assert_eq_int("handshake last \\r", str_byte(@resp, @rlen - 4), 13)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("handshake last \\n", str_byte(@resp, @rlen - 1), 10)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @t = ws_encode_text("hi")
+    @r = assert_eq_int("text frame size", str_len(@t), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("text byte0",      str_byte(@t, 0), 129)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("text byte1",      str_byte(@t, 1), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("websocket", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_ws_tests(0, 0)

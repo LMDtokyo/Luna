@@ -1,0 +1,130 @@
+# Tests for std/std/log — assert the JSON structure produced by
+# log_format (the underlying builder shared with log_*). We don't
+# scrape stderr — log_format returns the line directly.
+
+import log
+import test
+
+
+# _contains(@hay, @needle) -> 1 if @needle appears in @hay.
+fn _contains(@hay: int, @needle: int) -> int
+    @hlen = str_len(@hay)
+    @nlen = str_len(@needle)
+    if @nlen > @hlen
+        return 0
+    @i = 0
+    while @i <= @hlen - @nlen
+        @match = 1
+        @j = 0
+        while @j < @nlen
+            if str_byte(@hay, @i + @j) != str_byte(@needle, @j)
+                @match = 0
+                break
+            @j = @j + 1
+        if @match == 1
+            return 1
+        @i = @i + 1
+    return 0
+
+
+fn run_log_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1) No kvs — line must have ts, level, msg.
+    @kvs = vec_new()
+    @line = log_format("info", "hello", @kvs)
+    @r = assert_eq_int("starts with {",     str_byte(@line, 0), 123)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("ends with }",       str_byte(@line, str_len(@line) - 1), 125)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("has ts field",      _contains(@line, "\"ts\":\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("level=info",        _contains(@line, "\"level\":\"info\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("msg=hello",         _contains(@line, "\"msg\":\"hello\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) Single key-value.
+    @kvs = vec_new()
+    vec_push(@kvs, "user")
+    vec_push(@kvs, "alice")
+    @line = log_format("info", "login", @kvs)
+    @r = assert_eq_int("has user=alice",    _contains(@line, "\"user\":\"alice\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) Multiple fields preserved.
+    @kvs = vec_new()
+    vec_push(@kvs, "n")
+    vec_push(@kvs, "42")
+    vec_push(@kvs, "ip")
+    vec_push(@kvs, "1.2.3.4")
+    @line = log_format("warn", "rate", @kvs)
+    @r = assert_eq_int("level=warn",  _contains(@line, "\"level\":\"warn\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("n=42",        _contains(@line, "\"n\":\"42\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("ip=1.2.3.4",  _contains(@line, "\"ip\":\"1.2.3.4\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) Dangling odd key dropped silently.
+    @kvs = vec_new()
+    vec_push(@kvs, "k")
+    vec_push(@kvs, "v")
+    vec_push(@kvs, "orphan")           # no value, should be ignored
+    @line = log_format("error", "oops", @kvs)
+    @r = assert_eq_int("k=v survives", _contains(@line, "\"k\":\"v\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("orphan dropped", _contains(@line, "orphan"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) JSON escaping — quotes and backslashes in msg/value.
+    @kvs = vec_new()
+    vec_push(@kvs, "path")
+    vec_push(@kvs, "C:\\Users\\alice")
+    @line = log_format("info", "click on \"button\"", @kvs)
+    @r = assert_eq_int("msg escaped",  _contains(@line, "click on \\\"button\\\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("path escaped", _contains(@line, "C:\\\\Users\\\\alice"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) Level shorthand wrappers don't crash and produce expected level.
+    @kvs = vec_new()
+    vec_push(@kvs, "x")
+    vec_push(@kvs, "y")
+    @line = log_format("debug", "scratch", @kvs)
+    @r = assert_eq_int("level=debug", _contains(@line, "\"level\":\"debug\""), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7) Calling the convenience wrappers doesn't crash (the message
+    # itself goes to stderr; we don't capture it).
+    log_info("plain info")
+    log_info_1("one field", "k", "v")
+    log_info_2("two fields", "a", "1", "b", "2")
+    log_warn("plain warn")
+    log_error_1("error", "code", "500")
+    @r = assert_true("no crash on convenience wrappers", 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("log", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_log_tests(0, 0)

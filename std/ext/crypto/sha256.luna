@@ -1,0 +1,258 @@
+# tier: T6
+# deps:
+# ffi: none
+#
+# std/ext/crypto/sha256 — SHA-256 (FIPS 180-4) + HMAC-SHA-256 (RFC 2104)
+# in pure Luna. No FFI; uses only bootminor's u32/u64 + bitops intrinsics.
+#
+# Public API:
+#   sha256(@msg)              -> 32-byte digest as a string
+#   sha256_hex(@msg)          -> 64-char lowercase hex digest
+#   hmac_sha256(@key, @msg)   -> 32-byte HMAC digest
+#   hmac_sha256_hex(@key, @msg) -> 64-char hex HMAC
+#
+# Verified against the NIST FIPS 180-4 vectors ("abc",
+# multi-block, empty) and RFC 4231 HMAC vectors in
+# tests/std/ext/crypto/sha256_test.luna.
+
+
+fn _sha_rotr(@x: int, @n: int) -> int
+    return ((@x >> @n) | (@x << (32 - @n))) & 4294967295
+
+fn _sha_ch(@x: int, @y: int, @z: int) -> int
+    return (@x & @y) ^ ((~@x) & @z)
+
+fn _sha_maj(@x: int, @y: int, @z: int) -> int
+    return (@x & @y) ^ (@x & @z) ^ (@y & @z)
+
+fn _sha_bsig0(@x: int) -> int
+    return _sha_rotr(@x, 2) ^ _sha_rotr(@x, 13) ^ _sha_rotr(@x, 22)
+
+fn _sha_bsig1(@x: int) -> int
+    return _sha_rotr(@x, 6) ^ _sha_rotr(@x, 11) ^ _sha_rotr(@x, 25)
+
+fn _sha_ssig0(@x: int) -> int
+    return _sha_rotr(@x, 7) ^ _sha_rotr(@x, 18) ^ (@x >> 3)
+
+fn _sha_ssig1(@x: int) -> int
+    return _sha_rotr(@x, 17) ^ _sha_rotr(@x, 19) ^ (@x >> 10)
+
+fn _sha_be32(@buf: int, @off: int) -> int
+    return (str_byte(@buf, @off) << 24) | (str_byte(@buf, @off + 1) << 16) | (str_byte(@buf, @off + 2) << 8) | str_byte(@buf, @off + 3)
+
+
+# _sha_pad(@msg) — append the SHA-256 padding (1 bit, zero fill,
+# 8-byte big-endian length). Returns a fresh buffer.
+fn _sha_pad(@msg: int) -> int
+    @len = str_len(@msg)
+    @pad_len = 64 - ((@len + 9) % 64)
+    if @pad_len == 64
+        @pad_len = 0
+    @total = @len + 1 + @pad_len + 8
+    @padded = new_str(@total)
+    @i = 0
+    while @i < @len
+        str_set_byte(@padded, @i, str_byte(@msg, @i))
+        @i = @i + 1
+    str_set_byte(@padded, @len, 128)
+    @bit_len = @len * 8
+    @j = 0
+    while @j < 8
+        str_set_byte(@padded, @total - 8 + @j, (@bit_len >> ((7 - @j) * 8)) & 255)
+        @j = @j + 1
+    return @padded
+
+
+# _sha_compress_block(@H, @padded, @blk_off) — process one 64-byte
+# block at @blk_off, updating the 8 u32s stored in @H (32-byte buffer,
+# big-endian u32s at offsets 0,4,...,28).
+fn _sha_compress_block(@H: int, @padded: int, @blk_off: int) -> int
+    @mask = 4294967295
+    @W = new_str(64 * 8)
+    @t = 0
+    while @t < 16
+        u64_set(@W, @t, _sha_be32(@padded, @blk_off + @t * 4))
+        @t = @t + 1
+    while @t < 64
+        @w1 = u64_get(@W, @t - 2)
+        @w2 = u64_get(@W, @t - 7)
+        @w3 = u64_get(@W, @t - 15)
+        @w4 = u64_get(@W, @t - 16)
+        @nw = (_sha_ssig1(@w1) + @w2 + _sha_ssig0(@w3) + @w4) & @mask
+        u64_set(@W, @t, @nw)
+        @t = @t + 1
+
+    @a  = u32_at(@H, 0)
+    @b  = u32_at(@H, 4)
+    @c  = u32_at(@H, 8)
+    @d  = u32_at(@H, 12)
+    @e  = u32_at(@H, 16)
+    @f  = u32_at(@H, 20)
+    @gg = u32_at(@H, 24)
+    @hh = u32_at(@H, 28)
+
+    @K = [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]
+
+    @t = 0
+    while @t < 64
+        @wt = u64_get(@W, @t)
+        @kt = @K[@t]
+        @T1 = (@hh + _sha_bsig1(@e) + _sha_ch(@e, @f, @gg) + @kt + @wt) & @mask
+        @T2 = (_sha_bsig0(@a) + _sha_maj(@a, @b, @c)) & @mask
+        @hh = @gg
+        @gg = @f
+        @f  = @e
+        @e  = (@d + @T1) & @mask
+        @d  = @c
+        @c  = @b
+        @b  = @a
+        @a  = (@T1 + @T2) & @mask
+        @t = @t + 1
+
+    u32_set(@H,  0, (u32_at(@H,  0) + @a)  & @mask)
+    u32_set(@H,  4, (u32_at(@H,  4) + @b)  & @mask)
+    u32_set(@H,  8, (u32_at(@H,  8) + @c)  & @mask)
+    u32_set(@H, 12, (u32_at(@H, 12) + @d)  & @mask)
+    u32_set(@H, 16, (u32_at(@H, 16) + @e)  & @mask)
+    u32_set(@H, 20, (u32_at(@H, 20) + @f)  & @mask)
+    u32_set(@H, 24, (u32_at(@H, 24) + @gg) & @mask)
+    u32_set(@H, 28, (u32_at(@H, 28) + @hh) & @mask)
+    return 0
+
+
+# sha256(@msg) -> 32-byte digest as a string.
+fn sha256(@msg: int) -> int
+    @padded = _sha_pad(@msg)
+    @total = str_len(@padded)
+    @nblocks = @total / 64
+
+    @H = new_str(32)
+    u32_set(@H,  0, 1779033703)
+    u32_set(@H,  4, 3144134277)
+    u32_set(@H,  8, 1013904242)
+    u32_set(@H, 12, 2773480762)
+    u32_set(@H, 16, 1359893119)
+    u32_set(@H, 20, 2600822924)
+    u32_set(@H, 24, 528734635)
+    u32_set(@H, 28, 1541459225)
+
+    @blk = 0
+    while @blk < @nblocks
+        _sha_compress_block(@H, @padded, @blk * 64)
+        @blk = @blk + 1
+
+    # Pack H[0..8] as big-endian u32s into the 32-byte output.
+    @out = new_str(32)
+    @i = 0
+    while @i < 8
+        @v = u32_at(@H, @i * 4)
+        str_set_byte(@out, @i * 4,     (@v >> 24) & 255)
+        str_set_byte(@out, @i * 4 + 1, (@v >> 16) & 255)
+        str_set_byte(@out, @i * 4 + 2, (@v >>  8) & 255)
+        str_set_byte(@out, @i * 4 + 3,  @v        & 255)
+        @i = @i + 1
+    return @out
+
+
+# sha256_hex(@msg) -> 64-char lowercase hex digest.
+fn sha256_hex(@msg: int) -> int
+    @d = sha256(@msg)
+    @hex = new_str(64)
+    @i = 0
+    while @i < 32
+        @b = str_byte(@d, @i)
+        @hi = (@b >> 4) & 15
+        @lo = @b & 15
+        if @hi < 10
+            str_set_byte(@hex, @i * 2, 48 + @hi)
+        else
+            str_set_byte(@hex, @i * 2, 87 + @hi)
+        if @lo < 10
+            str_set_byte(@hex, @i * 2 + 1, 48 + @lo)
+        else
+            str_set_byte(@hex, @i * 2 + 1, 87 + @lo)
+        @i = @i + 1
+    return @hex
+
+
+# --- HMAC-SHA-256 (RFC 2104) ----------------------------------------------
+#
+# Block size for SHA-256 is 64 bytes. Keys longer than the block size
+# are first hashed; shorter keys are zero-padded.
+
+const HMAC_BLOCK: int = 64
+
+fn _hmac_normalise_key(@key: int) -> int
+    @klen = str_len(@key)
+    @nk = new_str(HMAC_BLOCK)
+    if @klen > HMAC_BLOCK
+        @hk = sha256(@key)
+        # @hk is 32 bytes; copy in, rest stays zero from new_str.
+        @i = 0
+        while @i < 32
+            str_set_byte(@nk, @i, str_byte(@hk, @i))
+            @i = @i + 1
+        return @nk
+    @i = 0
+    while @i < @klen
+        str_set_byte(@nk, @i, str_byte(@key, @i))
+        @i = @i + 1
+    return @nk
+
+
+fn hmac_sha256(@key: int, @msg: int) -> int
+    @k = _hmac_normalise_key(@key)
+    # ipad = k XOR 0x36..., opad = k XOR 0x5C...
+    @ipad = new_str(HMAC_BLOCK)
+    @opad = new_str(HMAC_BLOCK)
+    @i = 0
+    while @i < HMAC_BLOCK
+        @kb = str_byte(@k, @i)
+        str_set_byte(@ipad, @i, @kb ^ 54)
+        str_set_byte(@opad, @i, @kb ^ 92)
+        @i = @i + 1
+
+    # inner = sha256(ipad || msg)
+    @mlen = str_len(@msg)
+    @inner_in = new_str(HMAC_BLOCK + @mlen)
+    @i = 0
+    while @i < HMAC_BLOCK
+        str_set_byte(@inner_in, @i, str_byte(@ipad, @i))
+        @i = @i + 1
+    @i = 0
+    while @i < @mlen
+        str_set_byte(@inner_in, HMAC_BLOCK + @i, str_byte(@msg, @i))
+        @i = @i + 1
+    @inner = sha256(@inner_in)
+
+    # outer = sha256(opad || inner)
+    @outer_in = new_str(HMAC_BLOCK + 32)
+    @i = 0
+    while @i < HMAC_BLOCK
+        str_set_byte(@outer_in, @i, str_byte(@opad, @i))
+        @i = @i + 1
+    @i = 0
+    while @i < 32
+        str_set_byte(@outer_in, HMAC_BLOCK + @i, str_byte(@inner, @i))
+        @i = @i + 1
+    return sha256(@outer_in)
+
+
+fn hmac_sha256_hex(@key: int, @msg: int) -> int
+    @d = hmac_sha256(@key, @msg)
+    @hex = new_str(64)
+    @i = 0
+    while @i < 32
+        @b = str_byte(@d, @i)
+        @hi = (@b >> 4) & 15
+        @lo = @b & 15
+        if @hi < 10
+            str_set_byte(@hex, @i * 2, 48 + @hi)
+        else
+            str_set_byte(@hex, @i * 2, 87 + @hi)
+        if @lo < 10
+            str_set_byte(@hex, @i * 2 + 1, 48 + @lo)
+        else
+            str_set_byte(@hex, @i * 2 + 1, 87 + @lo)
+        @i = @i + 1
+    return @hex

@@ -1,0 +1,22 @@
+# End-to-end test of http_get_host: DNS + TCP + HTTP in one call,
+# all in pure Luna. Target is http://example.com/ on port 80, which
+# IANA serves as a stable test domain.
+
+import http
+
+
+fn main() -> int
+    let @resp: HttpResponse = http_get_host("example.com", 80, "/")
+    if @resp.status != 200
+        shine("FAIL: expected status 200, got:")
+        print_int(@resp.status)
+        return 1
+
+    @blen = str_len(@resp.body)
+    if @blen < 100
+        shine("FAIL: body suspiciously short:")
+        print_int(@blen)
+        return 1
+
+    shine("PASS: GET example.com -> 200 OK")
+    return 0

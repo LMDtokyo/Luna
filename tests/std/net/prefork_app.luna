@@ -1,0 +1,20 @@
+# Pre-fork worker pool demo server for prefork_e2e.sh. 4 workers
+# all sharing accept(). Each route returns the worker PID so the
+# E2E test can verify multiple workers actually handle requests.
+
+import http_router
+
+
+fn echo_path(@req: HttpRequest, @cli: int) -> int
+    return http_send_text(@cli, @req.path)
+
+
+fn main() -> int
+    let @r: Router = router_new()
+    router_any(@r, "/one",   echo_path)
+    router_any(@r, "/two",   echo_path)
+    router_any(@r, "/three", echo_path)
+    router_any(@r, "/four",  echo_path)
+    router_any(@r, "/five",  echo_path)
+    # 4 pre-forked workers.
+    return router_serve_prefork(@r, 18089, 4)

@@ -1,0 +1,69 @@
+# Smoke tests for std/net/tcp.
+#
+# Pure-parse tests live here; the end-to-end echo round-trip is driven
+# by tests/std/net/tcp_echo.sh which spawns a Python echo server on
+# 127.0.0.1, runs the compiled binary against it, and checks the
+# exchanged bytes.
+
+import tcp
+import test
+
+
+fn run_tcp_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1) Valid IP parses to a 4-byte buffer in network order.
+    @ip = tcp_parse_ipv4("127.0.0.1")
+    @r = assert_true("parse 127.0.0.1 ok", @ip > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("byte 0 = 127", u8_at(@ip, 0), 127)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("byte 3 = 1", u8_at(@ip, 3), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) Another valid IP.
+    @ip2 = tcp_parse_ipv4("8.8.4.4")
+    @r = assert_eq_int("8.8.4.4 byte 0", u8_at(@ip2, 0), 8)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("8.8.4.4 byte 2", u8_at(@ip2, 2), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) Rejects: out-of-range octet, missing dots, trailing dot,
+    #    empty string, non-digit chars.
+    @r = assert_eq_int("reject 256.0.0.1", tcp_parse_ipv4("256.0.0.1"), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("reject 1.2.3", tcp_parse_ipv4("1.2.3"), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("reject 1.2.3.", tcp_parse_ipv4("1.2.3."), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("reject empty", tcp_parse_ipv4(""), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("reject abc.def", tcp_parse_ipv4("abc.def.ghi.jkl"), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) Connect to an obviously-closed port locally — must fail
+    # cleanly (not crash). Port 1 on 127.0.0.1 is reserved/closed.
+    @fd = tcp_connect("127.0.0.1", 1)
+    @r = assert_eq_int("connect to closed port -> -1", @fd, -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("tcp", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_tcp_tests(0, 0)

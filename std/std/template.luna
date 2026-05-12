@@ -1,0 +1,141 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/std/template — {{var}} substitution for HTML/text rendering.
+#
+# Vars format:    "name=value;other=val;"   — same as the router's
+# req.params buffer and friends.
+#
+# Examples:
+#   template_render("Hello {{name}}!", "name=alice;")
+#       -> "Hello alice!"
+#
+#   template_render("{{a}}+{{b}}={{sum}}", "a=2;b=3;sum=5;")
+#       -> "2+3=5"
+#
+# Whitespace inside `{{ name }}` is stripped. Unknown variables expand
+# to the empty string. Literal `{` followed by a non-`{` is copied
+# verbatim, so `{json}` survives without escaping.
+#
+# Output cap is 64 KiB; exceed it and the result truncates silently.
+# Streaming for large payloads is a follow-up.
+
+
+const TPL_OUT_CAP: int = 65536
+
+
+fn _tpl_copy_byte(@out: int, @off: int, @c: int) -> int
+    if @off >= TPL_OUT_CAP
+        return @off
+    str_set_byte(@out, @off, @c)
+    return @off + 1
+
+
+# _tpl_find_close(@tmpl, @from, @tlen) -> offset of '}}' or -1.
+fn _tpl_find_close(@tmpl: int, @from: int, @tlen: int) -> int
+    @j = @from
+    while @j + 1 < @tlen
+        if str_byte(@tmpl, @j) == 125
+            if str_byte(@tmpl, @j + 1) == 125
+                return @j
+        @j = @j + 1
+    return -1
+
+
+# _tpl_trim(@s) -> @s with leading/trailing spaces stripped.
+fn _tpl_trim(@s: int) -> int
+    @slen = str_len(@s)
+    @start = 0
+    while @start < @slen
+        if str_byte(@s, @start) != 32
+            break
+        @start = @start + 1
+    @end = @slen
+    while @end > @start
+        if str_byte(@s, @end - 1) != 32
+            break
+        @end = @end - 1
+    return str_substr(@s, @start, @end - @start)
+
+
+# _tpl_var_lookup(@vars, @name) -> value string, or "" if absent.
+# @vars is "name=val;name=val;..." (router-style params buffer).
+fn _tpl_var_lookup(@vars: int, @name: int) -> int
+    if @vars == 0
+        return ""
+    @vlen = str_len(@vars)
+    if @vlen == 0
+        return ""
+    @nlen = str_len(@name)
+    @i = 0
+    while @i < @vlen
+        @name_s = @i
+        while @i < @vlen
+            if str_byte(@vars, @i) == 61
+                break
+            @i = @i + 1
+        if @i >= @vlen
+            return ""
+        @cand_len = @i - @name_s
+        @matched = 0
+        if @cand_len == @nlen
+            @matched = 1
+            @j = 0
+            while @j < @nlen
+                if str_byte(@vars, @name_s + @j) != str_byte(@name, @j)
+                    @matched = 0
+                    break
+                @j = @j + 1
+        @i = @i + 1                     # past '='
+        @val_s = @i
+        while @i < @vlen
+            if str_byte(@vars, @i) == 59
+                break
+            @i = @i + 1
+        if @matched == 1
+            return str_substr(@vars, @val_s, @i - @val_s)
+        if @i >= @vlen
+            return ""
+        @i = @i + 1                     # past ';'
+    return ""
+
+
+# _tpl_emit_str(@out, @off, @src) -> new offset after appending @src.
+fn _tpl_emit_str(@out: int, @off: int, @src: int) -> int
+    @slen = str_len(@src)
+    @i = 0
+    while @i < @slen
+        @off = _tpl_copy_byte(@out, @off, str_byte(@src, @i))
+        @i = @i + 1
+    return @off
+
+
+# template_render(@tmpl, @vars) -> rendered string.
+fn template_render(@tmpl: int, @vars: int) -> int
+    @tlen = str_len(@tmpl)
+    @out = new_str(TPL_OUT_CAP)
+    @off = 0
+    @i = 0
+    while @i < @tlen
+        @c = str_byte(@tmpl, @i)
+        @opens = 0
+        if @c == 123
+            if @i + 1 < @tlen
+                if str_byte(@tmpl, @i + 1) == 123
+                    @opens = 1
+        if @opens == 1
+            @close_at = _tpl_find_close(@tmpl, @i + 2, @tlen)
+            if @close_at < 0
+                @off = _tpl_copy_byte(@out, @off, @c)
+                @i = @i + 1
+            else
+                @raw = str_substr(@tmpl, @i + 2, @close_at - @i - 2)
+                @name = _tpl_trim(@raw)
+                @val = _tpl_var_lookup(@vars, @name)
+                @off = _tpl_emit_str(@out, @off, @val)
+                @i = @close_at + 2
+        else
+            @off = _tpl_copy_byte(@out, @off, @c)
+            @i = @i + 1
+    return str_substr(@out, 0, @off)

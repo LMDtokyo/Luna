@@ -1,0 +1,124 @@
+# Tests for std/net/sessions — session-management on kvstore.
+#
+# Each test reuses a single store path under /tmp; _cleanup wipes the
+# kvstore between scenarios so test order doesn't matter.
+
+import sessions
+import test
+
+
+fn _cleanup(@path: int) -> int
+    write_file(@path, "")
+    return 0
+
+
+fn run_sessions_tests(@p: int, @f: int) -> int
+    @r = 0
+    @path = "/tmp/luna-sess-test.kv"
+
+    _cleanup(@path)
+
+    # 1) session_path convention.
+    @r = assert_eq_str("path convention", session_path("/tmp/x"), "/tmp/x/sessions.kv")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) create returns a non-empty id, get round-trips data.
+    @sid = session_create(@path, "hello-payload", 3600)
+    @r = assert_true("create returns id", str_len(@sid) > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("get returns data", session_get(@path, @sid), "hello-payload")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) get on absent id -> "".
+    @r = assert_eq_str("get missing", session_get(@path, "no-such-id-xyz"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("get empty id", session_get(@path, ""), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) two creates yield distinct ids.
+    @sid2 = session_create(@path, "second", 3600)
+    @same = 0
+    if str_eq(@sid, @sid2) == 1
+        @same = 1
+    @r = assert_eq_int("ids distinct", @same, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("second get", session_get(@path, @sid2), "second")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) touch existing -> 1, touch missing -> 0.
+    @r = assert_eq_int("touch existing", session_touch(@path, @sid), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("touch missing", session_touch(@path, "no-such-id-xyz"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    # data preserved across touch.
+    @r = assert_eq_str("touch keeps data", session_get(@path, @sid), "hello-payload")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) set_data replaces stored payload.
+    @r = assert_eq_int("set_data existing", session_set_data(@path, @sid, "updated"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("data updated", session_get(@path, @sid), "updated")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("set_data missing", session_set_data(@path, "no-such", "x"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7) is_valid: fresh session valid, missing invalid.
+    @r = assert_eq_int("valid fresh", session_is_valid(@path, @sid), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("valid missing", session_is_valid(@path, "no-such-id-xyz"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("valid empty id", session_is_valid(@path, ""), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8) is_valid with already-expired ttl (0 second ttl => not valid).
+    @expired = session_create(@path, "doomed", 0)
+    @r = assert_eq_int("ttl 0 not valid", session_is_valid(@path, @expired), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("expired get is empty", session_get(@path, @expired), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 9) destroy removes the session; subsequent get returns "".
+    @r = assert_eq_int("destroy existing", session_destroy(@path, @sid), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("get after destroy", session_get(@path, @sid), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("destroy again", session_destroy(@path, @sid), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("destroy missing", session_destroy(@path, "no-such-id-xyz"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    # Other sessions unaffected by destroy.
+    @r = assert_eq_str("other survives", session_get(@path, @sid2), "second")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    _cleanup(@path)
+    test_summary("sessions", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_sessions_tests(0, 0)

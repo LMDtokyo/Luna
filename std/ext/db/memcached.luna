@@ -1,0 +1,261 @@
+# tier: T6
+# deps: tcp
+# ffi: none
+#
+# std/ext/db/memcached — Memcached client (text ASCII protocol) over
+# std/net/tcp.
+#
+# Wire protocol per the memcached project's `doc/protocol.txt`:
+#   set <key> <flags> <exptime> <bytes>\r\n<data>\r\n
+#       -> STORED\r\n | NOT_STORED\r\n | EXISTS\r\n | NOT_FOUND\r\n
+#   get <key>\r\n
+#       -> VALUE <key> <flags> <bytes>\r\n<data>\r\nEND\r\n
+#       -> END\r\n   (when the key is absent)
+#   delete <key>\r\n      -> DELETED\r\n | NOT_FOUND\r\n
+#   incr <key> <n>\r\n    -> <new_value>\r\n | NOT_FOUND\r\n
+#   decr <key> <n>\r\n    -> <new_value>\r\n | NOT_FOUND\r\n
+#   version\r\n           -> VERSION <ver>\r\n
+#   quit\r\n              (server closes the connection, no reply)
+#
+# Public surface:
+#   mc_connect(@host, @port)              -> fd, or -1
+#   mc_close(@fd)
+#   mc_set(@fd, @key, @value, @ttl_secs)  -> 1 on STORED, 0 otherwise
+#   mc_get(@fd, @key)                     -> value string, "" if absent
+#   mc_delete(@fd, @key)                  -> 1 on DELETED, 0 if missing
+#   mc_incr(@fd, @key, @n)                -> new value, -1 if missing
+#   mc_decr(@fd, @key, @n)                -> new value, -1 if missing
+#   mc_version(@fd)                       -> version string ("" on error)
+#   mc_quit(@fd)                          -> 0
+
+import tcp
+
+
+# _mc_int_to_str(@n) — local int->ASCII, avoiding a string-module dep.
+# Mirrors std/ext/db/redis.luna `_redis_int_to_str`.
+fn _mc_int_to_str(@n: int) -> int
+    if @n == 0
+        return "0"
+    @neg = 0
+    if @n < 0
+        @neg = 1
+        @n = 0 - @n
+    @tmp = new_str(24)
+    @i = 0
+    while @n > 0
+        u8_set(@tmp, @i, 48 + (@n % 10))
+        @n = @n / 10
+        @i = @i + 1
+    @out_len = @i + @neg
+    @out = new_str(@out_len)
+    @oi = 0
+    if @neg == 1
+        u8_set(@out, 0, 45)
+        @oi = 1
+    @j = 0
+    while @j < @i
+        u8_set(@out, @oi + @j, u8_at(@tmp, @i - 1 - @j))
+        @j = @j + 1
+    return @out
+
+
+# _mc_parse_int(@s) — parse a leading decimal integer (optional sign),
+# stop at the first non-digit. Returns 0 for an empty / unparseable
+# string.
+fn _mc_parse_int(@s: int) -> int
+    @slen = str_len(@s)
+    if @slen == 0
+        return 0
+    @neg = 0
+    @i = 0
+    if str_byte(@s, 0) == 45
+        @neg = 1
+        @i = 1
+    @n = 0
+    while @i < @slen
+        @c = str_byte(@s, @i)
+        if @c < 48
+            return @n
+        if @c > 57
+            return @n
+        @n = @n * 10 + (@c - 48)
+        @i = @i + 1
+    if @neg == 1
+        return 0 - @n
+    return @n
+
+
+# _mc_recv_line(@fd) -> read until CRLF, return the bytes preceding it
+# as a string (without the CRLF). Returns "" on EOF / read error. The
+# trailing \n is consumed so the next call starts at the next message.
+fn _mc_recv_line(@fd: int) -> int
+    @cap = 256
+    @buf = new_str(@cap)
+    @i = 0
+    @one = new_str(1)
+    while @i < @cap
+        @n = tcp_recv(@fd, @one, 1)
+        if @n <= 0
+            return str_substr(@buf, 0, @i)
+        @c = str_byte(@one, 0)
+        if @c == 13
+            @n = tcp_recv(@fd, @one, 1)
+            return str_substr(@buf, 0, @i)
+        str_set_byte(@buf, @i, @c)
+        @i = @i + 1
+    return str_substr(@buf, 0, @i)
+
+
+# _mc_recv_n(@fd, @n) -> read exactly @n bytes, return as a string.
+# On short read (peer closed) returns the partial buffer.
+fn _mc_recv_n(@fd: int, @n: int) -> int
+    if @n <= 0
+        return ""
+    @buf = new_str(@n)
+    @got = 0
+    while @got < @n
+        @r = tcp_recv(@fd, @buf + @got, @n - @got)
+        if @r <= 0
+            return str_substr(@buf, 0, @got)
+        @got = @got + @r
+    return @buf
+
+
+# _mc_line_starts_with(@line, @prefix) -> 1 if @line starts with @prefix.
+fn _mc_line_starts_with(@line: int, @prefix: int) -> int
+    @llen = str_len(@line)
+    @plen = str_len(@prefix)
+    if @llen < @plen
+        return 0
+    @i = 0
+    while @i < @plen
+        if str_byte(@line, @i) != str_byte(@prefix, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+
+# mc_connect(@host, @port) -> fd, or -1 on failure.
+fn mc_connect(@host: int, @port: int) -> int
+    return tcp_connect(@host, @port)
+
+
+fn mc_close(@fd: int) -> int
+    return tcp_close(@fd)
+
+
+# mc_set(@fd, @key, @value, @ttl_secs) -> 1 on STORED, 0 otherwise.
+# Flags are always sent as 0 — the text protocol treats this slot as
+# an opaque client value and we have no use for it here.
+fn mc_set(@fd: int, @key: int, @value: int, @ttl_secs: int) -> int
+    @vlen = str_len(@value)
+    @cmd = str_concat("set ", @key)
+    @cmd = str_concat(@cmd, " 0 ")
+    @cmd = str_concat(@cmd, _mc_int_to_str(@ttl_secs))
+    @cmd = str_concat(@cmd, " ")
+    @cmd = str_concat(@cmd, _mc_int_to_str(@vlen))
+    @cmd = str_concat(@cmd, "\r\n")
+    @cmd = str_concat(@cmd, @value)
+    @cmd = str_concat(@cmd, "\r\n")
+    tcp_send_str(@fd, @cmd)
+    @reply = _mc_recv_line(@fd)
+    if str_eq(@reply, "STORED") == 1
+        return 1
+    return 0
+
+
+# mc_get(@fd, @key) -> value string, "" if absent or on protocol error.
+#
+# Response shape on hit:
+#     VALUE <key> <flags> <bytes>\r\n
+#     <data>\r\n
+#     END\r\n
+# On miss the server sends just "END\r\n".
+fn mc_get(@fd: int, @key: int) -> int
+    @cmd = str_concat("get ", @key)
+    @cmd = str_concat(@cmd, "\r\n")
+    tcp_send_str(@fd, @cmd)
+    @hdr = _mc_recv_line(@fd)
+    if _mc_line_starts_with(@hdr, "VALUE ") == 0
+        return ""
+    # Parse the 4th whitespace-separated token: <bytes>.
+    @hlen = str_len(@hdr)
+    @tok = 0
+    @start = 0
+    @bytes_len = 0
+    @i = 0
+    while @i <= @hlen
+        @at_end = 0
+        if @i == @hlen
+            @at_end = 1
+        @is_space = 0
+        if @at_end == 0
+            if str_byte(@hdr, @i) == 32
+                @is_space = 1
+        if @at_end == 1
+            @is_space = 1
+        if @is_space == 1
+            if @tok == 3
+                @bytes_len = _mc_parse_int(str_substr(@hdr, @start, @i - @start))
+            @tok = @tok + 1
+            @start = @i + 1
+        @i = @i + 1
+    @data = _mc_recv_n(@fd, @bytes_len)
+    # Trailing \r\n after data, then "END\r\n".
+    _mc_recv_line(@fd)
+    _mc_recv_line(@fd)
+    return @data
+
+
+# mc_delete(@fd, @key) -> 1 on DELETED, 0 on NOT_FOUND.
+fn mc_delete(@fd: int, @key: int) -> int
+    @cmd = str_concat("delete ", @key)
+    @cmd = str_concat(@cmd, "\r\n")
+    tcp_send_str(@fd, @cmd)
+    @reply = _mc_recv_line(@fd)
+    if str_eq(@reply, "DELETED") == 1
+        return 1
+    return 0
+
+
+# mc_incr(@fd, @key, @n) -> new counter value, -1 on NOT_FOUND.
+fn mc_incr(@fd: int, @key: int, @n: int) -> int
+    @cmd = str_concat("incr ", @key)
+    @cmd = str_concat(@cmd, " ")
+    @cmd = str_concat(@cmd, _mc_int_to_str(@n))
+    @cmd = str_concat(@cmd, "\r\n")
+    tcp_send_str(@fd, @cmd)
+    @reply = _mc_recv_line(@fd)
+    if str_eq(@reply, "NOT_FOUND") == 1
+        return -1
+    return _mc_parse_int(@reply)
+
+
+# mc_decr(@fd, @key, @n) -> new counter value, -1 on NOT_FOUND.
+# Memcached clamps the result at zero; this wrapper just forwards.
+fn mc_decr(@fd: int, @key: int, @n: int) -> int
+    @cmd = str_concat("decr ", @key)
+    @cmd = str_concat(@cmd, " ")
+    @cmd = str_concat(@cmd, _mc_int_to_str(@n))
+    @cmd = str_concat(@cmd, "\r\n")
+    tcp_send_str(@fd, @cmd)
+    @reply = _mc_recv_line(@fd)
+    if str_eq(@reply, "NOT_FOUND") == 1
+        return -1
+    return _mc_parse_int(@reply)
+
+
+# mc_version(@fd) -> version string from the server ("" on error).
+fn mc_version(@fd: int) -> int
+    tcp_send_str(@fd, "version\r\n")
+    @reply = _mc_recv_line(@fd)
+    if _mc_line_starts_with(@reply, "VERSION ") == 0
+        return ""
+    return str_substr(@reply, 8, str_len(@reply) - 8)
+
+
+# mc_quit(@fd) — politely close the session. The server closes the
+# socket after receiving "quit\r\n" so there's no reply to read.
+fn mc_quit(@fd: int) -> int
+    tcp_send_str(@fd, "quit\r\n")
+    return 0

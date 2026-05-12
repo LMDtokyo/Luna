@@ -279,6 +279,11 @@ extern "C" fn sys_socket(@dom: int, @type: int, @prot: int) -> int
 extern "C" fn sys_bind(@fd: int, @addr: int, @len: int) -> int
 extern "C" fn sys_listen(@fd: int, @n: int) -> int
 extern "C" fn sys_accept(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn sys_connect(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn sys_setsockopt(@fd: int, @level: int, @opt: int, @val: int, @len: int) -> int
+extern "C" fn sys_time(@tloc: int) -> int
+extern "C" fn sys_rt_sigaction(@signum: int, @act: int, @oldact: int, @sigsetsize: int) -> int
+extern "C" fn sys_kill(@pid: int, @sig: int) -> int
 extern "C" fn sys_mprotect(@addr: int, @len: int, @prot: int) -> int
 
 
@@ -435,3 +440,191 @@ fn hot_listen(@sock_path: int) -> int
     sys_close(@cli)
     sys_close(@fd)
     return @rc
+
+
+# =====================================================================
+# Stack-trace runtime (docs/STACKTRACE_DESIGN.md P3).
+#
+# panic(@msg) writes "panic: <msg>\n" then walks the rbp chain, printing
+# "  at line N  fn NAME\n" for each frame, then exits with status 1.
+#
+# Frame walking uses the rbp-chain emitted by every bootminor function
+# prologue (push rbp; mov rbp, rsp). Address lookup uses the debug
+# table at data[40..56) — see compile_to_gen_target.
+
+fn _eprint_cstr(@p: int) -> int
+    @q = @p
+    while _load_u8(@q) != 0
+        @q = @q + 1
+    sys_write(2, @p, @q - @p)
+    return 0
+
+fn _eprint_hex(@n: int) -> int
+    if @n == 0
+        eprint("0")
+        return 0
+    @buf = vec_new()
+    @x = @n
+    while @x > 0
+        @d = @x & 15
+        if @d < 10
+            vec_push(@buf, 48 + @d)
+        else
+            vec_push(@buf, 87 + @d)
+        @x = @x >> 4
+    @len = vec_len(@buf)
+    @s = new_str(@len)
+    @k = 0
+    while @k < @len
+        str_set_byte(@s, @k, vec_get(@buf, @len - 1 - @k))
+        @k = @k + 1
+    eprint(@s)
+    return 0
+
+fn _addr_in_range(@addr: int, @lo: int, @hi: int) -> int
+    if @addr < @lo
+        return 0
+    if @addr >= @hi
+        return 0
+    return 1
+
+fn _panic_emit_match(@rec: int, @pool: int) -> int
+    @line = _load_u32(@rec + 16)
+    @nm_off = _load_u32(@rec + 20)
+    eprint("  at line ")
+    eprint_int(@line)
+    eprint("  fn ")
+    _eprint_cstr(@pool + @nm_off)
+    eprint("\n")
+    return 0
+
+# Look up @addr; return 0 if found (and printed), 1 if not (stops the walk).
+fn _panic_print_frame(@addr: int) -> int
+    @tbl = dbg_table_ptr()
+    @n = dbg_count()
+    @pool = dbg_pool_ptr()
+    @i = 0
+    while @i < @n
+        @rec = @tbl + @i * 24
+        @pc_lo = _load_u64(@rec)
+        @pc_hi = _load_u64(@rec + 8)
+        if _addr_in_range(@addr, @pc_lo, @pc_hi) == 1
+            _panic_emit_match(@rec, @pool)
+            return 0
+        @i = @i + 1
+    return 1
+
+fn panic(@msg: int) -> int
+    eprint("panic: ")
+    eprint(@msg)
+    eprint("\n")
+    @cur = _get_rbp()
+    while @cur != 0
+        @saved   = _load_u64(@cur)
+        @retaddr = _load_u64(@cur + 8)
+        if _panic_print_frame(@retaddr) != 0
+            @cur = 0
+        else
+            @cur = @saved
+    sys_exit(1)
+    return 1
+
+
+# =====================================================================
+# Fatal-signal handlers (docs/STACKTRACE_DESIGN.md P4).
+#
+# enable_panic_signals() installs a handler for SIGSEGV/SIGFPE/SIGBUS/
+# SIGABRT/SIGILL. On fatal signal, the handler prints "panic: signal N",
+# then walks the rbp chain from the FAULTING frame (RBP from ucontext)
+# and exits with status 128+N. The sa_restorer trampoline emitted by
+# bootminor lets the kernel cleanly return from the handler if needed.
+#
+# Call enable_panic_signals() at the top of main() to opt in.
+
+fn _u64_le_set(@buf: int, @off: int, @v: int) -> int
+    @i = 0
+    while @i < 8
+        str_set_byte(@buf, @off + @i, (@v >> (@i * 8)) & 255)
+        @i = @i + 1
+    return 0
+
+# Compare a NUL-terminated C-string @cp with a Luna string @ls. Returns 1
+# if equal, 0 otherwise. Length-first short-circuit.
+fn _cstr_eq(@cp: int, @ls: int) -> int
+    @n = str_len(@ls)
+    @i = 0
+    while @i < @n
+        @cb = _load_u8(@cp + @i)
+        if @cb == 0
+            return 0
+        if @cb != str_byte(@ls, @i)
+            return 0
+        @i = @i + 1
+    if _load_u8(@cp + @n) != 0
+        return 0
+    return 1
+
+# Find the absolute vaddr of a function by name. Iterates the hot-swap
+# fn table (one pointer per Luna fn).
+fn _fn_addr(@name: int) -> int
+    @count = hot_count()
+    @slots = hot_slots_ptr()
+    @names = hot_names_ptr()
+    @i = 0
+    while @i < @count
+        @nm_ptr = _load_u64(@names + @i * 8)
+        if _cstr_eq(@nm_ptr, @name) == 1
+            return _load_u64(@slots + @i * 8)
+        @i = @i + 1
+    return 0
+
+# The signal handler the kernel calls. SysV ABI: rdi=signum, rsi=siginfo*, rdx=ucontext*.
+# ucontext layout (x86_64 Linux):
+#   offset 40 = mcontext_t
+#   mcontext.gregs[REG_RBP] at index 10 → mcontext+80 → ucontext+120
+#   mcontext.gregs[REG_RIP] at index 16 → mcontext+128 → ucontext+168
+fn _panic_signal_handler(@signum: int, @info: int, @ctx: int) -> int
+    eprint("panic: caught signal ")
+    eprint_int(@signum)
+    eprint("\n")
+    @rip = _load_u64(@ctx + 168)
+    _panic_print_frame(@rip)
+    @rbp_at_fault = _load_u64(@ctx + 120)
+    @cur = @rbp_at_fault
+    while @cur != 0
+        @saved   = _load_u64(@cur)
+        @retaddr = _load_u64(@cur + 8)
+        if _panic_print_frame(@retaddr) != 0
+            @cur = 0
+        else
+            @cur = @saved
+    sys_exit(128 + @signum)
+    return 1
+
+# Install our handler for one signal. struct k_sigaction layout
+# (kernel ABI, NOT glibc): sa_handler, sa_flags, sa_restorer, sa_mask (8B).
+# Flags: SA_SIGINFO (0x4) | SA_RESTORER (0x04000000) | SA_RESETHAND (0x80000000)
+# = 0x84000004. SA_RESETHAND prevents infinite recursion if our handler
+# itself faults.
+fn _install_signal(@signum: int) -> int
+    @h = _fn_addr("_panic_signal_handler")
+    if @h == 0
+        return 0
+    @tramp = _panic_sig_trampoline_ptr()
+    @sa = new_str(32)
+    _u64_le_set(@sa, 0,  @h)
+    _u64_le_set(@sa, 8,  2214592516)
+    _u64_le_set(@sa, 16, @tramp)
+    _u64_le_set(@sa, 24, 0)
+    sys_rt_sigaction(@signum, @sa, 0, 8)
+    return 0
+
+# Install handlers for the five fatal signals. Call once near the top
+# of main() to opt into panic-style traces on SEGV/FPE/BUS/ABRT/ILL.
+fn enable_panic_signals() -> int
+    _install_signal(11)
+    _install_signal(8)
+    _install_signal(7)
+    _install_signal(6)
+    _install_signal(4)
+    return 0

@@ -1,0 +1,553 @@
+# tier: T4
+# deps: strings
+# ffi: none
+#
+# std/json — minimal in-place JSON scanner.
+#
+# This isn't a DOM parser — there's no allocation of node trees. Every
+# function takes a (src, pos) pair and returns either a value or a
+# new pos, so you can walk the document directly. Good fit for the
+# Telegram Bot API where you want a few specific fields out of each
+# update and don't care about generic traversal.
+#
+# All offsets are byte indices into the source string. A negative
+# return from a "find" function means "not present".
+#
+# Supported value kinds: object, array, string, integer (int64),
+# bool (true/false), null. Floats are parsed into ints with the
+# fractional part dropped — Telegram doesn't return floats in any
+# field a bot cares about.
+#
+# Strings are decoded into freshly-allocated Luna strings: \" \\ \/
+# \n \r \t \f \b \uXXXX (BMP only). UTF-8 bytes outside ASCII pass
+# through verbatim.
+
+import strings
+
+
+# --- whitespace + scanning helpers -----------------------------------
+
+fn _json_skip_ws(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    while @pos < @n
+        @c = str_byte(@src, @pos)
+        if @c == 32
+            @pos = @pos + 1
+        elif @c == 9
+            @pos = @pos + 1
+        elif @c == 10
+            @pos = @pos + 1
+        elif @c == 13
+            @pos = @pos + 1
+        else
+            break
+    return @pos
+
+# Skip a JSON string starting at @pos (which points to the opening
+# quote). Returns the position of the byte AFTER the closing quote,
+# or @pos if not a string.
+fn _json_skip_string(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    if @pos >= @n
+        return @pos
+    if str_byte(@src, @pos) != 34
+        return @pos
+    @pos = @pos + 1
+    while @pos < @n
+        @c = str_byte(@src, @pos)
+        if @c == 34
+            return @pos + 1
+        if @c == 92
+            @pos = @pos + 2
+        else
+            @pos = @pos + 1
+    return @pos
+
+# Skip a single JSON value (object/array/string/int/bool/null) and
+# return the position AFTER it. The caller must have already skipped
+# leading whitespace before @pos.
+fn json_skip_value(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    @pos = _json_skip_ws(@src, @pos)
+    if @pos >= @n
+        return @pos
+    @c = str_byte(@src, @pos)
+    if @c == 34
+        return _json_skip_string(@src, @pos)
+    if @c == 123
+        return _json_skip_object(@src, @pos)
+    if @c == 91
+        return _json_skip_array(@src, @pos)
+    # Keyword: true / false / null — consume the alpha run.
+    if @c == 116
+        return _json_skip_keyword(@src, @pos)
+    if @c == 102
+        return _json_skip_keyword(@src, @pos)
+    if @c == 110
+        return _json_skip_keyword(@src, @pos)
+    # Number: optional '-' / '+', digits, optional '.', optional 'e[+-]?'.
+    if @c == 45
+        @pos = @pos + 1
+    if @c == 43
+        @pos = @pos + 1
+    while @pos < @n
+        @b = str_byte(@src, @pos)
+        if @b == 46
+            @pos = @pos + 1
+        elif @b == 101
+            @pos = @pos + 1
+        elif @b == 69
+            @pos = @pos + 1
+        elif @b == 45
+            @pos = @pos + 1
+        elif @b == 43
+            @pos = @pos + 1
+        else
+            if @b < 48
+                break
+            if @b > 57
+                break
+            @pos = @pos + 1
+    return @pos
+
+fn _json_skip_keyword(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    while @pos < @n
+        @c = str_byte(@src, @pos)
+        if @c >= 97
+            if @c <= 122
+                @pos = @pos + 1
+                continue
+        if @c >= 65
+            if @c <= 90
+                @pos = @pos + 1
+                continue
+        break
+    return @pos
+
+fn _json_skip_object(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    if @pos >= @n
+        return @pos
+    @pos = @pos + 1                # consume '{'
+    @depth = 1
+    while @pos < @n
+        @pos = _json_skip_ws(@src, @pos)
+        if @pos >= @n
+            break
+        @c = str_byte(@src, @pos)
+        if @c == 125
+            @depth = @depth - 1
+            @pos = @pos + 1
+            if @depth == 0
+                return @pos
+        elif @c == 123
+            @pos = _json_skip_object(@src, @pos)
+        elif @c == 91
+            @pos = _json_skip_array(@src, @pos)
+        elif @c == 34
+            @pos = _json_skip_string(@src, @pos)
+        else
+            @pos = @pos + 1
+    return @pos
+
+fn _json_skip_array(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    if @pos >= @n
+        return @pos
+    @pos = @pos + 1                # consume '['
+    while @pos < @n
+        @pos = _json_skip_ws(@src, @pos)
+        if @pos >= @n
+            break
+        @c = str_byte(@src, @pos)
+        if @c == 93
+            return @pos + 1
+        if @c == 44
+            @pos = @pos + 1
+        else
+            @pos = json_skip_value(@src, @pos)
+    return @pos
+
+
+# --- key lookup inside an object -------------------------------------
+
+# Equality between a JSON-encoded string starting at @str_pos (pointing
+# at the opening quote) and a plain Luna string @key. Returns 1 on
+# match. Doesn't decode escapes — the caller's keys are ASCII.
+fn _json_str_eq(@src: int, @str_pos: int, @key: int) -> int
+    @n = str_len(@src)
+    if @str_pos >= @n
+        return 0
+    if str_byte(@src, @str_pos) != 34
+        return 0
+    @i = @str_pos + 1
+    @ki = 0
+    @kn = str_len(@key)
+    while @i < @n
+        @c = str_byte(@src, @i)
+        if @c == 34
+            if @ki == @kn
+                return 1
+            return 0
+        if @c == 92
+            if @i + 1 >= @n
+                return 0
+            @e = str_byte(@src, @i + 1)
+            if @ki >= @kn
+                return 0
+            @t = @e
+            if @e == 110
+                @t = 10
+            if @e == 114
+                @t = 13
+            if @e == 116
+                @t = 9
+            if str_byte(@key, @ki) != @t
+                return 0
+            @ki = @ki + 1
+            @i = @i + 2
+            continue
+        if @ki >= @kn
+            return 0
+        if str_byte(@key, @ki) != @c
+            return 0
+        @ki = @ki + 1
+        @i = @i + 1
+    return 0
+
+# Inside the object whose '{' is at @obj_pos, find the value position
+# associated with @key. Returns the position of the value (post-colon,
+# whitespace skipped), or -1 if the key isn't present.
+fn json_find_key(@src: int, @obj_pos: int, @key: int) -> int
+    @n = str_len(@src)
+    @pos = _json_skip_ws(@src, @obj_pos)
+    if @pos >= @n
+        return 0 - 1
+    if str_byte(@src, @pos) != 123
+        return 0 - 1
+    @pos = @pos + 1
+    while @pos < @n
+        @pos = _json_skip_ws(@src, @pos)
+        if @pos >= @n
+            return 0 - 1
+        @c = str_byte(@src, @pos)
+        if @c == 125
+            return 0 - 1
+        if @c == 44
+            @pos = @pos + 1
+            continue
+        # @pos at the opening quote of a key.
+        @match = _json_str_eq(@src, @pos, @key)
+        @after_key = _json_skip_string(@src, @pos)
+        @after_key = _json_skip_ws(@src, @after_key)
+        if @after_key >= @n
+            return 0 - 1
+        if str_byte(@src, @after_key) != 58
+            return 0 - 1
+        @val_pos = _json_skip_ws(@src, @after_key + 1)
+        if @match == 1
+            return @val_pos
+        @pos = json_skip_value(@src, @val_pos)
+    return 0 - 1
+
+
+# --- value extractors -----------------------------------------------
+
+# Extract a JSON string at @pos into a freshly allocated Luna string.
+# Decodes \" \\ \/ \n \r \t \f \b. Other escapes pass through. Returns
+# "" if @pos doesn't point at a string.
+fn json_get_string_at(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    @pos = _json_skip_ws(@src, @pos)
+    if @pos >= @n
+        return ""
+    if str_byte(@src, @pos) != 34
+        return ""
+    @buf = strbuf_new()
+    @i = @pos + 1
+    while @i < @n
+        @c = str_byte(@src, @i)
+        if @c == 34
+            return strbuf_done(@buf)
+        if @c == 92
+            if @i + 1 >= @n
+                return strbuf_done(@buf)
+            @e = str_byte(@src, @i + 1)
+            if @e == 110
+                strbuf_add_byte(@buf, 10)
+            elif @e == 114
+                strbuf_add_byte(@buf, 13)
+            elif @e == 116
+                strbuf_add_byte(@buf, 9)
+            elif @e == 102
+                strbuf_add_byte(@buf, 12)
+            elif @e == 98
+                strbuf_add_byte(@buf, 8)
+            elif @e == 34
+                strbuf_add_byte(@buf, 34)
+            elif @e == 92
+                strbuf_add_byte(@buf, 92)
+            elif @e == 47
+                strbuf_add_byte(@buf, 47)
+            elif @e == 117
+                # \uXXXX — decode 4 hex digits, encode as UTF-8.
+                if @i + 5 < @n
+                    @cp = _json_hex4(@src, @i + 2)
+                    @i = @i + 6
+                    _json_emit_utf8(@buf, @cp)
+                    continue
+                strbuf_add_byte(@buf, @e)
+            else
+                strbuf_add_byte(@buf, @e)
+            @i = @i + 2
+        else
+            strbuf_add_byte(@buf, @c)
+            @i = @i + 1
+    return strbuf_done(@buf)
+
+fn _json_hex4(@src: int, @pos: int) -> int
+    @v = 0
+    @i = 0
+    while @i < 4
+        @c = str_byte(@src, @pos + @i)
+        @d = 0
+        if @c >= 48
+            if @c <= 57
+                @d = @c - 48
+        if @c >= 97
+            if @c <= 102
+                @d = @c - 87
+        if @c >= 65
+            if @c <= 70
+                @d = @c - 55
+        @v = (@v << 4) | @d
+        @i = @i + 1
+    return @v
+
+fn _json_emit_utf8(@buf: StrBuf, @cp: int) -> int
+    if @cp < 128
+        strbuf_add_byte(@buf, @cp)
+        return 0
+    if @cp < 2048
+        strbuf_add_byte(@buf, 192 | (@cp >> 6))
+        strbuf_add_byte(@buf, 128 | (@cp & 63))
+        return 0
+    strbuf_add_byte(@buf, 224 | (@cp >> 12))
+    strbuf_add_byte(@buf, 128 | ((@cp >> 6) & 63))
+    strbuf_add_byte(@buf, 128 | (@cp & 63))
+    return 0
+
+# Extract a JSON integer at @pos. Returns 0 if not a number.
+fn json_get_int_at(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    @pos = _json_skip_ws(@src, @pos)
+    if @pos >= @n
+        return 0
+    @neg = 0
+    if str_byte(@src, @pos) == 45
+        @neg = 1
+        @pos = @pos + 1
+    if str_byte(@src, @pos) == 43
+        @pos = @pos + 1
+    @v = 0
+    while @pos < @n
+        @c = str_byte(@src, @pos)
+        if @c < 48
+            break
+        if @c > 57
+            break
+        @v = @v * 10 + (@c - 48)
+        @pos = @pos + 1
+    if @neg == 1
+        return 0 - @v
+    return @v
+
+# Extract a JSON bool at @pos. Returns 1 for true, 0 for false / null /
+# missing — the caller can distinguish via _is_null where needed.
+fn json_get_bool_at(@src: int, @pos: int) -> int
+    @pos = _json_skip_ws(@src, @pos)
+    @n = str_len(@src)
+    if @pos + 4 <= @n
+        if str_byte(@src, @pos) == 116
+            if str_byte(@src, @pos + 1) == 114
+                if str_byte(@src, @pos + 2) == 117
+                    if str_byte(@src, @pos + 3) == 101
+                        return 1
+    return 0
+
+
+# --- object-key convenience wrappers --------------------------------
+
+# Find @key in object at @obj and return its value as a string, or
+# "" if missing.
+fn json_obj_str(@src: int, @obj: int, @key: int) -> int
+    @v = json_find_key(@src, @obj, @key)
+    if @v < 0
+        return ""
+    return json_get_string_at(@src, @v)
+
+fn json_obj_int(@src: int, @obj: int, @key: int) -> int
+    @v = json_find_key(@src, @obj, @key)
+    if @v < 0
+        return 0
+    return json_get_int_at(@src, @v)
+
+fn json_obj_bool(@src: int, @obj: int, @key: int) -> int
+    @v = json_find_key(@src, @obj, @key)
+    if @v < 0
+        return 0
+    return json_get_bool_at(@src, @v)
+
+# Returns the position of the nested object/array's opening bracket,
+# or -1 if @key is missing.
+fn json_obj_pos(@src: int, @obj: int, @key: int) -> int
+    return json_find_key(@src, @obj, @key)
+
+
+# --- array iteration ------------------------------------------------
+
+# Build a Vec of positions, one per element, for the array starting
+# at @arr_pos. Each entry is a position pointing at a value (caller
+# can pass it to json_get_string_at / json_obj_str / etc.).
+fn json_array_positions(@src: int, @arr_pos: int) -> Vec
+    @out = vec_new()
+    @n = str_len(@src)
+    @pos = _json_skip_ws(@src, @arr_pos)
+    if @pos >= @n
+        return @out
+    if str_byte(@src, @pos) != 91
+        return @out
+    @pos = @pos + 1
+    while @pos < @n
+        @pos = _json_skip_ws(@src, @pos)
+        if @pos >= @n
+            break
+        @c = str_byte(@src, @pos)
+        if @c == 93
+            break
+        if @c == 44
+            @pos = @pos + 1
+            continue
+        vec_push(@out, @pos)
+        @pos = json_skip_value(@src, @pos)
+    return @out
+
+
+# --- writing JSON ---------------------------------------------------
+
+# Escape a string for inclusion in JSON output. Adds enclosing quotes.
+fn json_escape(@s: int) -> int
+    @b = strbuf_new()
+    strbuf_add_byte(@b, 34)
+    @n = str_len(@s)
+    @i = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c == 34
+            strbuf_add_byte(@b, 92)
+            strbuf_add_byte(@b, 34)
+        elif @c == 92
+            strbuf_add_byte(@b, 92)
+            strbuf_add_byte(@b, 92)
+        elif @c == 10
+            strbuf_add_byte(@b, 92)
+            strbuf_add_byte(@b, 110)
+        elif @c == 13
+            strbuf_add_byte(@b, 92)
+            strbuf_add_byte(@b, 114)
+        elif @c == 9
+            strbuf_add_byte(@b, 92)
+            strbuf_add_byte(@b, 116)
+        elif @c < 32
+            strbuf_add_byte(@b, 92)
+            strbuf_add_byte(@b, 117)
+            strbuf_add_byte(@b, 48)
+            strbuf_add_byte(@b, 48)
+            @hi = (@c >> 4) & 15
+            @lo = @c & 15
+            if @hi < 10
+                strbuf_add_byte(@b, 48 + @hi)
+            else
+                strbuf_add_byte(@b, 87 + @hi)
+            if @lo < 10
+                strbuf_add_byte(@b, 48 + @lo)
+            else
+                strbuf_add_byte(@b, 87 + @lo)
+        else
+            strbuf_add_byte(@b, @c)
+        @i = @i + 1
+    strbuf_add_byte(@b, 34)
+    return strbuf_done(@b)
+
+
+# --- Top-level convenience accessors -----------------------------------
+#
+# Most messenger code receives a whole JSON object as the request body
+# and just wants one or two fields. These wrap the json_obj_* family
+# with @obj=0 so the caller doesn't have to find the outermost object
+# position by hand.
+#
+#   @body = "{\"name\":\"alice\",\"age\":30,\"admin\":true}"
+#   json_get_str(@body,  "name")  -> "alice"
+#   json_get_int(@body,  "age")   -> 30
+#   json_get_bool(@body, "admin") -> 1
+
+fn json_get_str(@src: int, @key: int) -> int
+    return json_obj_str(@src, 0, @key)
+
+fn json_get_int(@src: int, @key: int) -> int
+    return json_obj_int(@src, 0, @key)
+
+fn json_get_bool(@src: int, @key: int) -> int
+    return json_obj_bool(@src, 0, @key)
+
+# json_has(@src, @key) -> 1 if the key exists in the top-level object,
+# 0 otherwise. Useful for distinguishing "missing" from "empty" for
+# string/int fields where the default-value can't be distinguished.
+fn json_has(@src: int, @key: int) -> int
+    if json_find_key(@src, 0, @key) >= 0
+        return 1
+    return 0
+
+
+# --- Top-level array accessors -----------------------------------------
+#
+# Most messenger payloads embed arrays inside the request body, e.g.
+#   {"messages":[{"text":"hi"},{"text":"yo"}], "next":"..."}
+# These wrap json_array_positions so the caller can ignore the @obj
+# position arithmetic.
+
+# json_array_at(@src, @key) -> Vec of element positions, empty Vec if
+# @key is missing or not an array.
+fn json_array_at(@src: int, @key: int) -> Vec
+    @apos = json_obj_pos(@src, 0, @key)
+    if @apos < 0
+        return vec_new()
+    return json_array_positions(@src, @apos)
+
+
+# json_array_len(@src, @key) -> element count for the array at @key.
+fn json_array_len(@src: int, @key: int) -> int
+    let @v: Vec = json_array_at(@src, @key)
+    return vec_len(@v)
+
+
+# json_array_str(@src, @key, @idx) -> string at index, or "".
+fn json_array_str(@src: int, @key: int, @idx: int) -> int
+    let @v: Vec = json_array_at(@src, @key)
+    if @idx < 0
+        return ""
+    if @idx >= vec_len(@v)
+        return ""
+    return json_get_string_at(@src, vec_get(@v, @idx))
+
+
+# json_array_int(@src, @key, @idx) -> int at index, or 0.
+fn json_array_int(@src: int, @key: int, @idx: int) -> int
+    let @v: Vec = json_array_at(@src, @key)
+    if @idx < 0
+        return 0
+    if @idx >= vec_len(@v)
+        return 0
+    return json_get_int_at(@src, vec_get(@v, @idx))

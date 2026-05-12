@@ -1,0 +1,111 @@
+# world.luna — handlers that hit external APIs.
+#
+# Every API picked here returns plain text or JSON without requiring
+# custom request headers (which the prelude's http_get can't set).
+# Outputs are short — fits in one Telegram message.
+
+fn cmd_weather(@token: int, @chat_id: int, @city: int) -> int
+    if str_len(@city) == 0
+        send_markdown(@token, @chat_id, "usage: `/weather <city>`")
+        return 0
+    @url = str_concat("https://wttr.in/", url_encode(@city))
+    @url = str_concat(@url, "?format=3")
+    @resp = http_get(@url)
+    if str_len(@resp) == 0
+        send_message(@token, @chat_id, "wttr.in did not reply (network/timeout)")
+        return 0
+    send_message(@token, @chat_id, str_trim(@resp))
+    return 0
+
+fn cmd_quote(@token: int, @chat_id: int) -> int
+    @resp = http_get("https://api.quotable.io/random")
+    if str_len(@resp) == 0
+        send_message(@token, @chat_id, "quotable did not reply")
+        return 0
+    @text   = json_get_str(@resp, "content")
+    @author = json_get_str(@resp, "author")
+    if str_len(@text) == 0
+        send_message(@token, @chat_id, "no quote in response")
+        return 0
+    @msg = str_concat("_", @text)
+    @msg = str_concat(@msg, "_\n— ")
+    @msg = str_concat(@msg, @author)
+    send_markdown(@token, @chat_id, @msg)
+    return 0
+
+fn cmd_catfact(@token: int, @chat_id: int) -> int
+    @resp = http_get("https://catfact.ninja/fact")
+    if str_len(@resp) == 0
+        send_message(@token, @chat_id, "catfact.ninja did not reply")
+        return 0
+    @fact = json_get_str(@resp, "fact")
+    if str_len(@fact) == 0
+        send_message(@token, @chat_id, "no fact in response")
+        return 0
+    send_message(@token, @chat_id, str_concat("🐱 ", @fact))
+    return 0
+
+fn cmd_btc(@token: int, @chat_id: int) -> int
+    @resp = http_get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+    if str_len(@resp) == 0
+        send_message(@token, @chat_id, "coingecko did not reply")
+        return 0
+    @bitcoin = json_pick_obj(@resp, "bitcoin")
+    @usd = json_get_int(@bitcoin, "usd")
+    send_message(@token, @chat_id, str_concat("💰 BTC: $", int_to_str(@usd)))
+    return 0
+
+fn cmd_eth(@token: int, @chat_id: int) -> int
+    @resp = http_get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")
+    if str_len(@resp) == 0
+        send_message(@token, @chat_id, "coingecko did not reply")
+        return 0
+    @eth = json_pick_obj(@resp, "ethereum")
+    @usd = json_get_int(@eth, "usd")
+    send_message(@token, @chat_id, str_concat("💎 ETH: $", int_to_str(@usd)))
+    return 0
+
+fn cmd_ip(@token: int, @chat_id: int, @addr: int) -> int
+    if str_len(@addr) == 0
+        send_markdown(@token, @chat_id, "usage: `/ip <address>`")
+        return 0
+    @url = str_concat("http://ip-api.com/json/", url_encode(@addr))
+    @resp = http_get(@url)
+    if str_len(@resp) == 0
+        send_message(@token, @chat_id, "ip-api did not reply")
+        return 0
+    @country = json_get_str(@resp, "country")
+    @region  = json_get_str(@resp, "regionName")
+    @city    = json_get_str(@resp, "city")
+    @isp     = json_get_str(@resp, "isp")
+    @msg = str_concat("*", @addr)
+    @msg = str_concat(@msg, "*\n📍 ")
+    @msg = str_concat(@msg, @city)
+    @msg = str_concat(@msg, ", ")
+    @msg = str_concat(@msg, @region)
+    @msg = str_concat(@msg, ", ")
+    @msg = str_concat(@msg, @country)
+    @msg = str_concat(@msg, "\n🛰 ")
+    @msg = str_concat(@msg, @isp)
+    send_markdown(@token, @chat_id, @msg)
+    return 0
+
+fn cmd_myip(@token: int, @chat_id: int) -> int
+    @resp = http_get("https://api.ipify.org")
+    if str_len(@resp) == 0
+        send_message(@token, @chat_id, "ipify did not reply")
+        return 0
+    send_message(@token, @chat_id, str_concat("my external IP is ", str_trim(@resp)))
+    return 0
+
+fn cmd_joke(@token: int, @chat_id: int) -> int
+    @resp = http_get("https://v2.jokeapi.dev/joke/Any?type=single&safe-mode")
+    if str_len(@resp) == 0
+        send_message(@token, @chat_id, "jokeapi did not reply")
+        return 0
+    @joke = json_get_str(@resp, "joke")
+    if str_len(@joke) == 0
+        send_message(@token, @chat_id, "no joke in response")
+        return 0
+    send_message(@token, @chat_id, str_concat("🤡 ", @joke))
+    return 0

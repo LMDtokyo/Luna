@@ -1,0 +1,35 @@
+# Tests for std/ext/crypto/sha512 — NIST vectors + RFC 4231 HMAC.
+
+import sha512
+import test
+
+
+fn run_sha512_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # NIST FIPS 180-4: sha512("abc")
+    @want_abc = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    @r = assert_eq_str("sha512 abc", sha512_hex("abc"), @want_abc)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Empty string vector.
+    @want_empty = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    @r = assert_eq_str("sha512 empty", sha512_hex(""), @want_empty)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # RFC 4231 #2: key "Jefe", message "what do ya want for nothing?"
+    @want_jefe = "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"
+    @r = assert_eq_str("hmac_sha512 Jefe", hmac_sha512_hex("Jefe", "what do ya want for nothing?"), @want_jefe)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("sha512", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_sha512_tests(0, 0)

@@ -1,0 +1,151 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/cli — GNU-style command-line argument parser.
+#
+# Bootminor port of src/stdlib_new/cli.luna. The parser body is
+# unchanged; the imports below pull in the helpers it relies on
+# (str_starts_with, parse_int from std/strings, map_* from std/map).
+#
+# Supports:
+#   --name=value     long flag with attached value
+#   --name value     long flag with detached value (next argv)
+#   --flag           bare long flag (stored as "1")
+#   -x               short flag (one byte → "1")
+#   -xyz             multiple short flags in one token
+#   -                positional (stdin convention)
+#   --               sentinel: everything after is positional
+#
+# A Cli handle is a Vec of two elements:
+#   index 0 → flags map  (name → value string)
+#   index 1 → positionals (Vec of strings)
+
+import strings
+import map
+
+
+fn cli_new() -> int
+    @cli = vec_new()
+    @flags = map_new()
+    @positionals = vec_new()
+    vec_push(@cli, @flags)
+    vec_push(@cli, @positionals)
+    return @cli
+
+fn _cli_flags(@cli: int) -> int
+    return vec_get(@cli, 0)
+
+fn _cli_positionals(@cli: int) -> int
+    return vec_get(@cli, 1)
+
+# Return 1 if string @s starts with byte @b (ASCII); else 0.
+fn _cli_starts_byte(@s: int, @b: int) -> int
+    if str_len(@s) < 1
+        return 0
+    if str_byte(@s, 0) == @b
+        return 1
+    return 0
+
+# Find first '=' in s; return its index or -1.
+fn _cli_find_eq(@s: int) -> int
+    @n = str_len(@s)
+    @i = 0
+    while @i < @n
+        if str_byte(@s, @i) == 61
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
+# Parse argv (a Vec of string pointers) into the @cli handle.
+fn cli_parse(@cli: int, @argv: int) -> int
+    @flags = _cli_flags(@cli)
+    @positionals = _cli_positionals(@cli)
+    @n = vec_len(@argv)
+    @i = 0
+    @stop_flags = 0
+    while @i < @n
+        @arg_s = vec_get(@argv, @i)
+        @len = str_len(@arg_s)
+        if @stop_flags == 1
+            vec_push(@positionals, @arg_s)
+            @i = @i + 1
+        elif str_eq(@arg_s, "--") == 1
+            @stop_flags = 1
+            @i = @i + 1
+        elif str_starts_with(@arg_s, "--") == 1
+            @rest = str_substr(@arg_s, 2, @len - 2)
+            @eq = _cli_find_eq(@rest)
+            if @eq >= 0
+                @name = str_substr(@rest, 0, @eq)
+                @val = str_substr(@rest, @eq + 1, str_len(@rest) - @eq - 1)
+                map_set(@flags, @name, @val)
+                @i = @i + 1
+            else
+                @has_next = 0
+                if @i + 1 < @n
+                    @has_next = 1
+                @take_val = 0
+                if @has_next == 1
+                    @next_s = vec_get(@argv, @i + 1)
+                    if _cli_starts_byte(@next_s, 45) == 0
+                        @take_val = 1
+                if @take_val == 1
+                    @nv = vec_get(@argv, @i + 1)
+                    map_set(@flags, @rest, @nv)
+                    @i = @i + 2
+                else
+                    map_set(@flags, @rest, "1")
+                    @i = @i + 1
+        elif str_starts_with(@arg_s, "-") == 1
+            if @len == 1
+                vec_push(@positionals, @arg_s)
+                @i = @i + 1
+            else
+                @j = 1
+                while @j < @len
+                    @cbyte = str_byte(@arg_s, @j)
+                    @key = new_str(1)
+                    str_set_byte(@key, 0, @cbyte)
+                    map_set(@flags, @key, "1")
+                    @j = @j + 1
+                @i = @i + 1
+        else
+            vec_push(@positionals, @arg_s)
+            @i = @i + 1
+    return 0
+
+fn cli_flag(@cli: int, @name: int) -> int
+    @flags = _cli_flags(@cli)
+    return map_has(@flags, @name)
+
+fn cli_opt(@cli: int, @name: int) -> int
+    @flags = _cli_flags(@cli)
+    if map_has(@flags, @name) == 0
+        return ""
+    return map_get(@flags, @name)
+
+fn cli_opt_or(@cli: int, @name: int, @default: int) -> int
+    @flags = _cli_flags(@cli)
+    if map_has(@flags, @name) == 0
+        return @default
+    return map_get(@flags, @name)
+
+fn cli_opt_int(@cli: int, @name: int, @default: int) -> int
+    @flags = _cli_flags(@cli)
+    if map_has(@flags, @name) == 0
+        return @default
+    @v = map_get(@flags, @name)
+    return parse_int(@v)
+
+fn cli_positional(@cli: int, @idx: int) -> int
+    @positionals = _cli_positionals(@cli)
+    if @idx < 0
+        return ""
+    if @idx >= vec_len(@positionals)
+        return ""
+    return vec_get(@positionals, @idx)
+
+fn cli_positional_count(@cli: int) -> int
+    @positionals = _cli_positionals(@cli)
+    return vec_len(@positionals)

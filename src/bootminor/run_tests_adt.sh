@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # ADT / pattern matching smoke suite.
 set -u
-LUNA_BOOT="${LUNA_BOOT:-./bootstrap/luna-boot.exe}"
-OUT_DIR="${OUT_DIR:-c:/tmp/luna_bootminor_adt}"
+if [ -z "${LUNA_NATIVE:-}" ] && ! grep -qiE 'microsoft|WSL' /proc/sys/kernel/osrelease 2>/dev/null; then
+    LUNA_NATIVE=1
+fi
+if [ "${LUNA_NATIVE:-0}" = "1" ]; then
+    LUNA_BOOT="${LUNA_BOOT:-./bootstrap/luna-boot}"
+    OUT_DIR="${OUT_DIR:-/tmp/luna_bootminor_adt}"
+else
+    LUNA_BOOT="${LUNA_BOOT:-./bootstrap/luna-boot.exe}"
+    OUT_DIR="${OUT_DIR:-c:/tmp/luna_bootminor_adt}"
+fi
 SRC_DIR="$(dirname "$0")"
 WSL_DISTRO="${WSL_DISTRO:-Ubuntu}"
 mkdir -p "$OUT_DIR"

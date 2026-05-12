@@ -1,0 +1,182 @@
+# JWT (HS256) round-trip + RFC 4648 base64url vectors.
+#
+# Payloads with embedded quotes are built byte-by-byte to sidestep
+# bootminor's \"-escape quirk inside braces (see CONTRIBUTING.md).
+
+import jwt
+import test
+import time
+
+
+# {"user":"alice"} — 16 bytes
+fn _mk_payload_alice() -> int
+    @s = new_str(16)
+    str_set_byte(@s, 0,  123)   # {
+    str_set_byte(@s, 1,  34)    # "
+    str_set_byte(@s, 2,  117)   # u
+    str_set_byte(@s, 3,  115)   # s
+    str_set_byte(@s, 4,  101)   # e
+    str_set_byte(@s, 5,  114)   # r
+    str_set_byte(@s, 6,  34)    # "
+    str_set_byte(@s, 7,  58)    # :
+    str_set_byte(@s, 8,  34)    # "
+    str_set_byte(@s, 9,  97)    # a
+    str_set_byte(@s, 10, 108)   # l
+    str_set_byte(@s, 11, 105)   # i
+    str_set_byte(@s, 12, 99)    # c
+    str_set_byte(@s, 13, 101)   # e
+    str_set_byte(@s, 14, 34)    # "
+    str_set_byte(@s, 15, 125)   # }
+    return @s
+
+
+# {"user":"bob"} — 14 bytes (used as the "tampered" payload)
+fn _mk_payload_bob() -> int
+    @s = new_str(14)
+    str_set_byte(@s, 0,  123)
+    str_set_byte(@s, 1,  34)
+    str_set_byte(@s, 2,  117)
+    str_set_byte(@s, 3,  115)
+    str_set_byte(@s, 4,  101)
+    str_set_byte(@s, 5,  114)
+    str_set_byte(@s, 6,  34)
+    str_set_byte(@s, 7,  58)
+    str_set_byte(@s, 8,  34)
+    str_set_byte(@s, 9,  98)
+    str_set_byte(@s, 10, 111)
+    str_set_byte(@s, 11, 98)
+    str_set_byte(@s, 12, 34)
+    str_set_byte(@s, 13, 125)
+    return @s
+
+
+# {"exp":<ts>} with the timestamp embedded as decimal.
+fn _mk_payload_exp(@ts: int) -> int
+    @ts_str = int_to_str(@ts)
+    @out = str_concat("{", "")
+    @q = new_str(1)
+    str_set_byte(@q, 0, 34)             # "
+    @out = str_concat(@out, @q)
+    @out = str_concat(@out, "exp")
+    @out = str_concat(@out, @q)
+    @out = str_concat(@out, ":")
+    @out = str_concat(@out, @ts_str)
+    @out = str_concat(@out, "}")
+    return @out
+
+
+# Swap parts[1] of @token with the given base64url-encoded payload.
+fn _tamper_payload(@token: int, @new_b64: int) -> int
+    @n = str_len(@token)
+    @first_dot = 0 - 1
+    @last_dot = 0 - 1
+    @i = 0
+    while @i < @n
+        if str_byte(@token, @i) == 46
+            if @first_dot < 0
+                @first_dot = @i
+            else
+                @last_dot = @i
+        @i = @i + 1
+    @head = str_substr(@token, 0, @first_dot + 1)
+    @tail = str_substr(@token, @last_dot, @n - @last_dot)
+    @out = str_concat(@head, @new_b64)
+    @out = str_concat(@out, @tail)
+    return @out
+
+
+fn run_jwt_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # --- base64url RFC 4648 sec 10 test vectors ---
+    @r = assert_eq_str("b64url empty", jwt_base64url_encode(""), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("b64url f", jwt_base64url_encode("f"), "Zg")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("b64url fo", jwt_base64url_encode("fo"), "Zm8")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("b64url foo", jwt_base64url_encode("foo"), "Zm9v")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("b64url foobar", jwt_base64url_encode("foobar"), "Zm9vYmFy")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # base64url decode round-trips
+    @r = assert_eq_str("b64url decode foobar", jwt_base64url_decode("Zm9vYmFy"), "foobar")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("b64url decode f", jwt_base64url_decode("Zg"), "f")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- sign + verify round trip ---
+    @payload = _mk_payload_alice()
+    @secret = "topsecret"
+    @token = jwt_sign(@payload, @secret)
+
+    @r = assert_eq_int("verify good", jwt_verify(@token, @secret), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- wrong secret rejected ---
+    @r = assert_eq_int("verify wrong secret", jwt_verify(@token, "othersecret"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- different secrets produce different signatures ---
+    @tok_a = jwt_sign(@payload, "secretA")
+    @tok_b = jwt_sign(@payload, "secretB")
+    @r = assert_false("differs across secrets", str_eq(@tok_a, @tok_b))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- tampered payload (swap base64-payload with bob) ---
+    @bob_b64 = jwt_base64url_encode(_mk_payload_bob())
+    @tampered = _tamper_payload(@token, @bob_b64)
+    @r = assert_eq_int("verify tampered", jwt_verify(@tampered, @secret), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- decoded payload matches original (no verification) ---
+    @decoded = jwt_decode_payload(@token)
+    @r = assert_eq_str("decode payload", @decoded, @payload)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- expired token rejected ---
+    @past = _mk_payload_exp(1000)
+    @tok_past = jwt_sign(@past, @secret)
+    @r = assert_eq_int("verify expired", jwt_verify(@tok_past, @secret), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- non-expired token accepted ---
+    @future_ts = time_now() + 3600
+    @future = _mk_payload_exp(@future_ts)
+    @tok_future = jwt_sign(@future, @secret)
+    @r = assert_eq_int("verify not yet expired", jwt_verify(@tok_future, @secret), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- malformed token returns "" from decode_payload ---
+    @r = assert_eq_str("decode malformed", jwt_decode_payload("not-a-jwt"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("jwt", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_jwt_tests(0, 0)

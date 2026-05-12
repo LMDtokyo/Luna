@@ -1,0 +1,66 @@
+# api.luna — Telegram Bot API plumbing.
+#
+# Two public verbs: send_message (plain text) and send_markdown (with
+# parse_mode set so *bold*, _italic_, `code` and links render).
+#
+# We can't use the prelude's `http_post_json` directly because it
+# doesn't set `Content-Type: application/json` — curl defaults to
+# `application/x-www-form-urlencoded`, and Telegram silently treats
+# our JSON payload as a misformed form (gives back "message text is
+# empty"). So we make the POST ourselves with an explicit header
+# slist: curl_slist_append (libcurl) builds a single-entry list, we
+# pass it through CURLOPT_HTTPHEADER (10023), and free it afterwards.
+
+extern "C" fn curl_slist_append(@list: int, @str: int) -> int
+extern "C" fn curl_slist_free_all(@list: int)
+
+
+fn api_url(@token: int, @method: int) -> int
+    @u = str_concat("https://api.telegram.org/bot", @token)
+    @u = str_concat(@u, "/")
+    return str_concat(@u, @method)
+
+# POST @body to @url with Content-Type: application/json. Returns the
+# response body as a Luna string, or "" on transport error.
+fn _post_json(@url: int, @body: int) -> int
+    @curl = curl_easy_init()
+    if @curl == 0
+        return ""
+    @out_path = "/tmp/luna_http_out"
+    @out_fp = fopen(@out_path, "wb")
+    @headers = curl_slist_append(0, "Content-Type: application/json")
+    curl_easy_setopt(@curl, 10002, @url)
+    curl_easy_setopt(@curl, 10001, @out_fp)
+    curl_easy_setopt(@curl, 47,    1)
+    curl_easy_setopt(@curl, 10015, @body)
+    curl_easy_setopt(@curl, 60,    str_len(@body))
+    curl_easy_setopt(@curl, 10023, @headers)
+    curl_easy_setopt(@curl, 13,    30)
+    @rc = curl_easy_perform(@curl)
+    fclose(@out_fp)
+    curl_slist_free_all(@headers)
+    curl_easy_cleanup(@curl)
+    if @rc != 0
+        return ""
+    @resp = read_file(@out_path)
+    remove(@out_path)
+    return @resp
+
+fn send_message(@token: int, @chat_id: int, @text: int) -> int
+    @url = api_url(@token, "sendMessage")
+    @jb = json_begin()
+    json_field_int(@jb, "chat_id", @chat_id)
+    json_field_str(@jb, "text",    @text)
+    @body = json_end(@jb)
+    @resp = _post_json(@url, @body)
+    return 0
+
+fn send_markdown(@token: int, @chat_id: int, @text: int) -> int
+    @url = api_url(@token, "sendMessage")
+    @jb = json_begin()
+    json_field_int(@jb, "chat_id", @chat_id)
+    json_field_str(@jb, "text",    @text)
+    json_field_str(@jb, "parse_mode", "Markdown")
+    @body = json_end(@jb)
+    @resp = _post_json(@url, @body)
+    return 0

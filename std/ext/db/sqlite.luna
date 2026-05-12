@@ -1,0 +1,183 @@
+# tier: T6
+# deps: process, io
+# ffi: sqlite3-cli
+#
+# std/ext/db/sqlite — SQLite via the `sqlite3` CLI subprocess.
+#
+# Why this exists:
+#   Real SQL — transactions, indexes, joins, FK constraints — without
+#   waiting on bootminor's libsqlite3 FFI to land. Same trick we used
+#   for HTTPS (`std/ext/https.luna` shells out to `openssl s_client`).
+#
+# Trade-offs:
+#   - Requires `sqlite3` CLI on the host (default on every modern
+#     Linux distro; available via `apt install sqlite3` if missing).
+#   - Each call forks + execs sqlite3 (~5-20ms overhead). For batch
+#     work, use `db_exec_many` to amortize.
+#   - Output parsed from CLI text format — fields with embedded
+#     pipes ('|') or newlines need quoting via `db_quote`.
+#
+# Public surface:
+#   db_open(@path)                 -> handle (int; just remembers path)
+#   db_exec(@h, @sql)              -> rowcount or -1 on error
+#   db_query(@h, @sql)             -> Vec of rows; each row is Vec of strings
+#   db_query_one(@h, @sql)         -> first row as Vec of strings, or empty Vec
+#   db_scalar(@h, @sql)            -> first column of first row as string, or ""
+#   db_quote(@s)                   -> SQL-quoted string ('s' with internal '' escaped)
+#   db_int(@s)                     -> parse_int wrapper (convenience)
+#   db_close(@h)                   -> no-op (no persistent handle in this impl)
+#
+# Note on transactions:
+#   Each `db_exec` is a fresh sqlite3 invocation, so BEGIN/COMMIT
+#   spanning multiple calls don't share a transaction. For atomic
+#   multi-statement work, pass them as ONE `db_exec` with the
+#   statements separated by ';'.
+
+import process
+import io
+
+
+# Internal: temp paths for the SQL input and result output.
+fn _sqlite_sql_path() -> int
+    return "/tmp/luna-sqlite-sql.txt"
+
+fn _sqlite_out_path() -> int
+    return "/tmp/luna-sqlite-out.txt"
+
+
+# db_open(@path) -> handle. The handle is just the database file path
+# echoed back as a string; we keep it opaque so the API stays stable
+# when we swap in real FFI.
+fn db_open(@path: int) -> int
+    return @path
+
+
+# db_close(@h) -> 0. No-op; here for API parity with FFI version.
+fn db_close(@h: int) -> int
+    return 0
+
+
+# _sqlite_run(@dbpath, @sql, @mode_flag, @out_rc) -> raw output string.
+# Writes the exit code of the sqlite3 invocation into @out_rc[0..4]
+# so callers can distinguish success (rc=0) from any failure (rc!=0)
+# without having to grep stderr text for "Error" / "Parse error" /
+# "Runtime error" / etc.
+fn _sqlite_run(@dbpath: int, @sql: int, @mode_flag: int, @out_rc: int) -> int
+    write_file(_sqlite_sql_path(), @sql)
+    @cmd = str_concat("sqlite3 -bail ", @mode_flag)
+    @cmd = str_concat(@cmd, " ")
+    @cmd = str_concat(@cmd, @dbpath)
+    @cmd = str_concat(@cmd, " < ")
+    @cmd = str_concat(@cmd, _sqlite_sql_path())
+    @cmd = str_concat(@cmd, " > ")
+    @cmd = str_concat(@cmd, _sqlite_out_path())
+    @cmd = str_concat(@cmd, " 2>&1")
+    @rc = shell_run(@cmd)
+    u32_set(@out_rc, 0, @rc)
+    if file_exists(_sqlite_out_path()) == 0
+        return ""
+    return read_file(_sqlite_out_path())
+
+
+# db_exec(@h, @sql) -> 0 on success, -1 on error (sqlite3 exit code
+# was non-zero — "Parse error", "Runtime error", constraint failure,
+# etc.). For CREATE/INSERT/UPDATE/DELETE.
+fn db_exec(@h: int, @sql: int) -> int
+    @rc_buf = new_str(4)
+    _sqlite_run(@h, @sql, "", @rc_buf)
+    @rc = u32_at(@rc_buf, 0)
+    if @rc == 0
+        return 0
+    return -1
+
+
+# _sqlite_split_row(@line, @llen) -> Vec of column strings, splitting
+# on '|' (sqlite3 default separator).
+fn _sqlite_split_row(@line: int, @llen: int) -> Vec
+    @cols = vec_new()
+    @start = 0
+    @i = 0
+    while @i < @llen
+        if str_byte(@line, @i) == 124           # '|'
+            vec_push(@cols, str_substr(@line, @start, @i - @start))
+            @start = @i + 1
+        @i = @i + 1
+    vec_push(@cols, str_substr(@line, @start, @llen - @start))
+    return @cols
+
+
+# db_query(@h, @sql) -> Vec of rows; each row is Vec of strings.
+# Empty Vec on no rows or error.
+fn db_query(@h: int, @sql: int) -> Vec
+    @rows = vec_new()
+    @rc_buf = new_str(4)
+    @out = _sqlite_run(@h, @sql, "", @rc_buf)
+    if u32_at(@rc_buf, 0) != 0
+        return @rows
+    @olen = str_len(@out)
+    if @olen == 0
+        return @rows
+    # Split on \n into lines; each line -> row.
+    @start = 0
+    @i = 0
+    while @i < @olen
+        if str_byte(@out, @i) == 10              # '\n'
+            if @i > @start
+                @line = str_substr(@out, @start, @i - @start)
+                let @row: Vec = _sqlite_split_row(@line, @i - @start)
+                vec_push(@rows, @row)
+            @start = @i + 1
+        @i = @i + 1
+    # Final line if no trailing newline.
+    if @start < @olen
+        @line = str_substr(@out, @start, @olen - @start)
+        let @row: Vec = _sqlite_split_row(@line, @olen - @start)
+        vec_push(@rows, @row)
+    return @rows
+
+
+# db_query_one(@h, @sql) -> first row, or empty Vec.
+fn db_query_one(@h: int, @sql: int) -> Vec
+    let @rows: Vec = db_query(@h, @sql)
+    if vec_len(@rows) == 0
+        return vec_new()
+    return vec_get(@rows, 0)
+
+
+# db_scalar(@h, @sql) -> first column of first row as string, or "".
+# Convenient for `SELECT COUNT(*) FROM t` style queries.
+fn db_scalar(@h: int, @sql: int) -> int
+    let @row: Vec = db_query_one(@h, @sql)
+    if vec_len(@row) == 0
+        return ""
+    return vec_get(@row, 0)
+
+
+# db_quote(@s) -> "'s with internal '' doubled'". Use this when
+# building SQL strings from untrusted input — but prefer parameterised
+# statements once the FFI version lands.
+fn db_quote(@s: int) -> int
+    @slen = str_len(@s)
+    @out = new_str(@slen * 2 + 2)
+    @oi = 0
+    str_set_byte(@out, @oi, 39)                  # '
+    @oi = @oi + 1
+    @i = 0
+    while @i < @slen
+        @c = str_byte(@s, @i)
+        if @c == 39
+            str_set_byte(@out, @oi, 39)
+            @oi = @oi + 1
+        str_set_byte(@out, @oi, @c)
+        @oi = @oi + 1
+        @i = @i + 1
+    str_set_byte(@out, @oi, 39)
+    @oi = @oi + 1
+    return str_substr(@out, 0, @oi)
+
+
+# db_int(@s) -> parse_int wrapper. Empty/non-numeric -> 0.
+fn db_int(@s: int) -> int
+    if str_len(@s) == 0
+        return 0
+    return parse_int(@s)

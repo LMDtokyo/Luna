@@ -32,6 +32,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 /* ========================================================================= */
 /* 1. TYPES + CONSTANTS                                                       */

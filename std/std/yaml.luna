@@ -1,0 +1,1215 @@
+# tier: T4
+# deps: strings
+# ffi: none
+#
+# std/yaml — YAML 1.2 subset parser.
+#
+# Real-world config files come in YAML. This module reads the subset
+# needed for "/config-style" use cases — Compose files, Kubernetes
+# specs, GitHub Actions, simple app configs.
+#
+# # Supported
+#
+#   scalars            unquoted, "double-quoted", 'single-quoted',
+#                      integers, floats, booleans, null
+#   mappings           "key: value" with nested indentation
+#   sequences          "- item" with nested indentation
+#   nesting            mappings inside sequences, sequences inside
+#                      mappings, to arbitrary depth
+#   comments           "# ..." through end of line
+#   flow mappings      "{ a: 1, b: 2 }"  — single-line only
+#   flow sequences     "[1, 2, 3]"       — single-line only
+#   booleans           true/false/True/False/TRUE/FALSE/yes/no
+#   null               "null", "~", or empty value after ":"
+#
+# # NOT supported (parse errors)
+#
+#   tabs in indent     YAML 1.2 forbids — we follow the spec
+#   block scalars      "|" and ">" literal/folded multi-line strings
+#   multi-doc          "---" / "..." document separators
+#   anchors / aliases  "&name" / "*name"
+#   explicit tags      "!!str", "!Type"
+#   flow across lines  flow block must close on the line it opens
+#
+# # Value model
+#
+# YAML values are represented as a small algebraic type stored in a
+# Vec. Each Value Vec begins with a tag byte:
+#
+#   tag 0 : null         — len 1
+#   tag 1 : bool         — [1, 0|1]
+#   tag 2 : int          — [2, int_value]
+#   tag 3 : string       — [3, str_ptr]
+#   tag 4 : mapping      — [4, key0, val0, key1, val1, ...]
+#                          keys are Luna strings, vals are Value Vecs
+#   tag 5 : sequence     — [5, val0, val1, ...]
+#                          each entry is a Value Vec
+#   tag 6 : float-as-str — [6, str_ptr]   (we keep the textual form
+#                          since bootminor has no float type)
+#   tag 7 : error        — [7, error_str_ptr]
+#
+# JSON's std/json scanner is position-based and produces no node tree.
+# Sharing its data model literally is therefore impossible; we keep a
+# similar *kind* set (object/array/string/number/bool/null) so anyone
+# moving between the two modules has the same mental model.
+#
+# # Error reporting
+#
+# yaml_parse returns the value as-is. On parse failure it returns an
+# error Value (tag 7) carrying the message — call yaml_is_error /
+# yaml_error_msg to inspect. `yaml_error(@root)` is a thin convenience
+# wrapper around yaml_error_msg.
+#
+# The spec sketch suggested a global `yaml_error()` getter, but the
+# bootminor subset has no module-level mutable state, so we tuck the
+# message into the root Value instead. The trade-off is small — every
+# parse call already returns the root, so the caller has it on hand.
+
+import strings
+
+
+# ---------------------------------------------------------------------
+# Value constructors
+# ---------------------------------------------------------------------
+
+fn _yv_null() -> Vec
+    @v = vec_new()
+    vec_push(@v, 0)
+    return @v
+
+fn _yv_bool(@b: int) -> Vec
+    @v = vec_new()
+    vec_push(@v, 1)
+    vec_push(@v, @b)
+    return @v
+
+fn _yv_int(@n: int) -> Vec
+    @v = vec_new()
+    vec_push(@v, 2)
+    vec_push(@v, @n)
+    return @v
+
+fn _yv_str(@s: int) -> Vec
+    @v = vec_new()
+    vec_push(@v, 3)
+    vec_push(@v, @s)
+    return @v
+
+fn _yv_map_empty() -> Vec
+    @v = vec_new()
+    vec_push(@v, 4)
+    return @v
+
+fn _yv_seq_empty() -> Vec
+    @v = vec_new()
+    vec_push(@v, 5)
+    return @v
+
+fn _yv_float(@s: int) -> Vec
+    @v = vec_new()
+    vec_push(@v, 6)
+    vec_push(@v, @s)
+    return @v
+
+fn _yv_error(@msg: int) -> Vec
+    @v = vec_new()
+    vec_push(@v, 7)
+    vec_push(@v, @msg)
+    return @v
+
+
+# ---------------------------------------------------------------------
+# Public introspection
+# ---------------------------------------------------------------------
+
+# yaml_tag(@v) -> tag byte (0..7) for a Value handle.
+fn yaml_tag(@v: int) -> int
+    if vec_len(@v) <= 0
+        return 0
+    return vec_get(@v, 0)
+
+fn yaml_is_null(@v: int) -> int
+    if yaml_tag(@v) == 0
+        return 1
+    return 0
+
+fn yaml_is_bool(@v: int) -> int
+    if yaml_tag(@v) == 1
+        return 1
+    return 0
+
+fn yaml_is_int(@v: int) -> int
+    if yaml_tag(@v) == 2
+        return 1
+    return 0
+
+fn yaml_is_str(@v: int) -> int
+    if yaml_tag(@v) == 3
+        return 1
+    return 0
+
+fn yaml_is_map(@v: int) -> int
+    if yaml_tag(@v) == 4
+        return 1
+    return 0
+
+fn yaml_is_seq(@v: int) -> int
+    if yaml_tag(@v) == 5
+        return 1
+    return 0
+
+fn yaml_is_float(@v: int) -> int
+    if yaml_tag(@v) == 6
+        return 1
+    return 0
+
+fn yaml_is_error(@v: int) -> int
+    if yaml_tag(@v) == 7
+        return 1
+    return 0
+
+fn yaml_as_int(@v: int) -> int
+    if yaml_tag(@v) != 2
+        return 0
+    return vec_get(@v, 1)
+
+fn yaml_as_bool(@v: int) -> int
+    if yaml_tag(@v) != 1
+        return 0
+    return vec_get(@v, 1)
+
+fn yaml_as_str(@v: int) -> int
+    @t = yaml_tag(@v)
+    if @t == 3
+        return vec_get(@v, 1)
+    if @t == 6
+        return vec_get(@v, 1)
+    return ""
+
+fn yaml_error_msg(@v: int) -> int
+    if yaml_tag(@v) != 7
+        return ""
+    return vec_get(@v, 1)
+
+# yaml_error(@v) — returns the error message stored on the root Value
+# (empty string when @v is not an error). This deviates from the
+# argless `yaml_error()` spec because Luna T4 has no module-level
+# mutable state in which to stash a "last error"; std/toml.luna takes
+# the same workaround (toml_error returns a fixed string). We chose to
+# keep the per-parse context by routing through the root handle.
+fn yaml_error(@v: int) -> int
+    return yaml_error_msg(@v)
+
+
+# ---------------------------------------------------------------------
+# Mapping accessors
+# ---------------------------------------------------------------------
+
+# yaml_map_get(@v, @key) -> child Value, or null Value if absent / not
+# a mapping. The returned Value is the live child (not a copy) — do not
+# mutate it.
+fn yaml_map_get(@v: int, @key: int) -> int
+    if yaml_tag(@v) != 4
+        return _yv_null()
+    @n = vec_len(@v)
+    @i = 1
+    while @i + 1 < @n
+        @k = vec_get(@v, @i)
+        if str_eq(@k, @key) == 1
+            return vec_get(@v, @i + 1)
+        @i = @i + 2
+    return _yv_null()
+
+fn yaml_map_has(@v: int, @key: int) -> int
+    if yaml_tag(@v) != 4
+        return 0
+    @n = vec_len(@v)
+    @i = 1
+    while @i + 1 < @n
+        @k = vec_get(@v, @i)
+        if str_eq(@k, @key) == 1
+            return 1
+        @i = @i + 2
+    return 0
+
+# yaml_keys(@v) -> Vec[str] of map keys in order. Empty Vec if not a
+# mapping.
+fn yaml_keys(@v: int) -> Vec
+    @out = vec_new()
+    if yaml_tag(@v) != 4
+        return @out
+    @n = vec_len(@v)
+    @i = 1
+    while @i + 1 < @n
+        vec_push(@out, vec_get(@v, @i))
+        @i = @i + 2
+    return @out
+
+
+# ---------------------------------------------------------------------
+# Sequence accessors
+# ---------------------------------------------------------------------
+
+fn yaml_seq_len(@v: int) -> int
+    if yaml_tag(@v) != 5
+        return 0
+    return vec_len(@v) - 1
+
+fn yaml_seq_get(@v: int, @idx: int) -> int
+    if yaml_tag(@v) != 5
+        return _yv_null()
+    if @idx < 0
+        return _yv_null()
+    if @idx + 1 >= vec_len(@v)
+        return _yv_null()
+    return vec_get(@v, @idx + 1)
+
+
+# ---------------------------------------------------------------------
+# Convenience extractors
+# ---------------------------------------------------------------------
+
+fn yaml_get_str(@root: int, @key: int) -> int
+    @child = yaml_map_get(@root, @key)
+    @t = yaml_tag(@child)
+    if @t == 3
+        return vec_get(@child, 1)
+    if @t == 6
+        return vec_get(@child, 1)
+    return ""
+
+fn yaml_get_int(@root: int, @key: int) -> int
+    @child = yaml_map_get(@root, @key)
+    if yaml_tag(@child) != 2
+        return 0
+    return vec_get(@child, 1)
+
+fn yaml_get_bool(@root: int, @key: int) -> int
+    @child = yaml_map_get(@root, @key)
+    if yaml_tag(@child) != 1
+        return 0
+    return vec_get(@child, 1)
+
+
+# ---------------------------------------------------------------------
+# Line tokenizer
+# ---------------------------------------------------------------------
+#
+# Produces three parallel Vecs:
+#   @indents  : indent (number of leading spaces, -1 for blank/comment)
+#   @bodies   : the line content with leading indent and trailing
+#               whitespace + comment stripped
+#   @rawnums  : 1-based source line number (for error messages)
+#
+# Blank lines and comment-only lines get indent = -1 and body = "" so
+# the parser can skip them with a single check.
+
+fn _ys_is_space(@c: int) -> int
+    if @c == 32
+        return 1
+    return 0
+
+# Walk @src from @pos, splitting on '\n'. CR is preserved if not part
+# of CRLF; trailing CR before LF is dropped. Returns the position AFTER
+# the newline (or end of input).
+fn _ys_next_line(@src: int, @pos: int, @out_start: Vec, @out_end: Vec) -> int
+    @n = str_len(@src)
+    @start = @pos
+    @end = @pos
+    while @end < @n
+        @c = str_byte(@src, @end)
+        if @c == 10
+            break
+        @end = @end + 1
+    @line_end = @end
+    if @line_end > @start
+        if str_byte(@src, @line_end - 1) == 13
+            @line_end = @line_end - 1
+    vec_push(@out_start, @start)
+    vec_push(@out_end, @line_end)
+    if @end < @n
+        return @end + 1
+    return @end
+
+# Strip a trailing "# comment" tail from a line body, respecting quoted
+# strings (so '#' inside "..." or '...' stays literal). Returns the new
+# byte length to keep.
+fn _ys_strip_comment(@body: int) -> int
+    @n = str_len(@body)
+    @i = 0
+    @in_dq = 0
+    @in_sq = 0
+    while @i < @n
+        @c = str_byte(@body, @i)
+        if @in_dq == 1
+            if @c == 92
+                @i = @i + 2
+                continue
+            if @c == 34
+                @in_dq = 0
+            @i = @i + 1
+            continue
+        if @in_sq == 1
+            if @c == 39
+                @in_sq = 0
+            @i = @i + 1
+            continue
+        if @c == 34
+            @in_dq = 1
+            @i = @i + 1
+            continue
+        if @c == 39
+            @in_sq = 1
+            @i = @i + 1
+            continue
+        if @c == 35
+            if @i == 0
+                return 0
+            if str_byte(@body, @i - 1) == 32
+                return @i
+            if str_byte(@body, @i - 1) == 9
+                return @i
+        @i = @i + 1
+    return @n
+
+# Right-trim ASCII whitespace from a string in-place by returning a
+# shortened substring. Cheap because str_substr allocates fresh.
+fn _ys_rtrim(@s: int) -> int
+    @n = str_len(@s)
+    while @n > 0
+        @c = str_byte(@s, @n - 1)
+        if @c == 32
+            @n = @n - 1
+        elif @c == 9
+            @n = @n - 1
+        elif @c == 13
+            @n = @n - 1
+        else
+            break
+    return str_substr(@s, 0, @n)
+
+# Tokenize @src into (indents, bodies, line_numbers). On a tab inside
+# the indent of a non-blank line, push indent = -2 to signal "tabbed
+# indent — reject" so the parser surfaces a proper error.
+fn _ys_tokenize(@src: int, @indents: Vec, @bodies: Vec, @lines: Vec) -> int
+    @n = str_len(@src)
+    @pos = 0
+    @lineno = 0
+    while @pos < @n
+        @lineno = @lineno + 1
+        @starts = vec_new()
+        @ends = vec_new()
+        @pos = _ys_next_line(@src, @pos, @starts, @ends)
+        @line_start = vec_get(@starts, 0)
+        @line_end   = vec_get(@ends, 0)
+        @indent = 0
+        @has_tab = 0
+        @k = @line_start
+        while @k < @line_end
+            @c = str_byte(@src, @k)
+            if @c == 32
+                @indent = @indent + 1
+                @k = @k + 1
+            elif @c == 9
+                @has_tab = 1
+                @k = @k + 1
+            else
+                break
+        if @k >= @line_end
+            vec_push(@indents, 0 - 1)
+            vec_push(@bodies, "")
+            vec_push(@lines, @lineno)
+            continue
+        if str_byte(@src, @k) == 35
+            vec_push(@indents, 0 - 1)
+            vec_push(@bodies, "")
+            vec_push(@lines, @lineno)
+            continue
+        if @has_tab == 1
+            vec_push(@indents, 0 - 2)
+            vec_push(@bodies, "")
+            vec_push(@lines, @lineno)
+            continue
+        @raw = str_substr(@src, @k, @line_end - @k)
+        @cut = _ys_strip_comment(@raw)
+        @body = str_substr(@raw, 0, @cut)
+        @body = _ys_rtrim(@body)
+        if str_len(@body) == 0
+            vec_push(@indents, 0 - 1)
+            vec_push(@bodies, "")
+            vec_push(@lines, @lineno)
+            continue
+        vec_push(@indents, @indent)
+        vec_push(@bodies, @body)
+        vec_push(@lines, @lineno)
+    return 0
+
+
+# ---------------------------------------------------------------------
+# Scalar parsing
+# ---------------------------------------------------------------------
+
+# Trim ASCII whitespace from both ends; returns a fresh substring.
+fn _ys_trim(@s: int) -> int
+    return str_trim(@s)
+
+# _ys_is_int_text(@s) -> 1 if @s is "-?digits" (no sign-only, no extras).
+fn _ys_is_int_text(@s: int) -> int
+    @n = str_len(@s)
+    if @n == 0
+        return 0
+    @i = 0
+    if str_byte(@s, 0) == 45
+        @i = 1
+        if @n == 1
+            return 0
+    if str_byte(@s, 0) == 43
+        @i = 1
+        if @n == 1
+            return 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c < 48
+            return 0
+        if @c > 57
+            return 0
+        @i = @i + 1
+    return 1
+
+# _ys_is_float_text — match "(-?)digits.digits". Exponential notation
+# (1e10) intentionally skipped per the MVP scope.
+fn _ys_is_float_text(@s: int) -> int
+    @n = str_len(@s)
+    if @n == 0
+        return 0
+    @i = 0
+    if str_byte(@s, 0) == 45
+        @i = 1
+    if str_byte(@s, 0) == 43
+        @i = 1
+    @digits = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c == 46
+            break
+        if @c < 48
+            return 0
+        if @c > 57
+            return 0
+        @digits = @digits + 1
+        @i = @i + 1
+    if @i >= @n
+        return 0
+    if str_byte(@s, @i) != 46
+        return 0
+    @i = @i + 1
+    @frac = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c < 48
+            return 0
+        if @c > 57
+            return 0
+        @frac = @frac + 1
+        @i = @i + 1
+    if @digits == 0
+        if @frac == 0
+            return 0
+    return 1
+
+# _ys_is_bool_word — match common YAML boolean spellings.
+# Returns: 1 = true, 2 = false, 0 = not a boolean.
+fn _ys_is_bool_word(@s: int) -> int
+    if str_eq(@s, "true") == 1
+        return 1
+    if str_eq(@s, "True") == 1
+        return 1
+    if str_eq(@s, "TRUE") == 1
+        return 1
+    if str_eq(@s, "yes") == 1
+        return 1
+    if str_eq(@s, "Yes") == 1
+        return 1
+    if str_eq(@s, "YES") == 1
+        return 1
+    if str_eq(@s, "false") == 1
+        return 2
+    if str_eq(@s, "False") == 1
+        return 2
+    if str_eq(@s, "FALSE") == 1
+        return 2
+    if str_eq(@s, "no") == 1
+        return 2
+    if str_eq(@s, "No") == 1
+        return 2
+    if str_eq(@s, "NO") == 1
+        return 2
+    return 0
+
+# _ys_is_null_word — "null", "Null", "NULL", "~", or empty string.
+fn _ys_is_null_word(@s: int) -> int
+    if str_len(@s) == 0
+        return 1
+    if str_eq(@s, "null") == 1
+        return 1
+    if str_eq(@s, "Null") == 1
+        return 1
+    if str_eq(@s, "NULL") == 1
+        return 1
+    if str_eq(@s, "~") == 1
+        return 1
+    return 0
+
+# Parse a double-quoted scalar's body (caller has stripped the quotes
+# in @body_inner). Returns the decoded string. We support \n \r \t \"
+# \\ \/  \0  — the most common bits.
+fn _ys_unquote_double(@body_inner: int) -> int
+    @b = strbuf_new()
+    @n = str_len(@body_inner)
+    @i = 0
+    while @i < @n
+        @c = str_byte(@body_inner, @i)
+        if @c != 92
+            strbuf_add_byte(@b, @c)
+            @i = @i + 1
+            continue
+        if @i + 1 >= @n
+            strbuf_add_byte(@b, @c)
+            @i = @i + 1
+            continue
+        @e = str_byte(@body_inner, @i + 1)
+        if @e == 110
+            strbuf_add_byte(@b, 10)
+        elif @e == 114
+            strbuf_add_byte(@b, 13)
+        elif @e == 116
+            strbuf_add_byte(@b, 9)
+        elif @e == 48
+            strbuf_add_byte(@b, 0)
+        elif @e == 34
+            strbuf_add_byte(@b, 34)
+        elif @e == 92
+            strbuf_add_byte(@b, 92)
+        elif @e == 47
+            strbuf_add_byte(@b, 47)
+        else
+            strbuf_add_byte(@b, @e)
+        @i = @i + 2
+    return strbuf_done(@b)
+
+# _ys_scalar_from_text — classify a trimmed text scalar and produce a
+# Value. The caller has already stripped surrounding whitespace.
+fn _ys_scalar_from_text(@s: int) -> Vec
+    @n = str_len(@s)
+    if @n == 0
+        return _yv_null()
+    @first = str_byte(@s, 0)
+    if @first == 34
+        if @n >= 2
+            if str_byte(@s, @n - 1) == 34
+                @inner = str_substr(@s, 1, @n - 2)
+                return _yv_str(_ys_unquote_double(@inner))
+        return _yv_str(@s)
+    if @first == 39
+        if @n >= 2
+            if str_byte(@s, @n - 1) == 39
+                @inner = str_substr(@s, 1, @n - 2)
+                return _yv_str(@inner)
+        return _yv_str(@s)
+    if _ys_is_null_word(@s) == 1
+        return _yv_null()
+    @bw = _ys_is_bool_word(@s)
+    if @bw == 1
+        return _yv_bool(1)
+    if @bw == 2
+        return _yv_bool(0)
+    if _ys_is_int_text(@s) == 1
+        return _yv_int(parse_int(@s))
+    if _ys_is_float_text(@s) == 1
+        return _yv_float(@s)
+    return _yv_str(@s)
+
+
+# ---------------------------------------------------------------------
+# Flow-style helpers
+# ---------------------------------------------------------------------
+#
+# Flow-style mappings ({a:1,b:2}) and sequences ([1,2,3]) are common
+# in inline overrides. We support a single-line subset — anything that
+# spans multiple lines is rejected as out-of-scope.
+
+# Skip an ASCII whitespace run.
+fn _ys_skip_ws(@s: int, @pos: int) -> int
+    @n = str_len(@s)
+    while @pos < @n
+        @c = str_byte(@s, @pos)
+        if @c == 32
+            @pos = @pos + 1
+        elif @c == 9
+            @pos = @pos + 1
+        else
+            break
+    return @pos
+
+# Read one flow-scalar (terminator-bounded). Stops at ',', ']' or '}'
+# at the current nesting level, respecting quoted runs. Returns the
+# token text; @out_pos receives the position after the token.
+fn _ys_flow_scalar(@s: int, @pos: int, @out_pos: Vec) -> int
+    @n = str_len(@s)
+    @start = @pos
+    if @pos >= @n
+        vec_push(@out_pos, @pos)
+        return ""
+    @first = str_byte(@s, @pos)
+    if @first == 34
+        @pos = @pos + 1
+        while @pos < @n
+            @c = str_byte(@s, @pos)
+            if @c == 92
+                @pos = @pos + 2
+                continue
+            if @c == 34
+                @pos = @pos + 1
+                break
+            @pos = @pos + 1
+        vec_push(@out_pos, @pos)
+        return str_substr(@s, @start, @pos - @start)
+    if @first == 39
+        @pos = @pos + 1
+        while @pos < @n
+            @c = str_byte(@s, @pos)
+            if @c == 39
+                @pos = @pos + 1
+                break
+            @pos = @pos + 1
+        vec_push(@out_pos, @pos)
+        return str_substr(@s, @start, @pos - @start)
+    while @pos < @n
+        @c = str_byte(@s, @pos)
+        if @c == 44
+            break
+        if @c == 93
+            break
+        if @c == 125
+            break
+        if @c == 58
+            break
+        @pos = @pos + 1
+    @end = @pos
+    while @end > @start
+        @c = str_byte(@s, @end - 1)
+        if @c == 32
+            @end = @end - 1
+        elif @c == 9
+            @end = @end - 1
+        else
+            break
+    vec_push(@out_pos, @pos)
+    return str_substr(@s, @start, @end - @start)
+
+# _ys_parse_flow_seq — parse "[a, b, c]" starting at @pos (which points
+# at '['). Returns Value Vec; @out_pos receives the position after ']'.
+fn _ys_parse_flow_seq(@s: int, @pos: int, @out_pos: Vec) -> Vec
+    @n = str_len(@s)
+    @result = _yv_seq_empty()
+    if @pos >= @n
+        vec_push(@out_pos, @pos)
+        return _yv_error("flow seq: unexpected end")
+    if str_byte(@s, @pos) != 91
+        vec_push(@out_pos, @pos)
+        return _yv_error("flow seq: missing '['")
+    @pos = @pos + 1
+    @pos = _ys_skip_ws(@s, @pos)
+    if @pos < @n
+        if str_byte(@s, @pos) == 93
+            vec_push(@out_pos, @pos + 1)
+            return @result
+    while @pos < @n
+        @pos = _ys_skip_ws(@s, @pos)
+        let @item: Vec = _ys_parse_flow_value(@s, @pos, @out_pos)
+        if yaml_is_error(@item) == 1
+            return @item
+        @pos = vec_get(@out_pos, vec_len(@out_pos) - 1)
+        vec_push(@result, @item)
+        @pos = _ys_skip_ws(@s, @pos)
+        if @pos >= @n
+            return _yv_error("flow seq: missing ']'")
+        @c = str_byte(@s, @pos)
+        if @c == 93
+            vec_pop(@out_pos)
+            vec_push(@out_pos, @pos + 1)
+            return @result
+        if @c == 44
+            @pos = @pos + 1
+            vec_pop(@out_pos)
+            continue
+        return _yv_error("flow seq: expected ',' or ']'")
+    return _yv_error("flow seq: missing ']'")
+
+# _ys_parse_flow_map — parse "{a: 1, b: 2}" starting at '{'. Returns
+# Value Vec.
+fn _ys_parse_flow_map(@s: int, @pos: int, @out_pos: Vec) -> Vec
+    @n = str_len(@s)
+    @result = _yv_map_empty()
+    if @pos >= @n
+        vec_push(@out_pos, @pos)
+        return _yv_error("flow map: unexpected end")
+    if str_byte(@s, @pos) != 123
+        vec_push(@out_pos, @pos)
+        return _yv_error("flow map: missing '{'")
+    @pos = @pos + 1
+    @pos = _ys_skip_ws(@s, @pos)
+    if @pos < @n
+        if str_byte(@s, @pos) == 125
+            vec_push(@out_pos, @pos + 1)
+            return @result
+    while @pos < @n
+        @pos = _ys_skip_ws(@s, @pos)
+        @key_tok = _ys_flow_scalar(@s, @pos, @out_pos)
+        @pos = vec_get(@out_pos, vec_len(@out_pos) - 1)
+        vec_pop(@out_pos)
+        @key_text = _ys_unquote_flow_key(@key_tok)
+        @pos = _ys_skip_ws(@s, @pos)
+        if @pos >= @n
+            return _yv_error("flow map: missing ':'")
+        if str_byte(@s, @pos) != 58
+            return _yv_error("flow map: missing ':'")
+        @pos = @pos + 1
+        @pos = _ys_skip_ws(@s, @pos)
+        let @val: Vec = _ys_parse_flow_value(@s, @pos, @out_pos)
+        if yaml_is_error(@val) == 1
+            return @val
+        @pos = vec_get(@out_pos, vec_len(@out_pos) - 1)
+        vec_pop(@out_pos)
+        vec_push(@result, @key_text)
+        vec_push(@result, @val)
+        @pos = _ys_skip_ws(@s, @pos)
+        if @pos >= @n
+            return _yv_error("flow map: missing '}'")
+        @c = str_byte(@s, @pos)
+        if @c == 125
+            vec_push(@out_pos, @pos + 1)
+            return @result
+        if @c == 44
+            @pos = @pos + 1
+            continue
+        return _yv_error("flow map: expected ',' or '}'")
+    return _yv_error("flow map: missing '}'")
+
+fn _ys_unquote_flow_key(@tok: int) -> int
+    @n = str_len(@tok)
+    if @n >= 2
+        if str_byte(@tok, 0) == 34
+            if str_byte(@tok, @n - 1) == 34
+                return _ys_unquote_double(str_substr(@tok, 1, @n - 2))
+        if str_byte(@tok, 0) == 39
+            if str_byte(@tok, @n - 1) == 39
+                return str_substr(@tok, 1, @n - 2)
+    return @tok
+
+# _ys_parse_flow_value — dispatch on first byte to scalar / [...] / {...}.
+fn _ys_parse_flow_value(@s: int, @pos: int, @out_pos: Vec) -> Vec
+    @n = str_len(@s)
+    if @pos >= @n
+        vec_push(@out_pos, @pos)
+        return _yv_null()
+    @c = str_byte(@s, @pos)
+    if @c == 91
+        return _ys_parse_flow_seq(@s, @pos, @out_pos)
+    if @c == 123
+        return _ys_parse_flow_map(@s, @pos, @out_pos)
+    @tok = _ys_flow_scalar(@s, @pos, @out_pos)
+    return _ys_scalar_from_text(@tok)
+
+
+# ---------------------------------------------------------------------
+# Parse a leaf value text (after the ':') that lives on the same line.
+# May be flow-style or a simple scalar.
+# ---------------------------------------------------------------------
+
+fn _ys_parse_inline_value(@text: int) -> Vec
+    @t = _ys_trim(@text)
+    if str_len(@t) == 0
+        return _yv_null()
+    @first = str_byte(@t, 0)
+    if @first == 91
+        @out_pos = vec_new()
+        let @vseq: Vec = _ys_parse_flow_seq(@t, 0, @out_pos)
+        return @vseq
+    if @first == 123
+        @out_pos = vec_new()
+        let @vmap: Vec = _ys_parse_flow_map(@t, 0, @out_pos)
+        return @vmap
+    if @first == 124
+        return _yv_error("block scalar '|' not supported")
+    if @first == 62
+        return _yv_error("folded scalar '>' not supported")
+    if @first == 38
+        return _yv_error("anchors not supported")
+    if @first == 42
+        return _yv_error("aliases not supported")
+    if @first == 33
+        return _yv_error("explicit tags not supported")
+    return _ys_scalar_from_text(@t)
+
+
+# ---------------------------------------------------------------------
+# Line classification
+# ---------------------------------------------------------------------
+#
+# A meaningful line is one of:
+#   - "key: value"          — mapping entry, possibly with leaf value
+#   - "key:"                — mapping entry, child on next lines
+#   - "- value"             — sequence item, possibly with leaf value
+#   - "- key: value"        — sequence item containing a mapping (the
+#                             '-' starts an item AND a mapping at the
+#                             column after "- ")
+#   - "- "                  — bare sequence item (null/empty)
+#
+# _ys_split_key — find a ':' that terminates a YAML key, taking flow
+# braces and quoted runs into account. Returns the offset of the ':',
+# or -1 if there's no key boundary.
+
+fn _ys_split_key(@body: int) -> int
+    @n = str_len(@body)
+    @i = 0
+    @in_dq = 0
+    @in_sq = 0
+    @depth = 0
+    while @i < @n
+        @c = str_byte(@body, @i)
+        if @in_dq == 1
+            if @c == 92
+                @i = @i + 2
+                continue
+            if @c == 34
+                @in_dq = 0
+            @i = @i + 1
+            continue
+        if @in_sq == 1
+            if @c == 39
+                @in_sq = 0
+            @i = @i + 1
+            continue
+        if @c == 34
+            @in_dq = 1
+            @i = @i + 1
+            continue
+        if @c == 39
+            @in_sq = 1
+            @i = @i + 1
+            continue
+        if @c == 91
+            @depth = @depth + 1
+            @i = @i + 1
+            continue
+        if @c == 123
+            @depth = @depth + 1
+            @i = @i + 1
+            continue
+        if @c == 93
+            @depth = @depth - 1
+            @i = @i + 1
+            continue
+        if @c == 125
+            @depth = @depth - 1
+            @i = @i + 1
+            continue
+        if @c == 58
+            if @depth == 0
+                @follow = 32
+                if @i + 1 < @n
+                    @follow = str_byte(@body, @i + 1)
+                if @follow == 32
+                    return @i
+                if @follow == 9
+                    return @i
+                if @i + 1 == @n
+                    return @i
+        @i = @i + 1
+    return 0 - 1
+
+# _ys_strip_key_quotes — if the key is wrapped in quotes, unquote it.
+# Returns the unquoted key text.
+fn _ys_strip_key_quotes(@key_text: int) -> int
+    @t = _ys_trim(@key_text)
+    @n = str_len(@t)
+    if @n >= 2
+        if str_byte(@t, 0) == 34
+            if str_byte(@t, @n - 1) == 34
+                return _ys_unquote_double(str_substr(@t, 1, @n - 2))
+        if str_byte(@t, 0) == 39
+            if str_byte(@t, @n - 1) == 39
+                return str_substr(@t, 1, @n - 2)
+    return @t
+
+
+# ---------------------------------------------------------------------
+# Recursive descent over (indent, body) line stream
+# ---------------------------------------------------------------------
+#
+# Parsing state is captured in a struct so we can pass it around once
+# and mutate the line cursor (@idx) freely.
+
+struct YParse
+    indents: int    # Vec<int>      — indent column per line, -1 = blank, -2 = tab error
+    bodies:  int    # Vec<str>      — stripped line body
+    lines:   int    # Vec<int>      — 1-based source line numbers
+    nlines:  int
+    idx:     int
+    err:     int    # 0 = ok, non-zero = first error line, msg in `errmsg`
+    errmsg:  int    # owned string, set when err != 0
+
+
+fn _ys_new_parser(@indents: Vec, @bodies: Vec, @lines: Vec) -> YParse
+    let @p: YParse = new_str(56)
+    @p.indents = @indents
+    @p.bodies = @bodies
+    @p.lines = @lines
+    @p.nlines = vec_len(@indents)
+    @p.idx = 0
+    @p.err = 0
+    @p.errmsg = ""
+    return @p
+
+fn _ys_set_error(@p: YParse, @msg: int) -> int
+    if @p.err != 0
+        return 0
+    @p.err = 1
+    @lineno = 0
+    if @p.idx < @p.nlines
+        @lineno = vec_get(@p.lines, @p.idx)
+    @prefix = "line "
+    @prefix = str_concat(@prefix, int_to_str(@lineno))
+    @prefix = str_concat(@prefix, ": ")
+    @p.errmsg = str_concat(@prefix, @msg)
+    return 0
+
+# _ys_skip_blanks — advance @p.idx past blank/comment lines.
+fn _ys_skip_blanks(@p: YParse) -> int
+    while @p.idx < @p.nlines
+        @ind = vec_get(@p.indents, @p.idx)
+        if @ind == 0 - 1
+            @p.idx = @p.idx + 1
+            continue
+        if @ind == 0 - 2
+            _ys_set_error(@p, "tab in indentation")
+            return 0
+        break
+    return 0
+
+# _ys_check_unsupported — multi-doc markers and other reserved
+# constructs. Returns 1 if it set an error.
+fn _ys_check_unsupported(@p: YParse) -> int
+    if @p.idx >= @p.nlines
+        return 0
+    @body = vec_get(@p.bodies, @p.idx)
+    if str_eq(@body, "---") == 1
+        _ys_set_error(@p, "multi-doc '---' not supported")
+        return 1
+    if str_eq(@body, "...") == 1
+        _ys_set_error(@p, "multi-doc '...' not supported")
+        return 1
+    return 0
+
+# _ys_parse_value_at — parse the value starting at the current line,
+# given a minimum-indent requirement.  Returns the Value.
+#
+# Dispatch:
+#   - Sequence (body starts with "- "): _ys_parse_sequence
+#   - Mapping  (key: present):         _ys_parse_mapping
+#
+# Callers that consumed an inline ': <text>' won't reach here.
+fn _ys_parse_value_at(@p: YParse, @min_indent: int) -> Vec
+    _ys_skip_blanks(@p)
+    if @p.err != 0
+        return _yv_error(@p.errmsg)
+    if @p.idx >= @p.nlines
+        return _yv_null()
+    if _ys_check_unsupported(@p) == 1
+        return _yv_error(@p.errmsg)
+    @ind = vec_get(@p.indents, @p.idx)
+    if @ind < @min_indent
+        return _yv_null()
+    @body = vec_get(@p.bodies, @p.idx)
+    if _ys_starts_with_dash(@body) == 1
+        return _ys_parse_sequence(@p, @ind)
+    return _ys_parse_mapping(@p, @ind)
+
+# _ys_starts_with_dash — body begins with "- " or is exactly "-".
+fn _ys_starts_with_dash(@body: int) -> int
+    @n = str_len(@body)
+    if @n == 0
+        return 0
+    if str_byte(@body, 0) != 45
+        return 0
+    if @n == 1
+        return 1
+    if str_byte(@body, 1) == 32
+        return 1
+    return 0
+
+# Parse a sequence whose first item is at the current line and indent.
+fn _ys_parse_sequence(@p: YParse, @indent: int) -> Vec
+    @result = _yv_seq_empty()
+    while @p.idx < @p.nlines
+        _ys_skip_blanks(@p)
+        if @p.err != 0
+            return _yv_error(@p.errmsg)
+        if @p.idx >= @p.nlines
+            break
+        @ind = vec_get(@p.indents, @p.idx)
+        if @ind < @indent
+            break
+        if @ind > @indent
+            break
+        @body = vec_get(@p.bodies, @p.idx)
+        if _ys_starts_with_dash(@body) == 0
+            break
+        let @item: Vec = _ys_parse_seq_item(@p, @indent, @body)
+        if yaml_is_error(@item) == 1
+            return @item
+        if @p.err != 0
+            return _yv_error(@p.errmsg)
+        vec_push(@result, @item)
+    return @result
+
+# _ys_parse_seq_item — handle one sequence row. Three subcases:
+#   "- "                — empty (null) item
+#   "- scalar"          — leaf scalar item
+#   "- key: value..."   — item is a mapping; the '-' position acts as
+#                         an extra-indent level for the inline mapping.
+fn _ys_parse_seq_item(@p: YParse, @indent: int, @body: int) -> Vec
+    @n = str_len(@body)
+    if @n == 1
+        @p.idx = @p.idx + 1
+        let @nested: Vec = _ys_parse_value_at(@p, @indent + 2)
+        return @nested
+    @rest_text = str_substr(@body, 2, @n - 2)
+    @rest_trim = _ys_trim(@rest_text)
+    @colon = _ys_split_key(@rest_trim)
+    if @colon < 0
+        @p.idx = @p.idx + 1
+        return _ys_parse_inline_value(@rest_trim)
+    @inner_indent = @indent + 2
+    return _ys_parse_dash_mapping(@p, @inner_indent, @rest_trim)
+
+# _ys_parse_dash_mapping — a "- key: value" line opens an inline
+# mapping whose effective indent is @indent_of_key (i.e. the column of
+# the key on the dash-line). Subsequent rows of the same mapping must
+# be at exactly that indent and lack the leading '-'.
+fn _ys_parse_dash_mapping(@p: YParse, @key_indent: int, @first_body: int) -> Vec
+    @result = _yv_map_empty()
+    _ys_consume_map_entry(@p, @result, @first_body, @key_indent)
+    if @p.err != 0
+        return _yv_error(@p.errmsg)
+    while @p.idx < @p.nlines
+        _ys_skip_blanks(@p)
+        if @p.err != 0
+            return _yv_error(@p.errmsg)
+        if @p.idx >= @p.nlines
+            break
+        @ind = vec_get(@p.indents, @p.idx)
+        if @ind != @key_indent
+            break
+        @body = vec_get(@p.bodies, @p.idx)
+        if _ys_starts_with_dash(@body) == 1
+            break
+        _ys_consume_map_entry(@p, @result, @body, @key_indent)
+        if @p.err != 0
+            return _yv_error(@p.errmsg)
+    return @result
+
+# Parse a block mapping whose first key sits at the current line.
+fn _ys_parse_mapping(@p: YParse, @indent: int) -> Vec
+    @result = _yv_map_empty()
+    while @p.idx < @p.nlines
+        _ys_skip_blanks(@p)
+        if @p.err != 0
+            return _yv_error(@p.errmsg)
+        if @p.idx >= @p.nlines
+            break
+        @ind = vec_get(@p.indents, @p.idx)
+        if @ind < @indent
+            break
+        if @ind > @indent
+            break
+        @body = vec_get(@p.bodies, @p.idx)
+        if _ys_starts_with_dash(@body) == 1
+            break
+        _ys_consume_map_entry(@p, @result, @body, @indent)
+        if @p.err != 0
+            return _yv_error(@p.errmsg)
+    return @result
+
+# _ys_consume_map_entry — advances over one "key: value" line and any
+# nested children, pushing (key, value) onto @result.
+fn _ys_consume_map_entry(@p: YParse, @result: Vec, @body: int, @indent: int) -> int
+    @colon = _ys_split_key(@body)
+    if @colon < 0
+        _ys_set_error(@p, "expected ':' in mapping entry")
+        return 0
+    @key_raw = str_substr(@body, 0, @colon)
+    @key = _ys_strip_key_quotes(@key_raw)
+    @rest_len = str_len(@body) - (@colon + 1)
+    @rest = ""
+    if @rest_len > 0
+        @rest = str_substr(@body, @colon + 1, @rest_len)
+    @rest_trim = _ys_trim(@rest)
+    if str_len(@rest_trim) > 0
+        @p.idx = @p.idx + 1
+        let @val: Vec = _ys_parse_inline_value(@rest_trim)
+        vec_push(@result, @key)
+        vec_push(@result, @val)
+        return 0
+    @p.idx = @p.idx + 1
+    let @nested: Vec = _ys_parse_value_at(@p, @indent + 1)
+    vec_push(@result, @key)
+    vec_push(@result, @nested)
+    return 0
+
+
+# ---------------------------------------------------------------------
+# Top-level entry
+# ---------------------------------------------------------------------
+
+fn yaml_parse(@src: int) -> int
+    @indents = vec_new()
+    @bodies = vec_new()
+    @lines = vec_new()
+    _ys_tokenize(@src, @indents, @bodies, @lines)
+    let @p: YParse = _ys_new_parser(@indents, @bodies, @lines)
+    _ys_skip_blanks(@p)
+    if @p.err != 0
+        return _yv_error(@p.errmsg)
+    if @p.idx >= @p.nlines
+        return _yv_map_empty()
+    if _ys_check_unsupported(@p) == 1
+        return _yv_error(@p.errmsg)
+    @first_body = vec_get(@p.bodies, @p.idx)
+    @first_indent = vec_get(@p.indents, @p.idx)
+    @first_byte = str_byte(@first_body, 0)
+    if @first_byte == 91
+        @out_pos = vec_new()
+        let @vseq: Vec = _ys_parse_flow_seq(@first_body, 0, @out_pos)
+        @p.idx = @p.idx + 1
+        _ys_skip_blanks(@p)
+        if @p.idx < @p.nlines
+            _ys_set_error(@p, "extra content after flow document")
+            return _yv_error(@p.errmsg)
+        return @vseq
+    if @first_byte == 123
+        @out_pos = vec_new()
+        let @vmap: Vec = _ys_parse_flow_map(@first_body, 0, @out_pos)
+        @p.idx = @p.idx + 1
+        _ys_skip_blanks(@p)
+        if @p.idx < @p.nlines
+            _ys_set_error(@p, "extra content after flow document")
+            return _yv_error(@p.errmsg)
+        return @vmap
+    let @root: Vec = _ys_parse_value_at(@p, @first_indent)
+    if yaml_is_error(@root) == 1
+        return @root
+    if @p.err != 0
+        return _yv_error(@p.errmsg)
+    return @root

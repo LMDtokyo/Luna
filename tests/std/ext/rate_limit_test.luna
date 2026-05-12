@@ -1,0 +1,107 @@
+# Tests for std/ext/rate_limit. Connects to 127.0.0.1:16380, the same
+# sandbox redis port redis_test.luna uses. If no redis is reachable
+# there, the test exits with a zero-summary "skip" line so the global
+# runner doesn't count it as a failure. Real coverage lives in
+# rate_limit_e2e.sh, which spawns a sandbox redis-server.
+
+import redis
+import rate_limit
+import test
+
+
+fn _rl_port() -> int
+    return 16380
+
+
+fn _rl_cleanup(@fd: int) -> int
+    redis_del(@fd, "luna-test:rl:burst")
+    redis_del(@fd, "luna-test:rl:remain")
+    redis_del(@fd, "luna-test:rl:ttl")
+    redis_del(@fd, "luna-test:rl:reset")
+    return 0
+
+
+fn run_rate_limit_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    @fd = redis_connect("127.0.0.1", _rl_port())
+    if @fd < 0
+        shine("[rate_limit] skip (no redis-server on 127.0.0.1:16380)")
+        test_summary("rate_limit", 0, 0)
+        return 0
+
+    _rl_cleanup(@fd)
+
+    # --- Burst pattern: max=5, win=60. First 5 allowed, 6th blocked.
+    @r = assert_eq_int("burst 1 allow", rate_limit_check(@fd, "luna-test:rl:burst", 5, 60), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("burst 2 allow", rate_limit_check(@fd, "luna-test:rl:burst", 5, 60), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("burst 3 allow", rate_limit_check(@fd, "luna-test:rl:burst", 5, 60), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("burst 4 allow", rate_limit_check(@fd, "luna-test:rl:burst", 5, 60), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("burst 5 allow", rate_limit_check(@fd, "luna-test:rl:burst", 5, 60), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("burst 6 block", rate_limit_check(@fd, "luna-test:rl:burst", 5, 60), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Reset clears the counter; the next check is fresh.
+    @r = assert_eq_int("reset existed", rate_limit_reset(@fd, "luna-test:rl:burst"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("after reset allow", rate_limit_check(@fd, "luna-test:rl:burst", 5, 60), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("reset absent 0", rate_limit_reset(@fd, "luna-test:rl:absent"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Remaining count decreases on each allow, floors at 0.
+    @r = assert_eq_int("remain fresh = max", rate_limit_remaining(@fd, "luna-test:rl:remain", 3), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    rate_limit_check(@fd, "luna-test:rl:remain", 3, 60)
+    @r = assert_eq_int("remain after 1 = 2", rate_limit_remaining(@fd, "luna-test:rl:remain", 3), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    rate_limit_check(@fd, "luna-test:rl:remain", 3, 60)
+    rate_limit_check(@fd, "luna-test:rl:remain", 3, 60)
+    @r = assert_eq_int("remain at 0", rate_limit_remaining(@fd, "luna-test:rl:remain", 3), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    rate_limit_check(@fd, "luna-test:rl:remain", 3, 60)
+    @r = assert_eq_int("remain floors at 0", rate_limit_remaining(@fd, "luna-test:rl:remain", 3), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- TTL: -2 before first INCR, > 0 after.
+    @r = assert_eq_int("ttl absent = -2", rate_limit_ttl(@fd, "luna-test:rl:ttl"), -2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    rate_limit_check(@fd, "luna-test:rl:ttl", 10, 60)
+    @t = rate_limit_ttl(@fd, "luna-test:rl:ttl")
+    @r = assert_true("ttl positive", @t > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("ttl <= window", @t <= 60)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    _rl_cleanup(@fd)
+    redis_close(@fd)
+
+    test_summary("rate_limit", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_rate_limit_tests(0, 0)

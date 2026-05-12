@@ -25,6 +25,18 @@ SRC_COMPILER="$REPO_ROOT/src/bootminor/luna-mini.elf"
 SRC_PRELUDE="$REPO_ROOT/src/bootminor/bootminor_prelude.luna"
 SRC_CLI="$REPO_ROOT/src/bootminor/luna"
 
+# Layered stdlib roots (see docs/ARCHITECTURE.md). Anything that exists
+# is shipped flat into ~/.luna/lib/std/. Source-level tier discipline
+# is enforced in-repo by tools/lint_tiers.sh; once installed the CLI
+# treats them as a flat namespace.
+SRC_STD_TIERS=(
+    "$REPO_ROOT/std/runtime"
+    "$REPO_ROOT/std/core"
+    "$REPO_ROOT/std/std"
+    "$REPO_ROOT/std/net"
+)
+SRC_STD_EXT="$REPO_ROOT/std/ext"
+
 # Sanity checks before we touch the user's home directory.
 if [ ! -f "$SRC_COMPILER" ]; then
     echo "error: $SRC_COMPILER not found." >&2
@@ -39,14 +51,48 @@ if [ ! -f "$SRC_CLI" ]; then
     echo "error: $SRC_CLI not found." >&2
     exit 1
 fi
+# At least one stdlib tier must exist.
+have_stdlib=0
+for dir in "${SRC_STD_TIERS[@]}" "$SRC_STD_EXT"; do
+    [ -d "$dir" ] && have_stdlib=1
+done
+if [ "$have_stdlib" = "0" ]; then
+    echo "error: no stdlib sources found under $REPO_ROOT/std/." >&2
+    exit 1
+fi
 
 echo "Installing Luna into $LUNA_HOME ..."
 
-mkdir -p "$BIN_DIR" "$LIB_DIR"
+mkdir -p "$BIN_DIR" "$LIB_DIR" "$LIB_DIR/std"
 
 install -m 0755 "$SRC_COMPILER" "$BIN_DIR/luna-mini"
 install -m 0755 "$SRC_CLI"      "$BIN_DIR/luna"
 install -m 0644 "$SRC_PRELUDE"  "$LIB_DIR/prelude.luna"
+
+# Ship stdlib modules into ~/.luna/lib/std/ as a flat namespace.
+shipped=""
+ship_module() {
+    # $1 = source file, $2 = pretty origin label for log
+    local src="$1" origin="$2" name
+    name="$(basename "$src")"
+    install -m 0644 "$src" "$LIB_DIR/std/$name"
+    shipped="$shipped $name($origin)"
+}
+
+for tier_dir in "${SRC_STD_TIERS[@]}"; do
+    [ -d "$tier_dir" ] || continue
+    for f in "$tier_dir"/*.luna; do
+        [ -f "$f" ] || continue
+        ship_module "$f" "$(basename "$tier_dir")"
+    done
+done
+
+if [ -d "$SRC_STD_EXT" ]; then
+    for f in "$SRC_STD_EXT"/*.luna "$SRC_STD_EXT"/*/*.luna; do
+        [ -f "$f" ] || continue
+        ship_module "$f" "ext"
+    done
+fi
 
 # Determine which shell rc file to update.
 shell_name="$(basename "${SHELL:-/bin/sh}")"

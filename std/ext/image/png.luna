@@ -1,0 +1,399 @@
+# tier: T6
+# deps: gzip
+# ffi: none
+#
+# std/ext/image/png — PNG decoder (RFC 2083 / W3C PNG spec) in pure Luna.
+# No FFI; reuses the DEFLATE decoder from std/ext/compress/gzip.
+#
+# MVP scope:
+#   - 8-bit color depth only.
+#   - Color types 0 (Grayscale), 2 (RGB), 6 (RGBA).
+#   - All five row filters (None / Sub / Up / Average / Paeth).
+#   - Multiple IDAT chunks (concatenated before inflate).
+#   - Ancillary chunks (gAMA, sRGB, tEXt, etc.) are skipped.
+#   - No palette (color type 3), no grayscale+alpha (4), no 16-bit depth,
+#     no Adam7 interlacing, no tRNS.
+#
+# Zlib envelope: 2-byte header + raw DEFLATE + 4-byte Adler-32. The
+# Adler is not validated (the CRC32 per chunk in PNG already detects
+# corruption; we skip both for MVP — see notes).
+#
+# Public API:
+#   png_decode(@src)       -> Image, or -1 on failure (png_error() set)
+#   img_width / img_height / img_channels / img_pixels  -> int accessors
+#   img_pixel(@img, @x, @y) -> packed u32 (R << 24) | (G << 16) | (B << 8) | A
+#   png_error()             -> last error string, "" on success
+#   is_png(@src)            -> 1 if @src starts with the 8-byte PNG sig
+#
+# Error state lives in /tmp/.luna_png_err.<pid> (same trick as gzip).
+
+import gzip
+
+
+# ---------- Error state -----------------------------------------------------
+
+fn _png_err_path() -> int
+    @pid = sys_getpid()
+    @base = "/tmp/.luna_png_err."
+    return str_concat(@base, int_to_str(@pid))
+
+fn _png_set_err(@msg: int) -> int
+    @path = _png_err_path()
+    write_file(@path, @msg)
+    return 0
+
+fn _png_clear_err() -> int
+    @path = _png_err_path()
+    write_file(@path, "")
+    return 0
+
+# png_error() -> last error string. Empty if last decode succeeded.
+fn png_error() -> int
+    @path = _png_err_path()
+    @fd = sys_open(@path, 0, 0)
+    if @fd < 0
+        return ""
+    @cap = 256
+    @buf = new_str(@cap)
+    @n = sys_read(@fd, @buf, @cap)
+    sys_close(@fd)
+    if @n <= 0
+        return ""
+    return str_substr(@buf, 0, @n)
+
+
+# ---------- Signature detection --------------------------------------------
+
+# is_png(@src) -> 1 if @src starts with the 8-byte PNG signature
+# (89 50 4E 47 0D 0A 1A 0A), else 0.
+fn is_png(@src: int) -> int
+    if str_len(@src) < 8
+        return 0
+    if str_byte(@src, 0) != 137
+        return 0
+    if str_byte(@src, 1) != 80
+        return 0
+    if str_byte(@src, 2) != 78
+        return 0
+    if str_byte(@src, 3) != 71
+        return 0
+    if str_byte(@src, 4) != 13
+        return 0
+    if str_byte(@src, 5) != 10
+        return 0
+    if str_byte(@src, 6) != 26
+        return 0
+    if str_byte(@src, 7) != 10
+        return 0
+    return 1
+
+
+# ---------- Image struct ---------------------------------------------------
+
+struct Image
+    width:    int
+    height:   int
+    depth:    int
+    channels: int
+    pixels:   int
+
+fn _img_new(@w: int, @h: int, @ch: int, @px: int) -> Image
+    let @img: Image = new_str(40)
+    @img.width = @w
+    @img.height = @h
+    @img.depth = 8
+    @img.channels = @ch
+    @img.pixels = @px
+    return @img
+
+fn img_width(@img: Image) -> int
+    return @img.width
+
+fn img_height(@img: Image) -> int
+    return @img.height
+
+fn img_channels(@img: Image) -> int
+    return @img.channels
+
+fn img_pixels(@img: Image) -> int
+    return @img.pixels
+
+# img_pixel(@img, @x, @y) -> packed u32 = (R << 24) | (G << 16) | (B << 8) | A.
+# For grayscale, R=G=B=value, A=255. For RGB, A=255.
+# Returns 0 if @x / @y is out of range (caller should bounds-check first).
+fn img_pixel(@img: Image, @x: int, @y: int) -> int
+    if @x < 0
+        return 0
+    if @y < 0
+        return 0
+    if @x >= @img.width
+        return 0
+    if @y >= @img.height
+        return 0
+    @ch = @img.channels
+    @stride = @img.width * @ch
+    @off = @y * @stride + @x * @ch
+    @buf = @img.pixels
+    if @ch == 1
+        @v = str_byte(@buf, @off)
+        return (@v << 24) | (@v << 16) | (@v << 8) | 255
+    if @ch == 3
+        @r = str_byte(@buf, @off)
+        @g = str_byte(@buf, @off + 1)
+        @b = str_byte(@buf, @off + 2)
+        return (@r << 24) | (@g << 16) | (@b << 8) | 255
+    if @ch == 4
+        @r = str_byte(@buf, @off)
+        @g = str_byte(@buf, @off + 1)
+        @b = str_byte(@buf, @off + 2)
+        @a = str_byte(@buf, @off + 3)
+        return (@r << 24) | (@g << 16) | (@b << 8) | @a
+    return 0
+
+
+# ---------- Chunk walker ---------------------------------------------------
+
+# _read_u32_be(@s, @off) -> big-endian 4 bytes as int. Caller must
+# ensure @off + 4 <= str_len(@s).
+fn _read_u32_be(@s: int, @off: int) -> int
+    @b0 = str_byte(@s, @off)
+    @b1 = str_byte(@s, @off + 1)
+    @b2 = str_byte(@s, @off + 2)
+    @b3 = str_byte(@s, @off + 3)
+    return (@b0 << 24) | (@b1 << 16) | (@b2 << 8) | @b3
+
+# _chunk_type_eq(@src, @off, @a, @b, @c, @d) -> 1 if 4 bytes at @off
+# match the 4 ASCII codes, else 0. Used to compare chunk types without
+# allocating substrings.
+fn _chunk_type_eq(@src: int, @off: int, @a: int, @b: int, @c: int, @d: int) -> int
+    if str_byte(@src, @off) != @a
+        return 0
+    if str_byte(@src, @off + 1) != @b
+        return 0
+    if str_byte(@src, @off + 2) != @c
+        return 0
+    if str_byte(@src, @off + 3) != @d
+        return 0
+    return 1
+
+
+# ---------- Filter undo ----------------------------------------------------
+
+# Per-byte Paeth predictor (RFC 2083 §6.6). a=left, b=up, c=upper-left.
+fn _paeth(@a: int, @b: int, @c: int) -> int
+    @p = @a + @b - @c
+    @pa = @p - @a
+    if @pa < 0
+        @pa = 0 - @pa
+    @pb = @p - @b
+    if @pb < 0
+        @pb = 0 - @pb
+    @pc = @p - @c
+    if @pc < 0
+        @pc = 0 - @pc
+    if @pa <= @pb
+        if @pa <= @pc
+            return @a
+        return @c
+    if @pb <= @pc
+        return @b
+    return @c
+
+# _unfilter(@raw, @width, @height, @channels) -> unfiltered pixel buffer
+# (length = width*height*channels), or 0 on error.
+#
+# @raw is the decompressed IDAT stream. Layout is height repetitions of
+#   filter_byte (1 byte) + scanline_bytes (width * channels bytes)
+# so str_len(@raw) must equal height * (1 + width * channels).
+#
+# Reconstruction (RFC 2083 §6) is done in-place into a fresh buffer.
+# For all filters except None, we need the previous reconstructed row,
+# which we read from the output buffer itself.
+fn _unfilter(@raw: int, @width: int, @height: int, @channels: int) -> int
+    @stride = @width * @channels
+    @want_len = @height * (@stride + 1)
+    if str_len(@raw) != @want_len
+        _png_set_err("png: decompressed IDAT has unexpected size")
+        return 0
+    @out_len = @height * @stride
+    @out = new_str(@out_len)
+
+    @y = 0
+    while @y < @height
+        @ftype = str_byte(@raw, @y * (@stride + 1))
+        @raw_row = @y * (@stride + 1) + 1
+        @out_row = @y * @stride
+        @i = 0
+        while @i < @stride
+            @x = str_byte(@raw, @raw_row + @i)
+
+            # Left byte (channel-distance before current position).
+            @left = 0
+            if @i >= @channels
+                @left = u8_at(@out, @out_row + @i - @channels)
+
+            # Up byte (previous row, same column).
+            @up = 0
+            if @y > 0
+                @up = u8_at(@out, @out_row - @stride + @i)
+
+            # Upper-left byte.
+            @ul = 0
+            if @y > 0
+                if @i >= @channels
+                    @ul = u8_at(@out, @out_row - @stride + @i - @channels)
+
+            @recon = 0
+            if @ftype == 0
+                @recon = @x
+            elif @ftype == 1
+                @recon = @x + @left
+            elif @ftype == 2
+                @recon = @x + @up
+            elif @ftype == 3
+                @recon = @x + ((@left + @up) >> 1)
+            elif @ftype == 4
+                @recon = @x + _paeth(@left, @up, @ul)
+            else
+                _png_set_err("png: unknown row filter")
+                return 0
+
+            u8_set(@out, @out_row + @i, @recon & 255)
+            @i = @i + 1
+        @y = @y + 1
+    return @out
+
+
+# ---------- Top-level decoder ----------------------------------------------
+
+# _channels_for(@color_type) -> samples per pixel for the supported
+# color types, or 0 for unsupported. The full PNG spec also defines
+# color types 3 (palette) and 4 (gray+alpha) — both are explicitly out
+# of scope for this MVP.
+fn _channels_for(@color_type: int) -> int
+    if @color_type == 0
+        return 1
+    if @color_type == 2
+        return 3
+    if @color_type == 6
+        return 4
+    return 0
+
+# png_decode(@src) -> Image on success, -1 on failure.
+# On failure png_error() returns a human-readable reason.
+fn png_decode(@src: int) -> int
+    _png_clear_err()
+    @n = str_len(@src)
+    if @n < 8
+        _png_set_err("png: input too short for signature")
+        return 0 - 1
+    if is_png(@src) == 0
+        _png_set_err("png: bad signature")
+        return 0 - 1
+
+    # First chunk must be IHDR (length=13, type "IHDR", 13 bytes data, CRC).
+    @pos = 8
+    if @pos + 8 > @n
+        _png_set_err("png: truncated before IHDR header")
+        return 0 - 1
+    @ihdr_len = _read_u32_be(@src, @pos)
+    if @ihdr_len != 13
+        _png_set_err("png: IHDR length != 13")
+        return 0 - 1
+    if _chunk_type_eq(@src, @pos + 4, 73, 72, 68, 82) == 0
+        _png_set_err("png: first chunk is not IHDR")
+        return 0 - 1
+    if @pos + 8 + 13 + 4 > @n
+        _png_set_err("png: IHDR chunk truncated")
+        return 0 - 1
+    @data = @pos + 8
+    @width = _read_u32_be(@src, @data)
+    @height = _read_u32_be(@src, @data + 4)
+    @depth = str_byte(@src, @data + 8)
+    @color_type = str_byte(@src, @data + 9)
+    @compression = str_byte(@src, @data + 10)
+    @filter_method = str_byte(@src, @data + 11)
+    @interlace = str_byte(@src, @data + 12)
+
+    if @width <= 0
+        _png_set_err("png: non-positive width")
+        return 0 - 1
+    if @height <= 0
+        _png_set_err("png: non-positive height")
+        return 0 - 1
+    if @depth != 8
+        _png_set_err("png: only 8-bit depth supported")
+        return 0 - 1
+    @channels = _channels_for(@color_type)
+    if @channels == 0
+        _png_set_err("png: unsupported color type (need 0, 2, or 6)")
+        return 0 - 1
+    if @compression != 0
+        _png_set_err("png: unknown compression method")
+        return 0 - 1
+    if @filter_method != 0
+        _png_set_err("png: unknown filter method")
+        return 0 - 1
+    if @interlace != 0
+        _png_set_err("png: Adam7 interlacing not supported")
+        return 0 - 1
+    @pos = @data + 13 + 4   # past data + CRC
+
+    # Walk remaining chunks. Concatenate every IDAT payload into one
+    # buffer, then inflate.
+    @zlib = ""
+    @saw_iend = 0
+    while @pos < @n
+        if @pos + 8 > @n
+            _png_set_err("png: chunk header truncated")
+            return 0 - 1
+        @clen = _read_u32_be(@src, @pos)
+        if @clen < 0
+            _png_set_err("png: negative chunk length")
+            return 0 - 1
+        @cdata = @pos + 8
+        if @cdata + @clen + 4 > @n
+            _png_set_err("png: chunk data truncated")
+            return 0 - 1
+
+        if _chunk_type_eq(@src, @pos + 4, 73, 68, 65, 84) == 1
+            @zlib = str_concat(@zlib, str_substr(@src, @cdata, @clen))
+        elif _chunk_type_eq(@src, @pos + 4, 73, 69, 78, 68) == 1
+            @saw_iend = 1
+            @pos = @cdata + @clen + 4
+            break
+        # Any other chunk type — ancillary (lowercase first letter) or
+        # an unknown critical chunk. For MVP we skip both; this matches
+        # libpng's behaviour for tEXt / gAMA / sRGB / pHYs / tRNS / etc.
+
+        @pos = @cdata + @clen + 4
+
+    if @saw_iend == 0
+        _png_set_err("png: missing IEND chunk")
+        return 0 - 1
+    if str_len(@zlib) == 0
+        _png_set_err("png: no IDAT data")
+        return 0 - 1
+
+    # Strip the 2-byte zlib header and 4-byte Adler-32 trailer.
+    @zn = str_len(@zlib)
+    if @zn < 6
+        _png_set_err("png: IDAT zlib stream too short")
+        return 0 - 1
+    @cmf = str_byte(@zlib, 0)
+    if (@cmf & 15) != 8
+        _png_set_err("png: zlib compression method != deflate")
+        return 0 - 1
+    @deflate_stream = str_substr(@zlib, 2, @zn - 6)
+
+    @raw = deflate_decompress(@deflate_stream)
+    if str_len(@raw) == 0
+        _png_set_err("png: DEFLATE decompression failed")
+        return 0 - 1
+
+    @pixels = _unfilter(@raw, @width, @height, @channels)
+    if @pixels == 0
+        return 0 - 1
+
+    let @img: Image = _img_new(@width, @height, @channels, @pixels)
+    return @img

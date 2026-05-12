@@ -1,0 +1,35 @@
+# notes.luna — per-chat persistent notes.
+# /note /notes /clearnotes
+
+fn cmd_note_add(@token: int, @chat_id: int, @text: int) -> int
+    if str_len(@text) == 0
+        send_markdown(@token, @chat_id, "usage: `/note <text>`")
+        return 0
+    @path = _notes_path(@chat_id)
+    @existing = read_file(@path)
+    if @existing == 0
+        @existing = ""
+    @merged = str_concat(@existing, str_concat(@text, "\n"))
+    write_file(@path, @merged)
+    send_message(@token, @chat_id, "noted ✓")
+    return 0
+
+fn cmd_notes(@token: int, @chat_id: int) -> int
+    @path = _notes_path(@chat_id)
+    @text = read_file(@path)
+    if @text == 0
+        send_message(@token, @chat_id, "no notes yet — try `/note your idea`")
+        return 0
+    if str_len(@text) == 0
+        send_message(@token, @chat_id, "no notes yet — try `/note your idea`")
+        return 0
+    @msg = "*your notes:*\n```\n"
+    @msg = str_concat(@msg, @text)
+    @msg = str_concat(@msg, "```")
+    send_markdown(@token, @chat_id, @msg)
+    return 0
+
+fn cmd_clearnotes(@token: int, @chat_id: int) -> int
+    write_file(_notes_path(@chat_id), "")
+    send_message(@token, @chat_id, "notes cleared.")
+    return 0

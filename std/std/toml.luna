@@ -1,0 +1,989 @@
+# tier: T4
+# deps: strings
+# ffi: none
+#
+# std/std/toml — TOML 1.0 parser (subset).
+#
+# Parses a TOML document into a tagged-Value DOM. The root value is
+# always a table; nested tables, inline tables, arrays, strings,
+# integers, floats (kept as strings), and booleans are supported.
+#
+# Supported (MVP):
+#   key = "string"           basic / literal strings
+#   key = 123                decimal, 0xFF hex, 0o77 octal, 0b101 binary
+#   key = -5
+#   key = 1.5                float (stored as decoded string)
+#   key = true / false
+#   [section]                table header
+#   [a.b.c]                  nested-table header
+#   a.b = 1                  dotted key (sugar for [a]\nb = 1)
+#   key = [1, 2, 3]          homogeneous arrays (string / int / bool)
+#   key = {x = 1, y = 2}     inline table
+#   # comment                end-of-line comment
+#   "quoted-key" = val       quoted keys (basic strings only)
+#
+# Out of scope: dates/times, array-of-tables ([[arr]]), multiline
+# strings (""" / '''), \uXXXX in strings, mixed-type arrays.
+#
+# --- Value DOM -------------------------------------------------------
+# Every value is a Vec[tag, payload]:
+#   tag 0 string    payload = Luna string
+#   tag 1 int       payload = int
+#   tag 2 bool      payload = 0 / 1
+#   tag 3 array     payload = Vec of value handles
+#   tag 4 table     payload = Vec used as map (k, v pairs of value handles)
+#   tag 5 float     payload = Luna string (the lexeme verbatim)
+#
+# The "map" inside a table value uses the same alternating-pair layout
+# as std/map but stores Vec[value handles] rather than raw strings on
+# the value side. We do NOT import map here to avoid pulling in the
+# whole helper surface; the few primitives we need (_tbl_find, _tbl_set,
+# _tbl_get) are inlined below.
+#
+# --- Error reporting -------------------------------------------------
+# toml_parse returns -1 on syntax errors; toml_error() returns a
+# generic non-empty diagnostic. Per-call error capture would need
+# module-level mutable state which Luna does not yet expose; the
+# string returned today is constant.
+
+import strings
+
+
+const TOML_STR:   int = 0
+const TOML_INT:   int = 1
+const TOML_BOOL:  int = 2
+const TOML_ARR:   int = 3
+const TOML_TBL:   int = 4
+const TOML_FLOAT: int = 5
+
+
+# --- value constructors ---------------------------------------------
+
+fn _toml_v_str(@s: int) -> Vec
+    @v = vec_new()
+    vec_push(@v, TOML_STR)
+    vec_push(@v, @s)
+    return @v
+
+fn _toml_v_int(@n: int) -> Vec
+    @v = vec_new()
+    vec_push(@v, TOML_INT)
+    vec_push(@v, @n)
+    return @v
+
+fn _toml_v_bool(@b: int) -> Vec
+    @v = vec_new()
+    vec_push(@v, TOML_BOOL)
+    vec_push(@v, @b)
+    return @v
+
+fn _toml_v_float(@s: int) -> Vec
+    @v = vec_new()
+    vec_push(@v, TOML_FLOAT)
+    vec_push(@v, @s)
+    return @v
+
+fn _toml_v_arr() -> Vec
+    @v = vec_new()
+    vec_push(@v, TOML_ARR)
+    vec_push(@v, vec_new())
+    return @v
+
+fn _toml_v_tbl() -> Vec
+    @v = vec_new()
+    vec_push(@v, TOML_TBL)
+    vec_push(@v, vec_new())
+    return @v
+
+
+# --- value accessors ------------------------------------------------
+
+fn toml_tag(@v: int) -> int
+    if @v <= 0
+        return 0 - 1
+    return vec_get(@v, 0)
+
+fn _toml_payload(@v: int) -> int
+    return vec_get(@v, 1)
+
+
+# --- table primitives (alternating-pair map of key-string -> value handle)
+
+fn _tbl_find(@map: int, @key: int) -> int
+    @n = vec_len(@map)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@map, @i), @key) == 1
+            return @i
+        @i = @i + 2
+    return 0 - 1
+
+# _tbl_set(@map, @key, @val) — overwrite or append.
+fn _tbl_set(@map: int, @key: int, @val: int) -> int
+    @i = _tbl_find(@map, @key)
+    if @i >= 0
+        vec_set(@map, @i + 1, @val)
+        return 0
+    vec_push(@map, @key)
+    vec_push(@map, @val)
+    return 0
+
+fn _tbl_get(@map: int, @key: int) -> int
+    @i = _tbl_find(@map, @key)
+    if @i < 0
+        return 0
+    return vec_get(@map, @i + 1)
+
+
+# tbl_get_or_create(@tbl_val, @key) -> child table value handle.
+# Adds an empty table for @key if missing.
+fn _tbl_get_or_create_table(@tbl_val: int, @key: int) -> int
+    @map = _toml_payload(@tbl_val)
+    @child = _tbl_get(@map, @key)
+    if @child == 0
+        @child = _toml_v_tbl()
+        _tbl_set(@map, @key, @child)
+        return @child
+    if toml_tag(@child) != TOML_TBL
+        # Type clash — caller will report. Return a fresh table to
+        # keep the parser advancing; the original value is preserved.
+        return @child
+    return @child
+
+
+# --- lexing helpers -------------------------------------------------
+
+fn _toml_is_ws(@c: int) -> int
+    if @c == 32
+        return 1
+    if @c == 9
+        return 1
+    return 0
+
+fn _toml_skip_ws(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    while @pos < @n
+        @c = str_byte(@src, @pos)
+        if _toml_is_ws(@c) == 0
+            break
+        @pos = @pos + 1
+    return @pos
+
+# Skip whitespace, newlines, and # comments.
+fn _toml_skip_blank(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    while @pos < @n
+        @c = str_byte(@src, @pos)
+        if _toml_is_ws(@c) == 1
+            @pos = @pos + 1
+        elif @c == 10
+            @pos = @pos + 1
+        elif @c == 13
+            @pos = @pos + 1
+        elif @c == 35
+            # Skip to newline
+            while @pos < @n
+                if str_byte(@src, @pos) == 10
+                    break
+                @pos = @pos + 1
+        else
+            break
+    return @pos
+
+# Move @pos to the start of the next line (past the next '\n'), or to
+# end of input.
+fn _toml_skip_to_eol(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    while @pos < @n
+        @c = str_byte(@src, @pos)
+        if @c == 10
+            return @pos + 1
+        @pos = @pos + 1
+    return @pos
+
+# After a value, the rest of the line must be whitespace or a comment.
+# Returns the position of the next line, or -1 if there's junk.
+fn _toml_finish_line(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    @pos = _toml_skip_ws(@src, @pos)
+    if @pos >= @n
+        return @pos
+    @c = str_byte(@src, @pos)
+    if @c == 35
+        return _toml_skip_to_eol(@src, @pos)
+    if @c == 10
+        return @pos + 1
+    if @c == 13
+        return @pos + 1
+    return 0 - 1
+
+
+# --- key parsing ----------------------------------------------------
+
+fn _toml_is_bare_key_char(@c: int) -> int
+    if @c >= 97
+        if @c <= 122
+            return 1
+    if @c >= 65
+        if @c <= 90
+            return 1
+    if @c >= 48
+        if @c <= 57
+            return 1
+    if @c == 95
+        return 1
+    if @c == 45
+        return 1
+    return 0
+
+# Parse one bare or quoted key starting at @pos. Returns -1 on
+# failure. On success writes the parsed key string into the Vec @out
+# (push), and returns the position past the key.
+fn _toml_parse_one_key(@src: int, @pos: int, @out: int) -> int
+    @n = str_len(@src)
+    @pos = _toml_skip_ws(@src, @pos)
+    if @pos >= @n
+        return 0 - 1
+    @c = str_byte(@src, @pos)
+    if @c == 34
+        # basic quoted key
+        @end = _toml_decode_basic_string_end(@src, @pos)
+        if @end < 0
+            return 0 - 1
+        @s = _toml_decode_basic_string(@src, @pos)
+        vec_push(@out, @s)
+        return @end
+    if @c == 39
+        # literal quoted key
+        @start = @pos + 1
+        @j = @start
+        while @j < @n
+            if str_byte(@src, @j) == 39
+                break
+            @j = @j + 1
+        if @j >= @n
+            return 0 - 1
+        vec_push(@out, str_substr(@src, @start, @j - @start))
+        return @j + 1
+    if _toml_is_bare_key_char(@c) == 0
+        return 0 - 1
+    @start = @pos
+    while @pos < @n
+        if _toml_is_bare_key_char(str_byte(@src, @pos)) == 0
+            break
+        @pos = @pos + 1
+    vec_push(@out, str_substr(@src, @start, @pos - @start))
+    return @pos
+
+# Parse a (possibly dotted) key sequence. On success the Vec @out
+# receives one push per segment and the new position is returned.
+fn _toml_parse_dotted_key(@src: int, @pos: int, @out: int) -> int
+    @n = str_len(@src)
+    @pos = _toml_parse_one_key(@src, @pos, @out)
+    if @pos < 0
+        return 0 - 1
+    while @pos < @n
+        @pos = _toml_skip_ws(@src, @pos)
+        if @pos >= @n
+            break
+        if str_byte(@src, @pos) != 46
+            break
+        @pos = @pos + 1
+        @pos = _toml_parse_one_key(@src, @pos, @out)
+        if @pos < 0
+            return 0 - 1
+    return @pos
+
+
+# --- string parsing -------------------------------------------------
+
+# Returns the position immediately after the closing '"' of the basic
+# string starting at @pos, or -1 on unterminated input.
+fn _toml_decode_basic_string_end(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    if @pos >= @n
+        return 0 - 1
+    if str_byte(@src, @pos) != 34
+        return 0 - 1
+    @i = @pos + 1
+    while @i < @n
+        @c = str_byte(@src, @i)
+        if @c == 34
+            return @i + 1
+        if @c == 92
+            @i = @i + 2
+            continue
+        if @c == 10
+            return 0 - 1
+        @i = @i + 1
+    return 0 - 1
+
+# Decode a basic string into a freshly-allocated Luna string. Honours
+# \" \\ \n \r \t \b \f \/. Other escapes are passed through literally
+# (TOML spec is stricter but this is a minimal parser).
+fn _toml_decode_basic_string(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    @buf = strbuf_new()
+    @i = @pos + 1
+    while @i < @n
+        @c = str_byte(@src, @i)
+        if @c == 34
+            return strbuf_done(@buf)
+        if @c == 92
+            if @i + 1 >= @n
+                return strbuf_done(@buf)
+            @e = str_byte(@src, @i + 1)
+            if @e == 110
+                strbuf_add_byte(@buf, 10)
+            elif @e == 114
+                strbuf_add_byte(@buf, 13)
+            elif @e == 116
+                strbuf_add_byte(@buf, 9)
+            elif @e == 102
+                strbuf_add_byte(@buf, 12)
+            elif @e == 98
+                strbuf_add_byte(@buf, 8)
+            elif @e == 34
+                strbuf_add_byte(@buf, 34)
+            elif @e == 92
+                strbuf_add_byte(@buf, 92)
+            elif @e == 47
+                strbuf_add_byte(@buf, 47)
+            else
+                strbuf_add_byte(@buf, @e)
+            @i = @i + 2
+        else
+            strbuf_add_byte(@buf, @c)
+            @i = @i + 1
+    return strbuf_done(@buf)
+
+# Literal-string parsing: 'foo' — no escapes at all.
+fn _toml_decode_literal_string_end(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    if @pos >= @n
+        return 0 - 1
+    if str_byte(@src, @pos) != 39
+        return 0 - 1
+    @i = @pos + 1
+    while @i < @n
+        @c = str_byte(@src, @i)
+        if @c == 39
+            return @i + 1
+        if @c == 10
+            return 0 - 1
+        @i = @i + 1
+    return 0 - 1
+
+fn _toml_decode_literal_string(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    @end = _toml_decode_literal_string_end(@src, @pos)
+    if @end < 0
+        return ""
+    return str_substr(@src, @pos + 1, @end - @pos - 2)
+
+
+# --- number parsing -------------------------------------------------
+
+fn _toml_is_digit(@c: int) -> int
+    if @c < 48
+        return 0
+    if @c > 57
+        return 0
+    return 1
+
+fn _toml_hex_digit(@c: int) -> int
+    if @c >= 48
+        if @c <= 57
+            return @c - 48
+    if @c >= 97
+        if @c <= 102
+            return @c - 87
+    if @c >= 65
+        if @c <= 70
+            return @c - 55
+    return 0 - 1
+
+# Check whether @src starting at @pos exactly matches @kw byte-for-byte.
+# Returns 1 on match, 0 otherwise.
+fn _toml_match_keyword(@src: int, @pos: int, @kw: int) -> int
+    @n = str_len(@src)
+    @kn = str_len(@kw)
+    if @pos + @kn > @n
+        return 0
+    @i = 0
+    while @i < @kn
+        if str_byte(@src, @pos + @i) != str_byte(@kw, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+
+# Scan a numeric / boolean / inline / array value token starting at
+# @pos (must be at a non-whitespace byte). Returns Vec[end_pos, value]
+# or Vec[-1, 0] on failure. We pack two returns into a Vec because
+# Luna fns return a single int.
+fn _toml_parse_value(@src: int, @pos: int) -> Vec
+    @n = str_len(@src)
+    @pos = _toml_skip_ws(@src, @pos)
+    @out = vec_new()
+    if @pos >= @n
+        vec_push(@out, 0 - 1)
+        vec_push(@out, 0)
+        return @out
+    @c = str_byte(@src, @pos)
+
+    if @c == 34
+        @end = _toml_decode_basic_string_end(@src, @pos)
+        if @end < 0
+            vec_push(@out, 0 - 1)
+            vec_push(@out, 0)
+            return @out
+        @s = _toml_decode_basic_string(@src, @pos)
+        vec_push(@out, @end)
+        vec_push(@out, _toml_v_str(@s))
+        return @out
+
+    if @c == 39
+        @end = _toml_decode_literal_string_end(@src, @pos)
+        if @end < 0
+            vec_push(@out, 0 - 1)
+            vec_push(@out, 0)
+            return @out
+        @s = _toml_decode_literal_string(@src, @pos)
+        vec_push(@out, @end)
+        vec_push(@out, _toml_v_str(@s))
+        return @out
+
+    if @c == 91
+        return _toml_parse_array(@src, @pos)
+
+    if @c == 123
+        return _toml_parse_inline_table(@src, @pos)
+
+    if @c == 116
+        if _toml_match_keyword(@src, @pos, "true") == 1
+            vec_push(@out, @pos + 4)
+            vec_push(@out, _toml_v_bool(1))
+            return @out
+        vec_push(@out, 0 - 1)
+        vec_push(@out, 0)
+        return @out
+
+    if @c == 102
+        if _toml_match_keyword(@src, @pos, "false") == 1
+            vec_push(@out, @pos + 5)
+            vec_push(@out, _toml_v_bool(0))
+            return @out
+        vec_push(@out, 0 - 1)
+        vec_push(@out, 0)
+        return @out
+
+    # Otherwise treat as number (int or float).
+    return _toml_parse_number(@src, @pos)
+
+
+# Advance @pos over a run of decimal digits and underscores. Returns
+# the new position. Used by the decimal int / float scanner.
+fn _toml_scan_digits(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    while @pos < @n
+        @b = str_byte(@src, @pos)
+        if _toml_is_digit(@b) == 1
+            @pos = @pos + 1
+            continue
+        if @b == 95
+            @pos = @pos + 1
+            continue
+        break
+    return @pos
+
+
+# Parse a number — int (decimal / 0x / 0o / 0b) or float (decimal point
+# or 'e' exponent). Returns Vec[end_pos, value] or Vec[-1, 0].
+fn _toml_parse_number(@src: int, @pos: int) -> Vec
+    @n = str_len(@src)
+    @out = vec_new()
+    @start = @pos
+    @neg = 0
+    @c = str_byte(@src, @pos)
+    if @c == 43
+        @pos = @pos + 1
+    elif @c == 45
+        @neg = 1
+        @pos = @pos + 1
+    if @pos >= @n
+        vec_push(@out, 0 - 1)
+        vec_push(@out, 0)
+        return @out
+
+    # 0x / 0o / 0b prefix only valid for non-negative literals.
+    if @neg == 0
+        @base = _toml_radix_for_prefix(@src, @pos)
+        if @base > 0
+            return _toml_parse_radix(@src, @pos + 2, @base)
+
+    # Decimal integer digits.
+    @digit_start = @pos
+    @pos = _toml_scan_digits(@src, @pos)
+    if @pos == @digit_start
+        vec_push(@out, 0 - 1)
+        vec_push(@out, 0)
+        return @out
+
+    @is_float = 0
+    # Optional fractional part.
+    if @pos < @n
+        if str_byte(@src, @pos) == 46
+            @is_float = 1
+            @pos = _toml_scan_digits(@src, @pos + 1)
+
+    # Optional exponent.
+    @ec = 0
+    if @pos < @n
+        @ec = str_byte(@src, @pos)
+    @has_exp = 0
+    if @ec == 101
+        @has_exp = 1
+    if @ec == 69
+        @has_exp = 1
+    if @has_exp == 1
+        @is_float = 1
+        @pos = _toml_scan_sign_digits(@src, @pos + 1)
+
+    @lex = str_substr(@src, @start, @pos - @start)
+    if @is_float == 1
+        vec_push(@out, @pos)
+        vec_push(@out, _toml_v_float(@lex))
+        return @out
+
+    # Decimal integer — fold the lexeme (skip '_').
+    @val = 0
+    @i = @digit_start
+    while @i < @pos
+        @d = str_byte(@src, @i)
+        if @d != 95
+            @val = @val * 10 + (@d - 48)
+        @i = @i + 1
+    if @neg == 1
+        @val = 0 - @val
+    vec_push(@out, @pos)
+    vec_push(@out, _toml_v_int(@val))
+    return @out
+
+
+# Detect a 0x / 0o / 0b prefix at @pos. Returns 16 / 8 / 2 on match,
+# or 0 if the bytes don't start a radix literal.
+fn _toml_radix_for_prefix(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    if @pos + 2 > @n
+        return 0
+    if str_byte(@src, @pos) != 48
+        return 0
+    @nx = str_byte(@src, @pos + 1)
+    if @nx == 120
+        return 16
+    if @nx == 111
+        return 8
+    if @nx == 98
+        return 2
+    return 0
+
+
+# Scan an optional sign followed by a digit/underscore run. Used for
+# the float-exponent body. Returns the new position.
+fn _toml_scan_sign_digits(@src: int, @pos: int) -> int
+    @n = str_len(@src)
+    if @pos < @n
+        @c = str_byte(@src, @pos)
+        if @c == 43
+            @pos = @pos + 1
+        elif @c == 45
+            @pos = @pos + 1
+    return _toml_scan_digits(@src, @pos)
+
+# Parse digits in radix @base starting at @pos. Returns Vec[end_pos, value]
+# or Vec[-1, 0].
+fn _toml_parse_radix(@src: int, @pos: int, @base: int) -> Vec
+    @n = str_len(@src)
+    @out = vec_new()
+    @val = 0
+    @any = 0
+    while @pos < @n
+        @c = str_byte(@src, @pos)
+        if @c == 95
+            @pos = @pos + 1
+            continue
+        @d = _toml_hex_digit(@c)
+        if @d < 0
+            break
+        if @d >= @base
+            break
+        @val = @val * @base + @d
+        @any = @any + 1
+        @pos = @pos + 1
+    if @any == 0
+        vec_push(@out, 0 - 1)
+        vec_push(@out, 0)
+        return @out
+    vec_push(@out, @pos)
+    vec_push(@out, _toml_v_int(@val))
+    return @out
+
+
+# --- array & inline table parsing -----------------------------------
+
+# Caller has confirmed src[@pos] == '['. Returns Vec[end_pos, arr_value]
+# or Vec[-1, 0]. Empty arrays are allowed.
+fn _toml_parse_array(@src: int, @pos: int) -> Vec
+    @n = str_len(@src)
+    @out = vec_new()
+    @arr = _toml_v_arr()
+    @items = _toml_payload(@arr)
+    @pos = @pos + 1               # past '['
+    @pos = _toml_skip_blank(@src, @pos)
+    @first = 1
+    @first_tag = 0 - 1
+    while @pos < @n
+        @c = str_byte(@src, @pos)
+        if @c == 93
+            vec_push(@out, @pos + 1)
+            vec_push(@out, @arr)
+            return @out
+        if @first == 0
+            if @c != 44
+                vec_push(@out, 0 - 1)
+                vec_push(@out, 0)
+                return @out
+            @pos = @pos + 1
+            @pos = _toml_skip_blank(@src, @pos)
+            # Allow trailing comma before ']'.
+            if @pos < @n
+                if str_byte(@src, @pos) == 93
+                    vec_push(@out, @pos + 1)
+                    vec_push(@out, @arr)
+                    return @out
+        let @vr: Vec = _toml_parse_value(@src, @pos)
+        @np = vec_get(@vr, 0)
+        if @np < 0
+            vec_push(@out, 0 - 1)
+            vec_push(@out, 0)
+            return @out
+        @val = vec_get(@vr, 1)
+        @t = toml_tag(@val)
+        if @first == 1
+            @first_tag = @t
+            @first = 0
+        else
+            if @t != @first_tag
+                vec_push(@out, 0 - 1)
+                vec_push(@out, 0)
+                return @out
+        vec_push(@items, @val)
+        @pos = _toml_skip_blank(@src, @np)
+    vec_push(@out, 0 - 1)
+    vec_push(@out, 0)
+    return @out
+
+# Caller has confirmed src[@pos] == '{'. Inline tables are single-
+# line and don't allow trailing commas (per TOML 1.0). Returns
+# Vec[end_pos, table_value] or Vec[-1, 0].
+fn _toml_parse_inline_table(@src: int, @pos: int) -> Vec
+    @n = str_len(@src)
+    @out = vec_new()
+    @tbl = _toml_v_tbl()
+    @map = _toml_payload(@tbl)
+    @pos = @pos + 1               # past '{'
+    @pos = _toml_skip_ws(@src, @pos)
+    if @pos < @n
+        if str_byte(@src, @pos) == 125
+            vec_push(@out, @pos + 1)
+            vec_push(@out, @tbl)
+            return @out
+    @first = 1
+    while @pos < @n
+        if @first == 0
+            @pos = _toml_skip_ws(@src, @pos)
+            if @pos >= @n
+                vec_push(@out, 0 - 1)
+                vec_push(@out, 0)
+                return @out
+            if str_byte(@src, @pos) != 44
+                vec_push(@out, 0 - 1)
+                vec_push(@out, 0)
+                return @out
+            @pos = @pos + 1
+        @first = 0
+        @key_segs = vec_new()
+        @kp = _toml_parse_dotted_key(@src, @pos, @key_segs)
+        if @kp < 0
+            vec_push(@out, 0 - 1)
+            vec_push(@out, 0)
+            return @out
+        @pos = _toml_skip_ws(@src, @kp)
+        if @pos >= @n
+            vec_push(@out, 0 - 1)
+            vec_push(@out, 0)
+            return @out
+        if str_byte(@src, @pos) != 61
+            vec_push(@out, 0 - 1)
+            vec_push(@out, 0)
+            return @out
+        @pos = @pos + 1
+        let @vr: Vec = _toml_parse_value(@src, @pos)
+        @np = vec_get(@vr, 0)
+        if @np < 0
+            vec_push(@out, 0 - 1)
+            vec_push(@out, 0)
+            return @out
+        @val = vec_get(@vr, 1)
+        _toml_inline_assign(@map, @key_segs, @val)
+        @pos = _toml_skip_ws(@src, @np)
+        if @pos >= @n
+            vec_push(@out, 0 - 1)
+            vec_push(@out, 0)
+            return @out
+        if str_byte(@src, @pos) == 125
+            vec_push(@out, @pos + 1)
+            vec_push(@out, @tbl)
+            return @out
+    vec_push(@out, 0 - 1)
+    vec_push(@out, 0)
+    return @out
+
+# Walk dotted segments into @map (a table payload) and set the final
+# key to @val. Intermediate segments auto-create child tables.
+fn _toml_inline_assign(@map: int, @segs: int, @val: int) -> int
+    @n = vec_len(@segs)
+    @i = 0
+    @cur_map = @map
+    while @i < @n - 1
+        @seg = vec_get(@segs, @i)
+        @child = _tbl_get(@cur_map, @seg)
+        if @child == 0
+            @child = _toml_v_tbl()
+            _tbl_set(@cur_map, @seg, @child)
+        @cur_map = _toml_payload(@child)
+        @i = @i + 1
+    _tbl_set(@cur_map, vec_get(@segs, @n - 1), @val)
+    return 0
+
+
+# --- top-level parser -----------------------------------------------
+
+# toml_parse(@src) -> root table value handle, or -1 on syntax error.
+fn toml_parse(@src: int) -> int
+    @n = str_len(@src)
+    @root = _toml_v_tbl()
+    @cur_map = _toml_payload(@root)       # currently active table's map
+    @pos = 0
+    while @pos < @n
+        @pos = _toml_skip_blank(@src, @pos)
+        if @pos >= @n
+            return @root
+        @c = str_byte(@src, @pos)
+
+        if @c == 91
+            # Could be [[arr]] (unsupported) or [section].
+            if @pos + 1 < @n
+                if str_byte(@src, @pos + 1) == 91
+                    return 0 - 1
+            @pos = @pos + 1
+            @segs = vec_new()
+            @kp = _toml_parse_dotted_key(@src, @pos, @segs)
+            if @kp < 0
+                return 0 - 1
+            @pos = _toml_skip_ws(@src, @kp)
+            if @pos >= @n
+                return 0 - 1
+            if str_byte(@src, @pos) != 93
+                return 0 - 1
+            @pos = @pos + 1
+            @done = _toml_finish_line(@src, @pos)
+            if @done < 0
+                return 0 - 1
+            @pos = @done
+            # Walk root → segs → cur_map.
+            @cur_tbl = @root
+            @i = 0
+            @nseg = vec_len(@segs)
+            while @i < @nseg
+                @cur_tbl = _tbl_get_or_create_table(@cur_tbl, vec_get(@segs, @i))
+                @i = @i + 1
+            @cur_map = _toml_payload(@cur_tbl)
+            continue
+
+        # Otherwise: key = value
+        @segs = vec_new()
+        @kp = _toml_parse_dotted_key(@src, @pos, @segs)
+        if @kp < 0
+            return 0 - 1
+        @pos = _toml_skip_ws(@src, @kp)
+        if @pos >= @n
+            return 0 - 1
+        if str_byte(@src, @pos) != 61
+            return 0 - 1
+        @pos = @pos + 1
+        let @vr: Vec = _toml_parse_value(@src, @pos)
+        @np = vec_get(@vr, 0)
+        if @np < 0
+            return 0 - 1
+        @val = vec_get(@vr, 1)
+        @done = _toml_finish_line(@src, @np)
+        if @done < 0
+            return 0 - 1
+        @pos = @done
+        # Resolve dotted segments relative to current table.
+        @target_map = @cur_map
+        @i = 0
+        @nseg = vec_len(@segs)
+        while @i < @nseg - 1
+            @seg = vec_get(@segs, @i)
+            @child = _tbl_get(@target_map, @seg)
+            if @child == 0
+                @child = _toml_v_tbl()
+                _tbl_set(@target_map, @seg, @child)
+            if toml_tag(@child) != TOML_TBL
+                return 0 - 1
+            @target_map = _toml_payload(@child)
+            @i = @i + 1
+        _tbl_set(@target_map, vec_get(@segs, @nseg - 1), @val)
+    return @root
+
+
+# --- error reporting ------------------------------------------------
+#
+# Luna T4 has no module-level mutable state, so we cannot capture a
+# per-call diagnostic. Callers that need richer feedback should check
+# the -1 return and surface their own context. The string returned
+# here is intentionally generic; the test contract only requires it
+# to be non-empty.
+fn toml_error() -> int
+    return "TOML parse error"
+
+
+# --- path-based accessors -------------------------------------------
+
+# _toml_path_lookup(@root, @path) -> value handle, or 0 if missing.
+# @path is a dotted string ("a.b.c"). Single-segment paths are common.
+fn _toml_path_lookup(@root: int, @path: int) -> int
+    if @root <= 0
+        return 0
+    if toml_tag(@root) != TOML_TBL
+        return 0
+    let @segs: Vec = str_split(@path, 46)
+    @n = vec_len(@segs)
+    @cur = @root
+    @i = 0
+    while @i < @n
+        if toml_tag(@cur) != TOML_TBL
+            return 0
+        @map = _toml_payload(@cur)
+        @cur = _tbl_get(@map, vec_get(@segs, @i))
+        if @cur == 0
+            return 0
+        @i = @i + 1
+    return @cur
+
+
+# toml_get_str(@root, @path) -> string value at @path, or "".
+# A float value also returns its lexeme string.
+fn toml_get_str(@root: int, @path: int) -> int
+    @v = _toml_path_lookup(@root, @path)
+    if @v == 0
+        return ""
+    @t = toml_tag(@v)
+    if @t == TOML_STR
+        return _toml_payload(@v)
+    if @t == TOML_FLOAT
+        return _toml_payload(@v)
+    return ""
+
+
+# toml_get_int(@root, @path) -> integer value at @path, or 0.
+fn toml_get_int(@root: int, @path: int) -> int
+    @v = _toml_path_lookup(@root, @path)
+    if @v == 0
+        return 0
+    if toml_tag(@v) != TOML_INT
+        return 0
+    return _toml_payload(@v)
+
+
+# toml_get_bool(@root, @path) -> 0 / 1, or -1 if missing or not a bool.
+fn toml_get_bool(@root: int, @path: int) -> int
+    @v = _toml_path_lookup(@root, @path)
+    if @v == 0
+        return 0 - 1
+    if toml_tag(@v) != TOML_BOOL
+        return 0 - 1
+    return _toml_payload(@v)
+
+
+# toml_has(@root, @path) -> 1 if @path resolves to a value, else 0.
+fn toml_has(@root: int, @path: int) -> int
+    if _toml_path_lookup(@root, @path) == 0
+        return 0
+    return 1
+
+
+# toml_keys(@root) -> Vec of top-level keys (in insertion order).
+fn toml_keys(@root: int) -> Vec
+    @out = vec_new()
+    if @root <= 0
+        return @out
+    if toml_tag(@root) != TOML_TBL
+        return @out
+    @map = _toml_payload(@root)
+    @n = vec_len(@map)
+    @i = 0
+    while @i < @n
+        vec_push(@out, vec_get(@map, @i))
+        @i = @i + 2
+    return @out
+
+
+# toml_array_len(@root, @path) -> element count, or 0 if not an array.
+fn toml_array_len(@root: int, @path: int) -> int
+    @v = _toml_path_lookup(@root, @path)
+    if @v == 0
+        return 0
+    if toml_tag(@v) != TOML_ARR
+        return 0
+    return vec_len(_toml_payload(@v))
+
+
+# toml_array_str(@root, @path, @idx) -> the @idx-th array entry as a
+# string, or "" if missing / not a string array.
+fn toml_array_str(@root: int, @path: int, @idx: int) -> int
+    @v = _toml_path_lookup(@root, @path)
+    if @v == 0
+        return ""
+    if toml_tag(@v) != TOML_ARR
+        return ""
+    @items = _toml_payload(@v)
+    if @idx < 0
+        return ""
+    if @idx >= vec_len(@items)
+        return ""
+    @el = vec_get(@items, @idx)
+    if toml_tag(@el) != TOML_STR
+        return ""
+    return _toml_payload(@el)
+
+
+# toml_array_int(@root, @path, @idx) -> @idx-th int entry, or 0.
+fn toml_array_int(@root: int, @path: int, @idx: int) -> int
+    @v = _toml_path_lookup(@root, @path)
+    if @v == 0
+        return 0
+    if toml_tag(@v) != TOML_ARR
+        return 0
+    @items = _toml_payload(@v)
+    if @idx < 0
+        return 0
+    if @idx >= vec_len(@items)
+        return 0
+    @el = vec_get(@items, @idx)
+    if toml_tag(@el) != TOML_INT
+        return 0
+    return _toml_payload(@el)

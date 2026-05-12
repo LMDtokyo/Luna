@@ -1,0 +1,163 @@
+# AES-GCM tests — McGrew/Viega "GCM" reference test vectors (cases 1,
+# 2, 13, 14) plus round-trip + tamper-detection coverage.
+#
+# All hex constants below are quoted verbatim from the original NIST
+# GCM specification (McGrew & Viega, 2005), which has been the de-facto
+# KAT source for every AES-GCM implementation since.
+
+import aes_gcm
+import test
+
+
+# _zeros(@n) — fresh @n-byte buffer of all zeros.
+fn _zeros(@n: int) -> int
+    return new_str(@n)
+
+
+fn run_aes_gcm_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # --- Input validation ---
+    @r = assert_eq_int("check_inputs 128/96 ok", aes_gcm_check_inputs(_zeros(16), _zeros(12)), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("check_inputs 256/96 ok", aes_gcm_check_inputs(_zeros(32), _zeros(12)), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("check_inputs short key", aes_gcm_check_inputs(_zeros(15), _zeros(12)), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("check_inputs short nonce", aes_gcm_check_inputs(_zeros(16), _zeros(11)), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Case 1 (AES-128, empty PT, empty AAD) ---
+    # K = 16x 00, IV = 12x 00, P = "", A = "" -> C = "", T = 58e2fcce...
+    @case1 = aes_gcm_encrypt(_zeros(16), _zeros(12), "", "")
+    @r = assert_eq_str("aes-128-gcm case1 tag", aes_gcm_hex(@case1), "58e2fccefa7e3061367f1d57a4e7455a")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Case 2 (AES-128, 16-byte zero PT, empty AAD) ---
+    @case2_pt = _zeros(16)
+    @case2 = aes_gcm_encrypt(_zeros(16), _zeros(12), @case2_pt, "")
+    @r = assert_eq_str("aes-128-gcm case2 ct+tag", aes_gcm_hex(@case2), "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Case 13 (AES-256, empty PT, empty AAD) ---
+    @case13 = aes_gcm_encrypt(_zeros(32), _zeros(12), "", "")
+    @r = assert_eq_str("aes-256-gcm case13 tag", aes_gcm_hex(@case13), "530f8afbc74536b9a963b4f1c4cb738b")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Case 14 (AES-256, 16-byte zero PT, empty AAD) ---
+    @case14_pt = _zeros(16)
+    @case14 = aes_gcm_encrypt(_zeros(32), _zeros(12), @case14_pt, "")
+    @r = assert_eq_str("aes-256-gcm case14 ct+tag", aes_gcm_hex(@case14), "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Round-trip (AES-128, AAD non-empty) ---
+    # Build a 12-byte nonce and 16-byte key with distinguishable bytes
+    # (0x11..., 0xaa...). This stresses key-expansion + counter-mode
+    # together. AAD = "header", PT = "hello world! this is luna gcm".
+    @key128 = new_str(16)
+    @ki = 0
+    while @ki < 16
+        str_set_byte(@key128, @ki, 17)
+        @ki = @ki + 1
+    @nonce = new_str(12)
+    @ni = 0
+    while @ni < 12
+        str_set_byte(@nonce, @ni, 170)
+        @ni = @ni + 1
+    @pt = "hello world! this is luna gcm"
+    @aad = "header"
+    @ct = aes_gcm_encrypt(@key128, @nonce, @pt, @aad)
+    @r = assert_eq_int("roundtrip-128 ct length", str_len(@ct), str_len(@pt) + 16)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @dec = aes_gcm_decrypt(@key128, @nonce, @ct, @aad)
+    @r = assert_eq_str("roundtrip-128 plaintext", @dec, @pt)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Round-trip (AES-256) ---
+    @key256 = new_str(32)
+    @ki = 0
+    while @ki < 32
+        str_set_byte(@key256, @ki, 51)
+        @ki = @ki + 1
+    @ct2 = aes_gcm_encrypt(@key256, @nonce, @pt, @aad)
+    @dec2 = aes_gcm_decrypt(@key256, @nonce, @ct2, @aad)
+    @r = assert_eq_str("roundtrip-256 plaintext", @dec2, @pt)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Wrong key -> "" ---
+    @bad_key = new_str(16)
+    @ki = 0
+    while @ki < 16
+        str_set_byte(@bad_key, @ki, 1)
+        @ki = @ki + 1
+    @bad = aes_gcm_decrypt(@bad_key, @nonce, @ct, @aad)
+    @r = assert_eq_int("wrong-key returns empty", str_len(@bad), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Wrong AAD -> "" ---
+    @bad_aad = aes_gcm_decrypt(@key128, @nonce, @ct, "different")
+    @r = assert_eq_int("wrong-aad returns empty", str_len(@bad_aad), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Tampered tag -> "" ---
+    # Flip the last byte of the ciphertext+tag (= last byte of tag).
+    @tampered = new_str(str_len(@ct))
+    @ti = 0
+    while @ti < str_len(@ct)
+        str_set_byte(@tampered, @ti, str_byte(@ct, @ti))
+        @ti = @ti + 1
+    @last = str_byte(@tampered, str_len(@tampered) - 1)
+    str_set_byte(@tampered, str_len(@tampered) - 1, (@last ^ 1) & 255)
+    @bad_tag = aes_gcm_decrypt(@key128, @nonce, @tampered, @aad)
+    @r = assert_eq_int("tampered-tag returns empty", str_len(@bad_tag), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Tampered ciphertext byte -> "" ---
+    # Flip the first byte (definitely a ciphertext byte since PT > 0).
+    @tampered2 = new_str(str_len(@ct))
+    @ti = 0
+    while @ti < str_len(@ct)
+        str_set_byte(@tampered2, @ti, str_byte(@ct, @ti))
+        @ti = @ti + 1
+    @first = str_byte(@tampered2, 0)
+    str_set_byte(@tampered2, 0, (@first ^ 1) & 255)
+    @bad_ct = aes_gcm_decrypt(@key128, @nonce, @tampered2, @aad)
+    @r = assert_eq_int("tampered-ct returns empty", str_len(@bad_ct), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Empty plaintext round-trip with AAD ---
+    @ct_e = aes_gcm_encrypt(@key128, @nonce, "", @aad)
+    @r = assert_eq_int("empty-pt ct length is 16", str_len(@ct_e), 16)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @dec_e = aes_gcm_decrypt(@key128, @nonce, @ct_e, @aad)
+    @r = assert_eq_int("empty-pt roundtrip length", str_len(@dec_e), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("aes_gcm", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_aes_gcm_tests(0, 0)

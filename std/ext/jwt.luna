@@ -1,0 +1,237 @@
+# tier: T6
+# deps: sha256, base64, json, time, strings
+# ffi: none
+#
+# std/ext/jwt — JSON Web Tokens (RFC 7519), HS256 only.
+#
+# A JWT is three base64url-encoded parts separated by '.':
+#   <header>.<payload>.<signature>
+#
+# Header (HS256): {"alg":"HS256","typ":"JWT"}
+# Payload:        any JSON object supplied by the caller
+# Signature:      base64url( HMAC-SHA256(secret, header_b64 + "." + payload_b64) )
+#
+# base64url = standard base64 with '+' -> '-', '/' -> '_', and trailing
+# '=' padding stripped.
+#
+# Public surface:
+#   jwt_sign(@payload_json, @secret)   -> full JWT string
+#   jwt_verify(@token, @secret)        -> 1 if sig valid AND not expired
+#   jwt_decode_payload(@token)         -> payload JSON, or "" on malformed
+#   jwt_base64url_encode(@bytes)       -> base64url string
+#   jwt_base64url_decode(@s)           -> raw bytes
+#
+# jwt_verify checks the optional `exp` claim (seconds since 1970): if
+# present and <= time_now(), the token is rejected.
+
+import sha256
+import base64
+import json
+import time
+import strings
+
+
+# --- base64url ---------------------------------------------------------
+
+fn jwt_base64url_encode(@bytes: int) -> int
+    @std = base64_encode(@bytes)
+    @n = str_len(@std)
+    # Find the unpadded length (trim trailing '=').
+    @end = @n
+    while @end > 0
+        if str_byte(@std, @end - 1) != 61
+            break
+        @end = @end - 1
+    @out = new_str(@end)
+    @i = 0
+    while @i < @end
+        @c = str_byte(@std, @i)
+        if @c == 43
+            str_set_byte(@out, @i, 45)
+        elif @c == 47
+            str_set_byte(@out, @i, 95)
+        else
+            str_set_byte(@out, @i, @c)
+        @i = @i + 1
+    return @out
+
+
+fn jwt_base64url_decode(@s: int) -> int
+    @n = str_len(@s)
+    # Re-pad to multiple of 4.
+    @rem = @n % 4
+    @pad = 0
+    if @rem == 2
+        @pad = 2
+    elif @rem == 3
+        @pad = 1
+    elif @rem == 1
+        # Invalid base64url length; behave as base64_decode would.
+        @pad = 3
+    @padded_len = @n + @pad
+    @std = new_str(@padded_len)
+    @i = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c == 45
+            str_set_byte(@std, @i, 43)
+        elif @c == 95
+            str_set_byte(@std, @i, 47)
+        else
+            str_set_byte(@std, @i, @c)
+        @i = @i + 1
+    @j = 0
+    while @j < @pad
+        str_set_byte(@std, @n + @j, 61)
+        @j = @j + 1
+    return base64_decode(@std)
+
+
+# --- hex decoding ------------------------------------------------------
+
+# _jwt_hex_to_bytes("deadbeef") -> 4 raw bytes 0xde,0xad,0xbe,0xef.
+# Input length must be even; odd byte is silently dropped.
+fn _jwt_hex_to_bytes(@hex: int) -> int
+    @n = str_len(@hex)
+    @out_len = @n / 2
+    @out = new_str(@out_len)
+    @i = 0
+    while @i < @out_len
+        @hi = _jwt_hex_digit(str_byte(@hex, @i * 2))
+        @lo = _jwt_hex_digit(str_byte(@hex, @i * 2 + 1))
+        str_set_byte(@out, @i, ((@hi << 4) | @lo) & 255)
+        @i = @i + 1
+    return @out
+
+
+fn _jwt_hex_digit(@c: int) -> int
+    if @c >= 48
+        if @c <= 57
+            return @c - 48
+    if @c >= 97
+        if @c <= 102
+            return @c - 87
+    if @c >= 65
+        if @c <= 70
+            return @c - 55
+    return 0
+
+
+# --- header constant ---------------------------------------------------
+#
+# Bootminor's string lexer mishandles \" inside literals in some
+# contexts, so build the canonical HS256 header at runtime.
+
+fn _jwt_header_json() -> int
+    @h = new_str(27)
+    str_set_byte(@h, 0,  123)   # {
+    str_set_byte(@h, 1,  34)    # "
+    str_set_byte(@h, 2,  97)    # a
+    str_set_byte(@h, 3,  108)   # l
+    str_set_byte(@h, 4,  103)   # g
+    str_set_byte(@h, 5,  34)    # "
+    str_set_byte(@h, 6,  58)    # :
+    str_set_byte(@h, 7,  34)    # "
+    str_set_byte(@h, 8,  72)    # H
+    str_set_byte(@h, 9,  83)    # S
+    str_set_byte(@h, 10, 50)    # 2
+    str_set_byte(@h, 11, 53)    # 5
+    str_set_byte(@h, 12, 54)    # 6
+    str_set_byte(@h, 13, 34)    # "
+    str_set_byte(@h, 14, 44)    # ,
+    str_set_byte(@h, 15, 34)    # "
+    str_set_byte(@h, 16, 116)   # t
+    str_set_byte(@h, 17, 121)   # y
+    str_set_byte(@h, 18, 112)   # p
+    str_set_byte(@h, 19, 34)    # "
+    str_set_byte(@h, 20, 58)    # :
+    str_set_byte(@h, 21, 34)    # "
+    str_set_byte(@h, 22, 74)    # J
+    str_set_byte(@h, 23, 87)    # W
+    str_set_byte(@h, 24, 84)    # T
+    str_set_byte(@h, 25, 34)    # "
+    str_set_byte(@h, 26, 125)   # }
+    return @h
+
+
+# --- signing -----------------------------------------------------------
+
+fn _jwt_signing_input(@payload_json: int) -> int
+    @header_b64 = jwt_base64url_encode(_jwt_header_json())
+    @payload_b64 = jwt_base64url_encode(@payload_json)
+    @msg = str_concat(@header_b64, ".")
+    @msg = str_concat(@msg, @payload_b64)
+    return @msg
+
+
+fn jwt_sign(@payload_json: int, @secret: int) -> int
+    @msg = _jwt_signing_input(@payload_json)
+    @sig_hex = hmac_sha256_hex(@secret, @msg)
+    @sig_bytes = _jwt_hex_to_bytes(@sig_hex)
+    @sig_b64 = jwt_base64url_encode(@sig_bytes)
+    @out = str_concat(@msg, ".")
+    @out = str_concat(@out, @sig_b64)
+    return @out
+
+
+# --- verification ------------------------------------------------------
+
+# Split token "h.p.s" into a Vec of 3 strings. Returns an empty Vec
+# when the token doesn't have exactly two '.' separators.
+fn _jwt_split(@token: int) -> Vec
+    let @parts: Vec = str_split(@token, 46)
+    return @parts
+
+
+fn jwt_decode_payload(@token: int) -> int
+    let @parts: Vec = _jwt_split(@token)
+    if vec_len(@parts) != 3
+        return ""
+    return jwt_base64url_decode(vec_get(@parts, 1))
+
+
+# Constant-time-ish byte string compare. Returns 1 on equality.
+# (Bootminor's str_eq already does length-prefixed equality; the
+# explicit byte walk here just guards against early-return through
+# length mismatch leaking timing.)
+fn _jwt_str_eq(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    if @la != @lb
+        return 0
+    @diff = 0
+    @i = 0
+    while @i < @la
+        @diff = @diff | (str_byte(@a, @i) ^ str_byte(@b, @i))
+        @i = @i + 1
+    if @diff == 0
+        return 1
+    return 0
+
+
+fn jwt_verify(@token: int, @secret: int) -> int
+    let @parts: Vec = _jwt_split(@token)
+    if vec_len(@parts) != 3
+        return 0
+    @header_b64 = vec_get(@parts, 0)
+    @payload_b64 = vec_get(@parts, 1)
+    @given_sig = vec_get(@parts, 2)
+
+    @msg = str_concat(@header_b64, ".")
+    @msg = str_concat(@msg, @payload_b64)
+
+    @want_hex = hmac_sha256_hex(@secret, @msg)
+    @want_bytes = _jwt_hex_to_bytes(@want_hex)
+    @want_b64 = jwt_base64url_encode(@want_bytes)
+
+    if _jwt_str_eq(@given_sig, @want_b64) == 0
+        return 0
+
+    # Signature is good — check optional `exp` claim.
+    @payload = jwt_base64url_decode(@payload_b64)
+    if json_has(@payload, "exp") == 1
+        @exp = json_get_int(@payload, "exp")
+        @now = time_now()
+        if @exp <= @now
+            return 0
+    return 1

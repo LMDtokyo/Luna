@@ -116,30 +116,93 @@ const DEFAULT_WRITE_TIMEOUT_MS: int = 30000
 const WS_GUID_LEN: int = 36
 
 # =============================================================================
-# SECTION 2: FFI EXTERN DECLARATIONS
+# SECTION 2: TRANSPORT BINDINGS
 # =============================================================================
-# Direct bindings to the Rust socket runtime (socket.rs, raw_socket.rs).
+# Originally these were Rust-runtime FFI symbols (`luna_socket_*`). For
+# Lunar Independence (no Rust runtime), they are now thin Luna wrappers
+# around plain libc socket / connect / send / recv / close — declared in
+# bootstrap/prelude.luna. DNS goes through gethostbyname.
 
-# --- Socket lifecycle ---
-extern fn luna_socket_create(@domain: int, @type: int, @protocol: int) -> int
-extern fn luna_socket_bind(@fd: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
-extern fn luna_socket_listen(@fd: int, @backlog: int) -> int
-extern fn luna_socket_accept(@fd: int) -> int
-extern fn luna_socket_connect_raw(@fd: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
-extern fn luna_socket_send(@fd: int, @data_ptr: int, @data_len: int) -> int
-extern fn luna_socket_recv(@fd: int, @buf_ptr: int, @buf_len: int) -> int
-extern fn luna_socket_close(@fd: int) -> int
-extern fn luna_socket_set_timeout(@fd: int, @read_ms: int, @write_ms: int) -> int
-extern fn luna_socket_set_nonblocking(@fd: int, @enable: int) -> int
-extern fn luna_socket_set_reuseaddr(@fd: int, @enable: int) -> int
-extern fn luna_socket_get_peer_addr(@fd: int) -> int
-extern fn luna_socket_get_peer_port(@fd: int) -> int
-extern fn luna_socket_get_local_port(@fd: int) -> int
+extern "C" fn gethostbyname(@name: int) -> int
+extern "C" fn setsockopt(@fd: int, @level: int, @opt: int, @val: int, @len: int) -> int
 
-# --- UDP specific ---
-extern fn luna_socket_sendto(@fd: int, @data_ptr: int, @data_len: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
-extern fn luna_socket_recvfrom(@fd: int, @buf_ptr: int, @buf_len: int) -> int
-extern fn luna_socket_set_broadcast(@fd: int, @enable: int) -> int
+# --- Socket lifecycle (libc-backed) ---
+fn luna_socket_create(@domain: int, @type: int, @protocol: int) -> int
+    return socket(@domain, @type, @protocol)
+
+fn luna_socket_close(@fd: int) -> int
+    return close(@fd)
+
+fn luna_socket_send(@fd: int, @data_ptr: int, @data_len: int) -> int
+    return send(@fd, @data_ptr, @data_len, 0)
+
+fn luna_socket_recv(@fd: int, @buf_ptr: int, @buf_len: int) -> int
+    return recv(@fd, @buf_ptr, @buf_len, 0)
+
+# Resolve hostname → IPv4, build sockaddr_in, connect. Returns 0 on
+# success, -1 on any failure.
+fn luna_socket_connect_raw(@fd: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
+    @he = gethostbyname(@addr_ptr)
+    if @he == 0
+        return 0 - 1
+    @addr_list = u64_at(@he, 24)
+    if @addr_list == 0
+        return 0 - 1
+    @first = u64_at(@addr_list, 0)
+    if @first == 0
+        return 0 - 1
+    @ip = u32_at(@first, 0)
+    @sa = new_str(16)
+    str_set_byte(@sa, 0, 2)
+    str_set_byte(@sa, 1, 0)
+    str_set_byte(@sa, 2, (@port >> 8) & 255)
+    str_set_byte(@sa, 3, @port & 255)
+    u32_set(@sa, 4, @ip)
+    return connect(@fd, @sa, 16)
+
+# Bind a sockaddr_in built from (port, INADDR_ANY) — used by tcp_listen.
+fn luna_socket_bind(@fd: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
+    @sa = new_str(16)
+    str_set_byte(@sa, 0, 2)
+    str_set_byte(@sa, 1, 0)
+    str_set_byte(@sa, 2, (@port >> 8) & 255)
+    str_set_byte(@sa, 3, @port & 255)
+    u32_set(@sa, 4, 0)
+    return bind(@fd, @sa, 16)
+
+extern "C" fn listen(@fd: int, @backlog: int) -> int
+extern "C" fn accept(@fd: int, @addr: int, @len: int) -> int
+extern "C" fn bind(@fd: int, @addr: int, @len: int) -> int
+
+fn luna_socket_listen(@fd: int, @backlog: int) -> int
+    return listen(@fd, @backlog)
+
+fn luna_socket_accept(@fd: int) -> int
+    return accept(@fd, 0, 0)
+
+# No-op shims for runtime conveniences we don't need.
+fn luna_socket_set_timeout(@fd: int, @read_ms: int, @write_ms: int) -> int
+    return 0
+fn luna_socket_set_nonblocking(@fd: int, @enable: int) -> int
+    return 0
+fn luna_socket_set_reuseaddr(@fd: int, @enable: int) -> int
+    @one = new_str(4)
+    str_set_byte(@one, 0, @enable & 255)
+    return setsockopt(@fd, 1, 2, @one, 4)
+fn luna_socket_get_peer_addr(@fd: int) -> int
+    return 0
+fn luna_socket_get_peer_port(@fd: int) -> int
+    return 0
+fn luna_socket_get_local_port(@fd: int) -> int
+    return 0
+
+# UDP / broadcast — not implemented, return error so callers detect.
+fn luna_socket_sendto(@fd: int, @data_ptr: int, @data_len: int, @addr_ptr: int, @addr_len: int, @port: int) -> int
+    return 0 - 1
+fn luna_socket_recvfrom(@fd: int, @buf_ptr: int, @buf_len: int) -> int
+    return 0 - 1
+fn luna_socket_set_broadcast(@fd: int, @enable: int) -> int
+    return 0 - 1
 
 # --- WebSocket (from socket.rs) ---
 extern fn luna_ws_connect(@url_ptr: int, @url_len: int) -> int
@@ -210,7 +273,19 @@ extern fn luna_ip_to_string(@ip: int) -> int
 extern fn luna_ip_in_cidr(@ip_ptr: int, @ip_len: int, @cidr_ptr: int, @cidr_len: int) -> int
 
 # --- DNS ---
-extern fn luna_dns_resolve(@host_ptr: int, @host_len: int) -> int
+# Use libc's gethostbyname (declared above). Returns IPv4 packed as a
+# u32, or 0 on resolution failure.
+fn luna_dns_resolve(@host_ptr: int, @host_len: int) -> int
+    @he = gethostbyname(@host_ptr)
+    if @he == 0
+        return 0
+    @addr_list = u64_at(@he, 24)
+    if @addr_list == 0
+        return 0
+    @first = u64_at(@addr_list, 0)
+    if @first == 0
+        return 0
+    return u32_at(@first, 0)
 
 # --- Memory ---
 extern fn luna_mem_alloc(@size: int) -> int
@@ -223,9 +298,18 @@ extern fn luna_mem_write_u8(@ptr: int, @offset: int, @value: int) -> void
 extern fn luna_mem_read_u8(@ptr: int, @offset: int) -> int
 
 # --- String interning ---
-extern fn luna_str_intern(@ptr: int, @len: int) -> int
-extern fn luna_str_get_ptr(@id: int) -> int
-extern fn luna_str_get_len(@id: int) -> int
+# Pure-Luna stub: we don't need an interner because Luna strings are
+# already heap-allocated by `new_str` and survive across calls. Just
+# return the pointer back so callers that store it as a "string id"
+# can still look the bytes up later.
+fn luna_str_intern(@ptr: int, @len: int) -> int
+    return @ptr
+fn luna_str_get_ptr(@id: int) -> int
+    return @id
+fn luna_str_get_len(@id: int) -> int
+    if @id == 0
+        return 0
+    return str_len(@id)
 
 # =============================================================================
 # SECTION 3: TCP STREAM

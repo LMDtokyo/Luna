@@ -1,0 +1,170 @@
+# tier: T5
+# deps:
+# ffi: none
+#
+# std/net/multipart — RFC 7578 multipart/form-data body parser.
+#
+# Usage from a request handler:
+#
+#   @ctype = _ws_header_value(@req.headers, "Content-Type:")  # or any
+#   @bnd   = multipart_boundary(@ctype)
+#   @text  = multipart_part(@req.body, @bnd, "message")
+#   @file  = multipart_part(@req.body, @bnd, "attachment")
+#   @fname = multipart_filename(@req.body, @bnd, "attachment")
+#
+# Public surface:
+#   multipart_boundary(@ctype)               -> boundary value or ""
+#   multipart_part(@body, @bnd, @name)       -> raw body of matched part
+#   multipart_filename(@body, @bnd, @name)   -> filename of matched part
+#
+# Limitations:
+#   - No multi-part return (one call -> one field). Loop yourself if
+#     you need to enumerate.
+#   - Headers other than Content-Disposition aren't surfaced.
+#   - Doesn't unfold continuation header lines (rarely used in practice).
+
+
+# _mp_find(@hay, @start, @hay_len, @needle) -> offset of @needle, or -1.
+fn _mp_find(@hay: int, @start: int, @hay_len: int, @needle: int) -> int
+    @nlen = str_len(@needle)
+    if @nlen == 0
+        return @start
+    if @nlen > @hay_len - @start
+        return -1
+    @end = @hay_len - @nlen
+    @i = @start
+    while @i <= @end
+        @match = 1
+        @j = 0
+        while @j < @nlen
+            if str_byte(@hay, @i + @j) != str_byte(@needle, @j)
+                @match = 0
+                break
+            @j = @j + 1
+        if @match == 1
+            return @i
+        @i = @i + 1
+    return -1
+
+
+# _mp_bytes_eq(@a, @ao, @b, @bo, @len) -> 1 if a[ao..ao+len] == b[bo..bo+len].
+fn _mp_bytes_eq(@a: int, @ao: int, @b: int, @bo: int, @len: int) -> int
+    @i = 0
+    while @i < @len
+        if str_byte(@a, @ao + @i) != str_byte(@b, @bo + @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+
+# multipart_boundary(@ctype) -> boundary string from
+# "multipart/form-data; boundary=XYZ". Strips optional quoting.
+fn multipart_boundary(@ctype: int) -> int
+    @clen = str_len(@ctype)
+    @key  = "boundary="
+    @pos  = _mp_find(@ctype, 0, @clen, @key)
+    if @pos < 0
+        return ""
+    @start = @pos + str_len(@key)
+    if @start >= @clen
+        return ""
+    if str_byte(@ctype, @start) == 34
+        # quoted: skip opening quote, end at closing quote
+        @start = @start + 1
+        @q = _mp_find(@ctype, @start, @clen, "\"")
+        if @q < 0
+            return ""
+        return str_substr(@ctype, @start, @q - @start)
+    # unquoted: end at ';' or end-of-string
+    @end = @clen
+    @i = @start
+    while @i < @clen
+        if str_byte(@ctype, @i) == 59
+            @end = @i
+            @i = @clen
+        else
+            @i = @i + 1
+    return str_substr(@ctype, @start, @end - @start)
+
+
+# _mp_disp_name_matches(@body, @hdr_s, @hdr_e, @name) -> 1 if the
+# headers in [@hdr_s..@hdr_e) contain `name="<@name>"`.
+fn _mp_disp_name_matches(@body: int, @hdr_s: int, @hdr_e: int, @name: int) -> int
+    @marker = "name=\""
+    @pos = _mp_find(@body, @hdr_s, @hdr_e, @marker)
+    if @pos < 0
+        return 0
+    @pos = @pos + str_len(@marker)
+    @wlen = str_len(@name)
+    if @pos + @wlen + 1 > @hdr_e
+        return 0
+    if _mp_bytes_eq(@body, @pos, @name, 0, @wlen) == 0
+        return 0
+    if str_byte(@body, @pos + @wlen) != 34
+        return 0
+    return 1
+
+
+# _mp_disp_filename(@body, @hdr_s, @hdr_e) -> filename value or "".
+fn _mp_disp_filename(@body: int, @hdr_s: int, @hdr_e: int) -> int
+    @marker = "filename=\""
+    @pos = _mp_find(@body, @hdr_s, @hdr_e, @marker)
+    if @pos < 0
+        return ""
+    @pos = @pos + str_len(@marker)
+    @q = _mp_find(@body, @pos, @hdr_e, "\"")
+    if @q < 0
+        return ""
+    return str_substr(@body, @pos, @q - @pos)
+
+
+# _mp_walk(@body, @boundary, @name, @want) -> matched extract.
+#   @want = 0: return part body
+#   @want = 1: return filename of matched part
+# "" if no matching part.
+fn _mp_walk(@body: int, @boundary: int, @name: int, @want: int) -> int
+    @blen = str_len(@body)
+    @first_delim = str_concat("--", @boundary)
+    @next_delim  = str_concat("\r\n--", @boundary)
+    @ndlen = str_len(@next_delim)
+    @first = _mp_find(@body, 0, @blen, @first_delim)
+    if @first < 0
+        return ""
+    @pos = @first + str_len(@first_delim)
+    if @pos + 2 > @blen
+        return ""
+    @pos = @pos + 2
+
+    while @pos < @blen
+        @hdr_end = _mp_find(@body, @pos, @blen, "\r\n\r\n")
+        if @hdr_end < 0
+            return ""
+        @matched = _mp_disp_name_matches(@body, @pos, @hdr_end, @name)
+        @body_start = @hdr_end + 4
+        @next = _mp_find(@body, @body_start, @blen, @next_delim)
+        if @next < 0
+            @next = @blen
+        if @matched == 1
+            if @want == 0
+                return str_substr(@body, @body_start, @next - @body_start)
+            return _mp_disp_filename(@body, @pos, @hdr_end)
+        @pos = @next + @ndlen
+        if @pos + 2 > @blen
+            return ""
+        if str_byte(@body, @pos) == 45
+            if str_byte(@body, @pos + 1) == 45
+                return ""
+        @pos = @pos + 2
+    return ""
+
+
+# multipart_part(@body, @boundary, @name) -> raw body of the part named
+# @name, or "" if absent.
+fn multipart_part(@body: int, @boundary: int, @name: int) -> int
+    return _mp_walk(@body, @boundary, @name, 0)
+
+
+# multipart_filename(@body, @boundary, @name) -> filename of the part
+# named @name (from `filename="..."` in Content-Disposition), or "".
+fn multipart_filename(@body: int, @boundary: int, @name: int) -> int
+    return _mp_walk(@body, @boundary, @name, 1)

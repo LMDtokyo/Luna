@@ -1,0 +1,314 @@
+# tier: T6
+# deps: sha256, base64, random
+# ffi: none
+#
+# std/ext/crypto/pbkdf2 — PBKDF2-HMAC-SHA256 (RFC 8018 §5.2) plus a
+# self-describing PHC-style storage format for password hashing.
+#
+# Why this module exists: SHA-256 alone is not a password hash. It has
+# no salt and no cost factor, so an attacker who steals the database
+# can brute-force the cheap hashes with GPUs in seconds. PBKDF2 fixes
+# both: per-password random salt + tunable iteration count.
+#
+# Public API:
+#   pbkdf2_sha256(@password, @salt, @iterations, @keylen)
+#       Raw KDF. Returns @keylen bytes as a Luna string.
+#
+#   pwhash_make(@password, @iterations)
+#       Generate a 16-byte random salt + derive a 32-byte key, then
+#       encode everything into a single storage string of the form
+#           $pbkdf2-sha256$i=<iter>$<salt_b64>$<hash_b64>$
+#       (PHC-style; base64 has no padding so the string stays one
+#       opaque token with no `=` to escape in URLs / JSON.)
+#
+#   pwhash_verify(@password, @stored)
+#       Re-derive with the salt + iterations from @stored, then compare
+#       in constant time. Returns 1 on match, 0 otherwise.
+#
+#   pwhash_recommended_iterations()
+#       Current floor recommendation. Returns 600000 (OWASP 2023 for
+#       PBKDF2-SHA-256). Callers should treat this as a minimum and
+#       raise the number as hardware gets faster.
+
+import sha256
+import base64
+import random
+
+
+const PBKDF2_HLEN: int = 32
+const PBKDF2_SALT_LEN: int = 16
+
+
+# --- base64 without padding -------------------------------------------
+#
+# RFC 4648 §3.2: "unpadded" base64 — same alphabet, just strip trailing
+# '=' on encode. Decode re-pads to a multiple of 4 before deferring to
+# the standard decoder.
+
+fn _b64_encode_no_pad(@bytes: int) -> int
+    @std = base64_encode(@bytes)
+    @n = str_len(@std)
+    @end = @n
+    while @end > 0
+        if str_byte(@std, @end - 1) != 61
+            break
+        @end = @end - 1
+    @out = new_str(@end)
+    @i = 0
+    while @i < @end
+        str_set_byte(@out, @i, str_byte(@std, @i))
+        @i = @i + 1
+    return @out
+
+
+fn _b64_decode_no_pad(@s: int) -> int
+    @n = str_len(@s)
+    @rem = @n % 4
+    @pad = 0
+    if @rem == 2
+        @pad = 2
+    elif @rem == 3
+        @pad = 1
+    elif @rem == 1
+        # Invalid length; defer to base64_decode (it will return junk
+        # but won't crash) by padding 3.
+        @pad = 3
+    @padded_len = @n + @pad
+    @std = new_str(@padded_len)
+    @i = 0
+    while @i < @n
+        str_set_byte(@std, @i, str_byte(@s, @i))
+        @i = @i + 1
+    @j = 0
+    while @j < @pad
+        str_set_byte(@std, @n + @j, 61)
+        @j = @j + 1
+    return base64_decode(@std)
+
+
+# --- XOR helper -------------------------------------------------------
+
+# _xor_into(@dst, @src) — dst[i] ^= src[i] for the full length of @dst.
+# Assumes str_len(@dst) <= str_len(@src). Mutates @dst in place.
+fn _xor_into(@dst: int, @src: int) -> int
+    @n = str_len(@dst)
+    @i = 0
+    while @i < @n
+        @a = str_byte(@dst, @i)
+        @b = str_byte(@src, @i)
+        str_set_byte(@dst, @i, (@a ^ @b) & 255)
+        @i = @i + 1
+    return 0
+
+
+# --- F() — one PBKDF2 block ------------------------------------------
+#
+# F(P, S, c, i) = U_1 XOR U_2 XOR ... XOR U_c
+#   U_1 = HMAC(P, S || INT_BE_32(i))
+#   U_j = HMAC(P, U_{j-1})
+#
+# Returns 32 bytes (= hLen for SHA-256).
+
+fn _pbkdf2_block(@password: int, @salt: int, @iter: int, @block_idx: int) -> int
+    @slen = str_len(@salt)
+    @msg = new_str(@slen + 4)
+    @i = 0
+    while @i < @slen
+        str_set_byte(@msg, @i, str_byte(@salt, @i))
+        @i = @i + 1
+    str_set_byte(@msg, @slen,     (@block_idx >> 24) & 255)
+    str_set_byte(@msg, @slen + 1, (@block_idx >> 16) & 255)
+    str_set_byte(@msg, @slen + 2, (@block_idx >> 8)  & 255)
+    str_set_byte(@msg, @slen + 3, @block_idx         & 255)
+
+    @u = hmac_sha256(@password, @msg)
+    # Copy U_1 into the accumulator @t.
+    @t = new_str(PBKDF2_HLEN)
+    @k = 0
+    while @k < PBKDF2_HLEN
+        str_set_byte(@t, @k, str_byte(@u, @k))
+        @k = @k + 1
+
+    @j = 1
+    while @j < @iter
+        @u = hmac_sha256(@password, @u)
+        _xor_into(@t, @u)
+        @j = @j + 1
+    return @t
+
+
+# --- Public KDF -------------------------------------------------------
+#
+# pbkdf2_sha256(P, S, c, dkLen) — RFC 8018 §5.2.
+#   dkLen must be > 0. We cap practical use at 32 bytes (one block) so
+#   no caller accidentally requests gigabytes; SHA-256's hLen=32 covers
+#   essentially every password-storage need. Multi-block dkLen is still
+#   computed correctly when asked.
+
+fn pbkdf2_sha256(@password: int, @salt: int, @iterations: int, @keylen: int) -> int
+    if @keylen <= 0
+        return ""
+    if @iterations <= 0
+        return ""
+    @nblocks = (@keylen + PBKDF2_HLEN - 1) / PBKDF2_HLEN
+    @out = new_str(@keylen)
+    @bi = 1
+    while @bi <= @nblocks
+        @t = _pbkdf2_block(@password, @salt, @iterations, @bi)
+        @off = (@bi - 1) * PBKDF2_HLEN
+        @copy = PBKDF2_HLEN
+        if @off + @copy > @keylen
+            @copy = @keylen - @off
+        @k = 0
+        while @k < @copy
+            str_set_byte(@out, @off + @k, str_byte(@t, @k))
+            @k = @k + 1
+        @bi = @bi + 1
+    return @out
+
+
+# --- PHC-style storage string ----------------------------------------
+#
+# Format: $pbkdf2-sha256$i=<iter>$<salt_b64_nopad>$<hash_b64_nopad>$
+#
+# The trailing '$' matches the spec the caller asked for and makes the
+# string trivially parseable: it always ends in five '$' separators.
+
+fn _int_to_str_pos(@n: int) -> int
+    if @n == 0
+        @z = new_str(1)
+        str_set_byte(@z, 0, 48)
+        return @z
+    @tmp = new_str(24)
+    @i = 0
+    while @n > 0
+        @d = @n % 10
+        str_set_byte(@tmp, @i, 48 + @d)
+        @n = @n / 10
+        @i = @i + 1
+    @out = new_str(@i)
+    @j = 0
+    while @j < @i
+        str_set_byte(@out, @j, str_byte(@tmp, @i - 1 - @j))
+        @j = @j + 1
+    return @out
+
+
+fn pwhash_make(@password: int, @iterations: int) -> int
+    if @iterations <= 0
+        @iterations = pwhash_recommended_iterations()
+    @salt = crypto_bytes(PBKDF2_SALT_LEN)
+    if str_len(@salt) != PBKDF2_SALT_LEN
+        # getrandom failed — refuse to produce an insecure hash with a
+        # known-bad salt. Caller must check the empty-string return.
+        return ""
+    @hash = pbkdf2_sha256(@password, @salt, @iterations, PBKDF2_HLEN)
+    @salt_b64 = _b64_encode_no_pad(@salt)
+    @hash_b64 = _b64_encode_no_pad(@hash)
+
+    @out = strbuf_new()
+    strbuf_add_byte(@out, 36)
+    strbuf_add_str(@out, "pbkdf2-sha256")
+    strbuf_add_byte(@out, 36)
+    strbuf_add_str(@out, "i=")
+    strbuf_add_str(@out, _int_to_str_pos(@iterations))
+    strbuf_add_byte(@out, 36)
+    strbuf_add_str(@out, @salt_b64)
+    strbuf_add_byte(@out, 36)
+    strbuf_add_str(@out, @hash_b64)
+    strbuf_add_byte(@out, 36)
+    return strbuf_done(@out)
+
+
+# --- Parsing ----------------------------------------------------------
+#
+# We don't have tuple returns. _pwhash_field(@stored, @idx) returns the
+# Nth '$'-delimited field (0-based). The format is:
+#     ""  "pbkdf2-sha256"  "i=<N>"  "<salt>"  "<hash>"  ""
+# Fields: 0           1                 2          3         4        5
+
+fn _pwhash_field(@stored: int, @idx: int) -> int
+    @n = str_len(@stored)
+    @field = 0
+    @start = 0
+    @i = 0
+    while @i <= @n
+        @at_end = 0
+        if @i == @n
+            @at_end = 1
+        @sep = 0
+        if @at_end == 0
+            if str_byte(@stored, @i) == 36
+                @sep = 1
+        if @sep == 1
+            if @field == @idx
+                return str_substr(@stored, @start, @i - @start)
+            @field = @field + 1
+            @start = @i + 1
+        if @at_end == 1
+            if @field == @idx
+                return str_substr(@stored, @start, @i - @start)
+            return ""
+        @i = @i + 1
+    return ""
+
+
+fn _parse_iter_field(@field: int) -> int
+    # Expect "i=<digits>". Returns the integer, or -1 on malformed.
+    @n = str_len(@field)
+    if @n < 3
+        return -1
+    if str_byte(@field, 0) != 105
+        return -1
+    if str_byte(@field, 1) != 61
+        return -1
+    @v = 0
+    @i = 2
+    while @i < @n
+        @c = str_byte(@field, @i)
+        if @c < 48
+            return -1
+        if @c > 57
+            return -1
+        @v = @v * 10 + (@c - 48)
+        @i = @i + 1
+    return @v
+
+
+# Constant-time string compare. Returns 1 if equal, 0 if not. Avoids
+# the early-out timing leak that str_eq has.
+fn _ct_eq(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    if @la != @lb
+        return 0
+    @diff = 0
+    @i = 0
+    while @i < @la
+        @diff = @diff | (str_byte(@a, @i) ^ str_byte(@b, @i))
+        @i = @i + 1
+    if @diff == 0
+        return 1
+    return 0
+
+
+fn pwhash_verify(@password: int, @stored: int) -> int
+    @scheme = _pwhash_field(@stored, 1)
+    if str_eq(@scheme, "pbkdf2-sha256") == 0
+        return 0
+    @iter_field = _pwhash_field(@stored, 2)
+    @iter = _parse_iter_field(@iter_field)
+    if @iter <= 0
+        return 0
+    @salt_b64 = _pwhash_field(@stored, 3)
+    @hash_b64 = _pwhash_field(@stored, 4)
+    @salt = _b64_decode_no_pad(@salt_b64)
+    @expected = _b64_decode_no_pad(@hash_b64)
+    if str_len(@expected) == 0
+        return 0
+    @got = pbkdf2_sha256(@password, @salt, @iter, str_len(@expected))
+    return _ct_eq(@got, @expected)
+
+
+fn pwhash_recommended_iterations() -> int
+    return 600000

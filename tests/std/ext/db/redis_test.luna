@@ -1,0 +1,134 @@
+# Tests for std/ext/db/redis. Connects to localhost:16380 (NOT the
+# default redis port — we expect a sandbox instance started by
+# redis_e2e.sh). If no redis is reachable there, the test exits with
+# a "skip" summary so tests/run_all.sh doesn't mark it as a failure.
+
+import redis
+import test
+
+
+fn _redis_port() -> int
+    return 16380
+
+
+fn run_redis_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    @fd = redis_connect("127.0.0.1", _redis_port())
+    if @fd < 0
+        # No sandbox redis running — emit a zero-summary so the global
+        # runner sees a clean pass with nothing executed. Real coverage
+        # lives in redis_e2e.sh.
+        shine("[redis] skip (no redis-server on 127.0.0.1:16380)")
+        test_summary("redis", 0, 0)
+        return 0
+
+    # PING.
+    @r = assert_eq_int("ping",     redis_ping(@fd),                       1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Cleanup any leftover.
+    redis_del(@fd, "luna-test:key")
+    redis_del(@fd, "luna-test:counter")
+    redis_del(@fd, "luna-test:list")
+    redis_del(@fd, "luna-test:hash")
+
+    # SET / GET / EXISTS.
+    @r = assert_eq_int("set ok",   redis_set(@fd, "luna-test:key", "hello"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("get",      redis_get(@fd, "luna-test:key"),       "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("exists 1", redis_exists(@fd, "luna-test:key"),    1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Missing key.
+    @r = assert_eq_str("get nil",  redis_get(@fd, "luna-test:nope"),      "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("exists 0", redis_exists(@fd, "luna-test:nope"),   0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # DEL.
+    @r = assert_eq_int("del 1",    redis_del(@fd, "luna-test:key"),       1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("del 0 missing", redis_del(@fd, "luna-test:key"),  0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # INCR / counter pattern.
+    @r = assert_eq_int("incr 1", redis_incr(@fd, "luna-test:counter"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("incr 2", redis_incr(@fd, "luna-test:counter"), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("incr 3", redis_incr(@fd, "luna-test:counter"), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # EXPIRE / TTL.
+    @r = assert_eq_int("expire ok", redis_expire(@fd, "luna-test:counter", 60), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @ttl = redis_ttl(@fd, "luna-test:counter")
+    @r = assert_true("ttl in (0, 60]", @ttl > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Lists.
+    redis_lpush(@fd, "luna-test:list", "a")
+    redis_lpush(@fd, "luna-test:list", "b")
+    redis_rpush(@fd, "luna-test:list", "c")
+    @r = assert_eq_int("llen 3", redis_llen(@fd, "luna-test:list"), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("lpop b",  redis_lpop(@fd, "luna-test:list"), "b")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("rpop c",  redis_rpop(@fd, "luna-test:list"), "c")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("rpop a",  redis_rpop(@fd, "luna-test:list"), "a")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("llen 0", redis_llen(@fd, "luna-test:list"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Hashes.
+    @r = assert_eq_int("hset new", redis_hset(@fd, "luna-test:hash", "name", "alice"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("hset upd", redis_hset(@fd, "luna-test:hash", "name", "bob"),   0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("hget",     redis_hget(@fd, "luna-test:hash", "name"),          "bob")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("hget miss", redis_hget(@fd, "luna-test:hash", "nope"),         "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("hdel 1",   redis_hdel(@fd, "luna-test:hash", "name"),          1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Cleanup before exiting.
+    redis_del(@fd, "luna-test:counter")
+    redis_del(@fd, "luna-test:list")
+    redis_del(@fd, "luna-test:hash")
+    redis_close(@fd)
+
+    test_summary("redis", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_redis_tests(0, 0)

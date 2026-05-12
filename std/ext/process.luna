@@ -1,0 +1,112 @@
+# tier: T6
+# deps:
+# ffi: none
+#
+# std/process — spawn external commands via fork + execve + wait4.
+#
+# Built on top of the sys_clone, sys_execve and sys_wait4 intrinsics.
+# Bootminor binaries are statically linked Linux ELF64 — no libc — so
+# we go straight to the kernel.
+#
+# All commands run through `/bin/sh -c "$cmd"`, which gives us shell
+# expansion, pipes, redirection, etc., for free. The PATH the child
+# sees defaults to a sensible Linux baseline; override via shell_envp
+# / shell_run_with_env if you need something else.
+#
+# Capture pattern (no live pipes yet — k.i.s.s.):
+#   shell_capture writes the command's stdout to a temporary file,
+#   waits for it, then reads the file. Works fine for short outputs
+#   (HTTP responses up to ~MB). For megabyte-stream workloads, switch
+#   to a pipe-based version once we add sys_pipe + sys_dup2 plumbing.
+
+import strings
+
+
+# Linux clone flag for fork-like behaviour: send SIGCHLD on exit, share
+# nothing else. With stack=0 the kernel uses a copy-on-write stack.
+const _PROC_SIGCHLD: int = 17
+
+# Empty environment string — ":" pseudo-PATH so /bin/sh runs but we
+# never inherit secrets from the parent process.
+fn _proc_default_envp() -> int
+    @argv_v = vec_new()
+    vec_push(@argv_v, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    return _proc_argv_build(@argv_v)
+
+# Build a NULL-terminated char** array from a Vec of Luna strings.
+# Each Luna string already has a trailing NUL at offset str_len(s),
+# so the pointer returned by new_str works as a C string in-place.
+fn _proc_argv_build(@parts: Vec) -> int
+    @n = vec_len(@parts)
+    @argv = new_str((@n + 1) * 8)
+    @i = 0
+    while @i < @n
+        u64_set(@argv, @i, vec_get(@parts, @i))
+        @i = @i + 1
+    u64_set(@argv, @n, 0)
+    return @argv
+
+# shell_run(@cmd) -> exit status (0..255) or -1 on spawn failure.
+# Runs the command synchronously; returns when the child exits.
+fn shell_run(@cmd: int) -> int
+    @argv_v = vec_new()
+    vec_push(@argv_v, "/bin/sh")
+    vec_push(@argv_v, "-c")
+    vec_push(@argv_v, @cmd)
+    @argv = _proc_argv_build(@argv_v)
+    @envp = _proc_default_envp()
+
+    @pid = sys_clone(_PROC_SIGCHLD, 0, 0, 0, 0)
+    if @pid < 0
+        return 0 - 1
+    if @pid == 0
+        sys_execve("/bin/sh", @argv, @envp)
+        # Only reached when execve fails.
+        sys_exit(127)
+    @status_buf = new_str(8)
+    sys_wait4(@pid, @status_buf, 0, 0)
+    @raw = u32_at(@status_buf, 0)
+    # WIFEXITED: low byte == 0 → exit. WEXITSTATUS: bits 15..8.
+    if (@raw & 127) == 0
+        return (@raw >> 8) & 255
+    # Killed by signal — return 128 + signum, matching shell convention.
+    return 128 + (@raw & 127)
+
+# Generate a per-PID temp path so concurrent shell_capture calls in
+# threaded code don't clobber each other.
+fn _proc_tmp_path(@suffix: int) -> int
+    @pid = sys_getpid()
+    @s = "/tmp/luna_proc_"
+    @s = str_concat(@s, int_to_str(@pid))
+    @s = str_concat(@s, "_")
+    @s = str_concat(@s, @suffix)
+    return @s
+
+# shell_capture(@cmd) -> stdout content as a Luna string. stderr is
+# left attached to the parent's stderr (so curl error messages still
+# show up in the terminal). Empty string on read failure or empty
+# stdout — distinguish by checking shell_run separately if needed.
+fn shell_capture(@cmd: int) -> int
+    @tmp = _proc_tmp_path("out")
+    # Inject the redirection ourselves so callers don't need to.
+    @full = str_concat(@cmd, " > ")
+    @full = str_concat(@full, @tmp)
+    @rc = shell_run(@full)
+    @body = read_file(@tmp)
+    if @body == 0
+        return ""
+    return @body
+
+# shell_capture_status(@cmd, @out_status) -> stdout content. Stores
+# the exit status into @out_status (1-byte buffer), so the caller can
+# tell apart "command failed" from "command produced no output".
+fn shell_capture_status(@cmd: int, @out_status: int) -> int
+    @tmp = _proc_tmp_path("out")
+    @full = str_concat(@cmd, " > ")
+    @full = str_concat(@full, @tmp)
+    @rc = shell_run(@full)
+    u8_set(@out_status, 0, @rc & 255)
+    @body = read_file(@tmp)
+    if @body == 0
+        return ""
+    return @body

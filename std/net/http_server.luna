@@ -1,0 +1,625 @@
+# tier: T5
+# deps: tcp
+# ffi: none
+#
+# std/net/http_server — sequential HTTP/1.1 server in pure Luna.
+#
+# What it does:
+#   http_serve(8080, handle_request) accepts connections, parses the
+#   request line + headers, calls the user-supplied handler with an
+#   HttpRequest struct and the client fd, then closes the connection.
+#
+# Shape:
+#   fn handler(@req: HttpRequest, @cli: int) -> int
+#       return http_send_text(@cli, "hello")
+#
+#   fn main() -> int
+#       return http_serve(8080, handler)
+#
+# Known limitations of this first cut:
+#   - Sequential. One request at a time; no threads, no keep-alive.
+#   - 8 KiB request cap (HTTP_SRV_REQ_CAP). Anything longer truncates.
+#   - Doesn't parse headers into a map. Handler gets the raw block;
+#     reach for a header parser when there's a real need.
+#   - Connection: close after every response.
+#
+# Caller gotcha — same as std/net/http: annotate struct receivers.
+#   let @req: HttpRequest = http_parse_request(@buf, @n)
+#   Without `: HttpRequest`, every `.field` reads offset 0 and crashes.
+
+import tcp
+import url
+
+
+const HTTP_SRV_REQ_CAP: int = 8192
+
+
+struct HttpRequest
+    method:  int       # "GET", "POST", ...
+    path:    int       # "/users/42" — query string already stripped
+    version: int       # "HTTP/1.1"
+    headers: int       # raw header block, no leading/trailing CRLFs
+    body:    int       # bytes after \r\n\r\n
+    params:  int       # ";"-delimited "name=val;..." set by the router; "" otherwise
+    query:   int       # "&"-delimited "from=10&limit=20" or "" — split from path
+
+
+# _httpsrv_int_to_str(@n) -> ASCII decimal. 0 handled; assumes >= 0.
+fn _httpsrv_int_to_str(@n: int) -> int
+    if @n == 0
+        return "0"
+    @tmp = new_str(24)
+    @i = 0
+    while @n > 0
+        u8_set(@tmp, @i, 48 + (@n % 10))
+        @n = @n / 10
+        @i = @i + 1
+    @out = new_str(@i)
+    @j = 0
+    while @j < @i
+        u8_set(@out, @j, u8_at(@tmp, @i - 1 - @j))
+        @j = @j + 1
+    return @out
+
+
+# _httpsrv_find_crlf(@buf, @off, @blen) -> offset of '\r\n', or -1.
+fn _httpsrv_find_crlf(@buf: int, @off: int, @blen: int) -> int
+    @i = @off
+    @end = @blen - 1
+    while @i < @end
+        if u8_at(@buf, @i) == 13
+            if u8_at(@buf, @i + 1) == 10
+                return @i
+        @i = @i + 1
+    return -1
+
+
+# _httpsrv_find_crlf_crlf(@buf, @blen) -> offset of '\r\n\r\n', or -1.
+fn _httpsrv_find_crlf_crlf(@buf: int, @blen: int) -> int
+    if @blen < 4
+        return -1
+    @i = 0
+    @end = @blen - 3
+    while @i < @end
+        if u8_at(@buf, @i) == 13
+            if u8_at(@buf, @i + 1) == 10
+                if u8_at(@buf, @i + 2) == 13
+                    if u8_at(@buf, @i + 3) == 10
+                        return @i
+        @i = @i + 1
+    return -1
+
+
+# _httpsrv_find_space(@buf, @off, @blen) -> offset of ' ', or -1.
+fn _httpsrv_find_space(@buf: int, @off: int, @blen: int) -> int
+    @i = @off
+    while @i < @blen
+        if u8_at(@buf, @i) == 32
+            return @i
+        @i = @i + 1
+    return -1
+
+
+# _httpsrv_find_qmark(@buf, @off, @end) -> offset of '?' in [@off..@end), or -1.
+fn _httpsrv_find_qmark(@buf: int, @off: int, @end: int) -> int
+    @i = @off
+    while @i < @end
+        if u8_at(@buf, @i) == 63
+            return @i
+        @i = @i + 1
+    return -1
+
+
+# http_parse_request(@buf, @blen) -> HttpRequest.
+# Returns a request with `.method = ""` on parse failure.
+fn http_parse_request(@buf: int, @blen: int) -> HttpRequest
+    let @req: HttpRequest = new_str(56)
+    @req.method  = ""
+    @req.path    = ""
+    @req.version = ""
+    @req.headers = ""
+    @req.body    = ""
+    @req.params  = ""
+    @req.query   = ""
+
+    # Request line: METHOD SP PATH SP VERSION CRLF
+    @sp1 = _httpsrv_find_space(@buf, 0, @blen)
+    if @sp1 < 0
+        return @req
+    @sp2 = _httpsrv_find_space(@buf, @sp1 + 1, @blen)
+    if @sp2 < 0
+        return @req
+    @line_end = _httpsrv_find_crlf(@buf, @sp2 + 1, @blen)
+    if @line_end < 0
+        return @req
+
+    @req.method  = str_substr(@buf, 0, @sp1)
+    @req.version = str_substr(@buf, @sp2 + 1, @line_end - @sp2 - 1)
+
+    # Split path-and-query at the first '?'. Whatever comes after lives
+    # in @req.query (without the '?'); the path keeps everything before.
+    @uri_start = @sp1 + 1
+    @uri_len   = @sp2 - @uri_start
+    @q_off     = _httpsrv_find_qmark(@buf, @uri_start, @sp2)
+    if @q_off < 0
+        @req.path  = str_substr(@buf, @uri_start, @uri_len)
+        @req.query = ""
+    else
+        @req.path  = str_substr(@buf, @uri_start, @q_off - @uri_start)
+        @req.query = str_substr(@buf, @q_off + 1, @sp2 - @q_off - 1)
+
+    @hdrs_start = @line_end + 2
+    @body_sep = _httpsrv_find_crlf_crlf(@buf, @blen)
+    if @body_sep < 0
+        # No body terminator — treat remainder as headers.
+        @req.headers = str_substr(@buf, @hdrs_start, @blen - @hdrs_start)
+        return @req
+
+    if @body_sep >= @hdrs_start
+        @req.headers = str_substr(@buf, @hdrs_start, @body_sep - @hdrs_start)
+    @body_start = @body_sep + 4
+    if @body_start < @blen
+        @req.body = str_substr(@buf, @body_start, @blen - @body_start)
+    return @req
+
+
+# http_send(@cli, @status, @reason, @ctype, @body) -> bytes sent, or -1.
+fn http_send(@cli: int, @status: int, @reason: int, @ctype: int, @body: int) -> int
+    @blen = str_len(@body)
+    @r = str_concat("HTTP/1.1 ", _httpsrv_int_to_str(@status))
+    @r = str_concat(@r, " ")
+    @r = str_concat(@r, @reason)
+    @r = str_concat(@r, "\r\nContent-Type: ")
+    @r = str_concat(@r, @ctype)
+    @r = str_concat(@r, "\r\nContent-Length: ")
+    @r = str_concat(@r, _httpsrv_int_to_str(@blen))
+    @r = str_concat(@r, "\r\nConnection: close\r\n\r\n")
+    if @blen > 0
+        @r = str_concat(@r, @body)
+    return tcp_send_str(@cli, @r)
+
+
+# _req_amp_lookup(@buf, @name) -> URL-decoded value or "".
+# Walks a "&"-delimited "key=value&key=value" buffer (used by both
+# req_query and req_form).
+fn _req_amp_lookup(@buf: int, @name: int) -> int
+    if @buf == 0
+        return ""
+    @qlen = str_len(@buf)
+    if @qlen == 0
+        return ""
+    @nlen = str_len(@name)
+    @i = 0
+    while @i < @qlen
+        @name_start = @i
+        @seek = 1
+        while @seek == 1
+            if @i >= @qlen
+                @seek = 0
+            else
+                if u8_at(@buf, @i) == 61
+                    @seek = 0
+                else
+                    @i = @i + 1
+        if @i >= @qlen
+            return ""
+
+        @cand_len = @i - @name_start
+        @matched = 0
+        if @cand_len == @nlen
+            @matched = 1
+            @j = 0
+            while @j < @nlen
+                if str_byte(@buf, @name_start + @j) != str_byte(@name, @j)
+                    @matched = 0
+                    @j = @nlen
+                @j = @j + 1
+
+        @i = @i + 1                     # past '='
+        @val_start = @i
+        @seek = 1
+        while @seek == 1
+            if @i >= @qlen
+                @seek = 0
+            else
+                if u8_at(@buf, @i) == 38
+                    @seek = 0
+                else
+                    @i = @i + 1
+
+        if @matched == 1
+            @raw = str_substr(@buf, @val_start, @i - @val_start)
+            return url_decode(@raw)
+
+        @i = @i + 1                     # past '&'
+    return ""
+
+
+# req_query(@req, @name) -> URL-decoded value string from the parsed
+# query (e.g. "/users?from=10&limit=20" -> req_query(req, "from") ==
+# "10"), or "" if absent. Walks the "&"-delimited @req.query buffer,
+# applies url_decode to the matched value.
+fn req_query(@req: HttpRequest, @name: int) -> int
+    return _req_amp_lookup(@req.query, @name)
+
+
+# req_form(@req, @name) -> URL-decoded value from an
+# application/x-www-form-urlencoded body. Same syntax as a query
+# string. No Content-Type check — caller is responsible for routing
+# the right requests here.
+fn req_form(@req: HttpRequest, @name: int) -> int
+    return _req_amp_lookup(@req.body, @name)
+
+
+# http_send_with_headers(@cli, @status, @reason, @ctype, @body, @extra)
+# — like http_send but injects @extra (already-formatted as
+# "Header: val\r\nHeader: val\r\n") between the auto-added headers
+# and the blank line. Pass "" if no extras.
+fn http_send_with_headers(@cli: int, @status: int, @reason: int, @ctype: int, @body: int, @extra: int) -> int
+    @blen = str_len(@body)
+    @r = str_concat("HTTP/1.1 ", _httpsrv_int_to_str(@status))
+    @r = str_concat(@r, " ")
+    @r = str_concat(@r, @reason)
+    @r = str_concat(@r, "\r\nContent-Type: ")
+    @r = str_concat(@r, @ctype)
+    @r = str_concat(@r, "\r\nContent-Length: ")
+    @r = str_concat(@r, _httpsrv_int_to_str(@blen))
+    @r = str_concat(@r, "\r\nConnection: close\r\n")
+    if str_len(@extra) > 0
+        @r = str_concat(@r, @extra)
+    @r = str_concat(@r, "\r\n")
+    if @blen > 0
+        @r = str_concat(@r, @body)
+    return tcp_send_str(@cli, @r)
+
+
+# http_cookie_set(@name, @value) -> a Set-Cookie header line for
+# str_concat'ing into http_send_with_headers' @extra argument.
+# Defaults: HttpOnly, Path=/. For more options, build the header
+# yourself (the format is "Set-Cookie: name=value; attr; attr\r\n").
+fn http_cookie_set(@name: int, @value: int) -> int
+    @s = str_concat("Set-Cookie: ", @name)
+    @s = str_concat(@s, "=")
+    @s = str_concat(@s, @value)
+    @s = str_concat(@s, "; HttpOnly; Path=/\r\n")
+    return @s
+
+
+# _httpsrv_is_cookie_prefix(@hdrs, @off) -> 1 if hdrs[@off..@off+7] == "Cookie:".
+fn _httpsrv_is_cookie_prefix(@hdrs: int, @off: int) -> int
+    @want = "Cookie:"
+    @j = 0
+    while @j < 7
+        if str_byte(@hdrs, @off + @j) != str_byte(@want, @j)
+            return 0
+        @j = @j + 1
+    return 1
+
+
+# _httpsrv_cookie_lookup(@hdrs, @start, @end, @name) -> value or "".
+# Walks "; "-delimited pairs in hdrs[@start..@end).
+fn _httpsrv_cookie_lookup(@hdrs: int, @start: int, @end: int, @name: int) -> int
+    @nlen = str_len(@name)
+    @k = @start
+    while @k < @end
+        # Skip leading whitespace.
+        while @k < @end
+            if str_byte(@hdrs, @k) != 32
+                break
+            @k = @k + 1
+        if @k >= @end
+            return ""
+
+        @name_s = @k
+        while @k < @end
+            if str_byte(@hdrs, @k) == 61
+                break
+            @k = @k + 1
+        if @k >= @end
+            return ""
+        @name_e = @k
+        @k = @k + 1                     # past '='
+
+        @val_s = @k
+        while @k < @end
+            if str_byte(@hdrs, @k) == 59
+                break
+            @k = @k + 1
+        @val_e = @k
+
+        if @name_e - @name_s == @nlen
+            @match = 1
+            @j = 0
+            while @j < @nlen
+                if str_byte(@hdrs, @name_s + @j) != str_byte(@name, @j)
+                    @match = 0
+                    break
+                @j = @j + 1
+            if @match == 1
+                return str_substr(@hdrs, @val_s, @val_e - @val_s)
+
+        if @k >= @end
+            return ""
+        @k = @k + 1                     # past ';'
+    return ""
+
+
+# req_cookie(@req, @name) -> cookie value, or "" if absent.
+# Scans @req.headers for a "Cookie:" line, then walks its value as a
+# "; "-delimited list of name=value pairs.
+fn req_cookie(@req: HttpRequest, @name: int) -> int
+    @hdrs = @req.headers
+    if @hdrs == 0
+        return ""
+    @hlen = str_len(@hdrs)
+    if @hlen == 0
+        return ""
+
+    @i = 0
+    while @i < @hlen
+        @line_s = @i
+        @line_e = _httpsrv_find_crlf(@hdrs, @i, @hlen)
+        if @line_e < 0
+            @line_e = @hlen
+        if @line_e - @line_s >= 7
+            if _httpsrv_is_cookie_prefix(@hdrs, @line_s) == 1
+                @v = _httpsrv_cookie_lookup(@hdrs, @line_s + 7, @line_e, @name)
+                if str_len(@v) > 0
+                    return @v
+        if @line_e >= @hlen
+            return ""
+        @i = @line_e + 2                # skip \r\n
+    return ""
+
+
+# Convenience responders.
+fn http_send_text(@cli: int, @body: int) -> int
+    return http_send(@cli, 200, "OK", "text/plain; charset=utf-8", @body)
+
+fn http_send_html(@cli: int, @body: int) -> int
+    return http_send(@cli, 200, "OK", "text/html; charset=utf-8", @body)
+
+fn http_send_json(@cli: int, @body: int) -> int
+    return http_send(@cli, 200, "OK", "application/json", @body)
+
+fn http_send_404(@cli: int) -> int
+    return http_send(@cli, 404, "Not Found", "text/plain", "Not Found\n")
+
+fn http_send_500(@cli: int, @msg: int) -> int
+    return http_send(@cli, 500, "Internal Server Error", "text/plain", @msg)
+
+
+# _httpsrv_handle_one(@cli, @handler) — read one request, dispatch,
+# return. Caller is responsible for closing @cli.
+#
+# `let @req: HttpRequest = new_str(40)` first, then reassign from
+# http_parse_request: bootminor only accepts `let : Type =` when the
+# initializer is the trivial new_str form. The reassignment keeps the
+# struct-typed binding alive for the handler call.
+fn _httpsrv_handle_one(@cli: int, @handler: int) -> int
+    # Snapshot the bump heap so every allocation made while parsing and
+    # responding to this request gets released on return. Without this
+    # a long-lived sequential server leaks ~50 KiB per request; with
+    # it, steady-state memory is bounded.
+    @mark = arena_mark()
+    let @req: HttpRequest = new_str(56)
+    @buf = new_str(HTTP_SRV_REQ_CAP)
+    @n = tcp_recv(@cli, @buf, HTTP_SRV_REQ_CAP)
+    if @n <= 0
+        arena_reset(@mark)
+        return 0
+    @req = http_parse_request(@buf, @n)
+    # bootminor parses `@handler(...)` as the start of an assignment;
+    # capturing the return value into a discard sidesteps that.
+    @_ = @handler(@req, @cli)
+    arena_reset(@mark)
+    return 0
+
+
+# http_serve(@port, @handler) -> -1 on bind failure; otherwise loops
+# forever. Handler signature:
+#   fn handler(@req: HttpRequest, @cli: int) -> int
+fn http_serve(@port: int, @handler: int) -> int
+    @srv = tcp_listen(@port)
+    if @srv < 0
+        return -1
+    while 1
+        @cli = tcp_accept(@srv)
+        if @cli >= 0
+            _httpsrv_handle_one(@cli, @handler)
+            tcp_close(@cli)
+    return 0
+
+
+# Same as _httpsrv_handle_one but passes @ctx as the first handler arg.
+fn _httpsrv_handle_one_ctx(@ctx: int, @cli: int, @handler: int) -> int
+    @mark = arena_mark()
+    let @req: HttpRequest = new_str(56)
+    @buf = new_str(HTTP_SRV_REQ_CAP)
+    @n = tcp_recv(@cli, @buf, HTTP_SRV_REQ_CAP)
+    if @n <= 0
+        arena_reset(@mark)
+        return 0
+    @req = http_parse_request(@buf, @n)
+    @_ = @handler(@ctx, @req, @cli)
+    arena_reset(@mark)
+    return 0
+
+
+# http_serve_ctx(@port, @handler, @ctx) — like http_serve but passes
+# @ctx as the first argument to every handler invocation. Handler
+# signature: fn(@ctx: int, @req: HttpRequest, @cli: int) -> int.
+# Use this whenever the handler needs per-server state (router table,
+# DB connection, application config, etc).
+fn http_serve_ctx(@port: int, @handler: int, @ctx: int) -> int
+    @srv = tcp_listen(@port)
+    if @srv < 0
+        return -1
+    while 1
+        @cli = tcp_accept(@srv)
+        if @cli >= 0
+            _httpsrv_handle_one_ctx(@ctx, @cli, @handler)
+            tcp_close(@cli)
+    return 0
+
+
+# --- Concurrent (fork-per-connection) serving ---------------------------
+#
+# Each accepted connection runs in its own child process forked off
+# the listener. Children inherit a copy-on-write view of the parent's
+# heap, so allocations don't race — bootminor's bump allocator is not
+# thread-safe, but every fork gets its own private heap_top.
+#
+# Lifecycle:
+#   parent  accept(srv) -> cli
+#           fork (sys_clone with SIGCHLD)
+#               in child:  close srv; handle(cli); close cli; exit 0
+#               in parent: close cli; non-blocking reap any zombies
+#
+# Production caveats:
+#   - Fork is expensive (~hundreds of microseconds). For >10k req/s,
+#     pre-fork a worker pool instead. For typical messenger backends
+#     this is plenty.
+#   - sys_wait4(WNOHANG) is called after every accept; long-lived
+#     children don't get reaped until a fresh connection arrives.
+#     For prototyping this is fine; for hardened deployments install
+#     a SIGCHLD-driven reaper.
+
+# _httpsrv_reap_zombies — non-blocking sys_wait4 loop that drains any
+# children that have exited since the last call. Called once per
+# accept in the parent.
+fn _httpsrv_reap_zombies(@status_buf: int) -> int
+    @done = 0
+    while @done == 0
+        @r = sys_wait4(0 - 1, @status_buf, 1, 0)        # -1, WNOHANG
+        if @r <= 0
+            @done = 1
+    return 0
+
+
+# http_serve_forking(@port, @handler) — fork-per-connection server.
+# Returns -1 on bind failure; loops forever otherwise.
+fn http_serve_forking(@port: int, @handler: int) -> int
+    @srv = tcp_listen(@port)
+    if @srv < 0
+        return -1
+    @reap = new_str(4)
+    while 1
+        @cli = tcp_accept(@srv)
+        if @cli >= 0
+            @pid = sys_clone(17, 0, 0, 0, 0)            # SIGCHLD
+            if @pid == 0
+                # Child: close listen socket, handle, exit.
+                sys_close(@srv)
+                _httpsrv_handle_one(@cli, @handler)
+                tcp_close(@cli)
+                sys_exit(0)
+            # Parent: drop the client fd (child owns it) and reap.
+            tcp_close(@cli)
+            _httpsrv_reap_zombies(@reap)
+    return 0
+
+
+# Fork-per-connection with context. Same shape as http_serve_ctx.
+fn http_serve_ctx_forking(@port: int, @handler: int, @ctx: int) -> int
+    @srv = tcp_listen(@port)
+    if @srv < 0
+        return -1
+    @reap = new_str(4)
+    while 1
+        @cli = tcp_accept(@srv)
+        if @cli >= 0
+            @pid = sys_clone(17, 0, 0, 0, 0)
+            if @pid == 0
+                sys_close(@srv)
+                _httpsrv_handle_one_ctx(@ctx, @cli, @handler)
+                tcp_close(@cli)
+                sys_exit(0)
+            tcp_close(@cli)
+            _httpsrv_reap_zombies(@reap)
+    return 0
+
+
+# --- Pre-fork worker pool ---------------------------------------------
+#
+# fork-per-connection costs ~100μs of fork() overhead per request.
+# Pre-forking N workers up-front and having them share the listening
+# socket (kernel does fair-ish wakeup distribution) lets each request
+# avoid the fork cost. Steady-state: just accept→handle→reset arena→
+# accept again, no process creation per request.
+#
+# Caveats:
+#   - All workers share the parent's heap state at fork time. Per-
+#     request arena_mark/reset (inside _httpsrv_handle_one) keeps
+#     each worker's heap bounded.
+#   - If a worker dies (handler panic, OOM), the pool shrinks. The
+#     parent doesn't currently respawn — that's a follow-up.
+#   - Use ~CPU-count workers as a starting point; tune from there.
+
+# _httpsrv_worker_loop(@srv, @handler) — child main loop.
+fn _httpsrv_worker_loop(@srv: int, @handler: int) -> int
+    while 1
+        @cli = tcp_accept(@srv)
+        if @cli >= 0
+            _httpsrv_handle_one(@cli, @handler)
+            tcp_close(@cli)
+    return 0
+
+
+# _httpsrv_worker_loop_ctx(@srv, @handler, @ctx) — child main loop
+# with context. Pulled out as a separate function on purpose:
+# bootminor's parser trips on the 5+ nesting depth when this body
+# lives inline inside the parent's fork branch.
+fn _httpsrv_worker_loop_ctx(@srv: int, @handler: int, @ctx: int) -> int
+    while 1
+        @cli = tcp_accept(@srv)
+        if @cli >= 0
+            _httpsrv_handle_one_ctx(@ctx, @cli, @handler)
+            tcp_close(@cli)
+    return 0
+
+
+# http_serve_prefork(@port, @handler, @n_workers) — pre-fork @n
+# workers up front, all sharing the listen socket. Parent reaps
+# zombies in a loop (so dead workers don't accumulate). Returns -1
+# on bind failure; otherwise this function never returns.
+fn http_serve_prefork(@port: int, @handler: int, @n_workers: int) -> int
+    @srv = tcp_listen(@port)
+    if @srv < 0
+        return -1
+
+    @i = 0
+    while @i < @n_workers
+        @pid = sys_clone(17, 0, 0, 0, 0)
+        if @pid == 0
+            _httpsrv_worker_loop(@srv, @handler)
+            sys_exit(0)
+        @i = @i + 1
+
+    # Parent: block in wait4, reaping any worker that dies. If a
+    # worker exits we silently let the pool shrink for now.
+    @status = new_str(4)
+    while 1
+        sys_wait4(0 - 1, @status, 0, 0)
+    return 0
+
+
+# Pre-fork worker pool with context. Handler signature is the same
+# as http_serve_ctx.
+fn http_serve_ctx_prefork(@port: int, @handler: int, @ctx: int, @n_workers: int) -> int
+    @srv = tcp_listen(@port)
+    if @srv < 0
+        return -1
+
+    @i = 0
+    while @i < @n_workers
+        @pid = sys_clone(17, 0, 0, 0, 0)
+        if @pid == 0
+            _httpsrv_worker_loop_ctx(@srv, @handler, @ctx)
+            sys_exit(0)
+        @i = @i + 1
+
+    @status = new_str(4)
+    while 1
+        sys_wait4(0 - 1, @status, 0, 0)
+    return 0

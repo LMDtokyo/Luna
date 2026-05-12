@@ -1,0 +1,93 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/test — minimal assertion helpers for module tests.
+#
+# Pattern: each *_test.luna program imports std/test plus the module
+# under test, runs assertions, and aggregates pass/fail counts. Each
+# assertion prints one line ("[label] PASS" or "[label] FAIL …") and
+# returns 1 / 0 so the caller can sum.
+#
+# Example:
+#     fn main() -> int
+#         @p = 0
+#         @f = 0
+#         @r = assert_eq_int("1+2", 1 + 2, 3)
+#         @p = @p + @r
+#         @f = @f + (1 - @r)
+#         test_summary("strings", @p, @f)
+#         if @f > 0
+#             return 1
+#         return 0
+
+
+# assert_eq_int(@label, @got, @want) -> 1 if equal, else 0.
+fn assert_eq_int(@label: int, @got: int, @want: int) -> int
+    if @got == @want
+        print("[")
+        print(@label)
+        shine("] PASS")
+        return 1
+    print("[")
+    print(@label)
+    print("] FAIL  got=")
+    print(int_to_str(@got))
+    print("  want=")
+    shine(int_to_str(@want))
+    return 0
+
+# assert_eq_str(@label, @got, @want) -> 1 / 0 with byte-equality.
+fn assert_eq_str(@label: int, @got: int, @want: int) -> int
+    if str_eq(@got, @want) == 1
+        print("[")
+        print(@label)
+        shine("] PASS")
+        return 1
+    print("[")
+    print(@label)
+    print("] FAIL")
+    print("    got:  '")
+    print(@got)
+    shine("'")
+    print("    want: '")
+    print(@want)
+    shine("'")
+    return 0
+
+# assert_true(@label, @cond) — assert @cond is non-zero.
+fn assert_true(@label: int, @cond: int) -> int
+    if @cond != 0
+        print("[")
+        print(@label)
+        shine("] PASS")
+        return 1
+    print("[")
+    print(@label)
+    shine("] FAIL  expected truthy, got 0")
+    return 0
+
+# assert_false(@label, @cond) — assert @cond is zero.
+fn assert_false(@label: int, @cond: int) -> int
+    if @cond == 0
+        print("[")
+        print(@label)
+        shine("] PASS")
+        return 1
+    print("[")
+    print(@label)
+    print("] FAIL  expected 0, got ")
+    shine(int_to_str(@cond))
+    return 0
+
+# test_summary(@suite, @pass, @fail) — print a one-line tally.
+fn test_summary(@suite: int, @pass: int, @fail: int) -> int
+    shine("")
+    print("=== ")
+    print(@suite)
+    print(": ")
+    print(int_to_str(@pass))
+    print(" PASS, ")
+    print(int_to_str(@fail))
+    shine(" FAIL ===")
+    return 0

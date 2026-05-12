@@ -51,7 +51,12 @@ fn _put64(@buf: int, @at: int, @v: int) -> int
     return 0
 
 
-fn _emit_elf(@buf: int, @file_sz: int, @mem_sz: int, @entry_off: int) -> int
+# Emit a minimal dynamic ELF64 (P1 of docs/TLS_DESIGN.md). Layout:
+#   [0..64)      Ehdr (e_phnum=3)
+#   [64..232)    Phdrs: PT_LOAD, PT_INTERP, PT_DYNAMIC
+#   [232..)      code + data + .interp + .dynstr + .dynsym + .hash + .dynamic
+#   [past file_sz] debug sections + SHT (unchanged from P5 stack-trace work)
+fn _emit_dynamic_elf(@buf: int, @file_sz: int, @mem_sz: int, @entry_off: int, @sht_off: int, @sht_count: int, @shstrndx: int, @interp_off: int, @interp_len: int, @dyn_off: int, @dyn_len: int) -> int
     _put8(@buf, 0, 127)
     _put8(@buf, 1, 69)
     _put8(@buf, 2, 76)
@@ -64,14 +69,74 @@ fn _emit_elf(@buf: int, @file_sz: int, @mem_sz: int, @entry_off: int) -> int
     _put32(@buf, 20, 1)
     _put64(@buf, 24, _elf_vaddr() + @entry_off)
     _put64(@buf, 32, _elf_hdr())
-    _put64(@buf, 40, 0)
+    _put64(@buf, 40, @sht_off)
+    _put32(@buf, 48, 0)
+    _put16(@buf, 52, _elf_hdr())
+    _put16(@buf, 54, _elf_phdr())
+    _put16(@buf, 56, 3)
+    if @sht_count > 0
+        _put16(@buf, 58, 64)
+    else
+        _put16(@buf, 58, 0)
+    _put16(@buf, 60, @sht_count)
+    _put16(@buf, 62, @shstrndx)
+    # PT_LOAD covering the whole loaded image
+    @p1 = _elf_hdr()
+    _put32(@buf, @p1 + 0,  1)
+    _put32(@buf, @p1 + 4,  7)
+    _put64(@buf, @p1 + 8,  0)
+    _put64(@buf, @p1 + 16, _elf_vaddr())
+    _put64(@buf, @p1 + 24, _elf_vaddr())
+    _put64(@buf, @p1 + 32, @file_sz)
+    _put64(@buf, @p1 + 40, @mem_sz)
+    _put64(@buf, @p1 + 48, 4096)
+    # PT_INTERP — pointer to /lib64/ld-linux-x86-64.so.2 string
+    @p2 = _elf_hdr() + _elf_phdr()
+    _put32(@buf, @p2 + 0,  3)
+    _put32(@buf, @p2 + 4,  4)
+    _put64(@buf, @p2 + 8,  @interp_off)
+    _put64(@buf, @p2 + 16, _elf_vaddr() + @interp_off)
+    _put64(@buf, @p2 + 24, _elf_vaddr() + @interp_off)
+    _put64(@buf, @p2 + 32, @interp_len)
+    _put64(@buf, @p2 + 40, @interp_len)
+    _put64(@buf, @p2 + 48, 1)
+    # PT_DYNAMIC — pointer to .dynamic table
+    @p3 = _elf_hdr() + _elf_phdr() * 2
+    _put32(@buf, @p3 + 0,  2)
+    _put32(@buf, @p3 + 4,  6)
+    _put64(@buf, @p3 + 8,  @dyn_off)
+    _put64(@buf, @p3 + 16, _elf_vaddr() + @dyn_off)
+    _put64(@buf, @p3 + 24, _elf_vaddr() + @dyn_off)
+    _put64(@buf, @p3 + 32, @dyn_len)
+    _put64(@buf, @p3 + 40, @dyn_len)
+    _put64(@buf, @p3 + 48, 8)
+    return 0
+
+
+fn _emit_elf(@buf: int, @file_sz: int, @mem_sz: int, @entry_off: int, @sht_off: int, @sht_count: int, @shstrndx: int) -> int
+    _put8(@buf, 0, 127)
+    _put8(@buf, 1, 69)
+    _put8(@buf, 2, 76)
+    _put8(@buf, 3, 70)
+    _put8(@buf, 4, 2)
+    _put8(@buf, 5, 1)
+    _put8(@buf, 6, 1)
+    _put16(@buf, 16, 2)
+    _put16(@buf, 18, 62)
+    _put32(@buf, 20, 1)
+    _put64(@buf, 24, _elf_vaddr() + @entry_off)
+    _put64(@buf, 32, _elf_hdr())
+    _put64(@buf, 40, @sht_off)
     _put32(@buf, 48, 0)
     _put16(@buf, 52, _elf_hdr())
     _put16(@buf, 54, _elf_phdr())
     _put16(@buf, 56, 1)
-    _put16(@buf, 58, 0)
-    _put16(@buf, 60, 0)
-    _put16(@buf, 62, 0)
+    if @sht_count > 0
+        _put16(@buf, 58, 64)
+    else
+        _put16(@buf, 58, 0)
+    _put16(@buf, 60, @sht_count)
+    _put16(@buf, 62, @shstrndx)
     @p = _elf_hdr()
     _put32(@buf, @p + 0,  1)
     _put32(@buf, @p + 4,  7)                  # PF_R|PF_W|PF_X (writable heap)
@@ -81,6 +146,102 @@ fn _emit_elf(@buf: int, @file_sz: int, @mem_sz: int, @entry_off: int) -> int
     _put64(@buf, @p + 32, @file_sz)
     _put64(@buf, @p + 40, @mem_sz)            # memsz > filesz → zeroed heap
     _put64(@buf, @p + 48, 4096)
+    return 0
+
+
+# --- DWARF / section-header helpers (P5) -----------------------------
+
+# Write one ELF64 section header (64 bytes) at @off.
+fn _shdr_put(@buf: int, @off: int, @name: int, @type: int, @flags: int, @addr: int, @soff: int, @size: int, @link: int, @info: int, @align: int, @entsize: int) -> int
+    _put32(@buf, @off + 0,  @name)
+    _put32(@buf, @off + 4,  @type)
+    _put64(@buf, @off + 8,  @flags)
+    _put64(@buf, @off + 16, @addr)
+    _put64(@buf, @off + 24, @soff)
+    _put64(@buf, @off + 32, @size)
+    _put32(@buf, @off + 40, @link)
+    _put32(@buf, @off + 44, @info)
+    _put64(@buf, @off + 48, @align)
+    _put64(@buf, @off + 56, @entsize)
+    return 0
+
+# Append a string to a StrBuf, INCLUDING a trailing NUL.
+# Returns the offset where the string started (so it can be referenced).
+fn _shstr_add(@b: StrBuf, @s: int) -> int
+    @off = _sb_len(@b)
+    @n = str_len(@s)
+    @i = 0
+    while @i < @n
+        strbuf_add_byte(@b, str_byte(@s, @i))
+        @i = @i + 1
+    strbuf_add_byte(@b, 0)
+    return @off
+
+# Append unsigned LEB128 to a StrBuf.
+fn _uleb128(@b: StrBuf, @v: int) -> int
+    @x = @v
+    while @x >= 128
+        strbuf_add_byte(@b, (@x & 127) | 128)
+        @x = @x >> 7
+    strbuf_add_byte(@b, @x & 127)
+    return 0
+
+fn _sleb_sign_extend(@logical_shifted: int, @bits: int) -> int
+    @r = @logical_shifted
+    @i = 0
+    while @i < @bits
+        @r = @r | (1 << (63 - @i))
+        @i = @i + 1
+    return @r
+
+# Append signed LEB128 to a StrBuf. Luna's `>>` is logical (not arithmetic),
+# so we manually sign-extend after each shift when the input was negative.
+fn _sleb128(@b: StrBuf, @v: int) -> int
+    # Fast path: values in [-64, 63] fit in a single byte.
+    if @v >= 0 - 64
+        if @v < 64
+            strbuf_add_byte(@b, @v & 127)
+            return 0
+    @x = @v
+    @done = 0
+    while @done == 0
+        @byte = @x & 127
+        @next = @x >> 7
+        if @x < 0
+            @next = _sleb_sign_extend(@next, 7)
+        if @next == 0
+            if (@byte & 64) == 0
+                @done = 1
+        if @next == 0 - 1
+            if (@byte & 64) != 0
+                @done = 1
+        if @done == 0
+            strbuf_add_byte(@b, @byte | 128)
+            @x = @next
+        else
+            strbuf_add_byte(@b, @byte)
+    return 0
+
+# Append little-endian u32 to a StrBuf.
+fn _sb_put32(@b: StrBuf, @v: int) -> int
+    strbuf_add_byte(@b, @v        & 255)
+    strbuf_add_byte(@b, (@v >> 8) & 255)
+    strbuf_add_byte(@b, (@v >> 16) & 255)
+    strbuf_add_byte(@b, (@v >> 24) & 255)
+    return 0
+
+# Append little-endian u64 to a StrBuf.
+fn _sb_put64(@b: StrBuf, @v: int) -> int
+    @i = 0
+    while @i < 8
+        strbuf_add_byte(@b, (@v >> (@i * 8)) & 255)
+        @i = @i + 1
+    return 0
+
+# Append little-endian u16 to a StrBuf.
+fn _sb_put16(@b: StrBuf, @v: int) -> int
+    strbuf_add_byte(@b, @v        & 255)
+    strbuf_add_byte(@b, (@v >> 8) & 255)
     return 0
 
 
@@ -100,6 +261,18 @@ fn _parse_target(@argc: int) -> int
         if str_eq(arg(@i), "--target") == 1
             if str_eq(arg(@i + 1), "windows") == 1
                 return 1
+        @i = @i + 1
+    return 0
+
+# Returns 1 if `--dynamic` is present. When set, bootminor emits a
+# dynamic ELF (PT_INTERP + DT_NEEDED libc.so.6) so ld-linux loads it
+# and shared libs are reachable via dlopen (P1 of docs/TLS_DESIGN.md).
+# Default 0 keeps the static path (preserves fixed-point self-host).
+fn _parse_dynamic(@argc: int) -> int
+    @i = 1
+    while @i < @argc
+        if str_eq(arg(@i), "--dynamic") == 1
+            return 1
         @i = @i + 1
     return 0
 
@@ -307,6 +480,498 @@ fn _emit_pe64(@out_path: int, @code_bytes: int, @code_len: int, @entry_off: int,
     return 0
 
 
+# Append a NUL-terminated string to @b. Returns the offset where it started.
+fn _dyn_add_cstr(@b: StrBuf, @s: int) -> int
+    @off = _sb_len(@b)
+    @n = str_len(@s)
+    @i = 0
+    while @i < @n
+        strbuf_add_byte(@b, str_byte(@s, @i))
+        @i = @i + 1
+    strbuf_add_byte(@b, 0)
+    return @off
+
+fn _dyn_pad8(@b: StrBuf) -> int
+    while (_sb_len(@b) % 8) != 0
+        strbuf_add_byte(@b, 0)
+    return 0
+
+fn _dyn_vec_str_idx(@v: Vec, @s: int) -> int
+    @n = vec_len(@v)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@v, @i), @s) == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
+# --- Dynamic-ELF blob builder (P1+P2 of docs/TLS_DESIGN.md) ----------
+#
+# Builds the dynamic-linker metadata. Layout (each section 8-byte aligned):
+#   .interp    — "/lib64/ld-linux-x86-64.so.2\0"
+#   .dynstr    — "\0libc.so.6\0[libdl.so.2\0]<sym names...>\0"
+#   .dynsym    — STN_UNDEF + one Elf64_Sym per imported symbol
+#   .hash      — single-bucket SysV hash covering all dynsym entries
+#   .got.plt   — 3 reserved slots + N function-pointer slots (filled by ld-linux)
+#   .rela.plt  — R_X86_64_JUMP_SLOT relocations targeting got.plt slots
+#   .dynamic   — DT_NEEDED libs + STRTAB/SYMTAB/HASH/PLTGOT/PLTRELSZ/PLTREL/JMPREL/BIND_NOW/NULL
+#
+# Returns layout info via @offs Vec: 5 ints —
+#   [0] interp_in_blob, [1] dyn_in_blob, [2] interp_len, [3] dyn_len, [4] gotplt_in_blob
+# Caller threads @g for access to imp_patches (set during codegen).
+fn _build_dyn_blob(@b: StrBuf, @base_off: int, @g: Gen, @offs: Vec) -> int
+    # Collect unique imported symbol names from imp_patches.
+    @uniq = vec_new()
+    @needs_libdl = 0
+    @ip = 0
+    @np = vec_len(@g.imp_patches)
+    while @ip < @np
+        @nm = vec_get(@g.imp_patches, @ip + 1)
+        if _dyn_vec_str_idx(@uniq, @nm) < 0
+            vec_push(@uniq, @nm)
+        if str_eq(@nm, "dlopen") == 1
+            @needs_libdl = 1
+        if str_eq(@nm, "dlsym") == 1
+            @needs_libdl = 1
+        @ip = @ip + 2
+    @nimp = vec_len(@uniq)
+
+    # .interp
+    @interp_in_blob = _sb_len(@b)
+    _dyn_add_cstr(@b, "/lib64/ld-linux-x86-64.so.2")
+    @interp_len = _sb_len(@b) - @interp_in_blob
+    _dyn_pad8(@b)
+
+    # .dynstr: NUL + lib names + symbol names. Track offsets.
+    @dynstr_in_blob = _sb_len(@b)
+    strbuf_add_byte(@b, 0)
+    @libc_off = _sb_len(@b) - @dynstr_in_blob
+    _dyn_add_cstr(@b, "libc.so.6")
+    @libdl_off = 0
+    if @needs_libdl == 1
+        @libdl_off = _sb_len(@b) - @dynstr_in_blob
+        _dyn_add_cstr(@b, "libdl.so.2")
+    @sym_name_offs = vec_new()
+    @si = 0
+    while @si < @nimp
+        @snm = vec_get(@uniq, @si)
+        @soff = _sb_len(@b) - @dynstr_in_blob
+        _dyn_add_cstr(@b, @snm)
+        vec_push(@sym_name_offs, @soff)
+        @si = @si + 1
+    @dynstr_len = _sb_len(@b) - @dynstr_in_blob
+    _dyn_pad8(@b)
+
+    # .dynsym: zero entry + one Elf64_Sym per import (24 bytes each).
+    @dynsym_in_blob = _sb_len(@b)
+    @zz = 0
+    while @zz < 24
+        strbuf_add_byte(@b, 0)
+        @zz = @zz + 1
+    @si2 = 0
+    while @si2 < @nimp
+        # st_name (u32) = dynstr offset
+        _sb_put32(@b, vec_get(@sym_name_offs, @si2))
+        # st_info = (STB_GLOBAL=1 << 4) | STT_FUNC=2 = 0x12
+        strbuf_add_byte(@b, 18)
+        # st_other = 0
+        strbuf_add_byte(@b, 0)
+        # st_shndx (u16) = 0 (SHN_UNDEF)
+        _sb_put16(@b, 0)
+        # st_value (u64) = 0
+        _sb_put64(@b, 0)
+        # st_size (u64) = 0
+        _sb_put64(@b, 0)
+        @si2 = @si2 + 1
+    @dynsym_count = 1 + @nimp
+
+    # .hash: single-bucket SysV hash. nbuckets=1, nchain=count.
+    # bucket[0] = 1 (first user symbol). chain[i] = i+1 except chain[count-1] = 0.
+    @hash_in_blob = _sb_len(@b)
+    _sb_put32(@b, 1)
+    _sb_put32(@b, @dynsym_count)
+    if @nimp > 0
+        _sb_put32(@b, 1)
+    else
+        _sb_put32(@b, 0)
+    _sb_put32(@b, 0)
+    @hi = 1
+    while @hi < @dynsym_count
+        if @hi < @dynsym_count - 1
+            _sb_put32(@b, @hi + 1)
+        else
+            _sb_put32(@b, 0)
+        @hi = @hi + 1
+    _dyn_pad8(@b)
+
+    # .got.plt: 3 reserved + N slots. Reserved slots filled by ld-linux.
+    @gotplt_in_blob = _sb_len(@b)
+    @gz = 0
+    @gtotal = 3 + @nimp
+    while @gz < @gtotal * 8
+        strbuf_add_byte(@b, 0)
+        @gz = @gz + 1
+
+    # .rela.plt: one Rela per imported symbol.
+    @relaplt_in_blob = _sb_len(@b)
+    @vbase = _elf_vaddr() + @base_off
+    @ri = 0
+    while @ri < @nimp
+        @got_slot_vaddr = @vbase + @gotplt_in_blob + (3 + @ri) * 8
+        _sb_put64(@b, @got_slot_vaddr)
+        # r_info: low 32 = R_X86_64_JUMP_SLOT (7), high 32 = sym_idx (1-based)
+        _sb_put32(@b, 7)
+        _sb_put32(@b, @ri + 1)
+        _sb_put64(@b, 0)
+        @ri = @ri + 1
+    @relaplt_size = @nimp * 24
+
+    # .dynamic
+    @dyn_in_blob = _sb_len(@b)
+    # DT_NEEDED libc
+    _sb_put64(@b, 1)
+    _sb_put64(@b, @libc_off)
+    if @needs_libdl == 1
+        _sb_put64(@b, 1)
+        _sb_put64(@b, @libdl_off)
+    _sb_put64(@b, 5)
+    _sb_put64(@b, @vbase + @dynstr_in_blob)
+    _sb_put64(@b, 6)
+    _sb_put64(@b, @vbase + @dynsym_in_blob)
+    _sb_put64(@b, 10)
+    _sb_put64(@b, @dynstr_len)
+    _sb_put64(@b, 11)
+    _sb_put64(@b, 24)
+    _sb_put64(@b, 4)
+    _sb_put64(@b, @vbase + @hash_in_blob)
+    if @nimp > 0
+        # DT_PLTGOT
+        _sb_put64(@b, 3)
+        _sb_put64(@b, @vbase + @gotplt_in_blob)
+        # DT_PLTRELSZ
+        _sb_put64(@b, 2)
+        _sb_put64(@b, @relaplt_size)
+        # DT_PLTREL = DT_RELA (7)
+        _sb_put64(@b, 20)
+        _sb_put64(@b, 7)
+        # DT_JMPREL
+        _sb_put64(@b, 23)
+        _sb_put64(@b, @vbase + @relaplt_in_blob)
+        # DT_BIND_NOW
+        _sb_put64(@b, 24)
+        _sb_put64(@b, 0)
+    # DT_NULL
+    _sb_put64(@b, 0)
+    _sb_put64(@b, 0)
+    @dyn_len = _sb_len(@b) - @dyn_in_blob
+
+    vec_push(@offs, @interp_in_blob)
+    vec_push(@offs, @dyn_in_blob)
+    vec_push(@offs, @interp_len)
+    vec_push(@offs, @dyn_len)
+    vec_push(@offs, @gotplt_in_blob)
+    return 0
+
+
+# --- DWARF section builders ------------------------------------------
+#
+# Reference: DWARF 4 spec. Reasoning behind subset choices in
+# docs/STACKTRACE_DESIGN.md P5.
+
+# .debug_str — pool of NUL-terminated strings. We push the compilation
+# unit name first, then one entry per function name. @offsets is a Vec
+# filled with pool-offsets in the same order as @g.fn_names so the
+# .debug_info pass can reference them via DW_FORM_strp.
+fn _dwarf_build_debug_str(@b: StrBuf, @g: Gen, @src_path: int, @offsets: Vec) -> int
+    # [0] = empty string (DWARF convention).
+    strbuf_add_byte(@b, 0)
+    # [1] = source file path. Offset captured for the CU DIE.
+    @cu_name_off = _sb_len(@b)
+    @pn = str_len(@src_path)
+    @pi = 0
+    while @pi < @pn
+        strbuf_add_byte(@b, str_byte(@src_path, @pi))
+        @pi = @pi + 1
+    strbuf_add_byte(@b, 0)
+    # Stash CU offset at index 0 of @offsets so callers find it.
+    vec_push(@offsets, @cu_name_off)
+    @nfn = vec_len(@g.fn_names)
+    @fi = 0
+    while @fi < @nfn
+        @nm = vec_get(@g.fn_names, @fi)
+        @nm_off = _sb_len(@b)
+        @nn = str_len(@nm)
+        @ni = 0
+        while @ni < @nn
+            strbuf_add_byte(@b, str_byte(@nm, @ni))
+            @ni = @ni + 1
+        strbuf_add_byte(@b, 0)
+        vec_push(@offsets, @nm_off)
+        @fi = @fi + 1
+    return 0
+
+# .debug_abbrev — declares the layout of every DIE form used in .debug_info.
+# We emit two abbrevs: CU (code 1) and subprogram (code 2).
+# DWARF tag/attr/form constants:
+#   DW_TAG_compile_unit = 0x11        DW_TAG_subprogram  = 0x2e
+#   DW_AT_name          = 0x03        DW_AT_low_pc       = 0x11
+#   DW_AT_high_pc       = 0x12        DW_AT_stmt_list    = 0x10
+#   DW_AT_language      = 0x13        DW_AT_decl_file    = 0x3a
+#   DW_AT_decl_line     = 0x3b
+#   DW_FORM_addr  = 0x01    DW_FORM_data1 = 0x0b    DW_FORM_data4 = 0x06
+#   DW_FORM_data8 = 0x07    DW_FORM_strp  = 0x0e    DW_FORM_sec_offset = 0x17
+fn _dwarf_build_debug_abbrev(@b: StrBuf) -> int
+    # Abbrev #1: compile_unit, has_children = 1
+    _uleb128(@b, 1)
+    _uleb128(@b, 17)
+    strbuf_add_byte(@b, 1)
+    _uleb128(@b, 3)
+    _uleb128(@b, 14)
+    _uleb128(@b, 17)
+    _uleb128(@b, 1)
+    _uleb128(@b, 18)
+    _uleb128(@b, 7)
+    _uleb128(@b, 16)
+    _uleb128(@b, 23)
+    _uleb128(@b, 19)
+    _uleb128(@b, 11)
+    _uleb128(@b, 0)
+    _uleb128(@b, 0)
+    # Abbrev #2: subprogram, has_children = 0
+    _uleb128(@b, 2)
+    _uleb128(@b, 46)
+    strbuf_add_byte(@b, 0)
+    _uleb128(@b, 3)
+    _uleb128(@b, 14)
+    _uleb128(@b, 17)
+    _uleb128(@b, 1)
+    _uleb128(@b, 18)
+    _uleb128(@b, 7)
+    _uleb128(@b, 58)
+    _uleb128(@b, 11)
+    _uleb128(@b, 59)
+    _uleb128(@b, 6)
+    _uleb128(@b, 0)
+    _uleb128(@b, 0)
+    # Terminator
+    _uleb128(@b, 0)
+    return 0
+
+# .debug_info — CU DIE + one subprogram DIE per fn.
+# Header: unit_length (4), version (2)=4, abbrev_off (4)=0, addr_size (1)=8.
+fn _dwarf_build_debug_info(@b: StrBuf, @g: Gen, @code_off: int, @code_len: int, @ds_offsets: Vec) -> int
+    # Compute body length ahead of time? Easier: build into a temp StrBuf
+    # then prepend the unit_length. Avoid the temp by reserving 4 bytes
+    # and patching at the end.
+    @len_at = _sb_len(@b)
+    _sb_put32(@b, 0)
+    _sb_put16(@b, 4)
+    _sb_put32(@b, 0)
+    strbuf_add_byte(@b, 8)
+    # CU DIE (abbrev 1).
+    _uleb128(@b, 1)
+    @cu_name_off = vec_get(@ds_offsets, 0)
+    _sb_put32(@b, @cu_name_off)
+    _sb_put64(@b, _elf_vaddr() + @code_off)
+    _sb_put64(@b, @code_len)
+    _sb_put32(@b, 0)
+    strbuf_add_byte(@b, 12)
+    # Subprogram DIEs (abbrev 2), one per fn.
+    @nfn = vec_len(@g.fn_names)
+    @fi = 0
+    while @fi < @nfn
+        _uleb128(@b, 2)
+        @nm_off = vec_get(@ds_offsets, @fi + 1)
+        _sb_put32(@b, @nm_off)
+        @pc_lo = _elf_vaddr() + @code_off + vec_get(@g.fn_offsets, @fi)
+        @pc_hi = _elf_vaddr() + @code_off + vec_get(@g.fn_pc_hi, @fi)
+        _sb_put64(@b, @pc_lo)
+        _sb_put64(@b, @pc_hi - @pc_lo)
+        strbuf_add_byte(@b, 1)
+        _sb_put32(@b, vec_get(@g.fn_decl_line, @fi))
+        @fi = @fi + 1
+    # End of CU children.
+    strbuf_add_byte(@b, 0)
+    # Patch unit_length = (body bytes) excluding the 4-byte length field itself.
+    @end = _sb_len(@b)
+    @body_len = @end - @len_at - 4
+    str_set_byte(@b.buf, @len_at + 0,  @body_len        & 255)
+    str_set_byte(@b.buf, @len_at + 1, (@body_len >> 8)  & 255)
+    str_set_byte(@b.buf, @len_at + 2, (@body_len >> 16) & 255)
+    str_set_byte(@b.buf, @len_at + 3, (@body_len >> 24) & 255)
+    return 0
+
+# .debug_line — DWARF 4 line number program.
+# Header: unit_length (4), version (2)=4, header_length (4),
+#         min_insn_len (1)=1, max_ops_per_insn (1)=1,
+#         default_is_stmt (1)=1, line_base (1)=-5, line_range (1)=14,
+#         opcode_base (1)=13, standard_opcode_lengths[12].
+# Then include_directories (single NUL = empty) and file_names list.
+# Then opcode stream that emits one (PC, line) row per fn entry.
+# .eh_frame — Call Frame Information for libunwind / async profilers.
+#
+# One CIE establishes the initial rules (at function entry):
+#   CFA = rsp + 8, return-address at CFA-8 (the call instruction left
+#   the RA on top of stack).
+# One FDE per function describes the prologue transition:
+#   offset 0:  state from CIE (CFA = rsp + 8, RA at CFA-8)
+#   offset 1 (after push rbp):  CFA = rsp + 16, rbp at CFA-16
+#   offset 4 (after mov rbp, rsp):  CFA = rbp + 16 (register-based)
+# Epilogue isn't described — async stacks taken during the 5-byte
+# epilogue window may be slightly off, acceptable trade-off.
+fn _dwarf_build_eh_frame(@b: StrBuf, @g: Gen, @code_off: int) -> int
+    @cie_start = _sb_len(@b)
+    @cie_len_at = _sb_len(@b)
+    _sb_put32(@b, 0)
+    _sb_put32(@b, 0)
+    strbuf_add_byte(@b, 1)
+    strbuf_add_byte(@b, 122)
+    strbuf_add_byte(@b, 82)
+    strbuf_add_byte(@b, 0)
+    _uleb128(@b, 1)
+    _sleb128(@b, 0 - 8)
+    strbuf_add_byte(@b, 16)
+    _uleb128(@b, 1)
+    strbuf_add_byte(@b, 3)
+    strbuf_add_byte(@b, 12)
+    _uleb128(@b, 7)
+    _uleb128(@b, 8)
+    strbuf_add_byte(@b, 144)
+    _uleb128(@b, 1)
+    @ca = _sb_len(@b) - @cie_start
+    while (@ca % 8) != 0
+        strbuf_add_byte(@b, 0)
+        @ca = @ca + 1
+    @cie_body = _sb_len(@b) - @cie_len_at - 4
+    str_set_byte(@b.buf, @cie_len_at + 0,  @cie_body        & 255)
+    str_set_byte(@b.buf, @cie_len_at + 1, (@cie_body >> 8)  & 255)
+    str_set_byte(@b.buf, @cie_len_at + 2, (@cie_body >> 16) & 255)
+    str_set_byte(@b.buf, @cie_len_at + 3, (@cie_body >> 24) & 255)
+    @nfn = vec_len(@g.fn_names)
+    @fi = 0
+    while @fi < @nfn
+        @fde_start = _sb_len(@b)
+        @fde_len_at = _sb_len(@b)
+        _sb_put32(@b, 0)
+        @cie_ptr_field = _sb_len(@b)
+        _sb_put32(@b, @cie_ptr_field - @cie_start)
+        @pc_lo = _elf_vaddr() + @code_off + vec_get(@g.fn_offsets, @fi)
+        @pc_hi = _elf_vaddr() + @code_off + vec_get(@g.fn_pc_hi, @fi)
+        _sb_put32(@b, @pc_lo)
+        _sb_put32(@b, @pc_hi - @pc_lo)
+        _uleb128(@b, 0)
+        strbuf_add_byte(@b, 65)
+        strbuf_add_byte(@b, 14)
+        _uleb128(@b, 16)
+        strbuf_add_byte(@b, 134)
+        _uleb128(@b, 2)
+        strbuf_add_byte(@b, 67)
+        strbuf_add_byte(@b, 13)
+        _uleb128(@b, 6)
+        @fa = _sb_len(@b) - @fde_start
+        while (@fa % 8) != 0
+            strbuf_add_byte(@b, 0)
+            @fa = @fa + 1
+        @fde_body = _sb_len(@b) - @fde_len_at - 4
+        str_set_byte(@b.buf, @fde_len_at + 0,  @fde_body        & 255)
+        str_set_byte(@b.buf, @fde_len_at + 1, (@fde_body >> 8)  & 255)
+        str_set_byte(@b.buf, @fde_len_at + 2, (@fde_body >> 16) & 255)
+        str_set_byte(@b.buf, @fde_len_at + 3, (@fde_body >> 24) & 255)
+        @fi = @fi + 1
+    _sb_put32(@b, 0)
+    return 0
+
+fn _dwarf_build_debug_line(@b: StrBuf, @g: Gen, @code_off: int, @code_len: int) -> int
+    @len_at = _sb_len(@b)
+    _sb_put32(@b, 0)
+    _sb_put16(@b, 4)
+    @hdr_len_at = _sb_len(@b)
+    _sb_put32(@b, 0)
+    @hdr_start = _sb_len(@b)
+    strbuf_add_byte(@b, 1)
+    strbuf_add_byte(@b, 1)
+    strbuf_add_byte(@b, 1)
+    strbuf_add_byte(@b, 251)
+    strbuf_add_byte(@b, 14)
+    strbuf_add_byte(@b, 13)
+    # standard_opcode_lengths[12]: how many ULEB128 args each takes.
+    strbuf_add_byte(@b, 0)
+    strbuf_add_byte(@b, 1)
+    strbuf_add_byte(@b, 1)
+    strbuf_add_byte(@b, 1)
+    strbuf_add_byte(@b, 1)
+    strbuf_add_byte(@b, 0)
+    strbuf_add_byte(@b, 0)
+    strbuf_add_byte(@b, 0)
+    strbuf_add_byte(@b, 1)
+    strbuf_add_byte(@b, 0)
+    strbuf_add_byte(@b, 0)
+    strbuf_add_byte(@b, 1)
+    # include_directories — empty list, terminator NUL.
+    strbuf_add_byte(@b, 0)
+    # file_names — one entry, then terminator.
+    # Format: name\0 dir_idx mtime size.
+    @nm = "luna_program.luna"
+    @nn = str_len(@nm)
+    @ni = 0
+    while @ni < @nn
+        strbuf_add_byte(@b, str_byte(@nm, @ni))
+        @ni = @ni + 1
+    strbuf_add_byte(@b, 0)
+    _uleb128(@b, 0)
+    _uleb128(@b, 0)
+    _uleb128(@b, 0)
+    strbuf_add_byte(@b, 0)
+    # Patch header_length.
+    @prog_start = _sb_len(@b)
+    @hdr_len = @prog_start - @hdr_start
+    str_set_byte(@b.buf, @hdr_len_at + 0,  @hdr_len        & 255)
+    str_set_byte(@b.buf, @hdr_len_at + 1, (@hdr_len >> 8)  & 255)
+    str_set_byte(@b.buf, @hdr_len_at + 2, (@hdr_len >> 16) & 255)
+    str_set_byte(@b.buf, @hdr_len_at + 3, (@hdr_len >> 24) & 255)
+    # Line number program: for each fn, set_address + advance_line + copy.
+    # Track current address and line in the state machine.
+    @cur_line = 1
+    @nfn = vec_len(@g.fn_names)
+    @fi = 0
+    while @fi < @nfn
+        @pc = _elf_vaddr() + @code_off + vec_get(@g.fn_offsets, @fi)
+        # DW_LNS_extended_op (0), length 9, DW_LNE_set_address (2), addr (8 bytes)
+        strbuf_add_byte(@b, 0)
+        _uleb128(@b, 9)
+        strbuf_add_byte(@b, 2)
+        _sb_put64(@b, @pc)
+        # DW_LNS_advance_line (3) + SLEB128 (target - cur_line)
+        @ln = vec_get(@g.fn_decl_line, @fi)
+        strbuf_add_byte(@b, 3)
+        _sleb128(@b, @ln - @cur_line)
+        @cur_line = @ln
+        # DW_LNS_copy (1)
+        strbuf_add_byte(@b, 1)
+        @fi = @fi + 1
+    # Advance address one past the last function so the previous row gets
+    # a proper PC range that addr2line can locate. set_address to code_end,
+    # then end_sequence — the kernel of the last fn's mapping is now
+    # [last_pc, code_end).
+    @end_pc = _elf_vaddr() + @code_off + @code_len
+    strbuf_add_byte(@b, 0)
+    _uleb128(@b, 9)
+    strbuf_add_byte(@b, 2)
+    _sb_put64(@b, @end_pc)
+    # DW_LNS_extended_op (0), length 1, DW_LNE_end_sequence (1).
+    strbuf_add_byte(@b, 0)
+    _uleb128(@b, 1)
+    strbuf_add_byte(@b, 1)
+    # Patch unit_length.
+    @end = _sb_len(@b)
+    @body_len = @end - @len_at - 4
+    str_set_byte(@b.buf, @len_at + 0,  @body_len        & 255)
+    str_set_byte(@b.buf, @len_at + 1, (@body_len >> 8)  & 255)
+    str_set_byte(@b.buf, @len_at + 2, (@body_len >> 16) & 255)
+    str_set_byte(@b.buf, @len_at + 3, (@body_len >> 24) & 255)
+    return 0
+
+
 fn main() -> int
     @argc = 0
     while str_eq(arg(@argc), "") == 0
@@ -318,13 +983,14 @@ fn main() -> int
     @src_path = arg(1)
     @out_path = _parse_output(@argc)
     @target   = _parse_target(@argc)
+    @dynamic  = _parse_dynamic(@argc)
 
     @src = read_file(@src_path)
     if @src == 0
         shine(str_concat("luna-mini: cannot read ", @src_path))
         return 1
 
-    let @g: Gen = compile_to_gen_target(@src, @target)
+    let @g: Gen = compile_to_gen_target(@src, @target, @dynamic)
     if @g.had_error == 1
         return 1
     @patches = @g.str_patches
@@ -338,17 +1004,53 @@ fn main() -> int
     if @target == 1
         return _emit_pe64(@out_path, @code_bytes, @code_len, @g.main_off, @g)
 
-    # Entry point = main's code offset inside the code section.
-    @entry_off = _elf_prelude() + @g.main_off
+    # Prelude size depends on number of program headers (each 56 bytes
+    # after the 64-byte Ehdr). Static = 1 phdr (PT_LOAD); dynamic = 3
+    # phdrs (PT_LOAD + PT_INTERP + PT_DYNAMIC).
+    @prelude_sz = _elf_prelude()
+    if @dynamic == 1
+        @prelude_sz = _elf_hdr() + _elf_phdr() * 3
+
+    # Entry point: static ELF jumps straight into main; dynamic ELF
+    # goes through `_start` which sets up libc via __libc_start_main.
+    @entry_off = @prelude_sz + @g.main_off
+    if @dynamic == 1
+        @entry_off = @prelude_sz + @g.start_off
 
     # Reserve 64 MB of extra memsz beyond filesz for the bump heap.
     # The self-compile case pushes Vec/StrBuf hard (tokens, AST-shaped
     # patches, data/code buffers) and 1 MB is not enough.
     @heap_size = 67108864
 
-    @code_off = _elf_prelude()
+    @code_off = @prelude_sz
     @data_off = @code_off + @code_len
     @file_sz  = @data_off + @data_len
+
+    # Dynamic ELF metadata blob (P1 of docs/TLS_DESIGN.md). Placed
+    # INSIDE the PT_LOAD segment, right after the compiler-emitted data
+    # section. ld-linux mmaps the whole image and reads DT_DYNAMIC entries
+    # from here when starting the binary.
+    @dyn_blob_off = 0
+    @dyn_blob_len = 0
+    @dyn_blob_bytes = ""
+    @interp_off_abs = 0
+    @interp_len_val = 0
+    @dyn_off_abs = 0
+    @dyn_len_val = 0
+    @gotplt_in_blob = 0
+    if @dynamic == 1
+        @dyn_blob_off = @file_sz
+        let @dyn_buf: StrBuf = strbuf_new()
+        @dyn_offs = vec_new()
+        _build_dyn_blob(@dyn_buf, @dyn_blob_off, @g, @dyn_offs)
+        @dyn_blob_bytes = strbuf_done(@dyn_buf)
+        @dyn_blob_len = str_len(@dyn_blob_bytes)
+        @interp_off_abs = @dyn_blob_off + vec_get(@dyn_offs, 0)
+        @dyn_off_abs    = @dyn_blob_off + vec_get(@dyn_offs, 1)
+        @interp_len_val = vec_get(@dyn_offs, 2)
+        @dyn_len_val    = vec_get(@dyn_offs, 3)
+        @gotplt_in_blob = vec_get(@dyn_offs, 4)
+        @file_sz = @file_sz + @dyn_blob_len
 
     # Patch every LEA disp32:
     #   disp = (DATA_VADDR + data_offset_in_section)
@@ -400,6 +1102,38 @@ fn main() -> int
         str_set_byte(@code_bytes, @pat_off + 2, (@rel >> 16) & 255)
         str_set_byte(@code_bytes, @pat_off + 3, (@rel >> 24) & 255)
         @h = @h + 1
+
+    # Resolve dynamic-import call sites (P2 of docs/TLS_DESIGN.md).
+    # Each `call qword [rip + disp32]` (6 bytes) is patched so disp32
+    # points at the corresponding .got.plt slot. ld-linux fills the
+    # slots at load time (BIND_NOW) with the resolved symbol addresses.
+    if @dynamic == 1
+        @uniq_for_patch = vec_new()
+        @ip2 = 0
+        @np2 = vec_len(@g.imp_patches)
+        while @ip2 < @np2
+            @nm2 = vec_get(@g.imp_patches, @ip2 + 1)
+            if _dyn_vec_str_idx(@uniq_for_patch, @nm2) < 0
+                vec_push(@uniq_for_patch, @nm2)
+            @ip2 = @ip2 + 2
+        @gotplt_vaddr = _elf_vaddr() + @dyn_blob_off + @gotplt_in_blob
+        @ip3 = 0
+        while @ip3 < @np2
+            @csite = vec_get(@g.imp_patches, @ip3)
+            @nm3 = vec_get(@g.imp_patches, @ip3 + 1)
+            @sym_pos = _dyn_vec_str_idx(@uniq_for_patch, @nm3)
+            @slot_vaddr = @gotplt_vaddr + (3 + @sym_pos) * 8
+            # disp32 is added to RIP at the FIRST byte after the call
+            # instruction (call_site + 4 in code_bytes coords since @csite
+            # is the offset of the disp32 field itself; the call's own RIP
+            # at execute time = code_vaddr + (csite + 4 from disp32 byte)).
+            @call_next_vaddr = _elf_vaddr() + @code_off + @csite + 4
+            @disp_imp = @slot_vaddr - @call_next_vaddr
+            str_set_byte(@code_bytes, @csite + 0,  @disp_imp        & 255)
+            str_set_byte(@code_bytes, @csite + 1, (@disp_imp >> 8)  & 255)
+            str_set_byte(@code_bytes, @csite + 2, (@disp_imp >> 16) & 255)
+            str_set_byte(@code_bytes, @csite + 3, (@disp_imp >> 24) & 255)
+            @ip3 = @ip3 + 2
 
     # Resolve hot-swap metadata loads. Each patch reads a u64 from
     # data[meta_off .. meta_off+8) via `mov rax, [rip+disp32]`.
@@ -454,10 +1188,114 @@ fn main() -> int
         @name_cursor = @name_cursor + str_len(@nm) + 1
         @fi = @fi + 1
 
+    # Debug-info table for stack traces (see docs/STACKTRACE_DESIGN.md).
+    # Header slots at data[40..64): table_vaddr, count, pool_vaddr.
+    @dbg_table_vaddr = @data_vaddr + @g.dbg_table_off
+    @dbg_pool_vaddr  = @data_vaddr + @g.dbg_pool_off
+    @dk = 0
+    while @dk < 8
+        str_set_byte(@data_bytes, 40 + @dk, (@dbg_table_vaddr >> (@dk * 8)) & 255)
+        str_set_byte(@data_bytes, 48 + @dk, (@nfn             >> (@dk * 8)) & 255)
+        str_set_byte(@data_bytes, 56 + @dk, (@dbg_pool_vaddr  >> (@dk * 8)) & 255)
+        @dk = @dk + 1
+    # Fill each 24-byte record: pc_lo (8B), pc_hi (8B), line (4B), name_off (4B).
+    @dbg_name_off = 0
+    @df = 0
+    while @df < @nfn
+        @rec_off = @g.dbg_table_off + @df * 24
+        @pc_lo_v = _elf_vaddr() + @code_off + vec_get(@g.fn_offsets, @df)
+        @pc_hi_v = _elf_vaddr() + @code_off + vec_get(@g.fn_pc_hi, @df)
+        @line_v  = vec_get(@g.fn_decl_line, @df)
+        @bw = 0
+        while @bw < 8
+            str_set_byte(@data_bytes, @rec_off + @bw,     (@pc_lo_v >> (@bw * 8)) & 255)
+            str_set_byte(@data_bytes, @rec_off + 8 + @bw, (@pc_hi_v >> (@bw * 8)) & 255)
+            @bw = @bw + 1
+        str_set_byte(@data_bytes, @rec_off + 16, @line_v        & 255)
+        str_set_byte(@data_bytes, @rec_off + 17, (@line_v >> 8) & 255)
+        str_set_byte(@data_bytes, @rec_off + 18, (@line_v >> 16) & 255)
+        str_set_byte(@data_bytes, @rec_off + 19, (@line_v >> 24) & 255)
+        str_set_byte(@data_bytes, @rec_off + 20, @dbg_name_off        & 255)
+        str_set_byte(@data_bytes, @rec_off + 21, (@dbg_name_off >> 8) & 255)
+        str_set_byte(@data_bytes, @rec_off + 22, (@dbg_name_off >> 16) & 255)
+        str_set_byte(@data_bytes, @rec_off + 23, (@dbg_name_off >> 24) & 255)
+        @dnm_main2 = vec_get(@g.fn_names, @df)
+        @dbg_name_off = @dbg_name_off + str_len(@dnm_main2) + 1
+        @df = @df + 1
+
     @mem_sz = @file_sz + @heap_size
 
-    @buf = new_str(@file_sz)
-    _emit_elf(@buf, @file_sz, @mem_sz, @entry_off)
+    # ---- DWARF section emission (P5: gdb/addr2line support) -------------
+    #
+    # Build the optional debug-info sections AFTER the loadable segment:
+    #   .debug_line   PC -> source line mapping
+    #   .debug_abbrev abbreviation table for .debug_info
+    #   .debug_info   CU + DW_TAG_subprogram per fn
+    #   .debug_str    string pool (fn names, file name)
+    #   .shstrtab     section name strings
+    # Then a section header table referencing all of the above.
+    #
+    # The PT_LOAD's file_sz stays unchanged; debug sections live past it
+    # in the file, never mapped at runtime.
+
+    let @eh: StrBuf = strbuf_new()
+    _dwarf_build_eh_frame(@eh, @g, @code_off)
+    @eh_bytes = strbuf_done(@eh)
+    @eh_len = str_len(@eh_bytes)
+
+    let @dl: StrBuf = strbuf_new()
+    _dwarf_build_debug_line(@dl, @g, @code_off, @code_len)
+    @dl_bytes = strbuf_done(@dl)
+    @dl_len = str_len(@dl_bytes)
+
+    let @dab: StrBuf = strbuf_new()
+    _dwarf_build_debug_abbrev(@dab)
+    @dab_bytes = strbuf_done(@dab)
+    @dab_len = str_len(@dab_bytes)
+
+    let @ds: StrBuf = strbuf_new()
+    @ds_offsets = vec_new()
+    _dwarf_build_debug_str(@ds, @g, @src_path, @ds_offsets)
+    @ds_bytes = strbuf_done(@ds)
+    @ds_len = str_len(@ds_bytes)
+
+    let @di: StrBuf = strbuf_new()
+    _dwarf_build_debug_info(@di, @g, @code_off, @code_len, @ds_offsets)
+    @di_bytes = strbuf_done(@di)
+    @di_len = str_len(@di_bytes)
+
+    # Section header string table.
+    let @shstr: StrBuf = strbuf_new()
+    strbuf_add_byte(@shstr, 0)
+    @nm_text     = _shstr_add(@shstr, ".text")
+    @nm_data     = _shstr_add(@shstr, ".data")
+    @nm_eh       = _shstr_add(@shstr, ".eh_frame")
+    @nm_dl       = _shstr_add(@shstr, ".debug_line")
+    @nm_dab      = _shstr_add(@shstr, ".debug_abbrev")
+    @nm_di       = _shstr_add(@shstr, ".debug_info")
+    @nm_ds       = _shstr_add(@shstr, ".debug_str")
+    @nm_shstrtab = _shstr_add(@shstr, ".shstrtab")
+    @shstr_bytes = strbuf_done(@shstr)
+    @shstr_len   = str_len(@shstr_bytes)
+
+    # File layout past PT_LOAD: debug sections, then shstrtab, then SHT.
+    @eh_off       = @file_sz
+    @dl_off       = @eh_off  + @eh_len
+    @dab_off      = @dl_off  + @dl_len
+    @di_off       = @dab_off + @dab_len
+    @ds_off       = @di_off  + @di_len
+    @shstr_off    = @ds_off  + @ds_len
+    @sht_off      = @shstr_off + @shstr_len
+    @sht_count    = 9
+    @shstrndx     = 8
+    @sht_size     = @sht_count * 64
+    @total_sz     = @sht_off + @sht_size
+
+    @buf = new_str(@total_sz)
+    if @dynamic == 1
+        _emit_dynamic_elf(@buf, @file_sz, @mem_sz, @entry_off, @sht_off, @sht_count, @shstrndx, @interp_off_abs, @interp_len_val, @dyn_off_abs, @dyn_len_val)
+    else
+        _emit_elf(@buf, @file_sz, @mem_sz, @entry_off, @sht_off, @sht_count, @shstrndx)
 
     # Copy code into [code_off..code_off+code_len)
     @k = 0
@@ -469,6 +1307,51 @@ fn main() -> int
     while @k < @data_len
         str_set_byte(@buf, @data_off + @k, str_byte(@data_bytes, @k))
         @k = @k + 1
+    # Copy dynamic ELF blob (P1) right after data, INSIDE PT_LOAD.
+    if @dynamic == 1
+        @k = 0
+        while @k < @dyn_blob_len
+            str_set_byte(@buf, @dyn_blob_off + @k, str_byte(@dyn_blob_bytes, @k))
+            @k = @k + 1
+    # Copy debug sections.
+    @k = 0
+    while @k < @eh_len
+        str_set_byte(@buf, @eh_off + @k, str_byte(@eh_bytes, @k))
+        @k = @k + 1
+    @k = 0
+    while @k < @dl_len
+        str_set_byte(@buf, @dl_off + @k, str_byte(@dl_bytes, @k))
+        @k = @k + 1
+    @k = 0
+    while @k < @dab_len
+        str_set_byte(@buf, @dab_off + @k, str_byte(@dab_bytes, @k))
+        @k = @k + 1
+    @k = 0
+    while @k < @di_len
+        str_set_byte(@buf, @di_off + @k, str_byte(@di_bytes, @k))
+        @k = @k + 1
+    @k = 0
+    while @k < @ds_len
+        str_set_byte(@buf, @ds_off + @k, str_byte(@ds_bytes, @k))
+        @k = @k + 1
+    @k = 0
+    while @k < @shstr_len
+        str_set_byte(@buf, @shstr_off + @k, str_byte(@shstr_bytes, @k))
+        @k = @k + 1
+
+    # Section header table. ORDER matches shstrndx (8) below.
+    # [0] NULL  [1] .text  [2] .data  [3] .eh_frame
+    # [4] .debug_line  [5] .debug_abbrev  [6] .debug_info  [7] .debug_str  [8] .shstrtab
+    @s = @sht_off
+    _shdr_put(@buf, @s,       0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    _shdr_put(@buf, @s + 64,  @nm_text,     1, 6, _elf_vaddr() + @code_off, @code_off, @code_len, 0, 0, 16, 0)
+    _shdr_put(@buf, @s + 128, @nm_data,     1, 3, _elf_vaddr() + @data_off, @data_off, @data_len, 0, 0, 8, 0)
+    _shdr_put(@buf, @s + 192, @nm_eh,       1, 0, 0, @eh_off,   @eh_len,    0, 0, 8, 0)
+    _shdr_put(@buf, @s + 256, @nm_dl,       1, 0, 0, @dl_off,   @dl_len,    0, 0, 1, 0)
+    _shdr_put(@buf, @s + 320, @nm_dab,      1, 0, 0, @dab_off,  @dab_len,   0, 0, 1, 0)
+    _shdr_put(@buf, @s + 384, @nm_di,       1, 0, 0, @di_off,   @di_len,    0, 0, 1, 0)
+    _shdr_put(@buf, @s + 448, @nm_ds,       1, 48, 0, @ds_off, @ds_len,    0, 0, 1, 1)
+    _shdr_put(@buf, @s + 512, @nm_shstrtab, 3, 0, 0, @shstr_off, @shstr_len, 0, 0, 1, 0)
 
     @n = write_file(@out_path, @buf)
     if @n < 0

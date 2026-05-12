@@ -1,0 +1,145 @@
+# Tests for std/strings.
+
+import strings
+import test
+
+
+fn run_strings_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # str_starts_with / str_ends_with
+    @r = assert_eq_int("starts_with /api/", str_starts_with("/api/v1", "/api/"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("starts_with miss", str_starts_with("/api/v1", "/v2/"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("ends_with .luna", str_ends_with("hello.luna", ".luna"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # str_index_of
+    @r = assert_eq_int("index_of mid", str_index_of("hello world", "world"), 6)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("index_of missing", str_index_of("hello", "xyz"), 0 - 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("index_of empty needle", str_index_of("hi", ""), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # str_contains
+    @r = assert_eq_int("contains true",  str_contains("rusty railway", "rail"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("contains false", str_contains("rusty railway", "trail"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # case conversions
+    @r = assert_eq_str("to_upper", str_to_upper("Hello, Luna!"), "HELLO, LUNA!")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("to_lower", str_to_lower("MiXeD CaSe"), "mixed case")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # trim
+    @r = assert_eq_str("trim spaces",   str_trim("   hello   "),   "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("trim mixed ws", str_trim("\t\n hi \r\n"),  "hi")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("trim empty",    str_trim(""),              "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("trim all ws",   str_trim("   "),           "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # parse_int
+    @r = assert_eq_int("parse_int 42",      parse_int("42"),     42)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("parse_int -7",      parse_int("-7"),     0 - 7)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("parse_int +13",     parse_int("+13"),    13)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("parse_int junk",    parse_int("abc"),    0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("parse_int trail",   parse_int("12cm"),   12)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # split + join
+    @parts = str_split("a,b,c,d", 44)
+    @r = assert_eq_int("split len",  vec_len(@parts),       4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("split [0]",  vec_get(@parts, 0),   "a")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("split [3]",  vec_get(@parts, 3),   "d")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # trailing separator yields trailing empty
+    @parts2 = str_split("x,,y,", 44)
+    @r = assert_eq_int("split trailing len", vec_len(@parts2), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("split trailing [3]", vec_get(@parts2, 3), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @joined = str_join(@parts, "|")
+    @r = assert_eq_str("join pipe",  @joined,                "a|b|c|d")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # replace
+    @r = assert_eq_str("replace once",   str_replace("hello world", "world", "luna"), "hello luna")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("replace many",   str_replace("aaa", "a", "bb"), "bbbbbb")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("replace empty",  str_replace("xyz", "", "_"),    "xyz")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # repeat
+    @r = assert_eq_str("repeat 3", str_repeat("ab", 3), "ababab")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Stash counts back via the heap-bump trick: we return @p, write
+    # @f into a 4-byte cell.
+    test_summary("strings", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_strings_tests(0, 0)

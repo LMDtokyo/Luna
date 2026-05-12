@@ -1,0 +1,37 @@
+# Standalone TCP echo round-trip test.
+#
+# Connects to 127.0.0.1:18080 (an echo server started by
+# tcp_echo.sh), sends "ping\n", reads the reply, exits 0 on match.
+
+import tcp
+
+
+fn main() -> int
+    @fd = tcp_connect("127.0.0.1", 18080)
+    if @fd < 0
+        shine("FAIL: connect refused or addr error")
+        return 1
+
+    @msg = "ping\n"
+    @r = tcp_send_str(@fd, @msg)
+    if @r < 0
+        shine("FAIL: send error")
+        tcp_close(@fd)
+        return 1
+
+    @buf = new_str(64)
+    @n = tcp_recv(@fd, @buf, 64)
+    if @n <= 0
+        shine("FAIL: recv EOF or error")
+        tcp_close(@fd)
+        return 1
+
+    @echoed = str_substr(@buf, 0, @n)
+    if str_eq(@echoed, @msg) == 1
+        shine("PASS: echo round-trip (5 bytes)")
+        tcp_close(@fd)
+        return 0
+
+    shine("FAIL: echo mismatch")
+    tcp_close(@fd)
+    return 1

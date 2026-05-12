@@ -1,0 +1,127 @@
+# Tests for std/cli.
+
+import cli
+import test
+
+
+# Convenience: build an argv Vec from variadic-style strings. Bootminor
+# doesn't support varargs, so the caller pushes manually.
+fn _argv() -> Vec
+    return vec_new()
+
+
+fn run_cli_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1. --name=value form.
+    @argv1 = _argv()
+    vec_push(@argv1, "--port=8080")
+    @c1 = cli_new()
+    cli_parse(@c1, @argv1)
+    @r = assert_eq_int("--port=8080 flag",  cli_flag(@c1, "port"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("--port=8080 value", cli_opt(@c1, "port"),  "8080")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("--port int parse",  cli_opt_int(@c1, "port", 0), 8080)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2. --name value detached.
+    @argv2 = _argv()
+    vec_push(@argv2, "--user")
+    vec_push(@argv2, "alice")
+    @c2 = cli_new()
+    cli_parse(@c2, @argv2)
+    @r = assert_eq_str("--user detached", cli_opt(@c2, "user"), "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3. bare --flag (no value).
+    @argv3 = _argv()
+    vec_push(@argv3, "--verbose")
+    @c3 = cli_new()
+    cli_parse(@c3, @argv3)
+    @r = assert_eq_int("--verbose flag",  cli_flag(@c3, "verbose"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("--verbose value", cli_opt(@c3, "verbose"), "1")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4. short flags glued together.
+    @argv4 = _argv()
+    vec_push(@argv4, "-vqx")
+    @c4 = cli_new()
+    cli_parse(@c4, @argv4)
+    @r = assert_eq_int("-v",  cli_flag(@c4, "v"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("-q",  cli_flag(@c4, "q"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("-x",  cli_flag(@c4, "x"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("-z absent", cli_flag(@c4, "z"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5. positionals + -- sentinel.
+    @argv5 = _argv()
+    vec_push(@argv5, "input.txt")
+    vec_push(@argv5, "--port=80")
+    vec_push(@argv5, "--")
+    vec_push(@argv5, "--literal")
+    vec_push(@argv5, "-q")
+    @c5 = cli_new()
+    cli_parse(@c5, @argv5)
+    @r = assert_eq_int("positional count", cli_positional_count(@c5), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("pos[0] file",   cli_positional(@c5, 0), "input.txt")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("pos[1] post --",cli_positional(@c5, 1), "--literal")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("pos[2] post --",cli_positional(@c5, 2), "-q")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("--port still parses before --", cli_opt_int(@c5, "port", 0), 80)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6. defaults
+    @argv6 = _argv()
+    vec_push(@argv6, "--known=1")
+    @c6 = cli_new()
+    cli_parse(@c6, @argv6)
+    @r = assert_eq_str("opt_or default", cli_opt_or(@c6, "missing", "fallback"), "fallback")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("opt_int default", cli_opt_int(@c6, "missing", 99), 99)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7. lone "-" is a positional, not a flag.
+    @argv7 = _argv()
+    vec_push(@argv7, "-")
+    @c7 = cli_new()
+    cli_parse(@c7, @argv7)
+    @r = assert_eq_int("- positional count", cli_positional_count(@c7), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("- positional value", cli_positional(@c7, 0), "-")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("cli", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_cli_tests(0, 0)

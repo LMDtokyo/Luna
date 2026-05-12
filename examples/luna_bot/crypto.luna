@@ -1,0 +1,58 @@
+# crypto.luna — random and crypto handlers.
+# /sha256 /hmac /uuid /random /dice /coin /randhex
+
+fn cmd_sha256(@token: int, @chat_id: int, @arg: int) -> int
+    if str_len(@arg) == 0
+        send_markdown(@token, @chat_id, "usage: `/sha256 <text>`")
+        return 0
+    send_markdown(@token, @chat_id, _md_code(sha256_hex(@arg)))
+    return 0
+
+fn cmd_hmac(@token: int, @chat_id: int, @arg: int) -> int
+    @rn = str_len(@arg)
+    if @rn == 0
+        send_markdown(@token, @chat_id, "usage: `/hmac <key> <message>`")
+        return 0
+    @space = 0
+    @i = 0
+    while @i < @rn
+        if str_byte(@arg, @i) == 32
+            @space = @i
+            @i = @rn
+        else
+            @i = @i + 1
+    if @space == 0
+        send_markdown(@token, @chat_id, "usage: `/hmac <key> <message>`")
+        return 0
+    @key = str_substr(@arg, 0, @space)
+    @msg = str_substr(@arg, @space + 1, @rn - @space - 1)
+    send_markdown(@token, @chat_id, _md_code(hmac_sha256_hex(@key, @msg)))
+    return 0
+
+fn cmd_uuid(@token: int, @chat_id: int) -> int
+    send_markdown(@token, @chat_id, _md_code(uuid_v4()))
+    return 0
+
+fn cmd_random(@token: int, @chat_id: int) -> int
+    send_message(@token, @chat_id, str_concat("🎲 ", int_to_str(random_u32())))
+    return 0
+
+fn cmd_dice(@token: int, @chat_id: int) -> int
+    send_message(@token, @chat_id, str_concat("🎲 ", int_to_str(random_range(1, 6))))
+    return 0
+
+fn cmd_coin(@token: int, @chat_id: int) -> int
+    if random_range(0, 1) == 0
+        send_message(@token, @chat_id, "heads")
+    else
+        send_message(@token, @chat_id, "tails")
+    return 0
+
+fn cmd_randhex(@token: int, @chat_id: int, @arg: int) -> int
+    @n = parse_int(@arg)
+    if @n <= 0
+        @n = 16
+    if @n > 64
+        @n = 64
+    send_markdown(@token, @chat_id, _md_code(_hex_random(@n)))
+    return 0

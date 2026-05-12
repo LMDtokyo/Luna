@@ -1,0 +1,222 @@
+# tier: T5
+# deps: tcp, dns
+# ffi: none
+#
+# std/net/http — HTTP/1.1 client in pure Luna over std/net/tcp.
+#
+# No curl, no FFI, no shelling out. Plain TCP + a small response
+# parser. IPv4 only; DNS will live in a sibling module.
+#
+# Limitations of this first cut:
+#   - HTTP/1.1 only, Connection: close (no keep-alive yet).
+#   - 1 MiB response cap (HTTP_MAX_RESPONSE). Larger payloads truncate.
+#   - Chunked transfer-encoding is NOT decoded yet (will land with
+#     a small TE parser next).
+#
+# Caller gotcha — type the receiver:
+#   Bootminor only computes struct field offsets when the receiver
+#   variable carries an explicit type annotation. Use:
+#       let @resp: HttpResponse = http_get(...)
+#       @resp.status, @resp.body
+#   Without `: HttpResponse`, every `@resp.field` reads offset 0.
+
+import tcp
+import dns
+
+
+const HTTP_MAX_RESPONSE: int = 1048576
+
+
+# An HTTP response. `status` is the numeric code (200, 404, ...) or
+# -1 if the response failed to parse. `headers` is the raw header
+# block (without trailing \r\n\r\n). `body` is the bytes after.
+struct HttpResponse
+    status:  int
+    headers: int
+    body:    int
+
+
+# _http_concat3(@a, @b, @c) -> single allocated string.
+fn _http_concat3(@a: int, @b: int, @c: int) -> int
+    return str_concat(str_concat(@a, @b), @c)
+
+
+# _http_int_to_str(@n) -> ASCII decimal representation of @n.
+# Handles 0; assumes non-negative for HTTP Content-Length.
+fn _http_int_to_str(@n: int) -> int
+    if @n == 0
+        return "0"
+    @tmp = new_str(24)
+    @i = 0
+    while @n > 0
+        @d = @n % 10
+        u8_set(@tmp, @i, 48 + @d)
+        @n = @n / 10
+        @i = @i + 1
+    # Reverse into output.
+    @out = new_str(@i)
+    @j = 0
+    while @j < @i
+        u8_set(@out, @j, u8_at(@tmp, @i - 1 - @j))
+        @j = @j + 1
+    return @out
+
+
+# _http_find_crlf_crlf(@buf, @blen) -> offset of "\r\n\r\n" or -1.
+fn _http_find_crlf_crlf(@buf: int, @blen: int) -> int
+    if @blen < 4
+        return -1
+    @i = 0
+    @end = @blen - 3
+    while @i < @end
+        if u8_at(@buf, @i) == 13
+            if u8_at(@buf, @i + 1) == 10
+                if u8_at(@buf, @i + 2) == 13
+                    if u8_at(@buf, @i + 3) == 10
+                        return @i
+        @i = @i + 1
+    return -1
+
+
+# _http_parse_status(@buf, @blen) -> integer status, or -1.
+# Reads from "HTTP/1.1 200 OK..." up to first \r or \n.
+fn _http_parse_status(@buf: int, @blen: int) -> int
+    if @blen < 12
+        return -1
+    # Walk past "HTTP/" prefix to first space.
+    @i = 0
+    while @i < @blen
+        if u8_at(@buf, @i) == 32
+            break
+        @i = @i + 1
+    if @i >= @blen
+        return -1
+    @i = @i + 1
+    # Now read three decimal digits.
+    @status = 0
+    @digits = 0
+    while @i < @blen
+        @c = u8_at(@buf, @i)
+        if @c < 48
+            break
+        if @c > 57
+            break
+        @status = @status * 10 + (@c - 48)
+        @digits = @digits + 1
+        @i = @i + 1
+    if @digits == 0
+        return -1
+    return @status
+
+
+# _http_recv_all(@fd, @max) -> (buf, len). Reads until EOF or @max.
+# Returns the buffer as a string (length-prefixed via the prelude's
+# new_str). Caller passes @out_len as a 1-int heap cell to receive
+# the actual byte count.
+fn _http_recv_all(@fd: int, @max: int, @out_len: int) -> int
+    @buf = new_str(@max)
+    @total = 0
+    while @total < @max
+        @r = sys_read(@fd, @buf + @total, @max - @total)
+        if @r <= 0
+            break
+        @total = @total + @r
+    u32_set(@out_len, 0, @total)
+    return @buf
+
+
+# http_request_via(@ip, @host_hdr, @port, @method, @path, @body, @ctype)
+# -> HttpResponse. Connects to @ip:@port but sends `Host: @host_hdr` so
+# vhosted servers (basically all of the modern web) route correctly.
+fn http_request_via(@ip: int, @host_hdr: int, @port: int, @method: int, @path: int, @body: int, @ctype: int) -> HttpResponse
+    let @resp: HttpResponse = new_str(24)
+    @resp.status = -1
+    @resp.headers = ""
+    @resp.body = ""
+
+    @fd = tcp_connect(@ip, @port)
+    if @fd < 0
+        return @resp
+
+    @req = str_concat(@method, " ")
+    @req = str_concat(@req, @path)
+    @req = str_concat(@req, " HTTP/1.1\r\nHost: ")
+    @req = str_concat(@req, @host_hdr)
+    @req = str_concat(@req, "\r\nConnection: close\r\n")
+
+    @blen = str_len(@body)
+    if @blen > 0
+        @req = str_concat(@req, "Content-Type: ")
+        @req = str_concat(@req, @ctype)
+        @req = str_concat(@req, "\r\nContent-Length: ")
+        @req = str_concat(@req, _http_int_to_str(@blen))
+        @req = str_concat(@req, "\r\n")
+    @req = str_concat(@req, "\r\n")
+    if @blen > 0
+        @req = str_concat(@req, @body)
+
+    if tcp_send_str(@fd, @req) < 0
+        tcp_close(@fd)
+        return @resp
+
+    @len_cell = new_str(4)
+    @raw = _http_recv_all(@fd, HTTP_MAX_RESPONSE, @len_cell)
+    @rlen = u32_at(@len_cell, 0)
+    tcp_close(@fd)
+
+    if @rlen <= 0
+        return @resp
+
+    @status = _http_parse_status(@raw, @rlen)
+    @resp.status = @status
+
+    @hdr_end = _http_find_crlf_crlf(@raw, @rlen)
+    if @hdr_end < 0
+        # No header terminator — return whole payload as body, no headers.
+        @resp.body = str_substr(@raw, 0, @rlen)
+        return @resp
+
+    @resp.headers = str_substr(@raw, 0, @hdr_end)
+    @body_start = @hdr_end + 4
+    @resp.body = str_substr(@raw, @body_start, @rlen - @body_start)
+    return @resp
+
+
+# http_request — keeps the old by-IP signature. The Host header uses
+# the IP, which works for testing against IP-pinned servers (like
+# python -m http.server). Most production servers are vhosted; use
+# http_get_host / http_post_host or http_request_via for those.
+fn http_request(@host_ip: int, @port: int, @method: int, @path: int, @body: int, @ctype: int) -> HttpResponse
+    @host_hdr = _http_concat3(@host_ip, ":", _http_int_to_str(@port))
+    return http_request_via(@host_ip, @host_hdr, @port, @method, @path, @body, @ctype)
+
+
+# Convenience wrappers — by IP. Host header = "<ip>:<port>".
+fn http_get(@host_ip: int, @port: int, @path: int) -> HttpResponse
+    return http_request(@host_ip, @port, "GET", @path, "", "")
+
+fn http_post(@host_ip: int, @port: int, @path: int, @body: int, @ctype: int) -> HttpResponse
+    return http_request(@host_ip, @port, "POST", @path, @body, @ctype)
+
+
+# By-hostname wrappers — resolve via std/net/dns and send the original
+# hostname as the Host header. Returns status -1 if DNS fails.
+fn http_get_host(@host: int, @port: int, @path: int) -> HttpResponse
+    let @resp: HttpResponse = new_str(24)
+    @resp.status = -1
+    @resp.headers = ""
+    @resp.body = ""
+    @ip = dns_resolve(@host)
+    if str_len(@ip) == 0
+        return @resp
+    return http_request_via(@ip, @host, @port, "GET", @path, "", "")
+
+fn http_post_host(@host: int, @port: int, @path: int, @body: int, @ctype: int) -> HttpResponse
+    let @resp: HttpResponse = new_str(24)
+    @resp.status = -1
+    @resp.headers = ""
+    @resp.body = ""
+    @ip = dns_resolve(@host)
+    if str_len(@ip) == 0
+        return @resp
+    return http_request_via(@ip, @host, @port, "POST", @path, @body, @ctype)

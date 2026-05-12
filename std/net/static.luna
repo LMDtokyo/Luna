@@ -1,0 +1,122 @@
+# tier: T5
+# deps: http_server, io
+# ffi: none
+#
+# std/net/static — static file server with MIME-type detection.
+#
+# Usage:
+#   fn assets(@req, @cli) -> int
+#       # @req.path is "/style.css"; strip the leading "/"
+#       return static_serve(@cli, "./public", @req.path)
+#
+#   fn main() -> int
+#       let @r: Router = router_new()
+#       router_get(@r, "/", index_handler)
+#       router_get(@r, "/style.css",  assets)
+#       router_get(@r, "/app.js",     assets)
+#       router_get(@r, "/favicon.ico", assets)
+#       return router_serve_forking(@r, 8080)
+#
+# Path-traversal defence: any "../" sequence in @relpath returns 403.
+# Symlinks outside @root aren't checked yet — assume @root contents
+# are trusted.
+
+import http_server
+import io
+
+
+# Detect MIME from path extension. Falls back to application/octet-
+# stream for unknown extensions.
+fn _static_mime(@path: int) -> int
+    @ext = path_extension(@path)
+    if str_eq(@ext, "html") == 1
+        return "text/html; charset=utf-8"
+    if str_eq(@ext, "htm") == 1
+        return "text/html; charset=utf-8"
+    if str_eq(@ext, "css") == 1
+        return "text/css"
+    if str_eq(@ext, "js") == 1
+        return "application/javascript"
+    if str_eq(@ext, "mjs") == 1
+        return "application/javascript"
+    if str_eq(@ext, "json") == 1
+        return "application/json"
+    if str_eq(@ext, "xml") == 1
+        return "application/xml"
+    if str_eq(@ext, "txt") == 1
+        return "text/plain; charset=utf-8"
+    if str_eq(@ext, "md") == 1
+        return "text/markdown; charset=utf-8"
+    if str_eq(@ext, "png") == 1
+        return "image/png"
+    if str_eq(@ext, "jpg") == 1
+        return "image/jpeg"
+    if str_eq(@ext, "jpeg") == 1
+        return "image/jpeg"
+    if str_eq(@ext, "gif") == 1
+        return "image/gif"
+    if str_eq(@ext, "svg") == 1
+        return "image/svg+xml"
+    if str_eq(@ext, "webp") == 1
+        return "image/webp"
+    if str_eq(@ext, "ico") == 1
+        return "image/x-icon"
+    if str_eq(@ext, "woff") == 1
+        return "font/woff"
+    if str_eq(@ext, "woff2") == 1
+        return "font/woff2"
+    if str_eq(@ext, "ttf") == 1
+        return "font/ttf"
+    if str_eq(@ext, "wasm") == 1
+        return "application/wasm"
+    if str_eq(@ext, "pdf") == 1
+        return "application/pdf"
+    if str_eq(@ext, "mp4") == 1
+        return "video/mp4"
+    if str_eq(@ext, "mp3") == 1
+        return "audio/mpeg"
+    return "application/octet-stream"
+
+
+# _static_has_dotdot(@path) -> 1 if the path contains a ".." segment.
+# Defends against ../../../../etc/passwd traversal.
+fn _static_has_dotdot(@path: int) -> int
+    @plen = str_len(@path)
+    @i = 0
+    while @i + 1 < @plen
+        if str_byte(@path, @i) == 46
+            if str_byte(@path, @i + 1) == 46
+                return 1
+        @i = @i + 1
+    return 0
+
+
+# static_serve(@cli, @root, @relpath) -> bytes sent or 0.
+# @relpath may start with "/"; we strip it. Returns 403 on "../",
+# 404 if the file is missing.
+fn static_serve(@cli: int, @root: int, @relpath: int) -> int
+    if _static_has_dotdot(@relpath) == 1
+        return http_send(@cli, 403, "Forbidden", "text/plain", "Forbidden\n")
+
+    # Strip leading '/' so str_concat with @root works for both
+    # "/foo" and "foo".
+    @plen = str_len(@relpath)
+    @start = 0
+    if @plen > 0
+        if str_byte(@relpath, 0) == 47
+            @start = 1
+    @clean = str_substr(@relpath, @start, @plen - @start)
+
+    # Build full path. Ensure @root ends with '/' or @clean starts
+    # with one.
+    @full = @root
+    @rlen = str_len(@root)
+    if @rlen > 0
+        if str_byte(@root, @rlen - 1) != 47
+            @full = str_concat(@root, "/")
+    @full = str_concat(@full, @clean)
+
+    if file_exists(@full) == 0
+        return http_send_404(@cli)
+    @content = read_file(@full)
+    return http_send(@cli, 200, "OK", _static_mime(@full), @content)

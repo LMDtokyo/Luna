@@ -1,0 +1,51 @@
+# helpers.luna — small string / byte utilities used across handlers.
+
+# Returns the text after the first space, or "" if there is none.
+fn _arg_after(@text: int) -> int
+    @n = str_len(@text)
+    @i = 0
+    while @i < @n
+        if str_byte(@text, @i) == 32
+            return str_substr(@text, @i + 1, @n - @i - 1)
+        @i = @i + 1
+    return ""
+
+# Reverse a string byte-by-byte (ASCII-safe; multi-byte UTF-8 will
+# desync, but Telegram sends short ASCII command args anyway).
+fn _str_reverse(@s: int) -> int
+    @n = str_len(@s)
+    @out = new_str(@n)
+    @i = 0
+    while @i < @n
+        str_set_byte(@out, @i, str_byte(@s, @n - 1 - @i))
+        @i = @i + 1
+    return @out
+
+fn _rot13_byte(@c: int) -> int
+    if @c >= 97
+        if @c <= 122
+            return 97 + ((@c - 97 + 13) % 26)
+    if @c >= 65
+        if @c <= 90
+            return 65 + ((@c - 65 + 13) % 26)
+    return @c
+
+fn _str_rot13(@s: int) -> int
+    @n = str_len(@s)
+    @out = new_str(@n)
+    @i = 0
+    while @i < @n
+        str_set_byte(@out, @i, _rot13_byte(str_byte(@s, @i)))
+        @i = @i + 1
+    return @out
+
+# rand_bytes is in the prelude; format the result as a hex string of
+# the requested *byte* length (so /randhex 16 → 32 hex chars).
+fn _hex_random(@n_bytes: int) -> int
+    @b = rand_bytes(@n_bytes)
+    return hex_encode(@b)
+
+# Wrap @s in backtick code-fence markers for Telegram Markdown.
+fn _md_code(@s: int) -> int
+    @r = str_concat("`", @s)
+    return str_concat(@r, "`")

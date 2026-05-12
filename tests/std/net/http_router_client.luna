@@ -1,0 +1,52 @@
+# Exercises three routes plus the 404 path against the router demo
+# server. Prints PASS / FAIL based on the body returned for each.
+
+import http
+
+
+fn _check(@label: int, @got: int, @want: int) -> int
+    if str_eq(@got, @want) == 1
+        return 1
+    shine("FAIL:")
+    shine(@label)
+    shine(@got)
+    return 0
+
+
+fn main() -> int
+    # GET / -> "root"
+    let @r1: HttpResponse = http_get("127.0.0.1", 18083, "/")
+    if @r1.status != 200
+        shine("FAIL: GET / status != 200")
+        return 1
+    @ok = _check("GET /", @r1.body, "root")
+    if @ok == 0
+        return 1
+
+    # GET /health -> "ok"
+    let @r2: HttpResponse = http_get("127.0.0.1", 18083, "/health")
+    if @r2.status != 200
+        shine("FAIL: GET /health status != 200")
+        return 1
+    @ok = _check("GET /health", @r2.body, "ok")
+    if @ok == 0
+        return 1
+
+    # POST /echo with body -> echoes body
+    let @r3: HttpResponse = http_post("127.0.0.1", 18083, "/echo", "ping-pong", "text/plain")
+    if @r3.status != 200
+        shine("FAIL: POST /echo status != 200")
+        return 1
+    @ok = _check("POST /echo", @r3.body, "ping-pong")
+    if @ok == 0
+        return 1
+
+    # GET /missing -> 404
+    let @r4: HttpResponse = http_get("127.0.0.1", 18083, "/missing")
+    if @r4.status != 404
+        shine("FAIL: GET /missing expected 404, got:")
+        print_int(@r4.status)
+        return 1
+
+    shine("PASS: 4 routes (GET /, GET /health, POST /echo, 404)")
+    return 0

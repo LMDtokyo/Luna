@@ -1,0 +1,152 @@
+# Unit tests for std/net/http_server parser.
+#
+# End-to-end server↔client round-trip lives in
+# tests/std/net/http_server_e2e.sh.
+
+import http_server
+import test
+
+
+fn run_http_server_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1) Minimal GET request.
+    @raw = "GET / HTTP/1.1\r\n\r\n"
+    let @req: HttpRequest = http_parse_request(@raw, str_len(@raw))
+    @r = assert_eq_str("min GET method",  @req.method,  "GET")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("min GET path",    @req.path,    "/")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("min GET version", @req.version, "HTTP/1.1")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("min GET body",    @req.body,    "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) GET with path and one header.
+    @raw2 = "GET /users/42 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    let @req2: HttpRequest = http_parse_request(@raw2, str_len(@raw2))
+    @r = assert_eq_str("nested path", @req2.path, "/users/42")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("host header", @req2.headers, "Host: example.com")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) POST with body (no escaped quotes — bootminor's lexer is
+    # touchy about \" inside string literals).
+    @raw3 = "POST /api HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
+    let @req3: HttpRequest = http_parse_request(@raw3, str_len(@raw3))
+    @r = assert_eq_str("POST method", @req3.method, "POST")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("POST path",   @req3.path,   "/api")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("POST body",   @req3.body,   "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) Malformed: no spaces -> method = "".
+    @bad = "garbage"
+    let @rb: HttpRequest = http_parse_request(@bad, str_len(@bad))
+    @r = assert_eq_str("garbage rejected", @rb.method, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4a) Query string split.
+    @raw_q = "GET /search?q=luna&limit=10 HTTP/1.1\r\nHost: x\r\n\r\n"
+    let @rq: HttpRequest = http_parse_request(@raw_q, str_len(@raw_q))
+    @r = assert_eq_str("query path",  @rq.path,  "/search")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("query string", @rq.query, "q=luna&limit=10")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("req_query q",     req_query(@rq, "q"),     "luna")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("req_query limit", req_query(@rq, "limit"), "10")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("req_query missing", req_query(@rq, "nope"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4b) No query string -> empty.
+    @r = assert_eq_str("no-query req_query", req_query(@req, "x"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4ba) URL-encoded query values are decoded automatically.
+    @raw_enc = "GET /search?q=hello%20world&type=user%2Bmsg HTTP/1.1\r\nHost: x\r\n\r\n"
+    let @renc: HttpRequest = http_parse_request(@raw_enc, str_len(@raw_enc))
+    @r = assert_eq_str("decoded %20", req_query(@renc, "q"), "hello world")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decoded +",   req_query(@renc, "type"), "user+msg")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4bb) Form-urlencoded body parsing.
+    @raw_form = "POST /login HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 33\r\n\r\nname=alice&pass=secret%21&age=30"
+    let @rform: HttpRequest = http_parse_request(@raw_form, str_len(@raw_form))
+    @r = assert_eq_str("form name",   req_form(@rform, "name"), "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("form pass",   req_form(@rform, "pass"), "secret!")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("form age",    req_form(@rform, "age"),  "30")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("form missing", req_form(@rform, "x"),    "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4c) Cookie parsing.
+    @raw_c = "GET / HTTP/1.1\r\nHost: x\r\nCookie: session=abc123; theme=dark; lang=en\r\n\r\n"
+    let @rc: HttpRequest = http_parse_request(@raw_c, str_len(@raw_c))
+    @r = assert_eq_str("cookie session", req_cookie(@rc, "session"), "abc123")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("cookie theme", req_cookie(@rc, "theme"), "dark")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("cookie lang", req_cookie(@rc, "lang"), "en")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("cookie missing", req_cookie(@rc, "nope"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4d) No Cookie header at all.
+    @r = assert_eq_str("no-cookie req_cookie", req_cookie(@req, "x"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4e) Cookie value builder.
+    @sc = http_cookie_set("token", "abc")
+    @r = assert_eq_str("Set-Cookie line", @sc, "Set-Cookie: token=abc; HttpOnly; Path=/\r\n")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) int_to_str spot-checks (used in response builder).
+    @r = assert_eq_str("int 200", _httpsrv_int_to_str(200), "200")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("int 0",   _httpsrv_int_to_str(0),   "0")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("http_server", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_http_server_tests(0, 0)

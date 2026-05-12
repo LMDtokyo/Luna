@@ -1,0 +1,174 @@
+# Tests for std/std/kvstore — uses a temp file under /tmp.
+
+import kvstore
+import test
+
+
+fn _cleanup(@path: int) -> int
+    # Best-effort delete via sys_unlink (syscall 87).
+    # The prelude doesn't expose unlink, so we just write an empty file
+    # to clear state. Tests append, so each rewrite resets the dataset.
+    write_file(@path, "")
+    return 0
+
+
+fn run_kvstore_tests(@p: int, @f: int) -> int
+    @r = 0
+    @path = "/tmp/luna-kvtest.kvs"
+
+    _cleanup(@path)
+
+    # 1) kv_get on missing key -> "".
+    @r = assert_eq_str("absent", kv_get(@path, "alice"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) put then get round-trip.
+    kv_put(@path, "alice", "hello world")
+    @r = assert_eq_str("put/get", kv_get(@path, "alice"), "hello world")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) shadowing — second put overrides.
+    kv_put(@path, "alice", "second")
+    @r = assert_eq_str("shadow", kv_get(@path, "alice"), "second")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) multiple keys coexist.
+    kv_put(@path, "bob", "foo")
+    kv_put(@path, "carol", "bar")
+    @r = assert_eq_str("bob",   kv_get(@path, "bob"),   "foo")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("carol", kv_get(@path, "carol"), "bar")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("alice still", kv_get(@path, "alice"), "second")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) values containing newlines and binary-ish bytes round-trip.
+    @big = "line1\nline2\nline3 with: special^chars=1"
+    kv_put(@path, "blob", @big)
+    @r = assert_eq_str("multiline blob", kv_get(@path, "blob"), @big)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) JSON-looking value round-trips.
+    @json = "{\"name\":\"alice\",\"age\":30,\"tags\":[\"admin\",\"user\"]}"
+    kv_put(@path, "user-1", @json)
+    @r = assert_eq_str("json value", kv_get(@path, "user-1"), @json)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7) delete (= put with empty value).
+    kv_delete(@path, "alice")
+    @r = assert_eq_str("deleted", kv_get(@path, "alice"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8) bad keys rejected.
+    @r = assert_eq_int("reject \\n key", kv_put(@path, "a\nb", "x"), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("reject ^ key",  kv_put(@path, "a^b", "x"), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("reject empty key", kv_put(@path, "", "x"), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 9) other keys unaffected by failed writes.
+    @r = assert_eq_str("bob unchanged", kv_get(@path, "bob"), "foo")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- kv_keys / kv_count -------------------------------------------
+    _cleanup(@path)
+    kv_put(@path, "alice", "1")
+    kv_put(@path, "bob",   "2")
+    kv_put(@path, "carol", "3")
+    @r = assert_eq_int("count 3", kv_count(@path), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    let @keys: Vec = kv_keys(@path)
+    @r = assert_eq_int("keys len",   vec_len(@keys),    3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("key[0]",     vec_get(@keys, 0), "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("key[1]",     vec_get(@keys, 1), "bob")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("key[2]",     vec_get(@keys, 2), "carol")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Shadowed write keeps only one entry, latest value.
+    kv_put(@path, "alice", "1-prime")
+    @r = assert_eq_int("count after shadow", kv_count(@path), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Tombstone removes from kv_keys.
+    kv_delete(@path, "bob")
+    @r = assert_eq_int("count after delete", kv_count(@path), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    let @after: Vec = kv_keys(@path)
+    @r = assert_eq_str("first survivor", vec_get(@after, 0), "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("second survivor", vec_get(@after, 1), "carol")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- kv_compact ----------------------------------------------------
+    _cleanup(@path)
+    # Write the same key many times — file should be N lines long.
+    @i = 0
+    while @i < 20
+        kv_put(@path, "counter", int_to_str(@i))
+        @i = @i + 1
+    # Add a couple more keys for variety.
+    kv_put(@path, "name", "alice")
+    kv_put(@path, "city", "moscow")
+    kv_delete(@path, "city")          # tombstone
+
+    @before_size = str_len(read_file(@path))
+    kv_compact(@path)
+    @after_size  = str_len(read_file(@path))
+
+    @r = assert_true("compact shrinks file", @after_size < @before_size)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # State must be preserved after compaction.
+    @r = assert_eq_str("counter survives", kv_get(@path, "counter"), "19")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("name survives",    kv_get(@path, "name"),    "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("city stays deleted", kv_get(@path, "city"),  "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # After compaction, every key has exactly one line. kv_count
+    # should match kv_keys length.
+    @r = assert_eq_int("compacted count", kv_count(@path), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    _cleanup(@path)
+    test_summary("kvstore", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_kvstore_tests(0, 0)

@@ -1,0 +1,231 @@
+# tier: T4
+# deps: io, base64
+# ffi: none
+#
+# std/std/kvstore — append-only file-backed key/value store.
+#
+# Each record on disk:  key^base64(value)\n
+# Values are base64-encoded so they can hold any bytes (including \n)
+# without ambiguity. Keys MUST NOT contain '^' (0x5E) or '\n' (0x0A);
+# both are rejected at write time.
+#
+# Semantics: kv_put appends a fresh record. kv_get returns the value
+# of the latest record for a key — later writes shadow earlier ones,
+# so the file effectively versions changes. kv_delete is kv_put with
+# an empty value (the same as `kv_put(path, key, "")`) and kv_get
+# returns "" for both "deleted" and "never written" cases.
+#
+# This is not a database. It's a one-file persistence layer suitable
+# for prototyping — small caches, session tables, draft messages. For
+# anything large or concurrent, swap it out for a real engine.
+
+import io
+import base64
+
+
+# _kv_validate_key(@key) -> 1 if safe, 0 otherwise.
+fn _kv_validate_key(@key: int) -> int
+    @klen = str_len(@key)
+    if @klen == 0
+        return 0
+    @i = 0
+    while @i < @klen
+        @c = str_byte(@key, @i)
+        if @c == 10
+            return 0
+        if @c == 94
+            return 0
+        @i = @i + 1
+    return 1
+
+
+# kv_put(@path, @key, @value) -> 0 on success, -1 on error.
+fn kv_put(@path: int, @key: int, @value: int) -> int
+    if _kv_validate_key(@key) == 0
+        return -1
+    @enc = base64_encode(@value)
+    @sep = new_str(1)
+    str_set_byte(@sep, 0, 94)
+    @nl = new_str(1)
+    str_set_byte(@nl, 0, 10)
+    @line = str_concat(@key, @sep)
+    @line = str_concat(@line, @enc)
+    @line = str_concat(@line, @nl)
+    return append_file(@path, @line)
+
+
+# kv_delete(@path, @key) — convenience alias for kv_put with empty value.
+fn kv_delete(@path: int, @key: int) -> int
+    return kv_put(@path, @key, "")
+
+
+# _kv_line_parse — find '^' and '\n' for the line starting at @start.
+# Sets @out[0] = sep offset, @out[1] = nl offset (both -1 on EOF/error).
+fn _kv_line_parse(@content: int, @clen: int, @start: int, @out: int) -> int
+    @sep_p = -1
+    @nl_p = -1
+    @j = @start
+    @done = 0
+    while @done == 0
+        if @j >= @clen
+            @done = 1
+        else
+            @c = str_byte(@content, @j)
+            if @c == 10
+                @nl_p = @j
+                @done = 1
+            else
+                if @c == 94
+                    if @sep_p < 0
+                        @sep_p = @j
+                @j = @j + 1
+    u64_set(@out, 0, @sep_p)
+    u64_set(@out, 8, @nl_p)
+    return 0
+
+
+# _kv_key_eq — compare bytes at content[@s..@e) against @key.
+fn _kv_key_eq(@content: int, @s: int, @e: int, @key: int) -> int
+    @cand_len = @e - @s
+    @klen = str_len(@key)
+    if @cand_len != @klen
+        return 0
+    @i = 0
+    while @i < @klen
+        if str_byte(@content, @s + @i) != str_byte(@key, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+
+# kv_get(@path, @key) -> latest value for @key, or "" if absent/deleted.
+fn kv_get(@path: int, @key: int) -> int
+    if file_exists(@path) == 0
+        return ""
+    @content = read_file(@path)
+    @clen = str_len(@content)
+    if @clen == 0
+        return ""
+
+    @last = ""
+    @parsed = new_str(16)
+    @line_s = 0
+    while @line_s < @clen
+        _kv_line_parse(@content, @clen, @line_s, @parsed)
+        @sep_p = u64_get(@parsed, 0)
+        @nl_p  = u64_get(@parsed, 8)
+        if @nl_p < 0
+            return @last
+        if @sep_p >= 0
+            if _kv_key_eq(@content, @line_s, @sep_p, @key) == 1
+                @val_s = @sep_p + 1
+                @val_len = @nl_p - @val_s
+                @enc = str_substr(@content, @val_s, @val_len)
+                @last = base64_decode(@enc)
+        @line_s = @nl_p + 1
+    return @last
+
+
+# kv_keys(@path) -> Vec of distinct live keys (deletions and shadowed
+# older writes are folded so the result reflects current state).
+# Order: by FIRST appearance (insertion order of the surviving rows).
+fn kv_keys(@path: int) -> Vec
+    @out = vec_new()
+    if file_exists(@path) == 0
+        return @out
+    @content = read_file(@path)
+    @clen = str_len(@content)
+    if @clen == 0
+        return @out
+
+    @parsed = new_str(16)
+    @line_s = 0
+    while @line_s < @clen
+        _kv_line_parse(@content, @clen, @line_s, @parsed)
+        @sep_p = u64_get(@parsed, 0)
+        @nl_p  = u64_get(@parsed, 8)
+        if @nl_p < 0
+            return @out
+        if @sep_p >= 0
+            @key = str_substr(@content, @line_s, @sep_p - @line_s)
+            @val_s = @sep_p + 1
+            @val_len = @nl_p - @val_s
+            @enc = str_substr(@content, @val_s, @val_len)
+            @decoded = base64_decode(@enc)
+            # Filter: include only if NOT already in @out (we'll check
+            # latest value separately) AND value is non-empty (not a
+            # tombstone). Shadowed updates are handled by overriding.
+            @found_at = _kv_index_in(@out, @key)
+            if @found_at < 0
+                if str_len(@decoded) > 0
+                    vec_push(@out, @key)
+            else
+                # Already present; if this write is a tombstone, drop it.
+                if str_len(@decoded) == 0
+                    _kv_vec_remove(@out, @found_at)
+        @line_s = @nl_p + 1
+    return @out
+
+
+# _kv_index_in(@vec, @target_str) -> index of matching string in Vec, or -1.
+fn _kv_index_in(@vec: Vec, @target: int) -> int
+    @i = 0
+    @n = vec_len(@vec)
+    while @i < @n
+        @s = vec_get(@vec, @i)
+        if str_eq(@s, @target) == 1
+            return @i
+        @i = @i + 1
+    return -1
+
+
+# _kv_vec_remove(@vec, @idx) — remove element at @idx by shifting.
+# bootminor's Vec has no built-in remove, so we rebuild in place.
+fn _kv_vec_remove(@vec: Vec, @idx: int) -> int
+    @n = vec_len(@vec)
+    @i = @idx
+    while @i + 1 < @n
+        vec_set(@vec, @i, vec_get(@vec, @i + 1))
+        @i = @i + 1
+    # Pop the now-duplicate last slot.
+    vec_pop(@vec)
+    return 0
+
+
+# kv_count(@path) -> number of live keys.
+fn kv_count(@path: int) -> int
+    let @v: Vec = kv_keys(@path)
+    return vec_len(@v)
+
+
+# kv_compact(@path) -> 0. Rewrites the store with only the latest
+# value for each live key — shadowed writes and tombstones are
+# dropped. Reduces on-disk size without changing the visible state.
+#
+# The previous file is replaced atomically via a temp file + rename
+# (well, write_file truncates+rewrites; not crash-proof yet, but
+# good enough for prototyping). Read-only callers should expect a
+# tiny window where reads might race the rewrite.
+fn kv_compact(@path: int) -> int
+    if file_exists(@path) == 0
+        return 0
+    let @keys: Vec = kv_keys(@path)
+    @n = vec_len(@keys)
+    # Build new content in a single pass.
+    @sep = new_str(1)
+    str_set_byte(@sep, 0, 94)
+    @nl = new_str(1)
+    str_set_byte(@nl, 0, 10)
+    @new_content = ""
+    @i = 0
+    while @i < @n
+        @k = vec_get(@keys, @i)
+        @v = kv_get(@path, @k)
+        @enc = base64_encode(@v)
+        @line = str_concat(@k, @sep)
+        @line = str_concat(@line, @enc)
+        @line = str_concat(@line, @nl)
+        @new_content = str_concat(@new_content, @line)
+        @i = @i + 1
+    write_file(@path, @new_content)
+    return 0

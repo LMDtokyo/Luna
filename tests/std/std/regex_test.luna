@@ -1,0 +1,164 @@
+# Tests for std/regex.
+
+import regex
+import test
+
+
+fn run_regex_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # ---- literal matching ------------------------------------------------
+    @r = assert_eq_int("literal hit",  regex_match("abc", "xyzabcdef"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("literal miss", regex_match("abc", "xyz"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- dot -------------------------------------------------------------
+    @r = assert_eq_int("dot abc",  regex_match("a.c", "abc"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("dot ac",   regex_match("a.c", "ac"),  0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- star ------------------------------------------------------------
+    @r = assert_eq_int("star aaab", regex_match("a*b", "aaab"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("star b",    regex_match("a*b", "b"),    1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("star x",    regex_match("a*b", "x"),    0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- plus ------------------------------------------------------------
+    @r = assert_eq_int("plus b",    regex_match("a+b", "b"),    0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("plus aaab", regex_match("a+b", "aaab"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- question --------------------------------------------------------
+    @r = assert_eq_int("? color",  regex_match("colou?r", "color"),  1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("? colour", regex_match("colou?r", "colour"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- anchors ---------------------------------------------------------
+    @r = assert_eq_int("^ miss",  regex_match("^abc", "xyzabc"),  0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("^ hit",   regex_match("^abc", "abcxyz"),  1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("$ hit",   regex_match("xyz$", "abcxyz"),  1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("$ miss",  regex_match("xyz$", "xyzabc"),  0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- char classes ---------------------------------------------------
+    @r = assert_eq_int("[0-9]+ in mixed",   regex_match("[0-9]+", "abc123def"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("[^0-9]+ digits",    regex_match("[^0-9]+", "12345"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("[abc] hit",         regex_match("[abc]", "zzzb"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("[abc] miss",        regex_match("[abc]", "xyz"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("[a-z][0-9]",        regex_match("[a-z][0-9]", "a7"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- escapes ---------------------------------------------------------
+    @r = assert_eq_int("\\d+ in abc42",     regex_match("\\d+", "abc42"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("\\w+ hello",        regex_match("\\w+", "hello"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("\\s+ in a b",       regex_match("\\s+", "a b"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("\\. literal",       regex_match("a\\.b", "a.b"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("\\. not dot",       regex_match("a\\.b", "axb"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- find ------------------------------------------------------------
+    @r = assert_eq_int("find \\d+",         regex_find("\\d+", "abc42xyz"), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("find none",         regex_find("\\d+", "abcdef"), 0 - 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("find anchored",     regex_find("^abc", "abcxyz"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- full match -----------------------------------------------------
+    @r = assert_eq_int("full [a-z]+ ok",    regex_full("[a-z]+", "abc"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("full [a-z]+ bad",   regex_full("[a-z]+", "abc1"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("full a.*c",         regex_full("a.*c", "abbbc"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ---- replace_all ----------------------------------------------------
+    @r = assert_eq_str("replace digits",    regex_replace_all("\\d+", "abc42xyz99", "_"), "abc_xyz_")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("replace none",      regex_replace_all("\\d+", "hello", "_"), "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("replace single",    regex_replace_all("a", "banana", "X"), "bXnXnX")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("regex", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_regex_tests(0, 0)

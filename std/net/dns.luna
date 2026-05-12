@@ -1,0 +1,219 @@
+# tier: T5
+# deps: tcp
+# ffi: none
+#
+# std/net/dns — minimal DNS-over-UDP A-record resolver in pure Luna.
+#
+# What it does:
+#   dns_resolve("api.example.com") -> "203.0.113.45"  (or "" on failure)
+#
+# How it works:
+#   1. If the input already parses as an IPv4 dotted-quad, return it.
+#   2. Otherwise open a UDP socket, connect() it to 8.8.8.8:53, send a
+#      one-question A/IN query, read up to 512 bytes back, walk the
+#      answer section for the first A record, format it as a dotted
+#      quad and return.
+#
+# Known limitations of this first cut:
+#   - No timeout — if the resolver is silent, the recv blocks. Wire a
+#     poll(2) timer once that intrinsic is exposed.
+#   - Resolver IP is hardcoded to 8.8.8.8. /etc/resolv.conf parsing
+#     will land in a follow-up.
+#   - First A record wins. CNAME chains are walked by the resolver, so
+#     the response normally already contains the A. If only CNAMEs come
+#     back, we return "".
+#   - Single-question queries only.
+
+import tcp
+
+
+const DNS_PORT:     int = 53
+const DNS_TYPE_A:   int = 1
+const DNS_CLASS_IN: int = 1
+const DNS_RESP_CAP: int = 512
+
+
+# _dns_int_to_str(@n) -> ASCII decimal. 0..255 range is enough for IPs.
+fn _dns_int_to_str(@n: int) -> int
+    if @n == 0
+        return "0"
+    @tmp = new_str(8)
+    @i = 0
+    while @n > 0
+        u8_set(@tmp, @i, 48 + (@n % 10))
+        @n = @n / 10
+        @i = @i + 1
+    @out = new_str(@i)
+    @j = 0
+    while @j < @i
+        u8_set(@out, @j, u8_at(@tmp, @i - 1 - @j))
+        @j = @j + 1
+    return @out
+
+
+# _dns_make_sockaddr_in(@ip4, @port) -> 16-byte sockaddr_in.
+# Duplicate of the tcp helper — kept inline so dns.luna stays
+# importable without touching tcp internals.
+fn _dns_make_sockaddr_in(@ip4: int, @port: int) -> int
+    @sa = new_str(16)
+    u8_set(@sa, 0, 2)                       # AF_INET, little-endian u16
+    u8_set(@sa, 1, 0)
+    u8_set(@sa, 2, (@port >> 8) & 255)      # port hi
+    u8_set(@sa, 3, @port & 255)             # port lo
+    u8_set(@sa, 4, u8_at(@ip4, 0))
+    u8_set(@sa, 5, u8_at(@ip4, 1))
+    u8_set(@sa, 6, u8_at(@ip4, 2))
+    u8_set(@sa, 7, u8_at(@ip4, 3))
+    return @sa
+
+
+# _dns_encode_name(@host, @buf, @off) -> bytes written.
+# "api.example.com" -> [3]api[7]example[3]com[0]
+fn _dns_encode_name(@host: int, @buf: int, @off: int) -> int
+    @hlen = str_len(@host)
+    @label_len_pos = @off
+    @label_len = 0
+    @i = 0
+    @cursor = @off + 1                      # first byte after length prefix
+    while @i < @hlen
+        @c = str_byte(@host, @i)
+        if @c == 46
+            # '.' — close the current label
+            u8_set(@buf, @label_len_pos, @label_len)
+            @label_len_pos = @cursor
+            @cursor = @cursor + 1
+            @label_len = 0
+        else
+            u8_set(@buf, @cursor, @c)
+            @cursor = @cursor + 1
+            @label_len = @label_len + 1
+        @i = @i + 1
+    # Close the final label and emit the root-zero terminator.
+    u8_set(@buf, @label_len_pos, @label_len)
+    u8_set(@buf, @cursor, 0)
+    return (@cursor - @off) + 1
+
+
+# _dns_build_query(@host, @out_len) -> packet bytes; writes byte count
+# into @out_len[0..4]. @out_len must be a 4-byte cell.
+fn _dns_build_query(@host: int, @out_len: int) -> int
+    @buf = new_str(512)
+    # Header — 12 bytes.
+    u8_set(@buf, 0, 66)      # transaction ID hi (0x42, arbitrary)
+    u8_set(@buf, 1, 66)      # transaction ID lo
+    u8_set(@buf, 2, 1)       # flags: RD (recursion desired)
+    u8_set(@buf, 3, 0)
+    u8_set(@buf, 4, 0)       # QDCOUNT = 1
+    u8_set(@buf, 5, 1)
+    u8_set(@buf, 6, 0)       # ANCOUNT = 0
+    u8_set(@buf, 7, 0)
+    u8_set(@buf, 8, 0)       # NSCOUNT
+    u8_set(@buf, 9, 0)
+    u8_set(@buf, 10, 0)      # ARCOUNT
+    u8_set(@buf, 11, 0)
+
+    # Question: NAME, QTYPE=A, QCLASS=IN.
+    @name_len = _dns_encode_name(@host, @buf, 12)
+    @qoff = 12 + @name_len
+    u8_set(@buf, @qoff, 0)
+    u8_set(@buf, @qoff + 1, DNS_TYPE_A)
+    u8_set(@buf, @qoff + 2, 0)
+    u8_set(@buf, @qoff + 3, DNS_CLASS_IN)
+
+    u32_set(@out_len, 0, @qoff + 4)
+    return @buf
+
+
+# _dns_skip_name(@pkt, @off, @plen) -> offset past the encoded name.
+# Honours pointer compression (top two bits set, two-byte form).
+fn _dns_skip_name(@pkt: int, @off: int, @plen: int) -> int
+    while @off < @plen
+        @b = u8_at(@pkt, @off)
+        if @b == 0
+            return @off + 1
+        if (@b & 192) == 192
+            return @off + 2
+        @off = @off + 1 + @b
+    return @off
+
+
+# _dns_format_ip(@pkt, @off) -> "a.b.c.d" from 4 bytes at @off.
+fn _dns_format_ip(@pkt: int, @off: int) -> int
+    @s = _dns_int_to_str(u8_at(@pkt, @off))
+    @s = str_concat(@s, ".")
+    @s = str_concat(@s, _dns_int_to_str(u8_at(@pkt, @off + 1)))
+    @s = str_concat(@s, ".")
+    @s = str_concat(@s, _dns_int_to_str(u8_at(@pkt, @off + 2)))
+    @s = str_concat(@s, ".")
+    @s = str_concat(@s, _dns_int_to_str(u8_at(@pkt, @off + 3)))
+    return @s
+
+
+# _dns_extract_first_a(@pkt, @plen) -> dotted-quad or "".
+fn _dns_extract_first_a(@pkt: int, @plen: int) -> int
+    if @plen < 12
+        return ""
+    @ancount = (u8_at(@pkt, 6) << 8) | u8_at(@pkt, 7)
+    if @ancount < 1
+        return ""
+
+    # Skip header + the single question (name + qtype + qclass).
+    @off = _dns_skip_name(@pkt, 12, @plen)
+    @off = @off + 4
+
+    @i = 0
+    while @i < @ancount
+        @off = _dns_skip_name(@pkt, @off, @plen)
+        if @off + 10 > @plen
+            return ""
+        @rtype  = (u8_at(@pkt, @off)     << 8) | u8_at(@pkt, @off + 1)
+        @rclass = (u8_at(@pkt, @off + 2) << 8) | u8_at(@pkt, @off + 3)
+        # TTL occupies @off+4 .. @off+8, skipped.
+        @rdlen  = (u8_at(@pkt, @off + 8) << 8) | u8_at(@pkt, @off + 9)
+        @off = @off + 10
+
+        if @rtype == DNS_TYPE_A
+            if @rclass == DNS_CLASS_IN
+                if @rdlen == 4
+                    if @off + 4 > @plen
+                        return ""
+                    return _dns_format_ip(@pkt, @off)
+        @off = @off + @rdlen
+        @i = @i + 1
+    return ""
+
+
+# dns_resolve(@hostname) -> dotted-quad IPv4 string, or "" on failure.
+#
+# Pass-through optimisation: if @hostname already parses as an IPv4,
+# it's returned verbatim without any network traffic.
+fn dns_resolve(@hostname: int) -> int
+    if tcp_parse_ipv4(@hostname) > 0
+        return @hostname
+
+    @sock = sys_socket(2, 2, 0)             # AF_INET, SOCK_DGRAM
+    if @sock < 0
+        return ""
+
+    @rip = tcp_parse_ipv4("8.8.8.8")
+    if @rip < 0
+        sys_close(@sock)
+        return ""
+    @sa = _dns_make_sockaddr_in(@rip, DNS_PORT)
+    if sys_connect(@sock, @sa, 16) < 0
+        sys_close(@sock)
+        return ""
+
+    @qlen_cell = new_str(4)
+    @query = _dns_build_query(@hostname, @qlen_cell)
+    @qlen = u32_at(@qlen_cell, 0)
+    if sys_write(@sock, @query, @qlen) != @qlen
+        sys_close(@sock)
+        return ""
+
+    @resp = new_str(DNS_RESP_CAP)
+    @n = sys_read(@sock, @resp, DNS_RESP_CAP)
+    sys_close(@sock)
+    if @n < 12
+        return ""
+    return _dns_extract_first_a(@resp, @n)

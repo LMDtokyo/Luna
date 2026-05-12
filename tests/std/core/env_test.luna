@@ -1,0 +1,45 @@
+# Tests for std/core/env.
+
+import env
+import test
+
+
+fn run_env_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # PATH should always be set.
+    @path = env_get("PATH")
+    @r = assert_true("PATH non-empty", str_len(@path) > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # A guaranteed-missing var (test runner shouldn't set this).
+    @miss = env_get("LUNA_DEFINITELY_NOT_SET_4242")
+    @r = assert_eq_str("missing -> empty", @miss, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # env_lookup distinguishes unset from empty.
+    @found = new_str(1)
+    @v = env_lookup("LUNA_DEFINITELY_NOT_SET_4242", @found)
+    @r = assert_eq_int("lookup missing flag", u8_at(@found, 0), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @v2 = env_lookup("PATH", @found)
+    @r = assert_eq_int("lookup PATH flag", u8_at(@found, 0), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_true("lookup PATH non-empty", str_len(@v2) > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("env", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_env_tests(0, 0)

@@ -1,0 +1,104 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/map — string-keyed associative array on top of Vec.
+#
+# Layout: a single Vec storing alternating [key, value, key, value, ...]
+# pointers. Lookup is linear (O(n)) — fine for small maps (CLI flags,
+# config dicts, header sets). For high-throughput hash tables a future
+# std/hashmap module will use power-of-two open-addressed buckets.
+#
+# Both keys and values are int pointers (Luna strings or any heap
+# object). Equality on keys uses str_eq, so values that aren't string-
+# shaped can still be stored, but they can't be retrieved unless the
+# caller passes a key that's str_eq-equal to the one used at insert.
+#
+# Returned values from map_get on a missing key are 0 (Luna's null/
+# falsy). Use map_has when you need to distinguish "missing" from
+# "present with empty/zero value".
+
+
+# map_new() -> empty map (a Vec).
+fn map_new() -> int
+    return vec_new()
+
+# map_len(@m) -> number of entries.
+fn map_len(@m: int) -> int
+    return vec_len(@m) / 2
+
+# Internal: linear search for @key. Returns the index of the key cell,
+# or -1 if not present. The matching value lives at index+1.
+fn _map_find(@m: int, @key: int) -> int
+    @n = vec_len(@m)
+    @i = 0
+    while @i < @n
+        if str_eq(vec_get(@m, @i), @key) == 1
+            return @i
+        @i = @i + 2
+    return 0 - 1
+
+# map_has(@m, @key) -> 1 if @key is in the map, else 0.
+fn map_has(@m: int, @key: int) -> int
+    if _map_find(@m, @key) >= 0
+        return 1
+    return 0
+
+# map_get(@m, @key) -> value pointer, or 0 if missing.
+fn map_get(@m: int, @key: int) -> int
+    @i = _map_find(@m, @key)
+    if @i < 0
+        return 0
+    return vec_get(@m, @i + 1)
+
+# map_get_or(@m, @key, @default) -> value if present, else @default.
+fn map_get_or(@m: int, @key: int, @default: int) -> int
+    @i = _map_find(@m, @key)
+    if @i < 0
+        return @default
+    return vec_get(@m, @i + 1)
+
+# map_set(@m, @key, @val) -> 0. Overwrites if @key already exists,
+# inserts at end otherwise.
+fn map_set(@m: int, @key: int, @val: int) -> int
+    @i = _map_find(@m, @key)
+    if @i >= 0
+        vec_set(@m, @i + 1, @val)
+        return 0
+    vec_push(@m, @key)
+    vec_push(@m, @val)
+    return 0
+
+# map_remove(@m, @key) -> 1 if removed, 0 if key wasn't present.
+# Compacts by moving the trailing pair into the gap (O(1) removal).
+fn map_remove(@m: int, @key: int) -> int
+    @i = _map_find(@m, @key)
+    if @i < 0
+        return 0
+    @n = vec_len(@m)
+    if @i + 2 < @n
+        vec_set(@m, @i,     vec_get(@m, @n - 2))
+        vec_set(@m, @i + 1, vec_get(@m, @n - 1))
+    vec_pop(@m)
+    vec_pop(@m)
+    return 1
+
+# map_keys(@m) -> Vec of key pointers, in insertion-then-removal order.
+fn map_keys(@m: int) -> int
+    @out = vec_new()
+    @n = vec_len(@m)
+    @i = 0
+    while @i < @n
+        vec_push(@out, vec_get(@m, @i))
+        @i = @i + 2
+    return @out
+
+# map_values(@m) -> Vec of value pointers.
+fn map_values(@m: int) -> int
+    @out = vec_new()
+    @n = vec_len(@m)
+    @i = 1
+    while @i < @n
+        vec_push(@out, vec_get(@m, @i))
+        @i = @i + 2
+    return @out

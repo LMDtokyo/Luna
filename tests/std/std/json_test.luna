@@ -1,0 +1,187 @@
+# Tests for std/json.
+
+import json
+import test
+
+
+fn run_json_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # primitive at top level via wrapping object
+    @r = assert_eq_int("ok=true",        json_obj_bool("{\"ok\":true}", 0, "ok"),         1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("ok=false",       json_obj_bool("{\"ok\":false}", 0, "ok"),        0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("missing bool",   json_obj_bool("{\"a\":1}", 0, "missing"),        0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("int positive",   json_obj_int("{\"n\":12345}", 0, "n"),           12345)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("int negative",   json_obj_int("{\"n\":-42}", 0, "n"),             0 - 42)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("int zero",       json_obj_int("{\"z\":0}", 0, "z"),               0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # whitespace tolerance
+    @r = assert_eq_int("ws around colon", json_obj_int("{ \"n\"  :  77 }", 0, "n"),       77)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # strings
+    @r = assert_eq_str("plain string",   json_obj_str("{\"s\":\"hello\"}", 0, "s"),       "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("escape quote",   json_obj_str("{\"s\":\"a\\\"b\"}", 0, "s"),      "a\"b")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("escape newline", json_obj_str("{\"s\":\"line1\\nline2\"}", 0, "s"), "line1\nline2")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("escape backslash", json_obj_str("{\"s\":\"a\\\\b\"}", 0, "s"),    "a\\b")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # A = 'A', é = 'é' (UTF-8 c3 a9)
+    @r = assert_eq_str("unicode bmp",    json_obj_str("{\"s\":\"\\u0041\\u00e9\"}", 0, "s"), "Aé")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # nested object navigation
+    @doc = "{\"user\":{\"name\":\"alice\",\"age\":30,\"admin\":true}}"
+    @user = json_obj_pos(@doc, 0, "user")
+    @r = assert_true("user found",       @user >= 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("user.name",      json_obj_str(@doc, @user, "name"),  "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("user.age",       json_obj_int(@doc, @user, "age"),   30)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("user.admin",     json_obj_bool(@doc, @user, "admin"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # array iteration
+    @arr_doc = "{\"xs\":[10,20,30,40]}"
+    @arr = json_obj_pos(@arr_doc, 0, "xs")
+    @items = json_array_positions(@arr_doc, @arr)
+    @r = assert_eq_int("array len",      vec_len(@items), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @sum = 0
+    @i = 0
+    while @i < vec_len(@items)
+        @sum = @sum + json_get_int_at(@arr_doc, vec_get(@items, @i))
+        @i = @i + 1
+    @r = assert_eq_int("array sum",      @sum, 100)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # array of objects (Telegram-shaped)
+    @tg = "{\"ok\":true,\"result\":[{\"id\":1,\"text\":\"hi\"},{\"id\":2,\"text\":\"yo\"}]}"
+    @res = json_obj_pos(@tg, 0, "result")
+    @upds = json_array_positions(@tg, @res)
+    @r = assert_eq_int("upds count",     vec_len(@upds), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @first = vec_get(@upds, 0)
+    @r = assert_eq_int("upd[0].id",      json_obj_int(@tg, @first, "id"),    1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @second = vec_get(@upds, 1)
+    @r = assert_eq_str("upd[1].text",    json_obj_str(@tg, @second, "text"), "yo")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # null + missing
+    @r = assert_eq_int("null is missing-ish", json_obj_bool("{\"a\":null}", 0, "a"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # json_escape — round-trip a tricky string
+    @input = "line1\nline2 \"quoted\" \\path"
+    @encoded = json_escape(@input)
+    # encoded should start and end with double-quote
+    @r = assert_eq_int("escape opens with quote", str_byte(@encoded, 0), 34)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @wrap = str_concat("{\"s\":", @encoded)
+    @wrap = str_concat(@wrap, "}")
+    @r = assert_eq_str("escape round-trip", json_obj_str(@wrap, 0, "s"), @input)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- top-level convenience accessors -------------------------------
+    @body = "{\"name\":\"alice\",\"age\":30,\"admin\":true}"
+    @r = assert_eq_str("get_str",      json_get_str(@body,  "name"),  "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("get_int",      json_get_int(@body,  "age"),   30)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("get_bool",     json_get_bool(@body, "admin"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("has present",  json_has(@body, "name"),       1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("has absent",   json_has(@body, "nope"),       0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- top-level array accessors -------------------------------------
+    @arr_body = "{\"tags\":[\"admin\",\"user\",\"vip\"],\"counts\":[10,20,30],\"empty\":[]}"
+    @r = assert_eq_int("array len tags",  json_array_len(@arr_body, "tags"),    3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("array len empty", json_array_len(@arr_body, "empty"),   0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("array len missing", json_array_len(@arr_body, "nope"),  0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("array str 0",     json_array_str(@arr_body, "tags", 0), "admin")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("array str 2",     json_array_str(@arr_body, "tags", 2), "vip")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("array str OOB",   json_array_str(@arr_body, "tags", 9), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("array int 0",     json_array_int(@arr_body, "counts", 0), 10)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("array int 2",     json_array_int(@arr_body, "counts", 2), 30)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("json", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_json_tests(0, 0)

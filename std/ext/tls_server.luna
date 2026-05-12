@@ -1,0 +1,425 @@
+# tier: T6
+# deps: tcp
+# ffi: libssl-via-dlopen
+#
+# std/ext/tls_server — inbound TLS (server-side TLS termination).
+#
+# Companion to std/ext/tls.luna which handles the client side. This
+# module wraps OpenSSL's server-side primitives (TLS_server_method,
+# SSL_CTX_use_certificate_file, SSL_accept, ...) so Luna apps can
+# terminate HTTPS in-process — no nginx/caddy fronting required.
+#
+# Loading model:
+#   libssl.so.3 (or .1.1 as a fallback) is loaded via dlopen at runtime
+#   on the first tls_server_init() call. Function pointers are cached
+#   in a fixed-vaddr mmap'd page so subsequent calls are a constant-
+#   time table lookup. Programs that don't call tls_server_init() pay
+#   zero cost.
+#
+# IMPORTANT: this module requires the binary to be compiled with the
+# `--dynamic` flag so dlopen / dlsym are reachable via PLT.
+#     luna build --dynamic my_https_server.luna
+#
+# Public surface:
+#   fn tls_server_init() -> int                                       # 0 ok, -1 fail
+#   fn tls_server_ctx_new(@cert_file: int, @key_file: int) -> TlsServerCtx
+#   fn tls_server_ctx_ok(@s: TlsServerCtx) -> int
+#   fn tls_server_accept(@s: TlsServerCtx, @tcp_fd: int) -> TlsServerConn
+#   fn tls_server_conn_ok(@c: TlsServerConn) -> int
+#   fn tls_server_read(@c: TlsServerConn, @max_len: int) -> int       # luna string
+#   fn tls_server_write(@c: TlsServerConn, @data: int) -> int         # bytes written
+#   fn tls_server_close(@c: TlsServerConn) -> int
+#   fn tls_server_ctx_free(@s: TlsServerCtx) -> int
+#   fn tls_server_error() -> int                                      # last error msg
+#
+# Caller gotcha — always annotate struct receivers:
+#       let @ctx:  TlsServerCtx  = tls_server_ctx_new("/tmp/cert.pem", "/tmp/key.pem")
+#       let @conn: TlsServerConn = tls_server_accept(@ctx, @client_fd)
+#   Without the explicit type bootminor reads every field at offset 0.
+
+import tcp
+
+
+# A server-side TLS context. Reused across many connections. Holds a
+# C-side SSL_CTX* with the cert + private key already loaded.
+struct TlsServerCtx
+    ctx: int
+
+# Per-connection state. SSL* binds an underlying TCP fd. Read/write
+# go through SSL_read/SSL_write; the fd is owned for shutdown purposes.
+struct TlsServerConn
+    ssl: int
+    fd:  int
+
+
+# ----------------------------------------------------------------------
+# Function-pointer cache.
+#
+# Bootminor has no module-static state. We pin a 4 KiB page at a fixed
+# virtual address via sys_mmap(MAP_FIXED_NOREPLACE) and lay out a small
+# table of cached dlsym results plus a couple of single-pointer slots
+# (last-error string, init-done flag). std/net/http2.luna uses the same
+# trick at 0x600000000000; we pick a non-overlapping address.
+#
+# Slot layout (each 8 bytes):
+#   [ 0]  init_done       (1 = tls_server_init succeeded, 0 = not yet)
+#   [ 1]  last_error      (pointer to Luna string, or 0)
+#   [ 2]  fp_TLS_server_method
+#   [ 3]  fp_SSL_CTX_new
+#   [ 4]  fp_SSL_CTX_use_certificate_file
+#   [ 5]  fp_SSL_CTX_use_PrivateKey_file
+#   [ 6]  fp_SSL_new
+#   [ 7]  fp_SSL_set_fd
+#   [ 8]  fp_SSL_accept
+#   [ 9]  fp_SSL_read
+#   [10]  fp_SSL_write
+#   [11]  fp_SSL_shutdown
+#   [12]  fp_SSL_free
+#   [13]  fp_SSL_CTX_free
+#   [14..15] reserved
+# ----------------------------------------------------------------------
+
+const _TLS_SRV_SLOT_ADDR:  int = 0x600100000000
+const _TLS_SRV_SLOT_LEN:   int = 4096
+# MAP_PRIVATE(2) | MAP_ANONYMOUS(0x20) | MAP_FIXED_NOREPLACE(0x100000)
+const _TLS_SRV_SLOT_FLAGS: int = 1048626
+# Slot indexes — kept as constants for clarity at call sites.
+const _TLS_SRV_IDX_INIT_DONE:       int = 0
+const _TLS_SRV_IDX_LAST_ERROR:      int = 1
+const _TLS_SRV_IDX_FP_METHOD:       int = 2
+const _TLS_SRV_IDX_FP_CTX_NEW:      int = 3
+const _TLS_SRV_IDX_FP_USE_CERT:     int = 4
+const _TLS_SRV_IDX_FP_USE_KEY:      int = 5
+const _TLS_SRV_IDX_FP_SSL_NEW:      int = 6
+const _TLS_SRV_IDX_FP_SET_FD:       int = 7
+const _TLS_SRV_IDX_FP_ACCEPT:       int = 8
+const _TLS_SRV_IDX_FP_READ:         int = 9
+const _TLS_SRV_IDX_FP_WRITE:        int = 10
+const _TLS_SRV_IDX_FP_SHUTDOWN:     int = 11
+const _TLS_SRV_IDX_FP_SSL_FREE:     int = 12
+const _TLS_SRV_IDX_FP_CTX_FREE:     int = 13
+
+# RTLD_NOW: resolve every symbol up-front so a missing function fails
+# at dlopen-time, not on the first call. Worth the few extra ms.
+const _TLS_SRV_RTLD_NOW: int = 2
+
+# SSL_FILETYPE_PEM — passed to SSL_CTX_use_*_file. Matches OpenSSL.
+const _TLS_SRV_FILETYPE_PEM: int = 1
+
+# Default max read chunk if a caller passes a non-positive max_len.
+const _TLS_SRV_DEFAULT_READ: int = 16384
+
+
+# _tls_srv_slot_addr() -> stable base address of the slot page, or 0
+# if mmap fails. Idempotent: subsequent calls hit EEXIST (-17) and
+# we treat that as success (the page is already ours).
+fn _tls_srv_slot_addr() -> int
+    @p = sys_mmap(_TLS_SRV_SLOT_ADDR, _TLS_SRV_SLOT_LEN, 3, _TLS_SRV_SLOT_FLAGS, 0 - 1, 0)
+    if @p == _TLS_SRV_SLOT_ADDR
+        return _TLS_SRV_SLOT_ADDR
+    if @p == 0 - 17
+        return _TLS_SRV_SLOT_ADDR
+    return 0
+
+
+# Read an 8-byte slot at index @idx as a little-endian u64. Returns 0
+# if the slot page can't be mapped (extremely unlikely after init).
+fn _tls_srv_slot_get(@idx: int) -> int
+    @base = _tls_srv_slot_addr()
+    if @base == 0
+        return 0
+    @off = @idx * 8
+    @v = 0
+    @i = 0
+    while @i < 8
+        @b = u8_at(@base, @off + @i)
+        @v = @v | (@b << (@i * 8))
+        @i = @i + 1
+    return @v
+
+
+# Write an 8-byte slot at index @idx. Pointers are 8 bytes on x86-64;
+# we write byte-by-byte to dodge any alignment surprises.
+fn _tls_srv_slot_set(@idx: int, @val: int) -> int
+    @base = _tls_srv_slot_addr()
+    if @base == 0
+        return -1
+    @off = @idx * 8
+    @v = @val
+    @i = 0
+    while @i < 8
+        u8_set(@base, @off + @i, @v & 255)
+        @v = @v >> 8
+        @i = @i + 1
+    return 0
+
+
+# _tls_srv_set_error(@msg) — store the last error string globally.
+# Errors are sticky: callers read tls_server_error() right after the
+# failing call; we don't clear on success because that races with any
+# concurrent reader.
+fn _tls_srv_set_error(@msg: int) -> int
+    _tls_srv_slot_set(_TLS_SRV_IDX_LAST_ERROR, @msg)
+    return 0
+
+
+# tls_server_error() — return the most recent error string. Empty
+# string ("") if nothing has failed yet.
+fn tls_server_error() -> int
+    @p = _tls_srv_slot_get(_TLS_SRV_IDX_LAST_ERROR)
+    if @p == 0
+        return ""
+    return @p
+
+
+# ----------------------------------------------------------------------
+# tls_server_init — dlopen libssl + cache function pointers.
+#
+# Tries libssl.so.3 first (current OpenSSL), falls back to .1.1 for
+# older boxes. Returns 0 on success, -1 if libssl can't be loaded or
+# any required symbol is missing. Safe to call multiple times; the
+# init_done slot short-circuits subsequent calls.
+# ----------------------------------------------------------------------
+
+fn _tls_srv_dlsym_into(@handle: int, @sym: int, @idx: int) -> int
+    @fp = _libc_dlsym(@handle, @sym)
+    if @fp == 0
+        _tls_srv_set_error(str_concat("dlsym failed: ", @sym))
+        return -1
+    _tls_srv_slot_set(@idx, @fp)
+    return 0
+
+
+fn tls_server_init() -> int
+    if _tls_srv_slot_get(_TLS_SRV_IDX_INIT_DONE) == 1
+        return 0
+
+    # Open libssl. Try .so.3 first, fall back to .so.1.1.
+    @handle = _libc_dlopen("libssl.so.3", _TLS_SRV_RTLD_NOW)
+    if @handle == 0
+        @handle = _libc_dlopen("libssl.so.1.1", _TLS_SRV_RTLD_NOW)
+    if @handle == 0
+        @handle = _libc_dlopen("libssl.so", _TLS_SRV_RTLD_NOW)
+    if @handle == 0
+        _tls_srv_set_error("dlopen libssl failed (tried .so.3, .so.1.1, .so)")
+        return -1
+
+    # Resolve every symbol we use. Bail out at the first miss — we'd
+    # rather fail loud at init than segfault later on a NULL fp.
+    if _tls_srv_dlsym_into(@handle, "TLS_server_method",            _TLS_SRV_IDX_FP_METHOD) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_CTX_new",                  _TLS_SRV_IDX_FP_CTX_NEW) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_CTX_use_certificate_file", _TLS_SRV_IDX_FP_USE_CERT) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_CTX_use_PrivateKey_file",  _TLS_SRV_IDX_FP_USE_KEY) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_new",                      _TLS_SRV_IDX_FP_SSL_NEW) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_set_fd",                   _TLS_SRV_IDX_FP_SET_FD) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_accept",                   _TLS_SRV_IDX_FP_ACCEPT) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_read",                     _TLS_SRV_IDX_FP_READ) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_write",                    _TLS_SRV_IDX_FP_WRITE) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_shutdown",                 _TLS_SRV_IDX_FP_SHUTDOWN) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_free",                     _TLS_SRV_IDX_FP_SSL_FREE) < 0
+        return -1
+    if _tls_srv_dlsym_into(@handle, "SSL_CTX_free",                 _TLS_SRV_IDX_FP_CTX_FREE) < 0
+        return -1
+
+    _tls_srv_slot_set(_TLS_SRV_IDX_INIT_DONE, 1)
+    return 0
+
+
+# Auto-init helper. Every public function calls this so callers don't
+# have to remember to invoke tls_server_init() explicitly. Returns 1
+# if init succeeded (now or earlier), 0 otherwise.
+fn _tls_srv_ensure_init() -> int
+    if _tls_srv_slot_get(_TLS_SRV_IDX_INIT_DONE) == 1
+        return 1
+    if tls_server_init() == 0
+        return 1
+    return 0
+
+
+# ----------------------------------------------------------------------
+# tls_server_ctx_new — build an SSL_CTX with cert + key already loaded.
+#
+# Both files must be PEM-encoded. On any failure the returned struct
+# has ctx == 0 and tls_server_error() holds a descriptive message.
+# The caller still owns the cert/key strings (their NUL-terminated
+# bytes are read inside OpenSSL during the call; no async retention).
+# ----------------------------------------------------------------------
+
+fn tls_server_ctx_new(@cert_file: int, @key_file: int) -> TlsServerCtx
+    let @out: TlsServerCtx = new_str(8)
+    @out.ctx = 0
+
+    if _tls_srv_ensure_init() == 0
+        return @out
+
+    @fp_method = _tls_srv_slot_get(_TLS_SRV_IDX_FP_METHOD)
+    @method    = _call_ptr0(@fp_method)
+    if @method == 0
+        _tls_srv_set_error("TLS_server_method returned NULL")
+        return @out
+
+    @fp_ctx_new = _tls_srv_slot_get(_TLS_SRV_IDX_FP_CTX_NEW)
+    @ctx        = _call_ptr1(@fp_ctx_new, @method)
+    if @ctx == 0
+        _tls_srv_set_error("SSL_CTX_new failed")
+        return @out
+
+    @fp_use_cert = _tls_srv_slot_get(_TLS_SRV_IDX_FP_USE_CERT)
+    @r1 = _call_ptr3(@fp_use_cert, @ctx, @cert_file, _TLS_SRV_FILETYPE_PEM)
+    if @r1 != 1
+        _tls_srv_set_error(str_concat("SSL_CTX_use_certificate_file failed: ", @cert_file))
+        @fp_ctx_free = _tls_srv_slot_get(_TLS_SRV_IDX_FP_CTX_FREE)
+        _call_ptr1(@fp_ctx_free, @ctx)
+        return @out
+
+    @fp_use_key = _tls_srv_slot_get(_TLS_SRV_IDX_FP_USE_KEY)
+    @r2 = _call_ptr3(@fp_use_key, @ctx, @key_file, _TLS_SRV_FILETYPE_PEM)
+    if @r2 != 1
+        _tls_srv_set_error(str_concat("SSL_CTX_use_PrivateKey_file failed: ", @key_file))
+        @fp_ctx_free = _tls_srv_slot_get(_TLS_SRV_IDX_FP_CTX_FREE)
+        _call_ptr1(@fp_ctx_free, @ctx)
+        return @out
+
+    @out.ctx = @ctx
+    return @out
+
+
+fn tls_server_ctx_ok(@s: TlsServerCtx) -> int
+    if @s.ctx == 0
+        return 0
+    return 1
+
+
+# ----------------------------------------------------------------------
+# tls_server_accept — TLS-handshake on an already-accepted TCP fd.
+#
+# The caller is expected to have called tcp_accept() (or sys_accept)
+# beforehand and pass the resulting fd here. We allocate an SSL*, bind
+# it to the fd, and drive the handshake via SSL_accept. The returned
+# struct has ssl == 0 on failure.
+# ----------------------------------------------------------------------
+
+fn tls_server_accept(@s: TlsServerCtx, @tcp_fd: int) -> TlsServerConn
+    let @out: TlsServerConn = new_str(16)
+    @out.ssl = 0
+    @out.fd  = @tcp_fd
+
+    if _tls_srv_ensure_init() == 0
+        return @out
+    if @s.ctx == 0
+        _tls_srv_set_error("tls_server_accept: ctx is NULL")
+        return @out
+    if @tcp_fd < 0
+        _tls_srv_set_error("tls_server_accept: invalid fd")
+        return @out
+
+    @fp_ssl_new = _tls_srv_slot_get(_TLS_SRV_IDX_FP_SSL_NEW)
+    @ssl        = _call_ptr1(@fp_ssl_new, @s.ctx)
+    if @ssl == 0
+        _tls_srv_set_error("SSL_new failed")
+        return @out
+
+    @fp_set_fd = _tls_srv_slot_get(_TLS_SRV_IDX_FP_SET_FD)
+    @r_set     = _call_ptr2(@fp_set_fd, @ssl, @tcp_fd)
+    if @r_set != 1
+        _tls_srv_set_error("SSL_set_fd failed")
+        @fp_ssl_free = _tls_srv_slot_get(_TLS_SRV_IDX_FP_SSL_FREE)
+        _call_ptr1(@fp_ssl_free, @ssl)
+        return @out
+
+    @fp_accept = _tls_srv_slot_get(_TLS_SRV_IDX_FP_ACCEPT)
+    @r_acc     = _call_ptr1(@fp_accept, @ssl)
+    if @r_acc != 1
+        _tls_srv_set_error("SSL_accept failed (handshake)")
+        @fp_ssl_free = _tls_srv_slot_get(_TLS_SRV_IDX_FP_SSL_FREE)
+        _call_ptr1(@fp_ssl_free, @ssl)
+        return @out
+
+    @out.ssl = @ssl
+    return @out
+
+
+fn tls_server_conn_ok(@c: TlsServerConn) -> int
+    if @c.ssl == 0
+        return 0
+    return 1
+
+
+# ----------------------------------------------------------------------
+# Read/write/close — same shape as the client side.
+#
+# tls_server_read returns a fresh Luna string holding the bytes read,
+# or "" on EOF / error. Use str_len() to discriminate. tls_server_write
+# accepts any Luna string and returns the byte count actually written
+# (or -1 on error).
+# ----------------------------------------------------------------------
+
+fn tls_server_read(@c: TlsServerConn, @max_len: int) -> int
+    if @c.ssl == 0
+        return ""
+    @cap = @max_len
+    if @cap <= 0
+        @cap = _TLS_SRV_DEFAULT_READ
+    @buf = new_str(@cap)
+    @fp_read = _tls_srv_slot_get(_TLS_SRV_IDX_FP_READ)
+    @n = _call_ptr3(@fp_read, @c.ssl, @buf, @cap)
+    if @n <= 0
+        return ""
+    return str_substr(@buf, 0, @n)
+
+
+fn tls_server_write(@c: TlsServerConn, @data: int) -> int
+    if @c.ssl == 0
+        return -1
+    @n = str_len(@data)
+    if @n <= 0
+        return 0
+    @fp_write = _tls_srv_slot_get(_TLS_SRV_IDX_FP_WRITE)
+    # Loop until the whole buffer is sent — SSL_write can short-write
+    # under TLS-record boundary alignment. If the peer closes mid-write
+    # we return however much made it through; total miss returns -1.
+    @off = 0
+    while @off < @n
+        @w = _call_ptr3(@fp_write, @c.ssl, @data + @off, @n - @off)
+        if @w <= 0
+            if @off > 0
+                return @off
+            _tls_srv_set_error("SSL_write returned non-positive")
+            return -1
+        @off = @off + @w
+    return @off
+
+
+# tls_server_close — clean TLS shutdown + free SSL*. The underlying
+# TCP fd is NOT closed here; the caller owns the fd's lifecycle (they
+# created it via tcp_accept). Returns 0.
+fn tls_server_close(@c: TlsServerConn) -> int
+    if @c.ssl == 0
+        return 0
+    @fp_shutdown = _tls_srv_slot_get(_TLS_SRV_IDX_FP_SHUTDOWN)
+    _call_ptr1(@fp_shutdown, @c.ssl)
+    @fp_ssl_free = _tls_srv_slot_get(_TLS_SRV_IDX_FP_SSL_FREE)
+    _call_ptr1(@fp_ssl_free, @c.ssl)
+    @c.ssl = 0
+    return 0
+
+
+# tls_server_ctx_free — release the SSL_CTX. Safe to call once after
+# all conns built from this ctx have been closed.
+fn tls_server_ctx_free(@s: TlsServerCtx) -> int
+    if @s.ctx == 0
+        return 0
+    @fp_ctx_free = _tls_srv_slot_get(_TLS_SRV_IDX_FP_CTX_FREE)
+    _call_ptr1(@fp_ctx_free, @s.ctx)
+    @s.ctx = 0
+    return 0

@@ -1,0 +1,95 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/std/signal — POSIX signal primitives.
+#
+# What you get today (without bootminor signal-trampoline support):
+#   signal_ignore(@sig)         set disposition to SIG_IGN
+#   signal_default(@sig)        restore SIG_DFL
+#   signal_kill(@pid, @sig)     send signal to a process
+#
+# Common signal numbers (Linux x86_64) exposed as constants:
+#   SIGHUP=1   SIGINT=2   SIGQUIT=3  SIGILL=4
+#   SIGABRT=6  SIGKILL=9  SIGUSR1=10
+#   SIGSEGV=11 SIGPIPE=13 SIGALRM=14 SIGTERM=15
+#   SIGUSR2=12 SIGCHLD=17 SIGSTOP=19 SIGCONT=18
+#
+# Why this is incomplete:
+#   Real signal HANDLERS (your own function running on signal) need a
+#   `sa_restorer` trampoline — a few bytes of assembly that calls
+#   `sys_rt_sigreturn` (syscall 15) when the handler returns. Luna
+#   doesn't have inline-asm yet, so we ship SIG_IGN / SIG_DFL only.
+#   Coming with TIER 6.2 (inline asm support).
+#
+# Notable uses for SIG_IGN today:
+#   - signal_ignore(SIGCHLD): kernel auto-reaps zombies (no
+#     sys_wait4 needed for forking servers).
+#   - signal_ignore(SIGPIPE): writing to a closed socket returns -1
+#     instead of killing the process.
+#   - signal_ignore(SIGTERM/SIGINT): process survives Ctrl-C; useful
+#     for daemons that want to do their own shutdown via a control
+#     file or socket.
+
+
+const SIGHUP:  int = 1
+const SIGINT:  int = 2
+const SIGQUIT: int = 3
+const SIGABRT: int = 6
+const SIGKILL: int = 9
+const SIGUSR1: int = 10
+const SIGSEGV: int = 11
+const SIGUSR2: int = 12
+const SIGPIPE: int = 13
+const SIGALRM: int = 14
+const SIGTERM: int = 15
+const SIGCHLD: int = 17
+const SIGCONT: int = 18
+const SIGSTOP: int = 19
+
+
+# Sentinel handler values per <signal.h>.
+const SIG_DFL: int = 0
+const SIG_IGN: int = 1
+
+
+# Build a kernel sigaction struct (32 bytes on x86_64):
+#   off  0: sa_handler  (8 bytes)
+#   off  8: sa_flags    (8 bytes)
+#   off 16: sa_restorer (8 bytes)
+#   off 24: sa_mask     (8 bytes — kernel sigset_t)
+fn _signal_make_sigaction(@handler: int) -> int
+    @sa = new_str(32)
+    u64_set(@sa, 0, @handler)
+    u64_set(@sa, 1, 0)
+    u64_set(@sa, 2, 0)
+    u64_set(@sa, 3, 0)
+    return @sa
+
+
+# signal_ignore(@sig) -> 0 on success, -1 on failure.
+fn signal_ignore(@sig: int) -> int
+    @sa = _signal_make_sigaction(SIG_IGN)
+    @r = sys_rt_sigaction(@sig, @sa, 0, 8)
+    if @r < 0
+        return -1
+    return 0
+
+
+# signal_default(@sig) -> restore default disposition. 0 / -1.
+fn signal_default(@sig: int) -> int
+    @sa = _signal_make_sigaction(SIG_DFL)
+    @r = sys_rt_sigaction(@sig, @sa, 0, 8)
+    if @r < 0
+        return -1
+    return 0
+
+
+# signal_kill(@pid, @sig) -> 0 on success, -1 on failure.
+# @pid == 0  → entire process group
+# @pid == -1 → every process the sender has permission to signal
+fn signal_kill(@pid: int, @sig: int) -> int
+    @r = sys_kill(@pid, @sig)
+    if @r < 0
+        return -1
+    return 0

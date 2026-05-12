@@ -1,0 +1,96 @@
+# H2C end-to-end client. Pairs with tests/std/net/http2_e2e.sh, which
+# spawns nghttpd on $H2_PORT (defaults to 8765) serving /tmp/h2_root.
+#
+# Test plan:
+#   1. h2_connect(127.0.0.1, 8765) returns a valid handle.
+#   2. h2_request(GET /probe.txt) returns status 200.
+#   3. Response body matches the file we wrote into /tmp/h2_root.
+#   4. A second sequential request on the same connection works.
+#   5. h2_connect to a definitely-closed port returns -1 with an
+#      error string.
+#
+# Prints PASS or FAIL lines and exits with code 0 on full success.
+
+import http2
+
+
+fn fail(@msg: int) -> int
+    print("FAIL: ")
+    shine(@msg)
+    return 1
+
+
+fn main() -> int
+    @port = 8765
+    @host = "127.0.0.1"
+
+    # 5) Connection refused on a closed port -> -1. We only assert
+    #    on the return code; the error-string side channel relies on
+    #    a fixed-address mmap which can fail on exotic kernels.
+    @bad = h2_connect(@host, 1)
+    if @bad != -1
+        return fail("expected -1 for closed port")
+    shine("PASS: refused -> -1")
+
+    # 1) Open a real connection.
+    @conn = h2_connect(@host, @port)
+    if @conn == -1
+        @e = h2_error()
+        print("h2_connect error: ")
+        shine(@e)
+        return fail("h2_connect failed")
+    shine("PASS: connected")
+
+    # 2) GET / — returns *some* status (nghttpd serves a directory
+    #    listing or 404, we just want >= 100 and the body present).
+    @resp = h2_request(@conn, "GET", "/probe.txt", @host, "")
+    if @resp == -1
+        @e = h2_error()
+        print("h2_request error: ")
+        shine(@e)
+        return fail("first request returned -1")
+    @status = h2_status(@resp)
+    if @status != 200
+        print("expected 200, got status=")
+        shine(int_to_str(@status))
+        return fail("status != 200")
+    shine("PASS: GET /probe.txt -> 200")
+
+    # 3) Body is non-empty and contains "luna h2".
+    @body = h2_body(@resp)
+    if str_len(@body) == 0
+        return fail("empty body")
+    if str_eq(@body, "luna h2 probe\n") == 0
+        print("body=")
+        shine(@body)
+        return fail("body mismatch")
+    shine("PASS: body matches probe content")
+
+    # 4) Second request on the same connection.
+    @resp2 = h2_request(@conn, "GET", "/probe2.txt", @host, "")
+    if @resp2 == -1
+        @e = h2_error()
+        print("h2_request#2 error: ")
+        shine(@e)
+        return fail("second request returned -1")
+    @s2 = h2_status(@resp2)
+    if @s2 != 200
+        print("second status=")
+        shine(int_to_str(@s2))
+        return fail("second request status != 200")
+    @b2 = h2_body(@resp2)
+    if str_eq(@b2, "second\n") == 0
+        return fail("second body mismatch")
+    shine("PASS: second request OK")
+
+    # Content-Type header should be served by nghttpd.
+    @ct = h2_header(@resp, "content-type")
+    if str_len(@ct) == 0
+        shine("WARN: no content-type header (acceptable; some servers omit it)")
+    else
+        print("content-type: ")
+        shine(@ct)
+
+    h2_close(@conn)
+    shine("PASS: clean close")
+    return 0

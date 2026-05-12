@@ -1,0 +1,138 @@
+# tier: T5
+# deps:
+# ffi: none
+#
+# std/net/tcp — IPv4 TCP sockets over Linux syscalls.
+#
+# Pure Luna over sys_socket / sys_connect / sys_bind / sys_listen /
+# sys_accept and sys_read/sys_write on socket fds. No DNS yet — the
+# caller passes a dotted-quad IP string. DNS will land as a sibling
+# module (std/net/dns) once it's written.
+
+
+# tcp_parse_ipv4(@s) -> 4-byte heap buffer with the IP in network
+# byte order, or -1 on parse failure.
+fn tcp_parse_ipv4(@s: int) -> int
+    @slen = str_len(@s)
+    if @slen < 7
+        return -1
+    @out = new_str(4)
+    @part_idx = 0
+    @cur = 0
+    @have_digit = 0
+    @i = 0
+    while @i < @slen
+        @c = str_byte(@s, @i)
+        if @c == 46
+            # '.': finalize the current part.
+            if @have_digit == 0
+                return -1
+            if @part_idx >= 3
+                return -1
+            u8_set(@out, @part_idx, @cur)
+            @part_idx = @part_idx + 1
+            @cur = 0
+            @have_digit = 0
+        else
+            if @c < 48
+                return -1
+            if @c > 57
+                return -1
+            @cur = @cur * 10 + (@c - 48)
+            if @cur > 255
+                return -1
+            @have_digit = 1
+        @i = @i + 1
+    if @part_idx != 3
+        return -1
+    if @have_digit == 0
+        return -1
+    u8_set(@out, 3, @cur)
+    return @out
+
+# _tcp_make_sockaddr_in(@ip4, @port) -> 16-byte sockaddr_in buffer.
+# @ip4 is a 4-byte buffer (from tcp_parse_ipv4); @port is host-order.
+fn _tcp_make_sockaddr_in(@ip4: int, @port: int) -> int
+    @sa = new_str(16)
+    # sin_family = AF_INET (2), little-endian u16
+    u8_set(@sa, 0, 2)
+    u8_set(@sa, 1, 0)
+    # sin_port: host -> network (big-endian)
+    u8_set(@sa, 2, (@port >> 8) & 255)
+    u8_set(@sa, 3, @port & 255)
+    # sin_addr: 4 bytes, already in network order from parse_ipv4
+    u8_set(@sa, 4, u8_at(@ip4, 0))
+    u8_set(@sa, 5, u8_at(@ip4, 1))
+    u8_set(@sa, 6, u8_at(@ip4, 2))
+    u8_set(@sa, 7, u8_at(@ip4, 3))
+    # sin_zero: 8 bytes left as zero by new_str.
+    return @sa
+
+# tcp_connect(@host_ip, @port) -> connected client fd, or -1.
+# @host_ip is a dotted-quad string like "127.0.0.1".
+fn tcp_connect(@host_ip: int, @port: int) -> int
+    @ip = tcp_parse_ipv4(@host_ip)
+    if @ip < 0
+        return -1
+    @fd = sys_socket(2, 1, 0)
+    if @fd < 0
+        return -1
+    @sa = _tcp_make_sockaddr_in(@ip, @port)
+    @r = sys_connect(@fd, @sa, 16)
+    if @r < 0
+        sys_close(@fd)
+        return -1
+    return @fd
+
+# tcp_listen(@port) -> listening server fd bound to 0.0.0.0, or -1.
+# Sets SO_REUSEADDR before bind so restarts aren't blocked by TIME_WAIT.
+# Backlog is 16 by default.
+fn tcp_listen(@port: int) -> int
+    @fd = sys_socket(2, 1, 0)
+    if @fd < 0
+        return -1
+    # SO_REUSEADDR: SOL_SOCKET=1, SO_REUSEADDR=2, optval = 1 (4 bytes).
+    @one = new_str(4)
+    u32_set(@one, 0, 1)
+    sys_setsockopt(@fd, 1, 2, @one, 4)
+    @ip = new_str(4)
+    @sa = _tcp_make_sockaddr_in(@ip, @port)
+    @r = sys_bind(@fd, @sa, 16)
+    if @r < 0
+        sys_close(@fd)
+        return -1
+    @r = sys_listen(@fd, 16)
+    if @r < 0
+        sys_close(@fd)
+        return -1
+    return @fd
+
+# tcp_accept(@server_fd) -> client fd, or -1 on failure. Blocks.
+fn tcp_accept(@server_fd: int) -> int
+    return sys_accept(@server_fd, 0, 0)
+
+# tcp_send(@fd, @buf, @n) -> bytes sent (may be < n on partial send).
+fn tcp_send(@fd: int, @buf: int, @n: int) -> int
+    return sys_write(@fd, @buf, @n)
+
+# tcp_send_all(@fd, @buf, @n) -> 0 on full send, -1 on error.
+fn tcp_send_all(@fd: int, @buf: int, @n: int) -> int
+    @sent = 0
+    while @sent < @n
+        @r = sys_write(@fd, @buf + @sent, @n - @sent)
+        if @r <= 0
+            return -1
+        @sent = @sent + @r
+    return 0
+
+# tcp_recv(@fd, @buf, @cap) -> bytes read, 0 on EOF, -1 on error.
+fn tcp_recv(@fd: int, @buf: int, @cap: int) -> int
+    return sys_read(@fd, @buf, @cap)
+
+# tcp_send_str(@fd, @s) -> 0 on full send, -1 on error.
+fn tcp_send_str(@fd: int, @s: int) -> int
+    return tcp_send_all(@fd, @s, str_len(@s))
+
+# tcp_close(@fd) -> 0.
+fn tcp_close(@fd: int) -> int
+    return sys_close(@fd)

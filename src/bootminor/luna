@@ -27,9 +27,83 @@ _ensure_ready() {
     [ -f "$PRELUDE"  ] || _die "prelude not found at $PRELUDE"
 }
 
+# Module resolver. Walks `^import NAME` directives, recursively
+# concatenates the matching NAME.luna files into the output, with
+# deduplication. Search order:
+#   1. Directory of the source being processed.
+#   2. $LUNA_PATH (colon-separated, like PATH).
+#   3. $LUNA_HOME/lib/std/   (shipped stdlib_new modules).
+#   4. $LUNA_HOME/lib/       (prelude + bare modules).
+#
+# Imports are top-level only; lines must literally match
+# `^[[:space:]]*import[[:space:]]+IDENT`. Already-imported modules
+# are skipped. Unresolved modules abort the build.
+__LUNA_SEEN_MODULES=""
+
+_resolve_module_path() {
+    # $1 = module name, $2 = source dir (for relative search)
+    local mod="$1"
+    local src_dir="$2"
+    local dir
+    local IFS_old="$IFS"
+    IFS=":"
+    for dir in "$src_dir" ${LUNA_PATH:-} "$LUNA_HOME/lib/std" "$LUNA_HOME/lib"; do
+        IFS="$IFS_old"
+        [ -z "$dir" ] && continue
+        if [ -f "$dir/$mod.luna" ]; then
+            printf "%s" "$dir/$mod.luna"
+            return 0
+        fi
+    done
+    IFS="$IFS_old"
+    return 1
+}
+
+_resolve_imports_recursive() {
+    # $1 = source file path
+    # $2 = output file (append-mode)
+    local src="$1"
+    local out="$2"
+    local src_dir
+    src_dir="$(dirname "$src")"
+
+    # First pass: walk imports recursively (depth-first).
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^[[:space:]]*import[[:space:]]+([A-Za-z_][A-Za-z0-9_]*) ]]; then
+            local mod="${BASH_REMATCH[1]}"
+            if [[ "$__LUNA_SEEN_MODULES" == *":$mod:"* ]]; then
+                continue
+            fi
+            __LUNA_SEEN_MODULES="${__LUNA_SEEN_MODULES}:$mod:"
+
+            local mod_path
+            if ! mod_path="$(_resolve_module_path "$mod" "$src_dir")"; then
+                echo "luna: cannot resolve module '$mod' (searched: $src_dir, \$LUNA_PATH, $LUNA_HOME/lib/std, $LUNA_HOME/lib)" >&2
+                return 1
+            fi
+            _resolve_imports_recursive "$mod_path" "$out" || return 1
+        fi
+    done < "$src"
+
+    # Second pass: emit file content, commenting out import lines so
+    # bootminor's parse_import stub stays happy and line numbers shift
+    # predictably.
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^[[:space:]]*import[[:space:]]+ ]]; then
+            printf "# luna-cli: %s\n" "$line" >> "$out"
+        else
+            printf "%s\n" "$line" >> "$out"
+        fi
+    done < "$src"
+}
+
 _concat_prelude() {
     # $1 = user source path, $2 = output tmp path
-    cat "$PRELUDE" "$1" > "$2"
+    cat "$PRELUDE" > "$2"
+    __LUNA_SEEN_MODULES=""
+    if ! _resolve_imports_recursive "$1" "$2"; then
+        return 1
+    fi
 }
 
 cmd_help() {
@@ -40,11 +114,18 @@ USAGE
     luna <command> [args...]
 
 COMMANDS
-    new <project>        Create a new project directory with a main.luna.
+    new [--layered|--lib|--flat] <project>
+                         Scaffold a project. Default is flat (one main.luna).
+                         --layered: core/lib/io/handlers + tests tree.
+                         --lib: library project (<name>.luna + internal/).
+                         See docs/PROJECT_LAYOUT.md.
     build [file]         Compile [file] (default: main.luna) to an ELF64
                          binary next to the source. Prelude is auto-prepended.
+                         Project subdirs (core/, lib/, io/, handlers/) and
+                         .luna/pkgs/* are added to the import search path.
     run   [file] [args]  Build then run the resulting binary. Extra args are
                          forwarded to the compiled program.
+    pkg <subcmd> ...     Package manager (see 'luna pkg help').
     version              Print CLI + compiler version.
     help                 Show this message.
 
@@ -52,11 +133,310 @@ ENVIRONMENT
     LUNA_HOME            Installation root (default: $HOME/.luna)
     LUNA_COMPILER        Path to luna-mini (default: $LUNA_HOME/bin/luna-mini)
     LUNA_PRELUDE         Path to prelude.luna (default: $LUNA_HOME/lib/prelude.luna)
+    LUNA_PATH            Colon-separated extra module search paths. `luna
+                         build` / `luna run` also auto-discover .luna/pkgs/
+                         under the nearest luna.toml.
 
 TARGETS
     Linux ELF64 only at the moment. Windows PE64 is planned; macOS is
     not a supported target.
 EOF
+}
+
+
+# Walk up from $PWD looking for the nearest luna.toml; echo its dir.
+_find_project_root() {
+    local d="$PWD"
+    while [ -n "$d" ] && [ "$d" != "/" ]; do
+        if [ -f "$d/luna.toml" ]; then
+            printf '%s' "$d"
+            return 0
+        fi
+        d="$(dirname "$d")"
+    done
+    return 1
+}
+
+# Echo colon-separated subdirs of the current project that contain .luna
+# files. Implements the layered project layout (see docs/PROJECT_LAYOUT.md):
+# `luna build`/`run` automatically adds core/, lib/, io/, handlers/, etc.
+# to the import search path so `import user` finds `core/user.luna` without
+# manual LUNA_PATH plumbing. Empty output if no project.
+#
+# Subdirs that conventionally don't hold importable code are skipped:
+# tests/, assets/, scripts/, docs/, examples/, .luna/, target/, build/,
+# dist/, node_modules/.
+_discover_project_subdirs() {
+    local root
+    root="$(_find_project_root)" || return 0
+    local paths=""
+    local sub base
+    # Project root itself, so e.g. tests/foo_test.luna can `import foo`
+    # to reach foo.luna at the root (typical lib layout).
+    if ls "$root"/*.luna >/dev/null 2>&1; then
+        paths="$root"
+    fi
+    for sub in "$root"/*/; do
+        [ -d "$sub" ] || continue
+        base="${sub%/}"
+        base="${base##*/}"
+        case "$base" in
+            tests|assets|scripts|docs|examples|target|build|dist|node_modules)
+                continue ;;
+            .*)
+                continue ;;
+        esac
+        if ls "$sub"/*.luna >/dev/null 2>&1; then
+            paths="${paths:+$paths:}${sub%/}"
+        fi
+    done
+    printf '%s' "$paths"
+}
+
+
+# Echo colon-separated module dirs from all installed packages under
+# the project's .luna/pkgs/. Empty output if no project / no packages.
+_discover_pkg_paths() {
+    local root
+    root="$(_find_project_root)" || return 0
+    [ -d "$root/.luna/pkgs" ] || return 0
+    local paths=""
+    local pkg sub cand
+    for pkg in "$root"/.luna/pkgs/*/; do
+        [ -d "$pkg" ] || continue
+        local base="${pkg%/}"
+        for sub in "" "src" "src/lib" "src/lib/std" "std/runtime" "std/core" "std/std" "std/net" "std/ext"; do
+            if [ -n "$sub" ]; then
+                cand="$base/$sub"
+            else
+                cand="$base"
+            fi
+            [ -d "$cand" ] || continue
+            # Only include if it has at least one .luna file.
+            if ls "$cand"/*.luna >/dev/null 2>&1; then
+                paths="${paths:+$paths:}$cand"
+            fi
+        done
+    done
+    printf '%s' "$paths"
+}
+
+
+# Split "<input>" into "<canonical_url> <clone_url>".
+# Echoes both on one line separated by a space.
+_pkg_normalize_url() {
+    local in="$1"
+    case "$in" in
+        github.com/*)
+            echo "$in https://$in.git"
+            ;;
+        https://github.com/*)
+            local p="${in#https://}"
+            p="${p%.git}"
+            echo "$p https://$p.git"
+            ;;
+        https://*|http://*|file://*)
+            echo "$in $in"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+
+_pkg_help() {
+    cat <<'EOF'
+Luna package manager.
+
+USAGE
+    luna pkg init                  Create luna.toml in the current directory.
+    luna pkg add <url>[@<rev>]     Install a git-hosted package.
+    luna pkg list                  List installed packages.
+    luna pkg remove <name>         Uninstall a package.
+    luna pkg sync                  Re-fetch every package listed in luna.toml.
+
+URL forms accepted by 'add'
+    github.com/user/repo           Shortcut for https://github.com/user/repo.git
+    https://host/path/repo.git     Any HTTPS-reachable git repo.
+    file:///abs/path/to/repo       Local repo (useful for testing).
+
+Packages are cloned into .luna/pkgs/<name>/ (gitignored). 'luna build'
+and 'luna run' add every package's module directories to LUNA_PATH so
+'import foo' resolves transparently.
+EOF
+}
+
+
+_pkg_init() {
+    if [ -f luna.toml ]; then
+        _die "luna.toml already exists in $(pwd)"
+    fi
+    local name
+    name="$(basename "$PWD")"
+    cat > luna.toml <<EOF
+# Luna project manifest. Edit by hand or via 'luna pkg add'.
+
+[package]
+name = "$name"
+version = "0.1.0"
+
+[deps]
+EOF
+    mkdir -p .luna/pkgs
+    if [ -f .gitignore ]; then
+        grep -qF ".luna/" .gitignore || echo ".luna/" >> .gitignore
+    else
+        echo ".luna/" > .gitignore
+    fi
+    echo "Initialized $(pwd)/luna.toml"
+    echo "Add a dependency:    luna pkg add github.com/user/repo"
+}
+
+
+_pkg_add() {
+    local target="${1:-}"
+    [ -n "$target" ] || _die "usage: luna pkg add <url>[@<rev>]"
+    [ -f luna.toml ] || _die "no luna.toml in $(pwd); run 'luna pkg init' first"
+    command -v git >/dev/null 2>&1 || _die "git not installed (luna pkg shells out to git)"
+
+    local url rev
+    case "$target" in
+        *@*) url="${target%@*}"; rev="${target##*@}" ;;
+        *)   url="$target";      rev="main" ;;
+    esac
+
+    local norm canonical clone_url
+    norm="$(_pkg_normalize_url "$url")" \
+        || _die "unsupported source: $url (try github.com/u/r, https://..., or file://...)"
+    canonical="${norm%% *}"
+    clone_url="${norm##* }"
+
+    local name="${canonical##*/}"
+    local pkg_dir=".luna/pkgs/$name"
+    if [ -d "$pkg_dir" ]; then
+        _die "package $name already installed; remove it first ('luna pkg remove $name')"
+    fi
+    mkdir -p .luna/pkgs
+
+    echo "Fetching $canonical@$rev ..."
+    # Try shallow clone of the branch/tag first; fall back to a full
+    # clone + checkout if rev is a commit SHA.
+    if ! git clone --quiet --depth 1 --branch "$rev" "$clone_url" "$pkg_dir" 2>/dev/null; then
+        rm -rf "$pkg_dir"
+        if ! git clone --quiet "$clone_url" "$pkg_dir" 2>&1 | sed 's/^/  /'; then
+            rm -rf "$pkg_dir"
+            _die "git clone failed for $clone_url"
+        fi
+        if ! (cd "$pkg_dir" && git checkout --quiet "$rev") 2>&1 | sed 's/^/  /'; then
+            rm -rf "$pkg_dir"
+            _die "git checkout '$rev' failed"
+        fi
+    fi
+
+    local commit
+    commit="$(cd "$pkg_dir" && git rev-parse HEAD)"
+    rm -rf "$pkg_dir/.git"
+
+    # Update luna.toml — either replace existing entry or append.
+    if grep -qE "^\"$canonical\"[[:space:]]*=" luna.toml; then
+        # Same canonical already declared; just refresh the rev.
+        sed -i "s|^\"$canonical\"[[:space:]]*=.*|\"$canonical\" = \"$rev\"|" luna.toml
+    else
+        grep -q '^\[deps\]' luna.toml || printf '\n[deps]\n' >> luna.toml
+        printf '"%s" = "%s"\n' "$canonical" "$rev" >> luna.toml
+    fi
+
+    # Update luna.lock — one line per package.
+    touch luna.lock
+    if grep -qE "^$canonical[[:space:]]" luna.lock; then
+        sed -i "s|^$canonical[[:space:]].*|$canonical $rev $commit|" luna.lock
+    else
+        printf '%s %s %s\n' "$canonical" "$rev" "$commit" >> luna.lock
+    fi
+
+    echo "  installed $name @ ${commit:0:12}"
+}
+
+
+_pkg_list() {
+    if [ ! -d .luna/pkgs ]; then
+        echo "(no packages installed)"
+        return 0
+    fi
+    local any=0 pkg name lock_line commit
+    for pkg in .luna/pkgs/*/; do
+        [ -d "$pkg" ] || continue
+        any=1
+        name="${pkg#.luna/pkgs/}"
+        name="${name%/}"
+        commit="?"
+        if [ -f luna.lock ]; then
+            lock_line="$(grep -E "/${name}[[:space:]]" luna.lock | head -1)"
+            [ -n "$lock_line" ] && commit="$(echo "$lock_line" | awk '{print $3}')"
+        fi
+        printf '  %-32s %s\n' "$name" "${commit:0:12}"
+    done
+    [ "$any" = "0" ] && echo "(no packages installed)"
+}
+
+
+_pkg_remove() {
+    local name="${1:-}"
+    [ -n "$name" ] || _die "usage: luna pkg remove <name>"
+    [ -d ".luna/pkgs/$name" ] || _die "not installed: $name"
+    rm -rf ".luna/pkgs/$name"
+    [ -f luna.toml ] && sed -i "/^\"[^\"]*\\/${name}\"[[:space:]]*=/d" luna.toml
+    [ -f luna.lock ] && sed -i "/^[^[:space:]]*\\/${name}[[:space:]]/d" luna.lock
+    echo "  removed $name"
+}
+
+
+_pkg_sync() {
+    [ -f luna.toml ] || _die "no luna.toml in $(pwd)"
+    command -v git >/dev/null 2>&1 || _die "git not installed"
+
+    # Collect deps first (don't iterate over a file we'll mutate).
+    local -a deps=()
+    local line in_deps=0
+    while IFS= read -r line; do
+        if [ "$line" = "[deps]" ]; then in_deps=1; continue; fi
+        case "$line" in
+            \[*\]) in_deps=0; continue ;;
+        esac
+        [ "$in_deps" = "1" ] || continue
+        if [[ "$line" =~ ^\"([^\"]+)\"[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+            deps+=("${BASH_REMATCH[1]}@${BASH_REMATCH[2]}")
+        fi
+    done < luna.toml
+
+    local dep name url_rev
+    for dep in "${deps[@]}"; do
+        url_rev="$dep"
+        name="${url_rev%@*}"
+        name="${name##*/}"
+        if [ -d ".luna/pkgs/$name" ]; then
+            echo "  already present: $name"
+            continue
+        fi
+        _pkg_add "$url_rev"
+    done
+    echo "sync complete"
+}
+
+
+cmd_pkg() {
+    local sub="${1:-help}"
+    shift 2>/dev/null || true
+    case "$sub" in
+        init)         _pkg_init "$@" ;;
+        add)          _pkg_add "$@" ;;
+        list|ls)      _pkg_list "$@" ;;
+        remove|rm)    _pkg_remove "$@" ;;
+        sync)         _pkg_sync "$@" ;;
+        help|--help)  _pkg_help ;;
+        *)            _die "unknown pkg command: $sub (try 'luna pkg help')" ;;
+    esac
 }
 
 cmd_version() {
@@ -68,11 +448,55 @@ cmd_version() {
 }
 
 cmd_new() {
-    [ $# -ge 1 ] || _die "usage: luna new <project>"
+    local kind="flat"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --layered) kind="layered"; shift ;;
+            --lib)     kind="lib";     shift ;;
+            --flat)    kind="flat";    shift ;;
+            --)        shift; break ;;
+            --*)       _die "unknown flag: $1  (try 'luna help')" ;;
+            *)         break ;;
+        esac
+    done
+    [ $# -ge 1 ] || _die "usage: luna new [--layered|--lib|--flat] <project>"
     local name="$1"
     if [ -e "$name" ]; then
         _die "path already exists: $name"
     fi
+    case "$kind" in
+        flat)    _new_flat    "$name" ;;
+        layered) _new_layered "$name" ;;
+        lib)     _new_lib     "$name" ;;
+    esac
+}
+
+# Shared: write luna.toml + .gitignore. $1 = project dir, $2 = entry file.
+_write_manifest_and_gitignore() {
+    local dir="$1"
+    local entry="$2"
+    cat > "$dir/luna.toml" <<EOF
+# Luna project manifest (placeholder — no package resolution yet).
+
+[package]
+name = "$(basename "$dir")"
+version = "0.1.0"
+
+[build]
+entry = "$entry"
+EOF
+    cat > "$dir/.gitignore" <<'EOF'
+# Generated binaries
+*.elf
+*.o
+
+# Vendored packages (managed by `luna pkg`).
+.luna/
+EOF
+}
+
+_new_flat() {
+    local name="$1"
     mkdir -p "$name"
     cat > "$name/main.luna" <<'EOF'
 # main.luna — generated by `luna new`.
@@ -87,31 +511,185 @@ fn main() -> int
     shine("Hello, Luna!")
     return 0
 EOF
-    cat > "$name/luna.toml" <<EOF
-# Luna project manifest (placeholder — no package resolution yet).
-
-[package]
-name = "$name"
-version = "0.1.0"
-
-[build]
-entry = "main.luna"
-EOF
-    cat > "$name/.gitignore" <<'EOF'
-# Generated binaries
-*.elf
-*.o
-EOF
-    echo "Created project '$name'."
+    _write_manifest_and_gitignore "$name" "main.luna"
+    echo "Created flat project '$name'."
     echo "Next:"
     echo "    cd $name"
     echo "    luna run"
+}
+
+_new_layered() {
+    local name="$1"
+    mkdir -p "$name"/{core,lib,io,handlers,tests/core,tests/lib,tests/io,tests/handlers,assets,scripts}
+    cat > "$name/main.luna" <<'EOF'
+# main.luna — composition root (generated by `luna new --layered`).
+#
+# Wires the layers together and calls fn main(). Keep this file thin:
+# it should mostly import the handlers and dispatch.
+#
+# Layered project layout — see docs/PROJECT_LAYOUT.md.
+#   core/     — pure domain types and rules, no I/O
+#   lib/      — utilities combining core + stdlib
+#   io/       — HTTP, DB, files, processes (the outside world)
+#   handlers/ — one file per route/command, glue between request and io
+#   tests/    — mirrored test tree
+
+import greet
+
+fn main() -> int
+    return greet_run()
+EOF
+    cat > "$name/core/greeting.luna" <<'EOF'
+# core/greeting.luna — pure domain.
+#
+# Types and rules. No I/O. No imports from io/ or handlers/.
+
+fn make_greeting(@who: int) -> int
+    let @b: StrBuf = strbuf_new()
+    strbuf_add_str(@b, "Hello, ")
+    strbuf_add_str(@b, @who)
+    strbuf_add_str(@b, "!")
+    return strbuf_done(@b)
+EOF
+    cat > "$name/handlers/greet.luna" <<'EOF'
+# handlers/greet.luna — one handler = one user-facing action.
+
+import greeting
+
+fn greet_run() -> int
+    @msg = make_greeting("Luna")
+    shine(@msg)
+    return 0
+EOF
+    cat > "$name/tests/core/greeting_test.luna" <<'EOF'
+# tests/core/greeting_test.luna — mirror of core/greeting.luna.
+
+import greeting
+import test
+
+fn main() -> int
+    @p = 0
+    @f = 0
+    @msg = make_greeting("World")
+    @r = assert_eq_str("greets world", @msg, "Hello, World!")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    test_summary("greeting", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+EOF
+    cat > "$name/README.md" <<EOF
+# $(basename "$name")
+
+A layered Luna project.
+
+## Run
+
+    luna run
+
+## Test
+
+    luna run tests/core/greeting_test.luna
+
+## Layout
+
+See [docs/PROJECT_LAYOUT.md](https://github.com/anthropics/luna/blob/main/docs/PROJECT_LAYOUT.md).
+
+\`\`\`
+main.luna     composition root
+core/         pure domain (no I/O)
+lib/          utilities
+io/           HTTP, DB, files
+handlers/     one file per route/command
+tests/        mirrored test tree
+assets/       templates, migrations, static files
+scripts/      deploy/seed/one-off bash
+\`\`\`
+
+Import direction: \`main → handlers → io → lib → core\`. Never upward.
+EOF
+    _write_manifest_and_gitignore "$name" "main.luna"
+    echo "Created layered project '$name'."
+    echo "Next:"
+    echo "    cd $name"
+    echo "    luna run                                  # the app"
+    echo "    luna run tests/core/greeting_test.luna    # one test"
+}
+
+_new_lib() {
+    local name="$1"
+    # Module name is the project name with hyphens turned into underscores.
+    local module
+    module="$(printf '%s' "$name" | tr -c 'A-Za-z0-9_' '_')"
+    mkdir -p "$name"/{internal,tests/internal}
+    cat > "$name/$module.luna" <<EOF
+# $module.luna — public face of the library.
+#
+# Re-export what the library wants to publish. Anything in internal/
+# stays internal until you explicitly forward it from here.
+
+import parser
+
+# Public surface — list each exported function in a comment so users
+# can grep this file as a quick reference.
+#
+#   parse(@src) -> ParseResult
+EOF
+    cat > "$name/internal/parser.luna" <<'EOF'
+# internal/parser.luna — not part of the public API.
+
+fn parse(@src: int) -> int
+    return @src
+EOF
+    cat > "$name/tests/${module}_test.luna" <<EOF
+# tests/${module}_test.luna — exercises the public surface.
+
+import $module
+import test
+
+fn main() -> int
+    @p = 0
+    @f = 0
+    @r = assert_eq_str("parse identity", parse("hello"), "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    test_summary("$module", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+EOF
+    _write_manifest_and_gitignore "$name" "$module.luna"
+    echo "Created library project '$name'."
+    echo "Next:"
+    echo "    cd $name"
+    echo "    luna run tests/${module}_test.luna"
 }
 
 cmd_build() {
     _ensure_ready
     local src="${1:-main.luna}"
     [ -f "$src" ] || _die "source file not found: $src"
+
+    # Auto-discover paths to feed the import resolver:
+    #   1. Project subdirs (core/, lib/, io/, handlers/, ...) — supports
+    #      the layered layout described in docs/PROJECT_LAYOUT.md.
+    #   2. .luna/pkgs/* — vendored packages from `luna pkg add`.
+    # Done here (not globally) so non-build commands keep their env clean.
+    local extra_paths=""
+    local proj_paths pkg_paths
+    proj_paths="$(_discover_project_subdirs)"
+    [ -n "$proj_paths" ] && extra_paths="$proj_paths"
+    pkg_paths="$(_discover_pkg_paths)"
+    [ -n "$pkg_paths" ] && extra_paths="${extra_paths:+$extra_paths:}$pkg_paths"
+    if [ -n "$extra_paths" ]; then
+        if [ -n "${LUNA_PATH:-}" ]; then
+            export LUNA_PATH="$LUNA_PATH:$extra_paths"
+        else
+            export LUNA_PATH="$extra_paths"
+        fi
+    fi
+
     local base
     base="$(basename "$src" .luna)"
     local dir
@@ -153,6 +731,7 @@ case "$sub" in
     new)      cmd_new "$@" ;;
     build)    cmd_build "$@" ;;
     run)      cmd_run "$@" ;;
+    pkg)      cmd_pkg "$@" ;;
     version|--version|-V) cmd_version ;;
     help|--help|-h)       cmd_help ;;
     *)                    _die "unknown command: $sub  (try 'luna help')" ;;

@@ -1,0 +1,143 @@
+# Tests for std/std/random — xorshift PRNG + crypto random.
+
+import random
+import test
+
+
+fn run_random_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # --- PRNG ---------------------------------------------------------
+    # Deterministic: same seed -> same first value.
+    @a = rng_new(42)
+    @b = rng_new(42)
+    @r = assert_eq_int("same seed same next", rng_next(@a), rng_next(@b))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Different seeds -> different values (overwhelmingly likely).
+    @a = rng_new(1)
+    @b = rng_new(2)
+    @va = rng_next(@a)
+    @vb = rng_next(@b)
+    @diff = 0
+    if @va != @vb
+        @diff = 1
+    @r = assert_eq_int("different seeds differ", @diff, 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # rng_int uniformity smoke test (not statistical, just bounds).
+    @rng = rng_new(123)
+    @i = 0
+    @any_low = 0
+    @any_high = 0
+    while @i < 100
+        @v = rng_int(@rng, 100)
+        if @v < 10
+            @any_low = 1
+        if @v > 89
+            @any_high = 1
+        if @v < 0
+            @r = assert_true("rng_int non-negative", 0)
+            @p = @p + @r
+            @f = @f + (1 - @r)
+        if @v >= 100
+            @r = assert_true("rng_int < max", 0)
+            @p = @p + @r
+            @f = @f + (1 - @r)
+        @i = @i + 1
+    @r = assert_eq_int("rng_int hit low band",  @any_low, 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("rng_int hit high band", @any_high, 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # rng_range.
+    @rng = rng_new(999)
+    @v = rng_range(@rng, 10, 20)
+    @ok = 0
+    if @v >= 10
+        if @v < 20
+            @ok = 1
+    @r = assert_eq_int("rng_range in [10,20)", @ok, 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # rng_bool returns only 0 or 1.
+    @rng = rng_new(777)
+    @i = 0
+    @bad = 0
+    while @i < 50
+        @v = rng_bool(@rng)
+        if @v != 0
+            if @v != 1
+                @bad = 1
+        @i = @i + 1
+    @r = assert_eq_int("rng_bool 0 or 1", @bad, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- Crypto random ----------------------------------------------
+    @r = assert_eq_int("crypto_bytes len",  str_len(crypto_bytes(16)), 16)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("crypto_bytes 0",    str_len(crypto_bytes(0)),  0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("crypto_hex 32",     str_len(crypto_hex(16)),   32)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Two crypto calls must produce different output (probability of
+    # collision over 16 bytes is 2^-128).
+    @x = crypto_hex(16)
+    @y = crypto_hex(16)
+    @same = 1
+    if str_eq(@x, @y) == 0
+        @same = 0
+    @r = assert_eq_int("crypto unique",     @same, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Token alphabet check: only A-Z a-z 0-9 - _
+    @tok = crypto_token(32)
+    @tlen = str_len(@tok)
+    @bad = 0
+    @i = 0
+    while @i < @tlen
+        @c = str_byte(@tok, @i)
+        @good = 0
+        if @c >= 65
+            if @c <= 90
+                @good = 1
+        if @c >= 97
+            if @c <= 122
+                @good = 1
+        if @c >= 48
+            if @c <= 57
+                @good = 1
+        if @c == 45
+            @good = 1
+        if @c == 95
+            @good = 1
+        if @good == 0
+            @bad = 1
+        @i = @i + 1
+    @r = assert_eq_int("crypto_token alphabet ok", @bad, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("crypto_token nonempty", @tlen > 32)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("random", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_random_tests(0, 0)

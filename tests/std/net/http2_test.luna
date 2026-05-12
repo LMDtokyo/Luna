@@ -1,0 +1,278 @@
+# Unit tests for std/net/http2 — framing helpers, HPACK encode +
+# decode round-trips, and the static-table lookup. End-to-end coverage
+# (real h2c handshake against nghttpd) lives in tests/std/net/http2_e2e.sh.
+
+import http2
+import test
+
+
+# Build a one-byte buffer at index 0 with @v and return it.
+fn _mk1(@v: int) -> int
+    @b = new_str(1)
+    u8_set(@b, 0, @v)
+    return @b
+
+
+# Assertion: read big-endian 24-bit integer.
+fn t_be_helpers(@p: int, @f: int) -> int
+    @buf = new_str(4)
+    _h2_put_u24_be(@buf, 0, 0x123456)
+    @r = assert_eq_int("u24 byte0", u8_at(@buf, 0), 0x12)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("u24 byte1", u8_at(@buf, 1), 0x34)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("u24 byte2", u8_at(@buf, 2), 0x56)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("u24 round-trip", _h2_get_u24_be(@buf, 0), 0x123456)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @buf2 = new_str(4)
+    _h2_put_u32_be(@buf2, 0, 0x01020304)
+    @r = assert_eq_int("u32 round-trip", _h2_get_u32_be(@buf2, 0), 0x01020304)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @buf3 = new_str(2)
+    _h2_put_u16_be(@buf3, 0, 0x0A0B)
+    @r = assert_eq_int("u16 round-trip", _h2_get_u16_be(@buf3, 0), 0x0A0B)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    return @p * 1000 + @f
+
+
+# Test HPACK prefix-integer encoding (RFC 7541 §5.1).
+fn t_hpack_int(@p: int, @f: int) -> int
+    @buf = new_str(16)
+    # 10 in a 5-bit prefix with mask 0xE0 (dyn-size update form).
+    # Expected: single byte 0xEA (0b11101010).
+    @new_off = _h2_encode_int(@buf, 0, 10, 5, 0xE0)
+    @r = assert_eq_int("enc int(10,5,0xE0) len", @new_off, 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("enc int(10,5,0xE0) byte", u8_at(@buf, 0), 0xEA)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 1337 in a 5-bit prefix: spec example -> 31, 154, 10  (0x1F, 0x9A, 0x0A)
+    @new_off = _h2_encode_int(@buf, 0, 1337, 5, 0x00)
+    @r = assert_eq_int("enc int(1337,5) len", @new_off, 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("enc int(1337) b0", u8_at(@buf, 0), 0x1F)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("enc int(1337) b1", u8_at(@buf, 1), 0x9A)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("enc int(1337) b2", u8_at(@buf, 2), 0x0A)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Decode round-trip.
+    @scratch = new_str(4)
+    @first = u8_at(@buf, 0)
+    @val = _h2_decode_int(@buf, 1, 3, 5, @first, @scratch)
+    @r = assert_eq_int("dec int(1337) val", @val, 1337)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("dec int(1337) off", u32_at(@scratch, 0), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    return @p * 1000 + @f
+
+
+# Test HPACK literal-without-indexing emit + decode round-trip.
+fn t_hpack_literal(@p: int, @f: int) -> int
+    @buf = new_str(64)
+    @off = _h2_encode_header(@buf, 0, "x-custom", "hi")
+    # 0x00 type byte, then 8-byte name (length 8), then 2-byte value (length 2).
+    @r = assert_eq_int("lit header total bytes", @off, 13)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("lit byte 0 (type)", u8_at(@buf, 0), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("lit byte 1 (name len)", u8_at(@buf, 1), 8)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("lit name byte 'x'", u8_at(@buf, 2), 120)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("lit value len byte", u8_at(@buf, 10), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Decode it back. The encoded buffer is a complete header block.
+    let @h: H2Hdrs = _h2_decode_block(@buf, 0, @off)
+    @r = assert_eq_str("decode error empty", @h.error, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("decoded 1 entry", vec_len(@h.names), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decoded name", vec_get(@h.names, 0), "x-custom")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decoded value", vec_get(@h.values, 0), "hi")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    return @p * 1000 + @f
+
+
+# Indexed-header decode against the static table.
+fn t_hpack_indexed(@p: int, @f: int) -> int
+    # Single byte 0x82 = indexed 2 = (:method, GET).
+    @buf = _mk1(0x82)
+    let @h: H2Hdrs = _h2_decode_block(@buf, 0, 1)
+    @r = assert_eq_str("idx2 error empty", @h.error, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("idx2 yields 1 entry", vec_len(@h.names), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("idx2 name", vec_get(@h.names, 0), ":method")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("idx2 value", vec_get(@h.values, 0), "GET")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 0x88 = indexed 8 = (:status, 200).
+    @buf2 = _mk1(0x88)
+    let @h2: H2Hdrs = _h2_decode_block(@buf2, 0, 1)
+    @r = assert_eq_str("idx8 error empty", @h2.error, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("idx8 status=200", @h2.status, 200)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("idx8 :status value", vec_get(@h2.values, 0), "200")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    return @p * 1000 + @f
+
+
+# Huffman bit set -> decode rejects.
+fn t_hpack_huffman_rejected(@p: int, @f: int) -> int
+    # Literal-without-indexing prefix (0x00), name length 0x84 (huffman+len=4).
+    @buf = new_str(2)
+    u8_set(@buf, 0, 0x00)
+    u8_set(@buf, 1, 0x84)
+    let @h: H2Hdrs = _h2_decode_block(@buf, 0, 2)
+    @len = str_len(@h.error)
+    @r = assert_true("huffman rejected", @len)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    return @p * 1000 + @f
+
+
+# Preface is exactly 24 bytes and starts with "PRI".
+fn t_preface(@p: int, @f: int) -> int
+    @pre = _h2_preface()
+    @r = assert_eq_int("preface len", str_len(@pre), 24)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("preface b0", u8_at(@pre, 0), 80)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("preface b1", u8_at(@pre, 1), 82)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("preface b2", u8_at(@pre, 2), 73)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("preface b3", u8_at(@pre, 3), 32)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    return @p * 1000 + @f
+
+
+# Encode a full pseudo-header request block and verify the byte
+# layout: a 4-header block has 4 leading 0x00 type bytes.
+fn t_build_block(@p: int, @f: int) -> int
+    @block = _h2_build_headers_block("GET", "/", "http", "example.com", 0)
+    @r = assert_eq_int("block first byte", u8_at(@block, 0), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("block :method len byte", u8_at(@block, 1), 7)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    # Decode it back end-to-end.
+    let @h: H2Hdrs = _h2_decode_block(@block, 0, str_len(@block))
+    @r = assert_eq_str("block decode no error", @h.error, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("block decode 4 hdrs", vec_len(@h.names), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decoded :method", vec_get(@h.names, 0), ":method")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decoded GET",     vec_get(@h.values, 0), "GET")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decoded :authority", vec_get(@h.names, 3), ":authority")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decoded example.com", vec_get(@h.values, 3), "example.com")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    return @p * 1000 + @f
+
+
+# Connection-refused: h2_connect returns -1. The error string is set
+# *if* mmap-backed module state is available on this kernel (4.17+);
+# we don't hard-fail on a missing error string because that depends
+# on the runtime environment.
+fn t_connect_refused(@p: int, @f: int) -> int
+    @h = h2_connect("127.0.0.1", 1)
+    @r = assert_eq_int("refused -> -1", @h, -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    return @p * 1000 + @f
+
+
+fn main() -> int
+    @p = 0
+    @f = 0
+
+    @r = t_be_helpers(@p, @f)
+    @p = @r / 1000
+    @f = @r % 1000
+
+    @r = t_hpack_int(@p, @f)
+    @p = @r / 1000
+    @f = @r % 1000
+
+    @r = t_hpack_literal(@p, @f)
+    @p = @r / 1000
+    @f = @r % 1000
+
+    @r = t_hpack_indexed(@p, @f)
+    @p = @r / 1000
+    @f = @r % 1000
+
+    @r = t_hpack_huffman_rejected(@p, @f)
+    @p = @r / 1000
+    @f = @r % 1000
+
+    @r = t_preface(@p, @f)
+    @p = @r / 1000
+    @f = @r % 1000
+
+    @r = t_build_block(@p, @f)
+    @p = @r / 1000
+    @f = @r % 1000
+
+    @r = t_connect_refused(@p, @f)
+    @p = @r / 1000
+    @f = @r % 1000
+
+    test_summary("http2", @p, @f)
+    if @f > 0
+        return 1
+    return 0

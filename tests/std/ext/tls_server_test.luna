@@ -1,0 +1,73 @@
+# tests/std/ext/tls_server_test.luna — unit-level coverage for the TLS
+# server module. These tests don't need a running peer; they probe the
+# init / ctx_new / error-reporting paths to catch dlopen wiring bugs.
+#
+# Compile + run with:
+#     LUNA_MINI=$HOME/.luna/bin/luna-mini
+#     $LUNA_MINI tests/std/ext/tls_server_test.luna -o /tmp/tls_server_test.elf --dynamic
+#     /tmp/tls_server_test.elf
+#
+# The e2e handshake check lives in tls_server_e2e.sh.
+
+import tls_server
+import test
+
+
+fn main() -> int
+    @p = 0
+    @f = 0
+
+    # 1. tls_server_init succeeds (libssl.so.3 present in CI).
+    @rc = tls_server_init()
+    @r1 = assert_eq_int("init returns 0", @rc, 0)
+    @p = @p + @r1
+    @f = @f + (1 - @r1)
+
+    # 2. Calling init a second time is idempotent / cheap.
+    @rc2 = tls_server_init()
+    @r2 = assert_eq_int("init idempotent", @rc2, 0)
+    @p = @p + @r2
+    @f = @f + (1 - @r2)
+
+    # 3. Bad cert path -> ctx_ok == 0.
+    let @bad: TlsServerCtx = tls_server_ctx_new("/tmp/__nonexistent_cert__.pem", "/tmp/__nonexistent_key__.pem")
+    @r3 = assert_eq_int("missing cert -> ctx_ok 0", tls_server_ctx_ok(@bad), 0)
+    @p = @p + @r3
+    @f = @f + (1 - @r3)
+
+    # 4. Error message populated after the bad-cert call.
+    @err = tls_server_error()
+    @r4 = 1
+    if str_len(@err) == 0
+        @r4 = 0
+    @p = @p + @r4
+    @f = @f + (1 - @r4)
+    if @r4 == 1
+        shine("PASS error populated")
+    else
+        shine("FAIL error not populated")
+
+    # 5. tls_server_conn_ok returns 0 for a zero-initialised conn.
+    let @z: TlsServerConn = new_str(16)
+    @z.ssl = 0
+    @z.fd  = -1
+    @r5 = assert_eq_int("zero conn ok==0", tls_server_conn_ok(@z), 0)
+    @p = @p + @r5
+    @f = @f + (1 - @r5)
+
+    # 6. tls_server_close on a NULL ssl is a no-op (returns 0).
+    @r6 = assert_eq_int("close NULL ssl no-op", tls_server_close(@z), 0)
+    @p = @p + @r6
+    @f = @f + (1 - @r6)
+
+    # 7. tls_server_ctx_free on a NULL ctx is a no-op.
+    let @cz: TlsServerCtx = new_str(8)
+    @cz.ctx = 0
+    @r7 = assert_eq_int("ctx_free NULL no-op", tls_server_ctx_free(@cz), 0)
+    @p = @p + @r7
+    @f = @f + (1 - @r7)
+
+    test_summary("tls_server", @p, @f)
+    if @f > 0
+        return 1
+    return 0

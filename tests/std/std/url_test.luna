@@ -1,0 +1,67 @@
+# Tests for std/std/url.
+
+import url
+import test
+
+
+fn run_url_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # --- url_decode ----------------------------------------------------
+    @r = assert_eq_str("decode plain",      url_decode("hello"),               "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode empty",      url_decode(""),                    "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode %20",        url_decode("Hello%20World"),       "Hello World")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode plus",       url_decode("a+b+c"),               "a b c")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode mixed",      url_decode("a%20b+c%21"),          "a b c!")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode lowercase",  url_decode("%e2%9c%93"),           "✓")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode slash",      url_decode("a%2Fb"),               "a/b")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    # Invalid %-sequences pass through.
+    @r = assert_eq_str("decode short %",    url_decode("a%2"),                 "a%2")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode bad hex",    url_decode("a%ZZ"),                "a%ZZ")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- url_encode ----------------------------------------------------
+    @r = assert_eq_str("encode plain",      url_encode("abc123"),              "abc123")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("encode space",      url_encode("Hello World"),         "Hello%20World")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("encode special",    url_encode("a!b/c?"),              "a%21b%2Fc%3F")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("encode unreserved", url_encode("a-b_c.d~e"),           "a-b_c.d~e")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- round trip ----------------------------------------------------
+    @sample = "Hello, Luna! Path: /api/v1 with spaces & symbols."
+    @r = assert_eq_str("round trip", url_decode(url_encode(@sample)), @sample)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("url", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_url_tests(0, 0)

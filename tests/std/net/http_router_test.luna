@@ -1,0 +1,157 @@
+# Unit tests for std/net/http_router.
+# End-to-end exchange lives in tests/std/net/http_router_e2e.sh.
+
+import http_router
+import test
+
+
+# Dummy handlers used in the routing-table assertions. Each returns a
+# distinct sentinel via the cli fd channel so we can detect which one
+# the router picked. We never actually call them through a socket —
+# router_handle simply returns whatever the handler returns.
+fn _h_root(@req: HttpRequest, @cli: int) -> int
+    return 100
+
+fn _h_users(@req: HttpRequest, @cli: int) -> int
+    return 200
+
+fn _h_post(@req: HttpRequest, @cli: int) -> int
+    return 300
+
+fn _h_any(@req: HttpRequest, @cli: int) -> int
+    return 400
+
+fn _h_nf(@req: HttpRequest, @cli: int) -> int
+    return 999
+
+# Param-aware handler — returns 1000 if @req.params has id=42, else 0.
+fn _h_check_id_42(@req: HttpRequest, @cli: int) -> int
+    @id = req_param(@req, "id")
+    if str_eq(@id, "42") == 1
+        return 1000
+    return 0
+
+# Param-aware handler — returns 2000 if id=alice AND msg=hi.
+fn _h_check_two(@req: HttpRequest, @cli: int) -> int
+    @id = req_param(@req, "id")
+    @msg = req_param(@req, "msg")
+    if str_eq(@id, "alice") == 0
+        return 0
+    if str_eq(@msg, "hi") == 0
+        return 0
+    return 2000
+
+
+# Build a request struct for testing.
+fn _mk_req(@method: int, @path: int) -> HttpRequest
+    let @req: HttpRequest = new_str(56)
+    @req.method  = @method
+    @req.path    = @path
+    @req.version = "HTTP/1.1"
+    @req.headers = ""
+    @req.body    = ""
+    @req.params  = ""
+    @req.query   = ""
+    return @req
+
+
+fn run_router_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    let @router: Router = router_new()
+    router_get(@router,    "/",                    _h_root)
+    router_get(@router,    "/users",               _h_users)
+    router_post(@router,   "/users",               _h_post)
+    router_any(@router,    "/any",                 _h_any)
+    router_get(@router,    "/users/:id",           _h_check_id_42)
+    router_get(@router,    "/u/:id/msg/:msg",      _h_check_two)
+
+    # 1) GET / -> _h_root (100).
+    let @r1: HttpRequest = _mk_req("GET", "/")
+    @rc = router_handle(@router, @r1, -1)
+    @r = assert_eq_int("GET / -> root", @rc, 100)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) GET /users -> _h_users (200).
+    let @r2: HttpRequest = _mk_req("GET", "/users")
+    @rc = router_handle(@router, @r2, -1)
+    @r = assert_eq_int("GET /users -> users", @rc, 200)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) POST /users -> _h_post (300) — method discriminates.
+    let @r3: HttpRequest = _mk_req("POST", "/users")
+    @rc = router_handle(@router, @r3, -1)
+    @r = assert_eq_int("POST /users -> post", @rc, 300)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) DELETE /any -> _h_any (400) — wildcard method.
+    let @r4: HttpRequest = _mk_req("DELETE", "/any")
+    @rc = router_handle(@router, @r4, -1)
+    @r = assert_eq_int("DELETE /any -> any", @rc, 400)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) GET /missing -> default 404 path (returns whatever
+    #    http_send_404 returns; we don't have a real socket here, but
+    #    it must NOT match any earlier handler). The router does the
+    #    tcp_send_str(-1, ...) call which returns -1 from sys_write.
+    let @r5: HttpRequest = _mk_req("GET", "/missing")
+    router_set_not_found(@router, _h_nf)
+    @rc = router_handle(@router, @r5, -1)
+    @r = assert_eq_int("GET /missing -> not_found", @rc, 999)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) GET /users/42 -> matches /users/:id, handler sees id=42.
+    let @r6: HttpRequest = _mk_req("GET", "/users/42")
+    @rc = router_handle(@router, @r6, -1)
+    @r = assert_eq_int("GET /users/42 -> id captured", @rc, 1000)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7) GET /users/99 -> matches but id != 42, handler returns 0.
+    let @r7: HttpRequest = _mk_req("GET", "/users/99")
+    @rc = router_handle(@router, @r7, -1)
+    @r = assert_eq_int("GET /users/99 -> wrong id", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8) GET /u/alice/msg/hi -> two params captured.
+    let @r8: HttpRequest = _mk_req("GET", "/u/alice/msg/hi")
+    @rc = router_handle(@router, @r8, -1)
+    @r = assert_eq_int("GET /u/alice/msg/hi -> both", @rc, 2000)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 9) GET /u/alice/msg/bye -> first param right, second wrong.
+    let @r9: HttpRequest = _mk_req("GET", "/u/alice/msg/bye")
+    @rc = router_handle(@router, @r9, -1)
+    @r = assert_eq_int("GET /u/alice/msg/bye -> wrong msg", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 10) GET /users (no trailing segment) -> still hits literal /users.
+    let @r10: HttpRequest = _mk_req("GET", "/users")
+    @rc = router_handle(@router, @r10, -1)
+    @r = assert_eq_int("GET /users still literal", @rc, 200)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 11) GET /users/42/extra -> too long, falls to not_found.
+    let @r11: HttpRequest = _mk_req("GET", "/users/42/extra")
+    @rc = router_handle(@router, @r11, -1)
+    @r = assert_eq_int("over-long path -> not_found", @rc, 999)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("http_router", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_router_tests(0, 0)

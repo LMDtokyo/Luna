@@ -1,0 +1,62 @@
+# RFC 4648 test vectors for base64_encode / base64_decode.
+
+import base64
+import test
+
+
+fn run_base64_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # Encode round-trip across the RFC 4648 standard vectors.
+    @r = assert_eq_str("encode ''",       base64_encode(""),       "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("encode 'f'",      base64_encode("f"),      "Zg==")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("encode 'fo'",     base64_encode("fo"),     "Zm8=")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("encode 'foo'",    base64_encode("foo"),    "Zm9v")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("encode 'foob'",   base64_encode("foob"),   "Zm9vYg==")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("encode 'fooba'",  base64_encode("fooba"),  "Zm9vYmE=")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("encode 'foobar'", base64_encode("foobar"), "Zm9vYmFy")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Decode round-trip.
+    @r = assert_eq_str("decode 'Zg=='",     base64_decode("Zg=="),     "f")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode 'Zm8='",     base64_decode("Zm8="),     "fo")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode 'Zm9v'",     base64_decode("Zm9v"),     "foo")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode 'Zm9vYmFy'", base64_decode("Zm9vYmFy"), "foobar")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Token-style ASCII payload — useful sanity for session tokens.
+    @r = assert_eq_str("encode hello", base64_encode("Hello, Luna!"), "SGVsbG8sIEx1bmEh")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("decode hello", base64_decode("SGVsbG8sIEx1bmEh"), "Hello, Luna!")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("base64", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_base64_tests(0, 0)

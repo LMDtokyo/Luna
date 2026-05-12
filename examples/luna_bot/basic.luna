@@ -1,0 +1,46 @@
+# basic.luna — handlers that don't need any external API or input.
+# /start /help /about /ping /time /uptime /stats
+
+fn cmd_start(@token: int, @chat_id: int, @from_name: int) -> int
+    @greet = str_concat("hello *", @from_name)
+    @greet = str_concat(@greet, "* — I'm a bot written entirely in Luna.\nSend `/help` for the menu.")
+    send_markdown(@token, @chat_id, @greet)
+    return 0
+
+fn cmd_help(@token: int, @chat_id: int) -> int
+    send_markdown(@token, @chat_id, help_text())
+    return 0
+
+fn cmd_about(@token: int, @chat_id: int) -> int
+    send_markdown(@token, @chat_id, about_text())
+    return 0
+
+fn cmd_ping(@token: int, @chat_id: int) -> int
+    send_message(@token, @chat_id, "pong")
+    return 0
+
+fn cmd_time(@token: int, @chat_id: int) -> int
+    send_message(@token, @chat_id, str_concat("⏱ ", iso_timestamp()))
+    return 0
+
+fn cmd_uptime(@token: int, @chat_id: int) -> int
+    @started = _stat_get("started_at")
+    @secs = now_unix() - @started
+    @msg = str_concat("up for ", int_to_str(@secs))
+    @msg = str_concat(@msg, " seconds")
+    send_message(@token, @chat_id, @msg)
+    return 0
+
+fn cmd_stats(@token: int, @chat_id: int) -> int
+    @messages = _stat_get("messages")
+    @started = _stat_get("started_at")
+    @secs = now_unix() - @started
+    @s = "📊 *bot stats*\n"
+    @s = str_concat(@s, "messages handled: ")
+    @s = str_concat(@s, int_to_str(@messages))
+    @s = str_concat(@s, "\nuptime (s): ")
+    @s = str_concat(@s, int_to_str(@secs))
+    @s = str_concat(@s, "\ncurrent chat: ")
+    @s = str_concat(@s, int_to_str(@chat_id))
+    send_markdown(@token, @chat_id, @s)
+    return 0

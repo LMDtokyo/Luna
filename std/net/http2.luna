@@ -1,0 +1,1021 @@
+# tier: T5
+# deps: tcp, dns
+# ffi: none
+#
+# std/net/http2 — HTTP/2 cleartext (H2C) client in pure Luna.
+#
+# Scope (MVP — see PR notes):
+#   * Connection preface ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") + initial
+#     empty SETTINGS frame (prior-knowledge h2c, no Upgrade dance, no TLS).
+#   * Frame format: 9-byte header (length:24, type:8, flags:8,
+#     R:1+stream_id:31) followed by payload.
+#   * Frame types handled: DATA(0), HEADERS(1), SETTINGS(4), PING(6),
+#     GOAWAY(7), WINDOW_UPDATE(8). Other frame types (PRIORITY,
+#     RST_STREAM, PUSH_PROMISE, CONTINUATION) are silently consumed.
+#   * HPACK encoding: every header emitted as "literal without indexing"
+#     (0x00 + length-prefixed name + length-prefixed value, length is
+#     a 7-bit unsigned prefix per RFC 7541 §5.1 — string fits if len < 127).
+#   * HPACK decoding: handles indexed (1xxxxxxx) lookup against the
+#     static table, "literal with incremental indexing" (01xxxxxx),
+#     "literal without indexing" (0000xxxx), and "literal never
+#     indexed" (0001xxxx). Huffman-encoded strings -> error. Dynamic
+#     table updates are accepted parse-wise but the dynamic table is
+#     NOT populated (matches the spec's "static-only" promise; servers
+#     that depend on dynamic indexing for response headers will lose
+#     header fidelity).
+#   * Response collection: read frames until END_STREAM on our stream.
+#     Concatenate DATA payloads into the body. SETTINGS/PING/WINDOW
+#     frames from server are auto-acked. GOAWAY ends the connection.
+#
+# Out of scope (deferred):
+#   * Server push, priority, CONTINUATION, alt-svc.
+#   * Multiple in-flight streams on one connection. The client API is
+#     sequential: one h2_request at a time (next_stream_id increments
+#     so multiple sequential requests are fine).
+#   * Huffman coding (encoding always emits literals; decoding rejects).
+#   * Dynamic HPACK table.
+#   * ALPN / TLS — H2 over TLS lands when TLS 1.3 does.
+#
+# Public API:
+#     fn h2_connect(@host: int, @port: int) -> int
+#     fn h2_request(@conn: int, @method: int, @path: int, @host: int, @body: int) -> int
+#     fn h2_request_with_headers(@conn: int, @method: int, @path: int,
+#                                @host: int, @headers: int, @body: int) -> int
+#     fn h2_status(@resp: int) -> int
+#     fn h2_header(@resp: int, @name: int) -> int
+#     fn h2_body(@resp: int) -> int
+#     fn h2_close(@conn: int) -> int
+#     fn h2_error() -> int
+#
+# Caller gotcha:
+#   The handle types (H2Conn / H2Response) are structs. The functions
+#   above hide that — they take/return int pointers and accept any
+#   int-shaped value. Internally they cast via `let @c: H2Conn = ...`.
+
+import tcp
+import dns
+
+
+# Frame types.
+const H2_FRAME_DATA:           int = 0
+const H2_FRAME_HEADERS:        int = 1
+const H2_FRAME_PRIORITY:       int = 2
+const H2_FRAME_RST_STREAM:     int = 3
+const H2_FRAME_SETTINGS:       int = 4
+const H2_FRAME_PUSH_PROMISE:   int = 5
+const H2_FRAME_PING:           int = 6
+const H2_FRAME_GOAWAY:         int = 7
+const H2_FRAME_WINDOW_UPDATE:  int = 8
+const H2_FRAME_CONTINUATION:   int = 9
+
+# Frame flags (per-type — fortunately the bits we care about don't collide).
+const H2_FLAG_END_STREAM:  int = 1
+const H2_FLAG_ACK:         int = 1
+const H2_FLAG_END_HEADERS: int = 4
+const H2_FLAG_PADDED:      int = 8
+const H2_FLAG_PRIORITY:    int = 32
+
+# Limits.
+const H2_MAX_BODY:    int = 1048576
+const H2_RECV_BUF:    int = 16384
+
+
+# H2Conn — handle returned by h2_connect.
+#   fd:              connected TCP socket (or -1).
+#   next_stream_id:  next client stream id (odd: 1, 3, 5, ...).
+#   error:           last error string (used by h2_error()).
+struct H2Conn
+    fd:             int
+    next_stream_id: int
+    error:          int
+
+
+# H2Response — handle returned by h2_request.
+#   status:    HTTP status code, or -1 on parse/protocol failure.
+#   names:     Vec of header-name strings (lowercase).
+#   values:    Vec of header-value strings.
+#   body:      response body bytes.
+#   stream_id: the stream id used (debug aid).
+struct H2Response
+    status:    int
+    names:     int
+    values:    int
+    body:      int
+    stream_id: int
+
+
+# Last-error storage. Bootminor has no module-static variables, so we
+# reserve a single page at a fixed virtual address (high enough to be
+# clear of text, heap, and stack) via mmap with MAP_FIXED_NOREPLACE.
+# The flag means the first call wins; subsequent calls hit EEXIST,
+# which we treat as success (the page is already mapped and ours).
+#
+# Requires Linux >= 4.17 for MAP_FIXED_NOREPLACE. Bootminor is Linux/
+# x86_64-only anyway, so that's fine.
+
+const H2_ERR_SLOT_ADDR: int = 0x600000000000
+const H2_ERR_SLOT_LEN:  int = 4096
+# MAP_PRIVATE(2) | MAP_ANONYMOUS(0x20) | MAP_FIXED_NOREPLACE(0x100000)
+const H2_ERR_SLOT_FLAGS: int = 1048626
+
+# _h2_err_addr() -> stable 8-byte address that holds the last error
+# string pointer. Returns 0 if mmap fails.
+fn _h2_err_addr() -> int
+    @p = sys_mmap(H2_ERR_SLOT_ADDR, H2_ERR_SLOT_LEN, 3, H2_ERR_SLOT_FLAGS, 0 - 1, 0)
+    # Success: mmap returns the chosen address (== H2_ERR_SLOT_ADDR).
+    # EEXIST (-17): page already mapped by us on a prior call — still
+    # usable. Other errno: real failure.
+    if @p == H2_ERR_SLOT_ADDR
+        return H2_ERR_SLOT_ADDR
+    if @p == 0 - 17
+        return H2_ERR_SLOT_ADDR
+    return 0
+
+# Set the process-wide last error. Falls back to no-op if sys_brk
+# fails (which would be exotic).
+fn _h2_set_error_global(@msg: int) -> int
+    @addr = _h2_err_addr()
+    if @addr == 0
+        return 0
+    # Store the pointer at byte offset 0. Pointers are 8 bytes; we
+    # write them little-endian via per-byte u8_set.
+    @p = @msg
+    @i = 0
+    while @i < 8
+        u8_set(@addr, @i, @p & 255)
+        @p = @p >> 8
+        @i = @i + 1
+    return 0
+
+# h2_error() — return the last error string set globally. Empty
+# string if nothing has failed.
+fn h2_error() -> int
+    @addr = _h2_err_addr()
+    if @addr == 0
+        return ""
+    @p = 0
+    @i = 0
+    while @i < 8
+        @b = u8_at(@addr, @i)
+        @p = @p | (@b << (@i * 8))
+        @i = @i + 1
+    if @p == 0
+        return ""
+    return @p
+
+
+# === HPACK static table =================================================
+#
+# Per RFC 7541 Appendix A. Index 1..61 (we expose 0-based internally
+# but the wire uses 1-based). The table is built once on demand.
+# Names are lowercase ASCII; some entries have a value, others have
+# an empty value (means: the wire encoding pairs that name with a
+# literal value supplied inline).
+fn _h2_static_names() -> int
+    @v = vec_new()
+    vec_push(@v, ":authority")
+    vec_push(@v, ":method")
+    vec_push(@v, ":method")
+    vec_push(@v, ":path")
+    vec_push(@v, ":path")
+    vec_push(@v, ":scheme")
+    vec_push(@v, ":scheme")
+    vec_push(@v, ":status")
+    vec_push(@v, ":status")
+    vec_push(@v, ":status")
+    vec_push(@v, ":status")
+    vec_push(@v, ":status")
+    vec_push(@v, ":status")
+    vec_push(@v, ":status")
+    vec_push(@v, "accept-charset")
+    vec_push(@v, "accept-encoding")
+    vec_push(@v, "accept-language")
+    vec_push(@v, "accept-ranges")
+    vec_push(@v, "accept")
+    vec_push(@v, "access-control-allow-origin")
+    vec_push(@v, "age")
+    vec_push(@v, "allow")
+    vec_push(@v, "authorization")
+    vec_push(@v, "cache-control")
+    vec_push(@v, "content-disposition")
+    vec_push(@v, "content-encoding")
+    vec_push(@v, "content-language")
+    vec_push(@v, "content-length")
+    vec_push(@v, "content-location")
+    vec_push(@v, "content-range")
+    vec_push(@v, "content-type")
+    vec_push(@v, "cookie")
+    vec_push(@v, "date")
+    vec_push(@v, "etag")
+    vec_push(@v, "expect")
+    vec_push(@v, "expires")
+    vec_push(@v, "from")
+    vec_push(@v, "host")
+    vec_push(@v, "if-match")
+    vec_push(@v, "if-modified-since")
+    vec_push(@v, "if-none-match")
+    vec_push(@v, "if-range")
+    vec_push(@v, "if-unmodified-since")
+    vec_push(@v, "last-modified")
+    vec_push(@v, "link")
+    vec_push(@v, "location")
+    vec_push(@v, "max-forwards")
+    vec_push(@v, "proxy-authenticate")
+    vec_push(@v, "proxy-authorization")
+    vec_push(@v, "range")
+    vec_push(@v, "referer")
+    vec_push(@v, "refresh")
+    vec_push(@v, "retry-after")
+    vec_push(@v, "server")
+    vec_push(@v, "set-cookie")
+    vec_push(@v, "strict-transport-security")
+    vec_push(@v, "transfer-encoding")
+    vec_push(@v, "user-agent")
+    vec_push(@v, "vary")
+    vec_push(@v, "via")
+    vec_push(@v, "www-authenticate")
+    return @v
+
+fn _h2_static_values() -> int
+    @v = vec_new()
+    vec_push(@v, "")
+    vec_push(@v, "GET")
+    vec_push(@v, "POST")
+    vec_push(@v, "/")
+    vec_push(@v, "/index.html")
+    vec_push(@v, "http")
+    vec_push(@v, "https")
+    vec_push(@v, "200")
+    vec_push(@v, "204")
+    vec_push(@v, "206")
+    vec_push(@v, "304")
+    vec_push(@v, "400")
+    vec_push(@v, "404")
+    vec_push(@v, "500")
+    vec_push(@v, "")
+    vec_push(@v, "gzip, deflate")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    vec_push(@v, "")
+    return @v
+
+
+# === Big-endian helpers =================================================
+
+# Write a 24-bit unsigned int big-endian into @buf at @off.
+fn _h2_put_u24_be(@buf: int, @off: int, @v: int) -> int
+    u8_set(@buf, @off, (@v >> 16) & 255)
+    u8_set(@buf, @off + 1, (@v >> 8) & 255)
+    u8_set(@buf, @off + 2, @v & 255)
+    return 0
+
+# Write a 32-bit unsigned int big-endian into @buf at @off.
+fn _h2_put_u32_be(@buf: int, @off: int, @v: int) -> int
+    u8_set(@buf, @off, (@v >> 24) & 255)
+    u8_set(@buf, @off + 1, (@v >> 16) & 255)
+    u8_set(@buf, @off + 2, (@v >> 8) & 255)
+    u8_set(@buf, @off + 3, @v & 255)
+    return 0
+
+# Write a 16-bit unsigned int big-endian.
+fn _h2_put_u16_be(@buf: int, @off: int, @v: int) -> int
+    u8_set(@buf, @off, (@v >> 8) & 255)
+    u8_set(@buf, @off + 1, @v & 255)
+    return 0
+
+# Read a 24-bit unsigned big-endian int from @buf at @off.
+fn _h2_get_u24_be(@buf: int, @off: int) -> int
+    @b0 = u8_at(@buf, @off)
+    @b1 = u8_at(@buf, @off + 1)
+    @b2 = u8_at(@buf, @off + 2)
+    return (@b0 << 16) | (@b1 << 8) | @b2
+
+# Read a 32-bit unsigned big-endian int.
+fn _h2_get_u32_be(@buf: int, @off: int) -> int
+    @b0 = u8_at(@buf, @off)
+    @b1 = u8_at(@buf, @off + 1)
+    @b2 = u8_at(@buf, @off + 2)
+    @b3 = u8_at(@buf, @off + 3)
+    return (@b0 << 24) | (@b1 << 16) | (@b2 << 8) | @b3
+
+# Read a 16-bit unsigned big-endian int.
+fn _h2_get_u16_be(@buf: int, @off: int) -> int
+    @b0 = u8_at(@buf, @off)
+    @b1 = u8_at(@buf, @off + 1)
+    return (@b0 << 8) | @b1
+
+
+# === Connection-preface plumbing ========================================
+
+# Build the 24-byte connection preface "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".
+# We construct via str_concat so the source stays readable; the
+# resulting buffer is exactly 24 bytes.
+fn _h2_preface() -> int
+    @p = str_concat("PRI * HTTP/2.0\r\n\r\n", "SM\r\n\r\n")
+    return @p
+
+# Send a frame header + payload.
+#   @fd, @type, @flags, @stream_id, @payload (str), @payload_len.
+# Returns 0 on success, -1 on send failure.
+fn _h2_send_frame(@fd: int, @type: int, @flags: int, @stream_id: int, @payload: int, @plen: int) -> int
+    @hdr = new_str(9)
+    _h2_put_u24_be(@hdr, 0, @plen)
+    u8_set(@hdr, 3, @type)
+    u8_set(@hdr, 4, @flags)
+    _h2_put_u32_be(@hdr, 5, @stream_id & 2147483647)
+    if tcp_send_all(@fd, @hdr, 9) < 0
+        return -1
+    if @plen > 0
+        if tcp_send_all(@fd, @payload, @plen) < 0
+            return -1
+    return 0
+
+
+# Read exactly @n bytes into @buf. Returns 0 on success, -1 on EOF or error.
+fn _h2_read_exact(@fd: int, @buf: int, @n: int) -> int
+    @got = 0
+    while @got < @n
+        @r = sys_read(@fd, @buf + @got, @n - @got)
+        if @r <= 0
+            return -1
+        @got = @got + @r
+    return 0
+
+
+# === HPACK encoder ======================================================
+#
+# Spec MVP: every header is emitted as "literal without indexing"
+# (first byte = 0x00, then name as 7-bit-prefix-length-prefixed octets,
+# then value the same way). Strings must be <= 126 octets each for the
+# fast path; longer strings use the multi-byte ULEB encoding from
+# RFC 7541 §5.1.
+
+# _h2_encode_int(@buf, @off, @value, @prefix_bits, @first_byte_mask)
+#   Writes a 7541 §5.1 prefix integer into @buf starting at @off.
+#   @prefix_bits is the bit-width of the integer's first slice
+#   (1..8). @first_byte_mask is OR'd into the first byte (e.g. 0x00
+#   for literal-without-indexing, 0x40 for literal-with-indexing).
+#   Returns the new offset (off + bytes_written).
+fn _h2_encode_int(@buf: int, @off: int, @value: int, @prefix_bits: int, @first_byte_mask: int) -> int
+    @max_prefix = (1 << @prefix_bits) - 1
+    if @value < @max_prefix
+        u8_set(@buf, @off, @first_byte_mask | @value)
+        return @off + 1
+    u8_set(@buf, @off, @first_byte_mask | @max_prefix)
+    @off = @off + 1
+    @v = @value - @max_prefix
+    while @v >= 128
+        u8_set(@buf, @off, (@v & 127) | 128)
+        @v = @v >> 7
+        @off = @off + 1
+    u8_set(@buf, @off, @v)
+    return @off + 1
+
+# _h2_encode_string(@buf, @off, @s) — write a length-prefixed string
+# (huffman bit = 0) into @buf. Returns new offset.
+fn _h2_encode_string(@buf: int, @off: int, @s: int) -> int
+    @slen = str_len(@s)
+    @off = _h2_encode_int(@buf, @off, @slen, 7, 0)
+    @i = 0
+    while @i < @slen
+        u8_set(@buf, @off + @i, str_byte(@s, @i))
+        @i = @i + 1
+    return @off + @slen
+
+# Compute the upper-bound encoded size of a "literal without indexing"
+# header (name_len + value_len + 1 type byte + up to 5 length bytes
+# for each string).
+fn _h2_header_max_size(@name: int, @value: int) -> int
+    return str_len(@name) + str_len(@value) + 16
+
+# _h2_encode_header(@buf, @off, @name, @value) — emit one header as
+# literal without indexing (first byte 0x00). Returns new offset.
+fn _h2_encode_header(@buf: int, @off: int, @name: int, @value: int) -> int
+    @off = _h2_encode_int(@buf, @off, 0, 4, 0)
+    @off = _h2_encode_string(@buf, @off, @name)
+    @off = _h2_encode_string(@buf, @off, @value)
+    return @off
+
+
+# === HPACK decoder ======================================================
+
+# H2Hdrs — output of a HEADERS-block decode. Two parallel Vecs (names,
+# values) and a numeric status when :status was seen.
+struct H2Hdrs
+    names:  int
+    values: int
+    status: int
+    error:  int
+
+# _h2_decode_int(@buf, @off, @end, @prefix_bits, @first_byte)
+#   Decode a 7541 prefix integer. The caller has already read the
+#   first byte into @first_byte. Returns the integer value via the
+#   return value; writes the new offset into u32 at slot @off_out
+#   (we pass it via a tiny scratch buffer to keep things one-int-
+#   wide). On error returns -1 and sets @off_out to -1.
+fn _h2_decode_int(@buf: int, @off: int, @end: int, @prefix_bits: int, @first_byte: int, @off_out: int) -> int
+    @max_prefix = (1 << @prefix_bits) - 1
+    @val = @first_byte & @max_prefix
+    if @val < @max_prefix
+        u32_set(@off_out, 0, @off)
+        return @val
+    @m = 0
+    @cur = @off
+    while @cur < @end
+        @b = u8_at(@buf, @cur)
+        @cur = @cur + 1
+        @val = @val + ((@b & 127) << @m)
+        @m = @m + 7
+        if (@b & 128) == 0
+            u32_set(@off_out, 0, @cur)
+            return @val
+        if @m > 28
+            u32_set(@off_out, 0, -1)
+            return -1
+    u32_set(@off_out, 0, -1)
+    return -1
+
+# _h2_decode_string(@buf, @off, @end, @off_out) — decode a length-
+# prefixed string. Errors if the Huffman bit (top bit of first byte)
+# is set, since this MVP doesn't implement Huffman.
+fn _h2_decode_string(@buf: int, @off: int, @end: int, @off_out: int) -> int
+    if @off >= @end
+        u32_set(@off_out, 0, -1)
+        return ""
+    @first = u8_at(@buf, @off)
+    @huff = @first & 128
+    if @huff != 0
+        u32_set(@off_out, 0, -1)
+        return ""
+    @off = @off + 1
+    @slen = _h2_decode_int(@buf, @off, @end, 7, @first, @off_out)
+    if @slen < 0
+        return ""
+    @new_off = u32_at(@off_out, 0)
+    if @new_off < 0
+        return ""
+    if @new_off + @slen > @end
+        u32_set(@off_out, 0, -1)
+        return ""
+    @s = str_substr(@buf, @new_off, @slen)
+    u32_set(@off_out, 0, @new_off + @slen)
+    return @s
+
+# Convert an ASCII numeric string to int. Returns -1 on parse error.
+fn _h2_atoi(@s: int) -> int
+    @n = str_len(@s)
+    if @n == 0
+        return -1
+    @i = 0
+    @v = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c < 48
+            return -1
+        if @c > 57
+            return -1
+        @v = @v * 10 + (@c - 48)
+        @i = @i + 1
+    return @v
+
+# Append (name, value) to the decoded header pair. If the name is
+# ":status" we parse it and store the integer in @hdrs.status.
+fn _h2_append_decoded(@hdrs: H2Hdrs, @name: int, @value: int) -> int
+    vec_push(@hdrs.names, @name)
+    vec_push(@hdrs.values, @value)
+    if str_eq(@name, ":status") == 1
+        @code = _h2_atoi(@value)
+        @hdrs.status = @code
+    return 0
+
+# Process an indexed-header instruction. @off has already advanced past
+# the first byte; @first is that byte. Returns the new offset, or -1
+# on error (with @h.error set).
+fn _h2_decode_indexed(@h: H2Hdrs, @snames: int, @svalues: int, @buf: int, @off: int, @end: int, @first: int, @scratch: int) -> int
+    @idx = _h2_decode_int(@buf, @off, @end, 7, @first, @scratch)
+    if @idx < 0
+        @h.error = "hpack: malformed indexed int"
+        return -1
+    @off = u32_at(@scratch, 0)
+    if @idx < 1
+        @h.error = "hpack: index 0 reserved"
+        return -1
+    if @idx > vec_len(@snames)
+        @h.error = "hpack: dynamic table index unsupported"
+        return -1
+    @name  = vec_get(@snames, @idx - 1)
+    @value = vec_get(@svalues, @idx - 1)
+    _h2_append_decoded(@h, @name, @value)
+    return @off
+
+# Resolve a literal header's name component. @idx==0 means "name is a
+# fresh literal string"; otherwise look up the static table. On
+# success, stashes the new offset into @scratch[0..4) and returns the
+# name string. On error returns "" (caller inspects @scratch).
+fn _h2_decode_literal_name(@h: H2Hdrs, @snames: int, @buf: int, @off: int, @end: int, @idx: int, @scratch: int) -> int
+    if @idx == 0
+        @name = _h2_decode_string(@buf, @off, @end, @scratch)
+        @nn = u32_at(@scratch, 0)
+        if @nn > 2147483647
+            @h.error = "hpack: huffman or short name"
+            return ""
+        return @name
+    if @idx > vec_len(@snames)
+        @h.error = "hpack: dynamic name index unsupported"
+        u32_set(@scratch, 0, -1)
+        return ""
+    u32_set(@scratch, 0, @off)
+    return vec_get(@snames, @idx - 1)
+
+# Process a literal-header instruction (01xxxxxx, 0000xxxx, 0001xxxx).
+# Returns the new offset, or -1 on error.
+fn _h2_decode_literal(@h: H2Hdrs, @snames: int, @buf: int, @off: int, @end: int, @first: int, @prefix_bits: int, @scratch: int) -> int
+    @idx = _h2_decode_int(@buf, @off, @end, @prefix_bits, @first, @scratch)
+    if @idx < 0
+        @h.error = "hpack: malformed literal idx"
+        return -1
+    @off = u32_at(@scratch, 0)
+    @name = _h2_decode_literal_name(@h, @snames, @buf, @off, @end, @idx, @scratch)
+    @off = u32_at(@scratch, 0)
+    if @off > 2147483647
+        return -1
+    if str_len(@h.error) > 0
+        return -1
+    @value = _h2_decode_string(@buf, @off, @end, @scratch)
+    @vv = u32_at(@scratch, 0)
+    if @vv > 2147483647
+        @h.error = "hpack: huffman or short value"
+        return -1
+    _h2_append_decoded(@h, @name, @value)
+    return @vv
+
+# Decode one HPACK header block (the payload of HEADERS frame, after
+# any PRIORITY/PADDED stripping). Returns an H2Hdrs.
+fn _h2_decode_block(@buf: int, @off: int, @end: int) -> H2Hdrs
+    let @h: H2Hdrs = new_str(32)
+    @h.names  = vec_new()
+    @h.values = vec_new()
+    @h.status = -1
+    @h.error  = ""
+
+    @snames  = _h2_static_names()
+    @svalues = _h2_static_values()
+    @scratch = new_str(4)
+
+    while @off < @end
+        @first = u8_at(@buf, @off)
+        @off = @off + 1
+
+        if (@first & 128) != 0
+            # 1xxxxxxx — indexed header field.
+            @off = _h2_decode_indexed(@h, @snames, @svalues, @buf, @off, @end, @first, @scratch)
+            if @off < 0
+                return @h
+        else
+            @top3 = @first & 224
+            @top2 = @first & 192
+            if @top3 == 32
+                # 001xxxxx — dynamic-table-size update; consume and skip.
+                @sz = _h2_decode_int(@buf, @off, @end, 5, @first, @scratch)
+                if @sz < 0
+                    @h.error = "hpack: malformed dyn-size update"
+                    return @h
+                @off = u32_at(@scratch, 0)
+            else
+                # 01xxxxxx -> 6-bit prefix, otherwise 4-bit.
+                @pb = 4
+                if @top2 == 64
+                    @pb = 6
+                @off = _h2_decode_literal(@h, @snames, @buf, @off, @end, @first, @pb, @scratch)
+                if @off < 0
+                    return @h
+    return @h
+
+
+# === SETTINGS / preface handshake =======================================
+
+# _h2_read_frame_into(@fd, @hdr, @payload_out) — read header + payload.
+# @payload_out is a one-int cell that receives the payload pointer.
+# Returns the payload length, or -1 on error. Caller already allocated
+# the 9-byte @hdr buffer.
+fn _h2_read_frame_into(@fd: int, @hdr: int, @payload_out: int) -> int
+    if _h2_read_exact(@fd, @hdr, 9) < 0
+        return -1
+    @plen = _h2_get_u24_be(@hdr, 0)
+    @payload = new_str(@plen)
+    if @plen > 0
+        if _h2_read_exact(@fd, @payload, @plen) < 0
+            return -1
+    u64_set(@payload_out, 0, @payload)
+    return @plen
+
+# Send a SETTINGS ack. Helper to keep _h2_do_handshake's nesting shallow.
+fn _h2_send_settings_ack(@fd: int) -> int
+    return _h2_send_frame(@fd, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, "", 0)
+
+# Send a PING ack with the original 8-byte opaque data.
+fn _h2_send_ping_ack(@fd: int, @payload: int, @plen: int) -> int
+    return _h2_send_frame(@fd, H2_FRAME_PING, H2_FLAG_ACK, 0, @payload, @plen)
+
+# After we send PREFACE + empty SETTINGS, the server MUST send its own
+# SETTINGS frame first. We read frames until we've seen one SETTINGS
+# from the server, then ack it. Returns 0 on success, -1 on protocol
+# error.
+fn _h2_do_handshake(@fd: int) -> int
+    @pre = _h2_preface()
+    if tcp_send_all(@fd, @pre, 24) < 0
+        return -1
+    if _h2_send_frame(@fd, H2_FRAME_SETTINGS, 0, 0, "", 0) < 0
+        return -1
+
+    @hdr = new_str(9)
+    @pcell = new_str(8)
+    @saw_settings = 0
+    while @saw_settings == 0
+        @plen = _h2_read_frame_into(@fd, @hdr, @pcell)
+        if @plen < 0
+            return -1
+        @ftype = u8_at(@hdr, 3)
+        @flags = u8_at(@hdr, 4)
+        @payload = u64_get(@pcell, 0)
+
+        if @ftype == H2_FRAME_GOAWAY
+            return -1
+        if @ftype == H2_FRAME_SETTINGS
+            if (@flags & H2_FLAG_ACK) == 0
+                if _h2_send_settings_ack(@fd) < 0
+                    return -1
+                @saw_settings = 1
+        if @ftype == H2_FRAME_PING
+            if (@flags & H2_FLAG_ACK) == 0
+                _h2_send_ping_ack(@fd, @payload, @plen)
+    return 0
+
+
+# === Public API =========================================================
+
+# h2_connect(@host, @port) — open H2C connection, do preface +
+# SETTINGS handshake, return a conn handle (as int). On failure
+# returns -1 and stashes an error string retrievable via h2_error().
+fn h2_connect(@host: int, @port: int) -> int
+    let @c: H2Conn = new_str(24)
+    @c.fd = -1
+    @c.next_stream_id = 1
+    @c.error = ""
+
+    # @host may be a dotted-quad IP or a hostname. Try IP parse first.
+    @ip = tcp_parse_ipv4(@host)
+    if @ip < 0
+        # Not an IP; try DNS.
+        @resolved = dns_resolve(@host)
+        if str_len(@resolved) == 0
+            _h2_set_error_global("h2_connect: dns resolve failed")
+            return -1
+        @host = @resolved
+
+    @fd = tcp_connect(@host, @port)
+    if @fd < 0
+        _h2_set_error_global("h2_connect: tcp connect failed")
+        return -1
+
+    # Set a recv timeout (5s) so a broken peer doesn't hang us.
+    @tv = new_str(16)
+    u8_set(@tv, 0, 5)
+    sys_setsockopt(@fd, 1, 20, @tv, 16)
+
+    if _h2_do_handshake(@fd) < 0
+        tcp_close(@fd)
+        _h2_set_error_global("h2_connect: handshake failed")
+        return -1
+
+    @c.fd = @fd
+    return @c
+
+
+# _h2_build_headers_block(@method, @path, @scheme, @authority, @hdrs)
+#   Encode the pseudo-headers + user headers into a single payload buffer.
+#   @hdrs is a Vec where entries alternate name, value, name, value, ...
+#   Returns a str_substr-sized buffer of exactly the encoded bytes.
+fn _h2_build_headers_block(@method: int, @path: int, @scheme: int, @authority: int, @hdrs: int) -> int
+    # Compute an upper bound for the buffer.
+    @cap = _h2_header_max_size(":method", @method)
+    @cap = @cap + _h2_header_max_size(":path", @path)
+    @cap = @cap + _h2_header_max_size(":scheme", @scheme)
+    @cap = @cap + _h2_header_max_size(":authority", @authority)
+    if @hdrs != 0
+        @n = vec_len(@hdrs)
+        @i = 0
+        while @i < @n
+            @kk = vec_get(@hdrs, @i)
+            @vv = vec_get(@hdrs, @i + 1)
+            @cap = @cap + _h2_header_max_size(@kk, @vv)
+            @i = @i + 2
+    @buf = new_str(@cap)
+    @off = 0
+    @off = _h2_encode_header(@buf, @off, ":method", @method)
+    @off = _h2_encode_header(@buf, @off, ":scheme", @scheme)
+    @off = _h2_encode_header(@buf, @off, ":path", @path)
+    @off = _h2_encode_header(@buf, @off, ":authority", @authority)
+    if @hdrs != 0
+        @n = vec_len(@hdrs)
+        @i = 0
+        while @i < @n
+            @kk = vec_get(@hdrs, @i)
+            @vv = vec_get(@hdrs, @i + 1)
+            @off = _h2_encode_header(@buf, @off, @kk, @vv)
+            @i = @i + 2
+    return str_substr(@buf, 0, @off)
+
+
+# Send the HEADERS frame (always with END_HEADERS; END_STREAM if no body).
+fn _h2_send_headers(@fd: int, @sid: int, @block: int, @end_stream: int) -> int
+    @flags = H2_FLAG_END_HEADERS
+    if @end_stream != 0
+        @flags = @flags | H2_FLAG_END_STREAM
+    return _h2_send_frame(@fd, H2_FRAME_HEADERS, @flags, @sid, @block, str_len(@block))
+
+
+# Send a single DATA frame with END_STREAM set.
+fn _h2_send_data(@fd: int, @sid: int, @body: int) -> int
+    @blen = str_len(@body)
+    return _h2_send_frame(@fd, H2_FRAME_DATA, H2_FLAG_END_STREAM, @sid, @body, @blen)
+
+
+# Process one frame after the request has been sent. Updates @resp in
+# place. Returns 1 if END_STREAM was seen on our stream (caller should
+# stop), 0 to keep reading, -1 on protocol error.
+fn _h2_handle_frame(@fd: int, @sid: int, @resp: H2Response, @body_acc: int) -> int
+    @hdr = new_str(9)
+    if _h2_read_exact(@fd, @hdr, 9) < 0
+        return -1
+    @plen   = _h2_get_u24_be(@hdr, 0)
+    @ftype  = u8_at(@hdr, 3)
+    @flags  = u8_at(@hdr, 4)
+    @fsid   = _h2_get_u32_be(@hdr, 5) & 2147483647
+
+    @payload = new_str(@plen)
+    if @plen > 0
+        if _h2_read_exact(@fd, @payload, @plen) < 0
+            return -1
+
+    if @ftype == H2_FRAME_SETTINGS
+        if (@flags & H2_FLAG_ACK) == 0
+            _h2_send_frame(@fd, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, "", 0)
+        return 0
+    if @ftype == H2_FRAME_PING
+        if (@flags & H2_FLAG_ACK) == 0
+            _h2_send_frame(@fd, H2_FRAME_PING, H2_FLAG_ACK, 0, @payload, @plen)
+        return 0
+    if @ftype == H2_FRAME_WINDOW_UPDATE
+        return 0
+    if @ftype == H2_FRAME_GOAWAY
+        # Server is shutting us down. If it's on stream 0 we treat it
+        # as fatal (we have no other streams in this MVP).
+        return -1
+    if @ftype == H2_FRAME_RST_STREAM
+        if @fsid == @sid
+            _h2_set_error_global("h2: stream reset by server")
+            return -1
+        return 0
+    if @ftype == H2_FRAME_HEADERS
+        if @fsid != @sid
+            return 0
+        # Strip PADDED / PRIORITY if present.
+        @start = 0
+        @end = @plen
+        if (@flags & H2_FLAG_PADDED) != 0
+            @pad = u8_at(@payload, 0)
+            @start = 1
+            @end = @end - @pad
+        if (@flags & H2_FLAG_PRIORITY) != 0
+            @start = @start + 5
+        if @end < @start
+            return -1
+        let @h: H2Hdrs = _h2_decode_block(@payload, @start, @end)
+        if str_len(@h.error) > 0
+            _h2_set_error_global(@h.error)
+            return -1
+        @resp.status = @h.status
+        @resp.names  = @h.names
+        @resp.values = @h.values
+        if (@flags & H2_FLAG_END_STREAM) != 0
+            return 1
+        return 0
+    if @ftype == H2_FRAME_DATA
+        if @fsid != @sid
+            return 0
+        @start = 0
+        @end = @plen
+        if (@flags & H2_FLAG_PADDED) != 0
+            @pad = u8_at(@payload, 0)
+            @start = 1
+            @end = @end - @pad
+        if @end > @start
+            @chunk = str_substr(@payload, @start, @end - @start)
+            strbuf_add_str(@body_acc, @chunk)
+        if (@flags & H2_FLAG_END_STREAM) != 0
+            return 1
+        return 0
+    # Unknown frame type — RFC says ignore.
+    return 0
+
+
+# h2_request_with_headers — full-feature request.
+#   @conn:     handle from h2_connect.
+#   @method:   "GET", "POST", ...
+#   @path:     ":path" pseudo-header value.
+#   @host:     ":authority" pseudo-header value.
+#   @headers:  Vec of alternating name,value strings (or 0).
+#   @body:     request body bytes (empty string means no body).
+# Returns an H2Response handle (as int), or -1 on protocol failure.
+fn h2_request_with_headers(@conn: int, @method: int, @path: int, @host: int, @headers: int, @body: int) -> int
+    if @conn <= 0
+        _h2_set_error_global("h2_request: bad conn")
+        return -1
+    let @c: H2Conn = @conn
+    @fd = @c.fd
+    if @fd < 0
+        _h2_set_error_global("h2_request: conn not open")
+        return -1
+
+    @sid = @c.next_stream_id
+    @c.next_stream_id = @sid + 2
+
+    @block = _h2_build_headers_block(@method, @path, "http", @host, @headers)
+    @has_body = 0
+    if str_len(@body) > 0
+        @has_body = 1
+    @es = 1 - @has_body
+
+    if _h2_send_headers(@fd, @sid, @block, @es) < 0
+        _h2_set_error_global("h2_request: send headers failed")
+        return -1
+    if @has_body == 1
+        if _h2_send_data(@fd, @sid, @body) < 0
+            _h2_set_error_global("h2_request: send data failed")
+            return -1
+
+    let @resp: H2Response = new_str(40)
+    @resp.status = -1
+    @resp.names = vec_new()
+    @resp.values = vec_new()
+    @resp.body = ""
+    @resp.stream_id = @sid
+
+    @body_acc = strbuf_new()
+
+    @done = 0
+    while @done == 0
+        @r = _h2_handle_frame(@fd, @sid, @resp, @body_acc)
+        if @r < 0
+            return -1
+        if @r == 1
+            @done = 1
+
+    @resp.body = strbuf_done(@body_acc)
+    return @resp
+
+
+# h2_request — bodyless / convenience variant. Pass body="" for GET.
+fn h2_request(@conn: int, @method: int, @path: int, @host: int, @body: int) -> int
+    return h2_request_with_headers(@conn, @method, @path, @host, 0, @body)
+
+
+# h2_status(@resp) -> integer status code, or -1.
+fn h2_status(@resp: int) -> int
+    if @resp <= 0
+        return -1
+    let @r: H2Response = @resp
+    return @r.status
+
+# h2_body(@resp) -> response body string ("" if none).
+fn h2_body(@resp: int) -> int
+    if @resp <= 0
+        return ""
+    let @r: H2Response = @resp
+    return @r.body
+
+# _h2_ascii_lower_eq(@a, @b) -> 1 if ASCII-lowercased @a equals @b.
+# Assumes @b is already lowercase (caller normalises). Used only by
+# the header lookup path.
+fn _h2_ascii_lower_eq(@a: int, @b: int) -> int
+    @la = str_len(@a)
+    @lb = str_len(@b)
+    if @la != @lb
+        return 0
+    @i = 0
+    while @i < @la
+        @ca = str_byte(@a, @i)
+        if @ca >= 65
+            if @ca <= 90
+                @ca = @ca + 32
+        if @ca != str_byte(@b, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+# _h2_to_lower(@s) -> a freshly allocated lowercase copy of @s.
+fn _h2_to_lower(@s: int) -> int
+    @n = str_len(@s)
+    @out = new_str(@n)
+    @i = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c >= 65
+            if @c <= 90
+                @c = @c + 32
+        u8_set(@out, @i, @c)
+        @i = @i + 1
+    return @out
+
+# h2_header(@resp, @name) -> header value (case-insensitive lookup),
+# or "" if absent.
+fn h2_header(@resp: int, @name: int) -> int
+    if @resp <= 0
+        return ""
+    let @r: H2Response = @resp
+    @lname = _h2_to_lower(@name)
+    @names = @r.names
+    @values = @r.values
+    @n = vec_len(@names)
+    @i = 0
+    while @i < @n
+        @hn = vec_get(@names, @i)
+        if _h2_ascii_lower_eq(@hn, @lname) == 1
+            return vec_get(@values, @i)
+        @i = @i + 1
+    return ""
+
+
+# h2_close — send GOAWAY (best-effort) and close the socket.
+fn h2_close(@conn: int) -> int
+    if @conn <= 0
+        return 0
+    let @c: H2Conn = @conn
+    @fd = @c.fd
+    if @fd < 0
+        return 0
+    # Best-effort GOAWAY (last-stream-id=0, error code 0, no debug).
+    @ga = new_str(8)
+    _h2_put_u32_be(@ga, 0, 0)
+    _h2_put_u32_be(@ga, 4, 0)
+    _h2_send_frame(@fd, H2_FRAME_GOAWAY, 0, 0, @ga, 8)
+    tcp_close(@fd)
+    @c.fd = -1
+    return 0
+
+
+# === Header-list helpers (caller convenience) ===========================
+
+# h2_headers_new() -> a fresh Vec of name/value pairs to feed
+# h2_request_with_headers. Use h2_headers_add to populate.
+fn h2_headers_new() -> int
+    return vec_new()
+
+# h2_headers_add(@hdrs, @name, @value) -> @hdrs (chainable).
+fn h2_headers_add(@hdrs: int, @name: int, @value: int) -> int
+    vec_push(@hdrs, @name)
+    vec_push(@hdrs, @value)
+    return @hdrs

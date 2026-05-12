@@ -1,0 +1,370 @@
+# tier: T6
+# deps: base64, tcp, http_server
+# ffi: none
+#
+# std/ext/websocket — WebSocket (RFC 6455) frame codec, handshake
+# helper, and minimal server-side send/recv built on std/net/tcp.
+#
+# Public surface:
+#   ws_accept_key(@client_key)           -> Sec-WebSocket-Accept value
+#   ws_handshake_response(@client_key)   -> full 101 Switching Protocols
+#   ws_encode_text(@text)                -> outbound text frame bytes
+#   ws_encode_binary(@data)              -> outbound binary frame bytes
+#   ws_encode_frame(@opcode, @payload)   -> any opcode (0x8 close, etc.)
+#   ws_decode_frame(@buf, @off)          -> Vec [opcode, payload, next_off]
+#   ws_upgrade(@req, @cli)               -> 1 on success, 0 on failure
+#   ws_send_text / _binary / _close      -> wrap encode + tcp_send_str
+#   ws_recv_text(@cli, @buf, @cap)       -> next payload string, or ""
+#
+# RFC 6455's handshake requires SHA-1 (not SHA-256), so a self-contained
+# implementation (`_ws_sha1_raw`) ships below.
+
+import base64
+import tcp
+import http_server
+
+
+# --- private bit helpers ------------------------------------------------
+
+fn _ws_rotl32(@x: int, @n: int) -> int
+    @mask = 4294967295
+    @x = @x & @mask
+    return (((@x << @n) & @mask) | (@x >> (32 - @n))) & @mask
+
+fn _ws_be32_load(@buf: int, @off: int) -> int
+    @b0 = str_byte(@buf, @off)
+    @b1 = str_byte(@buf, @off + 1)
+    @b2 = str_byte(@buf, @off + 2)
+    @b3 = str_byte(@buf, @off + 3)
+    return ((@b0 << 24) | (@b1 << 16) | (@b2 << 8) | @b3) & 4294967295
+
+fn _ws_be32_store(@buf: int, @off: int, @v: int) -> int
+    str_set_byte(@buf, @off,     (@v >> 24) & 255)
+    str_set_byte(@buf, @off + 1, (@v >> 16) & 255)
+    str_set_byte(@buf, @off + 2, (@v >>  8) & 255)
+    str_set_byte(@buf, @off + 3,  @v        & 255)
+    return 0
+
+
+# --- private SHA-1 ------------------------------------------------------
+
+fn _ws_sha1_pad(@msg: int) -> int
+    @len = str_len(@msg)
+    @pad_len = 64 - ((@len + 9) % 64)
+    if @pad_len == 64
+        @pad_len = 0
+    @total = @len + 1 + @pad_len + 8
+    @padded = new_str(@total)
+    @i = 0
+    while @i < @len
+        str_set_byte(@padded, @i, str_byte(@msg, @i))
+        @i = @i + 1
+    str_set_byte(@padded, @len, 128)
+    @bit_len = @len * 8
+    @j = 0
+    while @j < 8
+        str_set_byte(@padded, @total - 8 + @j, (@bit_len >> ((7 - @j) * 8)) & 255)
+        @j = @j + 1
+    return @padded
+
+
+fn _ws_sha1_raw(@msg: int) -> int
+    @padded = _ws_sha1_pad(@msg)
+    @total = str_len(@padded)
+    @nblocks = @total / 64
+
+    @h0 = 1732584193
+    @h1 = 4023233417
+    @h2 = 2562383102
+    @h3 = 271733878
+    @h4 = 3285377520
+
+    @mask = 4294967295
+    @W = new_str(80 * 8)
+
+    @blk = 0
+    while @blk < @nblocks
+        @t = 0
+        while @t < 16
+            u64_set(@W, @t, _ws_be32_load(@padded, @blk * 64 + @t * 4))
+            @t = @t + 1
+        while @t < 80
+            @w1 = u64_get(@W, @t - 3)
+            @w2 = u64_get(@W, @t - 8)
+            @w3 = u64_get(@W, @t - 14)
+            @w4 = u64_get(@W, @t - 16)
+            u64_set(@W, @t, _ws_rotl32(@w1 ^ @w2 ^ @w3 ^ @w4, 1))
+            @t = @t + 1
+
+        @a = @h0
+        @b = @h1
+        @c = @h2
+        @d = @h3
+        @e = @h4
+
+        @t = 0
+        while @t < 80
+            if @t < 20
+                @f = (@b & @c) | ((~@b) & @d)
+                @k = 1518500249
+            if @t >= 20
+                if @t < 40
+                    @f = @b ^ @c ^ @d
+                    @k = 1859775393
+            if @t >= 40
+                if @t < 60
+                    @f = (@b & @c) | (@b & @d) | (@c & @d)
+                    @k = 2400959708
+            if @t >= 60
+                @f = @b ^ @c ^ @d
+                @k = 3395469782
+            @tmp = (_ws_rotl32(@a, 5) + @f + @e + @k + u64_get(@W, @t)) & @mask
+            @e = @d
+            @d = @c
+            @c = _ws_rotl32(@b, 30)
+            @b = @a
+            @a = @tmp
+            @t = @t + 1
+
+        @h0 = (@h0 + @a) & @mask
+        @h1 = (@h1 + @b) & @mask
+        @h2 = (@h2 + @c) & @mask
+        @h3 = (@h3 + @d) & @mask
+        @h4 = (@h4 + @e) & @mask
+        @blk = @blk + 1
+
+    @out = new_str(20)
+    _ws_be32_store(@out, 0,  @h0)
+    _ws_be32_store(@out, 4,  @h1)
+    _ws_be32_store(@out, 8,  @h2)
+    _ws_be32_store(@out, 12, @h3)
+    _ws_be32_store(@out, 16, @h4)
+    return @out
+
+
+# --- handshake ----------------------------------------------------------
+
+fn ws_accept_key(@client_key: int) -> int
+    @magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    @combined = str_concat(@client_key, @magic)
+    @digest = _ws_sha1_raw(@combined)
+    return base64_encode(@digest)
+
+
+fn ws_handshake_response(@client_key: int) -> int
+    @accept = ws_accept_key(@client_key)
+    @r = "HTTP/1.1 101 Switching Protocols\r\n"
+    @r = str_concat(@r, "Upgrade: websocket\r\n")
+    @r = str_concat(@r, "Connection: Upgrade\r\n")
+    @r = str_concat(@r, "Sec-WebSocket-Accept: ")
+    @r = str_concat(@r, @accept)
+    @r = str_concat(@r, "\r\n\r\n")
+    return @r
+
+
+# --- frame encoder (server -> client, unmasked) ------------------------
+
+fn ws_encode_frame(@opcode: int, @payload: int) -> int
+    @plen = str_len(@payload)
+    @hdr_extra = 0
+    @len7 = 0
+    if @plen <= 125
+        @len7 = @plen
+        @hdr_extra = 0
+    else
+        if @plen <= 65535
+            @len7 = 126
+            @hdr_extra = 2
+        else
+            @len7 = 127
+            @hdr_extra = 8
+
+    @total = 2 + @hdr_extra + @plen
+    @frame = new_str(@total)
+    str_set_byte(@frame, 0, (128 | (@opcode & 15)) & 255)
+    str_set_byte(@frame, 1, @len7 & 255)
+
+    @off = 2
+    if @hdr_extra == 2
+        str_set_byte(@frame, @off,     (@plen >> 8) & 255)
+        str_set_byte(@frame, @off + 1,  @plen       & 255)
+        @off = @off + 2
+    if @hdr_extra == 8
+        @k = 0
+        while @k < 8
+            str_set_byte(@frame, @off + @k, (@plen >> ((7 - @k) * 8)) & 255)
+            @k = @k + 1
+        @off = @off + 8
+
+    @i = 0
+    while @i < @plen
+        str_set_byte(@frame, @off + @i, str_byte(@payload, @i))
+        @i = @i + 1
+
+    return @frame
+
+
+fn ws_encode_text(@text: int) -> int
+    return ws_encode_frame(1, @text)
+
+fn ws_encode_binary(@data: int) -> int
+    return ws_encode_frame(2, @data)
+
+
+# --- frame decoder ------------------------------------------------------
+
+fn ws_decode_frame(@buf: int, @off: int) -> Vec
+    @buflen = str_len(@buf)
+
+    @short = vec_new()
+    vec_push(@short, -1)
+    vec_push(@short, "")
+    vec_push(@short, 0)
+
+    if @buflen - @off < 2
+        return @short
+
+    @b0 = str_byte(@buf, @off)
+    @b1 = str_byte(@buf, @off + 1)
+
+    @opcode = @b0 & 15
+    @masked = (@b1 >> 7) & 1
+    @len7   = @b1 & 127
+
+    @hdr = 2
+    @plen = 0
+    if @len7 <= 125
+        @plen = @len7
+    else
+        if @len7 == 126
+            if @buflen - @off < @hdr + 2
+                return @short
+            @p0 = str_byte(@buf, @off + @hdr)
+            @p1 = str_byte(@buf, @off + @hdr + 1)
+            @plen = (@p0 << 8) | @p1
+            @hdr = @hdr + 2
+        else
+            if @buflen - @off < @hdr + 8
+                return @short
+            @plen = 0
+            @k = 0
+            while @k < 8
+                @plen = (@plen << 8) | str_byte(@buf, @off + @hdr + @k)
+                @k = @k + 1
+            @hdr = @hdr + 8
+
+    @mask_off = @off + @hdr
+    if @masked == 1
+        if @buflen - @off < @hdr + 4
+            return @short
+        @hdr = @hdr + 4
+
+    @payload_off = @off + @hdr
+    if @buflen - @off < @hdr + @plen
+        return @short
+
+    @payload = new_str(@plen)
+    if @masked == 1
+        @i = 0
+        while @i < @plen
+            @m = str_byte(@buf, @mask_off + (@i & 3))
+            str_set_byte(@payload, @i, str_byte(@buf, @payload_off + @i) ^ @m)
+            @i = @i + 1
+    else
+        @i = 0
+        while @i < @plen
+            str_set_byte(@payload, @i, str_byte(@buf, @payload_off + @i))
+            @i = @i + 1
+
+    @out = vec_new()
+    vec_push(@out, @opcode)
+    vec_push(@out, @payload)
+    vec_push(@out, @payload_off + @plen)
+    return @out
+
+
+# --- HTTP integration ---------------------------------------------------
+
+fn _ws_str_eq_at(@buf: int, @off: int, @s: int) -> int
+    @slen = str_len(@s)
+    @j = 0
+    while @j < @slen
+        if str_byte(@buf, @off + @j) != str_byte(@s, @j)
+            return 0
+        @j = @j + 1
+    return 1
+
+
+fn _ws_skip_spaces(@buf: int, @s: int, @e: int) -> int
+    while @s < @e
+        if str_byte(@buf, @s) != 32
+            return @s
+        @s = @s + 1
+    return @s
+
+
+fn _ws_find_crlf(@buf: int, @off: int, @blen: int) -> int
+    while @off < @blen
+        if str_byte(@buf, @off) == 13
+            return @off
+        @off = @off + 1
+    return @blen
+
+
+# _ws_header_value(@hdrs, @prefix) -> trimmed value or "".
+fn _ws_header_value(@hdrs: int, @prefix: int) -> int
+    if @hdrs == 0
+        return ""
+    @hlen = str_len(@hdrs)
+    @plen = str_len(@prefix)
+    if @hlen < @plen
+        return ""
+    @i = 0
+    while @i < @hlen
+        @line_s = @i
+        @line_e = _ws_find_crlf(@hdrs, @i, @hlen)
+        if @line_e - @line_s >= @plen
+            if _ws_str_eq_at(@hdrs, @line_s, @prefix) == 1
+                @v = _ws_skip_spaces(@hdrs, @line_s + @plen, @line_e)
+                return str_substr(@hdrs, @v, @line_e - @v)
+        if @line_e >= @hlen
+            return ""
+        @i = @line_e + 2
+    return ""
+
+
+# ws_upgrade(@req, @cli) -> 1 if handshake completed, 0 otherwise.
+fn ws_upgrade(@req: HttpRequest, @cli: int) -> int
+    @key = _ws_header_value(@req.headers, "Sec-WebSocket-Key:")
+    if str_len(@key) == 0
+        return 0
+    @resp = ws_handshake_response(@key)
+    if tcp_send_str(@cli, @resp) < 0
+        return 0
+    return 1
+
+
+fn ws_send_text(@cli: int, @text: int) -> int
+    return tcp_send_str(@cli, ws_encode_text(@text))
+
+fn ws_send_binary(@cli: int, @data: int) -> int
+    return tcp_send_str(@cli, ws_encode_binary(@data))
+
+fn ws_send_close(@cli: int) -> int
+    return tcp_send_str(@cli, ws_encode_frame(8, ""))
+
+
+# ws_recv_text(@cli, @buf, @cap) -> payload string, or "" on EOF /
+# close / decode failure.
+fn ws_recv_text(@cli: int, @buf: int, @cap: int) -> int
+    @n = tcp_recv(@cli, @buf, @cap)
+    if @n <= 0
+        return ""
+    @raw = str_substr(@buf, 0, @n)
+    let @v: Vec = ws_decode_frame(@raw, 0)
+    @op = vec_get(@v, 0)
+    if @op < 0
+        return ""
+    if @op == 8
+        return ""
+    return vec_get(@v, 1)

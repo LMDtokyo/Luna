@@ -1,0 +1,93 @@
+# Tests for std/ext/db/memcached. Connects to 127.0.0.1:21211 (a
+# sandbox memcached spawned by memcached_e2e.sh — NOT the default
+# 11211 port). If nothing is listening there, the test emits a clean
+# skip summary so tests/run_all.sh doesn't flag it.
+
+import memcached
+import test
+
+
+fn _mc_port() -> int
+    return 21211
+
+
+fn run_memcached_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    @fd = mc_connect("127.0.0.1", _mc_port())
+    if @fd < 0
+        shine("[memcached] skip (no memcached on 127.0.0.1:21211)")
+        test_summary("memcached", 0, 0)
+        return 0
+
+    # Clean leftover state from previous runs.
+    mc_delete(@fd, "luna-mc:key")
+    mc_delete(@fd, "luna-mc:counter")
+    mc_delete(@fd, "luna-mc:gone")
+
+    # SET / GET round-trip.
+    @r = assert_eq_int("set ok",  mc_set(@fd, "luna-mc:key", "hello", 60), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("get hit", mc_get(@fd, "luna-mc:key"),              "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Overwrite with a longer value (exercises bytes-length parsing).
+    @r = assert_eq_int("set ovr", mc_set(@fd, "luna-mc:key", "world!!!", 60), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("get ovr", mc_get(@fd, "luna-mc:key"),                "world!!!")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Missing key.
+    @r = assert_eq_str("get miss", mc_get(@fd, "luna-mc:nope"),             "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # DELETE present, then missing.
+    @r = assert_eq_int("del ok",   mc_delete(@fd, "luna-mc:key"),           1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("del miss", mc_delete(@fd, "luna-mc:key"),           0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # INCR on a missing key: memcached returns NOT_FOUND, our wrapper
+    # surfaces -1.
+    @r = assert_eq_int("incr miss", mc_incr(@fd, "luna-mc:gone", 1),        -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Seed a counter and walk it up / down. The seed value must be an
+    # ASCII integer string per the text protocol.
+    mc_set(@fd, "luna-mc:counter", "10", 60)
+    @r = assert_eq_int("incr 1",   mc_incr(@fd, "luna-mc:counter", 1),      11)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("incr 5",   mc_incr(@fd, "luna-mc:counter", 5),      16)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("decr 6",   mc_decr(@fd, "luna-mc:counter", 6),      10)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # VERSION returns something non-empty.
+    @ver = mc_version(@fd)
+    @r = assert_true("version nonempty", str_len(@ver) > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Cleanup.
+    mc_delete(@fd, "luna-mc:counter")
+    mc_close(@fd)
+
+    test_summary("memcached", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_memcached_tests(0, 0)

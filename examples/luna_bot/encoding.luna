@@ -1,0 +1,26 @@
+# encoding.luna — text-encoding handlers.
+# /b64enc /b64dec /hexenc /hexdec /urlenc /urldec
+
+fn cmd_b64enc(@token: int, @chat_id: int, @arg: int) -> int
+    send_markdown(@token, @chat_id, _md_code(base64_encode(@arg)))
+    return 0
+
+fn cmd_b64dec(@token: int, @chat_id: int, @arg: int) -> int
+    send_message(@token, @chat_id, base64_decode(@arg))
+    return 0
+
+fn cmd_hexenc(@token: int, @chat_id: int, @arg: int) -> int
+    send_markdown(@token, @chat_id, _md_code(hex_encode(@arg)))
+    return 0
+
+fn cmd_hexdec(@token: int, @chat_id: int, @arg: int) -> int
+    send_message(@token, @chat_id, hex_decode(@arg))
+    return 0
+
+fn cmd_urlenc(@token: int, @chat_id: int, @arg: int) -> int
+    send_markdown(@token, @chat_id, _md_code(url_encode(@arg)))
+    return 0
+
+fn cmd_urldec(@token: int, @chat_id: int, @arg: int) -> int
+    send_message(@token, @chat_id, url_decode(@arg))
+    return 0

@@ -1,0 +1,26 @@
+# help.luna — static help and about texts.
+
+fn help_text() -> int
+    @t = "*Luna Bot* — written entirely in Luna.\n\n"
+    @t = str_concat(@t, "*Basics*\n")
+    @t = str_concat(@t, "/start /help /about /ping /time /uptime /stats\n\n")
+    @t = str_concat(@t, "*Text*\n")
+    @t = str_concat(@t, "/echo /upper /lower /reverse /rot13 /len\n\n")
+    @t = str_concat(@t, "*Crypto*\n")
+    @t = str_concat(@t, "/sha256 /hmac /uuid /random /dice /coin /randhex\n\n")
+    @t = str_concat(@t, "*Encoding*\n")
+    @t = str_concat(@t, "/b64enc /b64dec /hexenc /hexdec /urlenc /urldec\n\n")
+    @t = str_concat(@t, "*World*\n")
+    @t = str_concat(@t, "/weather /quote /catfact /btc /eth /ip /myip /joke\n\n")
+    @t = str_concat(@t, "*Notes*\n")
+    @t = str_concat(@t, "/note /notes /clearnotes")
+    return @t
+
+fn about_text() -> int
+    @t = "🌙 *Luna Bot*\n\n"
+    @t = str_concat(@t, "Built with the Luna programming language.\n")
+    @t = str_concat(@t, "Source: ")
+    @t = str_concat(@t, "[examples/luna_bot/](https://github.com/LMDtokyo/Luna/tree/main/examples/luna_bot)\n\n")
+    @t = str_concat(@t, "Compiled by `bootstrap/luna-boot`. Modular layout — every command lives in a small handler file.\n")
+    @t = str_concat(@t, "Showcases: HTTP, JSON, SHA-256, HMAC, base64, UUID, random, file I/O, multi-module imports.")
+    return @t

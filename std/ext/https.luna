@@ -1,0 +1,707 @@
+# tier: T6
+# deps: http, tls, signal
+# ffi: libssl-via-dlopen
+#
+# std/ext/https — outbound HTTPS over **in-process TLS**.
+#
+# Previous incarnations of this module shelled out to `openssl s_client`,
+# first per-request (fork+exec on every call) and then via a persistent
+# pool of child processes. Both worked but paid a heavy fork/exec tax
+# and required the openssl binary on the host. With std/ext/tls (P5 of
+# docs/TLS_DESIGN.md) we can finally do TLS in-process via dlopen on
+# libssl.so.3 — the same trick libcurl uses. This module is now a thin
+# HTTP/1.1 framing layer on top of that.
+#
+# What's the same:
+#   - Public API (https_get / https_post / https_request_to and the
+#     full pool surface) — callers don't need to change.
+#   - Per-(host, port) connection caching for keep-alive reuse.
+#   - HTTP/1.1 response framing (Content-Length / chunked / close).
+#
+# What's different:
+#   - No openssl subprocess. Binaries must be linked `--dynamic` so
+#     ld-linux loads libssl at startup (or dlopen finds it at runtime).
+#   - One TLS handshake per (host, port) instead of one openssl spawn.
+#     Cold connect is ~5x faster; warm reuse is essentially free.
+#   - Streaming reads are now possible (tls_read returns chunks);
+#     this module doesn't expose that yet, but std/ext/websocket can.
+#
+# Public surface (unchanged):
+#   https_pool_new()                                    -> int
+#   https_pool_acquire(@pool, @host, @port)             -> HttpsConn
+#   https_pool_release(@pool, @conn, @keep_alive)       -> int
+#   https_pool_request(@pool, @host, @port, @m, @p, @body, @ct) -> HttpResponse
+#   https_pool_get(@pool, @host, @path)                 -> HttpResponse
+#   https_pool_post(@pool, @host, @path, @body, @ctype) -> HttpResponse
+#   https_pool_close(@pool)                             -> int
+#   https_get(@host, @path)                             -> HttpResponse
+#   https_post(@host, @path, @body, @ctype)             -> HttpResponse
+#   https_request_to(@host, @port, @method, @path, @body, @ctype) -> HttpResponse
+#
+# Caller gotcha — type your receivers explicitly:
+#       let @r:    HttpResponse = https_pool_get(@pool, "api.x.com", "/")
+#       let @conn: HttpsConn    = https_pool_acquire(@pool, "api.x.com", 443)
+#   Without `: T` bootminor reads every field at offset 0 and you get
+#   silent corruption.
+
+import http
+import tls
+import signal
+
+
+# 1 MiB response cap, matching std/net/http. Bigger payloads truncate.
+const _HTTPS_MAX_RESP:   int = 1048576
+# Per-read syscall size. tls_read returns whatever's in the SSL buffer
+# up to this many bytes.
+const _HTTPS_READ_CHUNK: int = 16384
+
+
+# HttpsConn is the per-host record kept in the pool. Layout starts with
+# the same three fields as TlsConn (ctx, ssl, fd) so we can alias a
+# `let @t: TlsConn = @conn` and hand it straight to tls_read / tls_write.
+# The trailing host/port let _https_pool_find match entries.
+struct HttpsConn
+    ctx:  int
+    ssl:  int
+    fd:   int
+    host: int
+    port: int
+
+
+# ----------------------------------------------------------------------
+# Pool — a Vec of HttpsConn pointers. Lookup is linear; the pool is
+# expected to hold one entry per host the program talks to, so a Vec
+# scan is fine for typical sizes (<10 entries). Swap in a map later.
+# ----------------------------------------------------------------------
+
+fn https_pool_new() -> int
+    return vec_new()
+
+
+fn _https_make_conn(@host: int, @port: int) -> HttpsConn
+    let @c: HttpsConn = new_str(40)
+    @c.ctx  = 0
+    @c.ssl  = 0
+    @c.fd   = -1
+    @c.host = @host
+    @c.port = @port
+    return @c
+
+
+# Populate @conn (in-place) with a fresh TlsConn. On failure leaves the
+# conn with ssl == 0 / fd == -1 (tls_conn_ok will report 0).
+fn _https_dial(@conn: HttpsConn) -> int
+    let @tc: TlsConn = tls_connect(@conn.host, @conn.port)
+    if tls_conn_ok(@tc) != 1
+        @conn.ctx = 0
+        @conn.ssl = 0
+        @conn.fd  = -1
+        return -1
+    @conn.ctx = @tc.ctx
+    @conn.ssl = @tc.ssl
+    @conn.fd  = @tc.fd
+    return 0
+
+
+# Close the underlying TLS session if any. Leaves the host/port fields
+# intact so the slot can be re-dialed on the next acquire.
+fn _https_close_conn(@conn: HttpsConn) -> int
+    if @conn.ssl != 0
+        let @tc: TlsConn = new_str(24)
+        @tc.ctx = @conn.ctx
+        @tc.ssl = @conn.ssl
+        @tc.fd  = @conn.fd
+        tls_close(@tc)
+    @conn.ctx = 0
+    @conn.ssl = 0
+    @conn.fd  = -1
+    return 0
+
+
+fn _https_pool_find(@pool: int, @host: int, @port: int) -> int
+    let @v: Vec = @pool
+    @n = vec_len(@v)
+    @i = 0
+    while @i < @n
+        let @c: HttpsConn = vec_get(@v, @i)
+        if @c.port == @port
+            if str_eq(@c.host, @host) == 1
+                return @i
+        @i = @i + 1
+    return -1
+
+
+# https_pool_acquire — return a live HttpsConn for the host. Dials a
+# fresh TLS session if (a) we've never talked to this host, or (b) the
+# cached session was marked dead by release/invalidate.
+fn https_pool_acquire(@pool: int, @host: int, @port: int) -> HttpsConn
+    let @v: Vec = @pool
+    @idx = _https_pool_find(@pool, @host, @port)
+    if @idx >= 0
+        let @existing: HttpsConn = vec_get(@v, @idx)
+        if @existing.ssl != 0
+            return @existing
+        # Slot exists but session is dead — re-dial in place.
+        _https_dial(@existing)
+        return @existing
+
+    let @new_conn: HttpsConn = _https_make_conn(@host, @port)
+    _https_dial(@new_conn)
+    vec_push(@v, @new_conn)
+    return @new_conn
+
+
+# https_pool_release — return @conn to the pool. @keep_alive == 0 means
+# "this session is no longer reusable, close it and force a re-dial on
+# the next acquire". @keep_alive != 0 means "leave it open, the next
+# acquire reuses it as-is". The slot stays in the pool either way.
+fn https_pool_release(@pool: int, @conn: HttpsConn, @keep_alive: int) -> int
+    if @keep_alive != 0
+        return 0
+    _https_close_conn(@conn)
+    return 0
+
+
+# https_pool_close — close every live session, drain the pool. Safe to
+# call multiple times.
+fn https_pool_close(@pool: int) -> int
+    let @v: Vec = @pool
+    @n = vec_len(@v)
+    @i = 0
+    while @i < @n
+        let @c: HttpsConn = vec_get(@v, @i)
+        _https_close_conn(@c)
+        @i = @i + 1
+    return 0
+
+
+fn _https_pool_invalidate(@pool: int, @host: int, @port: int) -> int
+    @idx = _https_pool_find(@pool, @host, @port)
+    if @idx < 0
+        return 0
+    let @v: Vec = @pool
+    let @c: HttpsConn = vec_get(@v, @idx)
+    _https_close_conn(@c)
+    return 0
+
+
+# ----------------------------------------------------------------------
+# HTTP/1.1 request framing.
+# ----------------------------------------------------------------------
+
+fn _https_build_request(@host: int, @port: int, @method: int, @path: int, @body: int, @ctype: int) -> int
+    @host_hdr = @host
+    if @port != 443
+        @host_hdr = str_concat(@host, ":")
+        @host_hdr = str_concat(@host_hdr, int_to_str(@port))
+
+    @r = str_concat(@method, " ")
+    @r = str_concat(@r, @path)
+    @r = str_concat(@r, " HTTP/1.1\r\nHost: ")
+    @r = str_concat(@r, @host_hdr)
+    @r = str_concat(@r, "\r\nUser-Agent: luna/0.2\r\nConnection: keep-alive\r\nAccept: */*\r\n")
+
+    @blen = str_len(@body)
+    if @blen > 0
+        @r = str_concat(@r, "Content-Type: ")
+        @r = str_concat(@r, @ctype)
+        @r = str_concat(@r, "\r\nContent-Length: ")
+        @r = str_concat(@r, int_to_str(@blen))
+        @r = str_concat(@r, "\r\n")
+    @r = str_concat(@r, "\r\n")
+    if @blen > 0
+        @r = str_concat(@r, @body)
+    return @r
+
+
+# Write the entire string @s via tls_write. tls_write may short-write,
+# so loop until done. -1 on any error.
+fn _https_write_all(@conn: HttpsConn, @s: int) -> int
+    let @tc: TlsConn = new_str(24)
+    @tc.ctx = @conn.ctx
+    @tc.ssl = @conn.ssl
+    @tc.fd  = @conn.fd
+    @n = str_len(@s)
+    @off = 0
+    while @off < @n
+        @chunk = @n - @off
+        if @off == 0
+            @w = tls_write(@tc, @s)
+        else
+            @w = tls_write(@tc, str_substr(@s, @off, @chunk))
+        if @w <= 0
+            return -1
+        @off = @off + @w
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Response parsing helpers — case-insensitive header matching, status
+# code parsing, chunked-transfer decoder. Same shape as the previous
+# implementation; just decoupled from the pipe-based read loop.
+# ----------------------------------------------------------------------
+
+fn _https_lower(@c: int) -> int
+    if @c >= 65
+        if @c <= 90
+            return @c + 32
+    return @c
+
+
+fn _https_header_match(@buf: int, @start: int, @end: int, @name: int) -> int
+    @nlen = str_len(@name)
+    if @end - @start < @nlen
+        return 0
+    @i = 0
+    while @i < @nlen
+        @a = _https_lower(str_byte(@buf, @start + @i))
+        @b = _https_lower(str_byte(@name, @i))
+        if @a != @b
+            return 0
+        @i = @i + 1
+    return 1
+
+
+fn _https_skip_ws(@buf: int, @off: int, @end: int) -> int
+    while @off < @end
+        @c = str_byte(@buf, @off)
+        if @c != 32
+            if @c != 9
+                return @off
+        @off = @off + 1
+    return @off
+
+
+fn _https_parse_int(@buf: int, @off: int, @end: int) -> int
+    @v = 0
+    @d = 0
+    while @off < @end
+        @c = str_byte(@buf, @off)
+        if @c < 48
+            break
+        if @c > 57
+            break
+        @v = @v * 10 + (@c - 48)
+        @d = @d + 1
+        @off = @off + 1
+    if @d == 0
+        return -1
+    return @v
+
+
+# Scan the header block for Content-Length / Transfer-Encoding /
+# Connection. Returns Content-Length (or -1 if absent). Writes flags
+# at @flags_out: byte 0 = connection_close (1 if found),
+#                byte 1 = chunked          (1 if found).
+fn _https_scan_headers(@buf: int, @hdr_end: int, @flags_out: int) -> int
+    u32_set(@flags_out, 0, 0)
+    @content_length = -1
+    @i = 0
+    # Skip the status line.
+    while @i < @hdr_end
+        if str_byte(@buf, @i) == 10
+            @i = @i + 1
+            break
+        @i = @i + 1
+
+    while @i < @hdr_end
+        @line_start = @i
+        while @i < @hdr_end
+            if str_byte(@buf, @i) == 10
+                break
+            @i = @i + 1
+        @line_end = @i
+        if @i > @line_start
+            if str_byte(@buf, @i - 1) == 13
+                @line_end = @i - 1
+        if @i < @hdr_end
+            @i = @i + 1
+
+        @colon = @line_start
+        while @colon < @line_end
+            if str_byte(@buf, @colon) == 58
+                break
+            @colon = @colon + 1
+        if @colon >= @line_end
+            continue
+
+        if _https_header_match(@buf, @line_start, @colon, "Content-Length") == 1
+            @vs = _https_skip_ws(@buf, @colon + 1, @line_end)
+            @v = _https_parse_int(@buf, @vs, @line_end)
+            if @v >= 0
+                @content_length = @v
+        if _https_header_match(@buf, @line_start, @colon, "Transfer-Encoding") == 1
+            @vs = _https_skip_ws(@buf, @colon + 1, @line_end)
+            if _https_header_match(@buf, @vs, @line_end, "chunked") == 1
+                u8_set(@flags_out, 1, 1)
+        if _https_header_match(@buf, @line_start, @colon, "Connection") == 1
+            @vs = _https_skip_ws(@buf, @colon + 1, @line_end)
+            if _https_header_match(@buf, @vs, @line_end, "close") == 1
+                u8_set(@flags_out, 0, 1)
+    return @content_length
+
+
+fn _https_find_crlf_crlf(@buf: int, @blen: int) -> int
+    if @blen < 4
+        return -1
+    @i = 0
+    @end = @blen - 3
+    while @i < @end
+        if str_byte(@buf, @i) == 13
+            if str_byte(@buf, @i + 1) == 10
+                if str_byte(@buf, @i + 2) == 13
+                    if str_byte(@buf, @i + 3) == 10
+                        return @i
+        @i = @i + 1
+    return -1
+
+
+# Parse status from "HTTP/1.1 200 OK". Returns -1 on malformed input.
+fn _https_parse_status(@buf: int, @blen: int) -> int
+    if @blen < 12
+        return -1
+    @i = 0
+    while @i < @blen
+        if str_byte(@buf, @i) == 32
+            break
+        @i = @i + 1
+    if @i >= @blen
+        return -1
+    @i = @i + 1
+    @s = 0
+    @d = 0
+    while @i < @blen
+        @c = str_byte(@buf, @i)
+        if @c < 48
+            break
+        if @c > 57
+            break
+        @s = @s * 10 + (@c - 48)
+        @d = @d + 1
+        @i = @i + 1
+    if @d == 0
+        return -1
+    return @s
+
+
+fn _https_hex_digit(@c: int) -> int
+    if @c >= 48
+        if @c <= 57
+            return @c - 48
+    if @c >= 97
+        if @c <= 102
+            return @c - 87
+    if @c >= 65
+        if @c <= 70
+            return @c - 55
+    return -1
+
+
+# ----------------------------------------------------------------------
+# Response read loop — drives tls_read into a growing scratch buffer
+# until we have headers + body framed.
+#
+# tls_read returns a Luna string of length 0 on EOF/error. We append
+# its bytes to @scratch[@total..] and stop based on Content-Length,
+# chunked, or EOF.
+# ----------------------------------------------------------------------
+
+# Append the bytes of @src into @dst at offset @off. Returns the new
+# offset (off + len(src)) clamped to @cap.
+fn _https_append(@dst: int, @off: int, @cap: int, @src: int) -> int
+    @n = str_len(@src)
+    if @off + @n > @cap
+        @n = @cap - @off
+    @i = 0
+    while @i < @n
+        u8_set(@dst, @off + @i, str_byte(@src, @i))
+        @i = @i + 1
+    return @off + @n
+
+
+# Read at least one chunk of bytes via tls_read into @dst at @off.
+# Returns the new offset, or @off unchanged on EOF/error (caller spots
+# it because no progress was made).
+fn _https_read_more(@conn: HttpsConn, @dst: int, @off: int, @cap: int) -> int
+    if @off >= @cap
+        return @off
+    let @tc: TlsConn = new_str(24)
+    @tc.ctx = @conn.ctx
+    @tc.ssl = @conn.ssl
+    @tc.fd  = @conn.fd
+    @want = @cap - @off
+    if @want > _HTTPS_READ_CHUNK
+        @want = _HTTPS_READ_CHUNK
+    @s = tls_read(@tc, @want)
+    if str_len(@s) <= 0
+        return @off
+    return _https_append(@dst, @off, @cap, @s)
+
+
+# Read until \r\n\r\n is in @scratch[0..@total). Returns header_end on
+# success (offset of the first \r), or -1 on EOF/overflow. Stores the
+# final total at @meta[0] (u32) and the eof flag at @meta[4] (u8).
+fn _https_read_headers(@conn: HttpsConn, @scratch: int, @cap: int, @meta: int) -> int
+    @total = 0
+    u32_set(@meta, 0, 0)
+    u8_set(@meta,  4, 0)
+    while @total < @cap
+        @new_total = _https_read_more(@conn, @scratch, @total, @cap)
+        if @new_total == @total
+            u32_set(@meta, 0, @total)
+            u8_set(@meta,  4, 1)
+            return -1
+        @total = @new_total
+        @hdr_end = _https_find_crlf_crlf(@scratch, @total)
+        if @hdr_end >= 0
+            u32_set(@meta, 0, @total)
+            return @hdr_end
+    u32_set(@meta, 0, @total)
+    u8_set(@meta,  4, 1)
+    return -1
+
+
+# Read until @scratch[0..) holds at least @target bytes. Returns the
+# new total, which equals @target on success or less on EOF/error.
+fn _https_fill_to(@conn: HttpsConn, @scratch: int, @total: int, @target: int, @cap: int) -> int
+    if @target > @cap
+        @target = @cap
+    while @total < @target
+        @new_total = _https_read_more(@conn, @scratch, @total, @cap)
+        if @new_total == @total
+            return @total
+        @total = @new_total
+    return @total
+
+
+# Find a CRLF in @scratch[@from..@total). Returns offset of \r or -1.
+fn _https_find_crlf(@scratch: int, @from: int, @total: int) -> int
+    if @total - @from < 2
+        return -1
+    @i = @from
+    @end = @total - 1
+    while @i < @end
+        if str_byte(@scratch, @i) == 13
+            if str_byte(@scratch, @i + 1) == 10
+                return @i
+        @i = @i + 1
+    return -1
+
+
+# Decode chunked-transfer body sitting in @scratch[@body_start..@total).
+# More bytes may arrive on @conn as we go. Output the decoded body in
+# place: shift each chunk's data left over the chunk-size lines, so
+# @scratch[@body_start..body_start+decoded) is the contiguous body.
+# Returns the decoded length, or -1 on protocol error / connection death.
+fn _https_decode_chunked(@conn: HttpsConn, @scratch: int, @body_start: int, @total: int, @cap: int) -> int
+    @read_off  = @body_start
+    @write_off = @body_start
+    while 1
+        # Need a complete size line at @read_off.
+        @crlf = _https_find_crlf(@scratch, @read_off, @total)
+        while @crlf < 0
+            @new_total = _https_read_more(@conn, @scratch, @total, @cap)
+            if @new_total == @total
+                return -1
+            @total = @new_total
+            @crlf = _https_find_crlf(@scratch, @read_off, @total)
+
+        # Parse hex size, ignoring chunk extensions after ';'.
+        @semi = @read_off
+        while @semi < @crlf
+            if str_byte(@scratch, @semi) == 59
+                break
+            @semi = @semi + 1
+        @size = 0
+        @i = @read_off
+        while @i < @semi
+            @d = _https_hex_digit(str_byte(@scratch, @i))
+            if @d < 0
+                return -1
+            @size = @size * 16 + @d
+            @i = @i + 1
+        @read_off = @crlf + 2
+
+        if @size == 0
+            # Drain trailers (empty line) — best effort.
+            @crlf2 = _https_find_crlf(@scratch, @read_off, @total)
+            while @crlf2 < 0
+                @new_total = _https_read_more(@conn, @scratch, @total, @cap)
+                if @new_total == @total
+                    break
+                @total = @new_total
+                @crlf2 = _https_find_crlf(@scratch, @read_off, @total)
+            return @write_off - @body_start
+
+        # Ensure @size + 2 bytes available (chunk body + trailing CRLF).
+        @needed = @read_off + @size + 2
+        if @needed > @cap
+            return -1
+        while @total < @needed
+            @new_total = _https_read_more(@conn, @scratch, @total, @cap)
+            if @new_total == @total
+                return -1
+            @total = @new_total
+
+        # Shift chunk body left over the size line.
+        @j = 0
+        while @j < @size
+            u8_set(@scratch, @write_off + @j, str_byte(@scratch, @read_off + @j))
+            @j = @j + 1
+        @write_off = @write_off + @size
+        @read_off  = @read_off + @size + 2
+
+
+# Pull one full HTTP/1.1 response off @conn. Returns the raw bytes as
+# a Luna string (headers + body). Sets @dead_out[0] = 1 if the session
+# died or the server announced Connection: close.
+fn _https_recv_response(@conn: HttpsConn, @dead_out: int) -> int
+    u8_set(@dead_out, 0, 0)
+    @scratch = new_str(_HTTPS_MAX_RESP)
+    @meta    = new_str(8)
+    @hdr_end = _https_read_headers(@conn, @scratch, _HTTPS_MAX_RESP, @meta)
+    @total   = u32_at(@meta, 0)
+    if @hdr_end < 0
+        u8_set(@dead_out, 0, 1)
+        if @total > 0
+            return str_substr(@scratch, 0, @total)
+        return ""
+
+    @flags = new_str(4)
+    @content_length = _https_scan_headers(@scratch, @hdr_end, @flags)
+    @conn_close = u8_at(@flags, 0)
+    @chunked    = u8_at(@flags, 1)
+    if @conn_close == 1
+        u8_set(@dead_out, 0, 1)
+
+    @body_start = @hdr_end + 4
+
+    if @chunked == 1
+        @decoded = _https_decode_chunked(@conn, @scratch, @body_start, @total, _HTTPS_MAX_RESP)
+        if @decoded < 0
+            u8_set(@dead_out, 0, 1)
+            return str_substr(@scratch, 0, @body_start)
+        return str_substr(@scratch, 0, @body_start + @decoded)
+
+    if @content_length < 0
+        # No framing → drain until EOF.
+        while @total < _HTTPS_MAX_RESP
+            @new_total = _https_read_more(@conn, @scratch, @total, _HTTPS_MAX_RESP)
+            if @new_total == @total
+                break
+            @total = @new_total
+        u8_set(@dead_out, 0, 1)
+        return str_substr(@scratch, 0, @total)
+
+    @target = @body_start + @content_length
+    if @target > _HTTPS_MAX_RESP
+        @target = _HTTPS_MAX_RESP
+    @final_total = _https_fill_to(@conn, @scratch, @total, @target, _HTTPS_MAX_RESP)
+    if @final_total < @target
+        u8_set(@dead_out, 0, 1)
+    return str_substr(@scratch, 0, @final_total)
+
+
+# ----------------------------------------------------------------------
+# Top-level GET/POST that drive the pool.
+# ----------------------------------------------------------------------
+
+# _https_finalise — turn raw bytes into an HttpResponse. Status -1 if
+# the buffer is empty or unparseable.
+fn _https_finalise(@raw: int) -> HttpResponse
+    let @resp: HttpResponse = new_str(24)
+    @resp.status = -1
+    @resp.headers = ""
+    @resp.body = ""
+    @rlen = str_len(@raw)
+    if @rlen <= 0
+        return @resp
+    @resp.status = _https_parse_status(@raw, @rlen)
+    @hdr_end = _https_find_crlf_crlf(@raw, @rlen)
+    if @hdr_end < 0
+        @resp.body = str_substr(@raw, 0, @rlen)
+        return @resp
+    @resp.headers = str_substr(@raw, 0, @hdr_end)
+    @body_start = @hdr_end + 4
+    @resp.body = str_substr(@raw, @body_start, @rlen - @body_start)
+    return @resp
+
+
+fn https_pool_request(@pool: int, @host: int, @port: int, @method: int, @path: int, @body: int, @ctype: int) -> HttpResponse
+    let @resp: HttpResponse = new_str(24)
+    @resp.status = -1
+    @resp.headers = ""
+    @resp.body = ""
+
+    # If the cached session died and tls_write would hit a closed FD,
+    # the kernel sends SIGPIPE — ignore it so the parent process keeps
+    # running and we can detect the failure via the write return value.
+    signal_ignore(SIGPIPE)
+
+    # Lazy libssl init on the first call. Cheap to redo (returns 0 once
+    # the global SSL_CTX is set up).
+    if tls_init() < 0
+        return @resp
+
+    let @conn: HttpsConn = https_pool_acquire(@pool, @host, @port)
+    if @conn.ssl == 0
+        return @resp
+
+    @raw_req = _https_build_request(@host, @port, @method, @path, @body, @ctype)
+    if _https_write_all(@conn, @raw_req) < 0
+        # Write failed — session is dead. Recycle and retry once.
+        _https_pool_invalidate(@pool, @host, @port)
+        let @conn2: HttpsConn = https_pool_acquire(@pool, @host, @port)
+        if @conn2.ssl == 0
+            return @resp
+        if _https_write_all(@conn2, @raw_req) < 0
+            _https_pool_invalidate(@pool, @host, @port)
+            return @resp
+        @dead = new_str(4)
+        @raw  = _https_recv_response(@conn2, @dead)
+        if u8_at(@dead, 0) == 1
+            _https_pool_invalidate(@pool, @host, @port)
+        return _https_finalise(@raw)
+
+    @dead = new_str(4)
+    @raw  = _https_recv_response(@conn, @dead)
+    if u8_at(@dead, 0) == 1
+        _https_pool_invalidate(@pool, @host, @port)
+    return _https_finalise(@raw)
+
+
+fn https_pool_get(@pool: int, @host: int, @path: int) -> HttpResponse
+    return https_pool_request(@pool, @host, 443, "GET", @path, "", "")
+
+
+fn https_pool_post(@pool: int, @host: int, @path: int, @body: int, @ctype: int) -> HttpResponse
+    return https_pool_request(@pool, @host, 443, "POST", @path, @body, @ctype)
+
+
+# ----------------------------------------------------------------------
+# Backwards-compat — old single-shot API. Each call gets a fresh pool
+# and tears it down on the way out, so the behaviour matches the
+# pre-keepalive implementation (no shared state, no leaked session).
+# ----------------------------------------------------------------------
+
+fn https_get(@host: int, @path: int) -> HttpResponse
+    @pool = https_pool_new()
+    let @r: HttpResponse = https_pool_get(@pool, @host, @path)
+    https_pool_close(@pool)
+    return @r
+
+
+fn https_post(@host: int, @path: int, @body: int, @ctype: int) -> HttpResponse
+    @pool = https_pool_new()
+    let @r: HttpResponse = https_pool_post(@pool, @host, @path, @body, @ctype)
+    https_pool_close(@pool)
+    return @r
+
+
+# https_request_to — kept for compat with callers that targeted a
+# non-443 port through the old API.
+fn https_request_to(@host: int, @port: int, @method: int, @path: int, @body: int, @ctype: int) -> HttpResponse
+    @pool = https_pool_new()
+    let @r: HttpResponse = https_pool_request(@pool, @host, @port, @method, @path, @body, @ctype)
+    https_pool_close(@pool)
+    return @r

@@ -1,0 +1,152 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/io — file and path helpers.
+#
+# Built on the bootminor prelude (read_file, write_file, sys_open,
+# sys_close, sys_lseek). Path-string functions are pure byte work and
+# don't touch the filesystem.
+#
+# Path helpers assume Unix '/' separator. On Windows, every path
+# constant in this module would need bootminor's PE64 backend to ship
+# IO syscalls — not yet supported.
+
+import strings
+
+
+# --- existence + size ------------------------------------------------
+
+# file_exists(@path) -> 1 if the path can be opened for read, else 0.
+# Doesn't distinguish file / dir / symlink — anything readable returns 1.
+fn file_exists(@path: int) -> int
+    @fd = sys_open(@path, 0, 0)
+    if @fd < 0
+        return 0
+    sys_close(@fd)
+    return 1
+
+# file_size(@path) -> byte length, or -1 on open / seek failure.
+fn file_size(@path: int) -> int
+    @fd = sys_open(@path, 0, 0)
+    if @fd < 0
+        return 0 - 1
+    @sz = sys_lseek(@fd, 0, 2)
+    sys_close(@fd)
+    return @sz
+
+
+# --- reading + writing -----------------------------------------------
+
+# read_lines(@path) -> Vec of strings, one per source line. The
+# trailing newline of each line is dropped. A trailing newline at EOF
+# does NOT produce a final empty string. Empty file returns an empty
+# Vec.
+fn read_lines(@path: int) -> Vec
+    @text = read_file(@path)
+    @out = vec_new()
+    if @text == 0
+        return @out
+    @n = str_len(@text)
+    if @n == 0
+        return @out
+    @start = 0
+    @i = 0
+    while @i < @n
+        if str_byte(@text, @i) == 10
+            vec_push(@out, str_substr(@text, @start, @i - @start))
+            @start = @i + 1
+        @i = @i + 1
+    if @start < @n
+        vec_push(@out, str_substr(@text, @start, @n - @start))
+    return @out
+
+# append_file(@path, @content) -> bytes appended, or -1 on failure.
+# Reads the existing content, concatenates, and rewrites — fine for
+# small files (logs, configs) but O(N) per append; consider a fresh
+# fd-based syscall path for hot loops.
+fn append_file(@path: int, @content: int) -> int
+    @prev = read_file(@path)
+    if @prev == 0
+        @prev = ""
+    @merged = str_concat(@prev, @content)
+    @n = str_len(@content)
+    @rc = write_file(@path, @merged)
+    if @rc < 0
+        return 0 - 1
+    return @n
+
+
+# --- path manipulation ----------------------------------------------
+
+# basename(@path) -> last path segment after the rightmost '/', or
+# the path unchanged if it has no slashes.
+fn basename(@path: int) -> int
+    @n = str_len(@path)
+    @i = @n
+    while @i > 0
+        if str_byte(@path, @i - 1) == 47
+            return str_substr(@path, @i, @n - @i)
+        @i = @i - 1
+    return @path
+
+# dirname(@path) -> everything before the rightmost '/', or "." if
+# there are no slashes. Trailing slash on dir-only paths becomes "".
+fn dirname(@path: int) -> int
+    @n = str_len(@path)
+    @i = @n
+    while @i > 0
+        if str_byte(@path, @i - 1) == 47
+            if @i == 1
+                return "/"
+            return str_substr(@path, 0, @i - 1)
+        @i = @i - 1
+    return "."
+
+# path_extension(@path) -> the extension (without the leading '.'),
+# or "" when the basename has none. Hidden files like ".bashrc" have
+# no extension.
+fn path_extension(@path: int) -> int
+    @base = basename(@path)
+    @n = str_len(@base)
+    @i = @n
+    while @i > 0
+        @c = str_byte(@base, @i - 1)
+        if @c == 47
+            return ""
+        if @c == 46
+            if @i == 1
+                return ""
+            return str_substr(@base, @i, @n - @i)
+        @i = @i - 1
+    return ""
+
+# path_stem(@path) -> the basename without its extension. Hidden
+# files keep their leading dot ("./.bashrc" → ".bashrc").
+fn path_stem(@path: int) -> int
+    @base = basename(@path)
+    @n = str_len(@base)
+    @i = @n
+    while @i > 0
+        @c = str_byte(@base, @i - 1)
+        if @c == 46
+            if @i == 1
+                return @base
+            return str_substr(@base, 0, @i - 1)
+        @i = @i - 1
+    return @base
+
+# path_join(@a, @b) -> @a + '/' + @b, collapsing redundant separators.
+# An absolute @b drops @a entirely (mirrors Python's os.path.join).
+fn path_join(@a: int, @b: int) -> int
+    @na = str_len(@a)
+    @nb = str_len(@b)
+    if @nb == 0
+        return @a
+    if @na == 0
+        return @b
+    if str_byte(@b, 0) == 47
+        return @b
+    if str_byte(@a, @na - 1) == 47
+        return str_concat(@a, @b)
+    return str_concat(str_concat(@a, "/"), @b)

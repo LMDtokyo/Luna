@@ -1,0 +1,22 @@
+# Single client used in the parallel-fire test: reads its target
+# path from arg(1) (defaulting to "/one"), expects the server to
+# echo back exactly that path. Exits 0 on PASS, 1 on FAIL.
+
+import http
+import sys
+
+
+fn main() -> int
+    @path = arg(1)
+    if str_len(@path) == 0
+        @path = "/one"
+    let @resp: HttpResponse = http_get("127.0.0.1", 18084, @path)
+    if @resp.status != 200
+        shine("FAIL: status")
+        return 1
+    if str_eq(@resp.body, @path) == 0
+        shine("FAIL: body mismatch")
+        shine(@resp.body)
+        return 1
+    shine(str_concat("PASS: ", @path))
+    return 0

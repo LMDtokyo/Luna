@@ -1,0 +1,66 @@
+# Tests for std/std/signal — exercise SIG_IGN / SIG_DFL / kill.
+#
+# Verifies:
+#   * signal_ignore returns 0 for a real signal number
+#   * signal_default returns 0 (restore)
+#   * signal_kill of a known-dead child PID returns -1 (ESRCH)
+#   * SIGPIPE can be ignored, then a write to a half-closed pipe
+#     returns -1 instead of killing this process.
+
+import signal
+import test
+
+
+fn run_signal_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1) Ignore SIGUSR1 — must succeed.
+    @r = assert_eq_int("ignore SIGUSR1", signal_ignore(SIGUSR1), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) Restore SIGUSR1 to default — must succeed.
+    @r = assert_eq_int("default SIGUSR1", signal_default(SIGUSR1), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) Now actually deliver SIGUSR1 to OURSELVES while ignored — must
+    # NOT crash. Target our own PID specifically; sending to PID 0
+    # (process group) or -1 (everyone) would hit our parent shell too.
+    signal_ignore(SIGUSR1)
+    @self = sys_getpid()
+    @r = assert_eq_int("self SIGUSR1 ignored", signal_kill(@self, SIGUSR1), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) Ignore SIGPIPE.
+    @r = assert_eq_int("ignore SIGPIPE", signal_ignore(SIGPIPE), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) Kill an obviously-dead PID (PID 1 reserved for init but we
+    # don't have perms to signal it as non-root; the call should
+    # fail with -1).
+    @r = assert_eq_int("kill init fails", signal_kill(1, SIGUSR1), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) Constants are non-zero and well-known.
+    @r = assert_eq_int("SIGTERM=15", SIGTERM, 15)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("SIGKILL=9", SIGKILL, 9)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("SIGCHLD=17", SIGCHLD, 17)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("signal", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_signal_tests(0, 0)

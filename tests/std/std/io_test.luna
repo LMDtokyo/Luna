@@ -1,0 +1,134 @@
+# Tests for std/io.
+
+import io
+import test
+
+
+fn run_io_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # --- path manipulation (pure, no filesystem) ---
+    @r = assert_eq_str("basename plain",   basename("/a/b/c.luna"),  "c.luna")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("basename root",    basename("/file"),         "file")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("basename relative",basename("just.txt"),      "just.txt")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("dirname plain",    dirname("/a/b/c.luna"),    "/a/b")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("dirname root",     dirname("/file"),          "/")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("dirname none",     dirname("file"),           ".")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("ext .luna",        path_extension("a/b.luna"),"luna")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("ext none",         path_extension("Makefile"),"")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("ext hidden file",  path_extension(".bashrc"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("ext two dots",     path_extension("a.tar.gz"),"gz")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("stem .luna",       path_stem("a/b.luna"),     "b")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("stem hidden file", path_stem(".bashrc"),      ".bashrc")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("join two",         path_join("/etc", "passwd"), "/etc/passwd")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("join trailing /",  path_join("/etc/", "passwd"),"/etc/passwd")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("join abs b",       path_join("/etc", "/abs"),  "/abs")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("join empty b",     path_join("/etc", ""),      "/etc")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- filesystem operations ---
+    # /etc/hostname is on every Linux box; non-empty.
+    @r = assert_eq_int("file_exists hostname", file_exists("/etc/hostname"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("file_exists missing",  file_exists("/this/path/does/not/exist/luna"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_true("file_size hostname > 0", file_size("/etc/hostname") > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("file_size missing",    file_size("/this/path/does/not/exist/luna"), 0 - 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # write/read/lines round-trip
+    @tmp = "/tmp/luna_io_test.txt"
+    write_file(@tmp, "alpha\nbeta\ngamma\n")
+    @lines = read_lines(@tmp)
+    @r = assert_eq_int("read_lines len",   vec_len(@lines), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("read_lines [0]",   vec_get(@lines, 0), "alpha")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("read_lines [2]",   vec_get(@lines, 2), "gamma")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # No trailing newline → final partial line is included.
+    write_file(@tmp, "x\ny")
+    @lines2 = read_lines(@tmp)
+    @r = assert_eq_int("read_lines no-tail len", vec_len(@lines2), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("read_lines no-tail last", vec_get(@lines2, 1), "y")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # append_file
+    write_file(@tmp, "hello ")
+    @rc = append_file(@tmp, "luna")
+    @r = assert_eq_int("append rc",        @rc, 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("append result",    read_file(@tmp), "hello luna")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("io", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_io_tests(0, 0)

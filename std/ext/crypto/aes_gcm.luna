@@ -1,0 +1,788 @@
+# tier: T6
+# deps:
+# ffi: none
+#
+# std/ext/crypto/aes_gcm — AES-128-GCM and AES-256-GCM (NIST SP 800-38D)
+# in pure Luna. No FFI; only bootminor string + bitop intrinsics.
+#
+# Public API:
+#   aes_gcm_encrypt(@key, @nonce, @plaintext, @aad) -> ciphertext || tag (16-byte tag appended)
+#   aes_gcm_decrypt(@key, @nonce, @cipher_plus_tag, @aad) -> plaintext, or "" on auth failure
+#   aes_gcm_check_inputs(@key, @nonce) -> 1 if key is 16 or 32 bytes and nonce is 12 bytes
+#   aes_gcm_hex(@bytes) -> lowercase hex
+#
+# Nonce MUST be 12 bytes (96 bits). Key MUST be 16 (AES-128) or 32 (AES-256).
+# Variant is auto-detected from key length.
+#
+# Implementation notes:
+#   - AES S-box and round constants are built lazily as byte buffers
+#     (no 256-element int literal lists to avoid lexer pressure).
+#   - GHASH multiplies in GF(2^128) via bit-by-bit shift-XOR. Slow but
+#     correct; ~1024 ops per 16-byte block. Adequate for stdlib use.
+#   - Counter mode increments the last 4 bytes of J0 as big-endian u32.
+
+
+# --- AES S-box --------------------------------------------------------
+#
+# Pre-built into a 256-byte string buffer the first time someone calls
+# _aes_sbox / _aes_inv_sbox. Cached via a 1-cell vec.
+
+fn _aes_build_sbox() -> int
+    @s = new_str(256)
+    # Standard FIPS-197 S-box, 16 rows of 16 bytes.
+    str_set_byte(@s,   0,  99)
+    str_set_byte(@s,   1, 124)
+    str_set_byte(@s,   2, 119)
+    str_set_byte(@s,   3, 123)
+    str_set_byte(@s,   4, 242)
+    str_set_byte(@s,   5, 107)
+    str_set_byte(@s,   6, 111)
+    str_set_byte(@s,   7, 197)
+    str_set_byte(@s,   8,  48)
+    str_set_byte(@s,   9,   1)
+    str_set_byte(@s,  10, 103)
+    str_set_byte(@s,  11,  43)
+    str_set_byte(@s,  12, 254)
+    str_set_byte(@s,  13, 215)
+    str_set_byte(@s,  14, 171)
+    str_set_byte(@s,  15, 118)
+    str_set_byte(@s,  16, 202)
+    str_set_byte(@s,  17, 130)
+    str_set_byte(@s,  18, 201)
+    str_set_byte(@s,  19, 125)
+    str_set_byte(@s,  20, 250)
+    str_set_byte(@s,  21,  89)
+    str_set_byte(@s,  22,  71)
+    str_set_byte(@s,  23, 240)
+    str_set_byte(@s,  24, 173)
+    str_set_byte(@s,  25, 212)
+    str_set_byte(@s,  26, 162)
+    str_set_byte(@s,  27, 175)
+    str_set_byte(@s,  28, 156)
+    str_set_byte(@s,  29, 164)
+    str_set_byte(@s,  30, 114)
+    str_set_byte(@s,  31, 192)
+    str_set_byte(@s,  32, 183)
+    str_set_byte(@s,  33, 253)
+    str_set_byte(@s,  34, 147)
+    str_set_byte(@s,  35,  38)
+    str_set_byte(@s,  36,  54)
+    str_set_byte(@s,  37,  63)
+    str_set_byte(@s,  38, 247)
+    str_set_byte(@s,  39, 204)
+    str_set_byte(@s,  40,  52)
+    str_set_byte(@s,  41, 165)
+    str_set_byte(@s,  42, 229)
+    str_set_byte(@s,  43, 241)
+    str_set_byte(@s,  44, 113)
+    str_set_byte(@s,  45, 216)
+    str_set_byte(@s,  46,  49)
+    str_set_byte(@s,  47,  21)
+    str_set_byte(@s,  48,   4)
+    str_set_byte(@s,  49, 199)
+    str_set_byte(@s,  50,  35)
+    str_set_byte(@s,  51, 195)
+    str_set_byte(@s,  52,  24)
+    str_set_byte(@s,  53, 150)
+    str_set_byte(@s,  54,   5)
+    str_set_byte(@s,  55, 154)
+    str_set_byte(@s,  56,   7)
+    str_set_byte(@s,  57,  18)
+    str_set_byte(@s,  58, 128)
+    str_set_byte(@s,  59, 226)
+    str_set_byte(@s,  60, 235)
+    str_set_byte(@s,  61,  39)
+    str_set_byte(@s,  62, 178)
+    str_set_byte(@s,  63, 117)
+    str_set_byte(@s,  64,   9)
+    str_set_byte(@s,  65, 131)
+    str_set_byte(@s,  66,  44)
+    str_set_byte(@s,  67,  26)
+    str_set_byte(@s,  68,  27)
+    str_set_byte(@s,  69, 110)
+    str_set_byte(@s,  70,  90)
+    str_set_byte(@s,  71, 160)
+    str_set_byte(@s,  72,  82)
+    str_set_byte(@s,  73,  59)
+    str_set_byte(@s,  74, 214)
+    str_set_byte(@s,  75, 179)
+    str_set_byte(@s,  76,  41)
+    str_set_byte(@s,  77, 227)
+    str_set_byte(@s,  78,  47)
+    str_set_byte(@s,  79, 132)
+    str_set_byte(@s,  80,  83)
+    str_set_byte(@s,  81, 209)
+    str_set_byte(@s,  82,   0)
+    str_set_byte(@s,  83, 237)
+    str_set_byte(@s,  84,  32)
+    str_set_byte(@s,  85, 252)
+    str_set_byte(@s,  86, 177)
+    str_set_byte(@s,  87,  91)
+    str_set_byte(@s,  88, 106)
+    str_set_byte(@s,  89, 203)
+    str_set_byte(@s,  90, 190)
+    str_set_byte(@s,  91,  57)
+    str_set_byte(@s,  92,  74)
+    str_set_byte(@s,  93,  76)
+    str_set_byte(@s,  94,  88)
+    str_set_byte(@s,  95, 207)
+    str_set_byte(@s,  96, 208)
+    str_set_byte(@s,  97, 239)
+    str_set_byte(@s,  98, 170)
+    str_set_byte(@s,  99, 251)
+    str_set_byte(@s, 100,  67)
+    str_set_byte(@s, 101,  77)
+    str_set_byte(@s, 102,  51)
+    str_set_byte(@s, 103, 133)
+    str_set_byte(@s, 104,  69)
+    str_set_byte(@s, 105, 249)
+    str_set_byte(@s, 106,   2)
+    str_set_byte(@s, 107, 127)
+    str_set_byte(@s, 108,  80)
+    str_set_byte(@s, 109,  60)
+    str_set_byte(@s, 110, 159)
+    str_set_byte(@s, 111, 168)
+    str_set_byte(@s, 112,  81)
+    str_set_byte(@s, 113, 163)
+    str_set_byte(@s, 114,  64)
+    str_set_byte(@s, 115, 143)
+    str_set_byte(@s, 116, 146)
+    str_set_byte(@s, 117, 157)
+    str_set_byte(@s, 118,  56)
+    str_set_byte(@s, 119, 245)
+    str_set_byte(@s, 120, 188)
+    str_set_byte(@s, 121, 182)
+    str_set_byte(@s, 122, 218)
+    str_set_byte(@s, 123,  33)
+    str_set_byte(@s, 124,  16)
+    str_set_byte(@s, 125, 255)
+    str_set_byte(@s, 126, 243)
+    str_set_byte(@s, 127, 210)
+    str_set_byte(@s, 128, 205)
+    str_set_byte(@s, 129,  12)
+    str_set_byte(@s, 130,  19)
+    str_set_byte(@s, 131, 236)
+    str_set_byte(@s, 132,  95)
+    str_set_byte(@s, 133, 151)
+    str_set_byte(@s, 134,  68)
+    str_set_byte(@s, 135,  23)
+    str_set_byte(@s, 136, 196)
+    str_set_byte(@s, 137, 167)
+    str_set_byte(@s, 138, 126)
+    str_set_byte(@s, 139,  61)
+    str_set_byte(@s, 140, 100)
+    str_set_byte(@s, 141,  93)
+    str_set_byte(@s, 142,  25)
+    str_set_byte(@s, 143, 115)
+    str_set_byte(@s, 144,  96)
+    str_set_byte(@s, 145, 129)
+    str_set_byte(@s, 146,  79)
+    str_set_byte(@s, 147, 220)
+    str_set_byte(@s, 148,  34)
+    str_set_byte(@s, 149,  42)
+    str_set_byte(@s, 150, 144)
+    str_set_byte(@s, 151, 136)
+    str_set_byte(@s, 152,  70)
+    str_set_byte(@s, 153, 238)
+    str_set_byte(@s, 154, 184)
+    str_set_byte(@s, 155,  20)
+    str_set_byte(@s, 156, 222)
+    str_set_byte(@s, 157,  94)
+    str_set_byte(@s, 158,  11)
+    str_set_byte(@s, 159, 219)
+    str_set_byte(@s, 160, 224)
+    str_set_byte(@s, 161,  50)
+    str_set_byte(@s, 162,  58)
+    str_set_byte(@s, 163,  10)
+    str_set_byte(@s, 164,  73)
+    str_set_byte(@s, 165,   6)
+    str_set_byte(@s, 166,  36)
+    str_set_byte(@s, 167,  92)
+    str_set_byte(@s, 168, 194)
+    str_set_byte(@s, 169, 211)
+    str_set_byte(@s, 170, 172)
+    str_set_byte(@s, 171,  98)
+    str_set_byte(@s, 172, 145)
+    str_set_byte(@s, 173, 149)
+    str_set_byte(@s, 174, 228)
+    str_set_byte(@s, 175,  121)
+    str_set_byte(@s, 176, 231)
+    str_set_byte(@s, 177, 200)
+    str_set_byte(@s, 178,  55)
+    str_set_byte(@s, 179, 109)
+    str_set_byte(@s, 180, 141)
+    str_set_byte(@s, 181, 213)
+    str_set_byte(@s, 182,  78)
+    str_set_byte(@s, 183, 169)
+    str_set_byte(@s, 184, 108)
+    str_set_byte(@s, 185,  86)
+    str_set_byte(@s, 186, 244)
+    str_set_byte(@s, 187, 234)
+    str_set_byte(@s, 188, 101)
+    str_set_byte(@s, 189, 122)
+    str_set_byte(@s, 190, 174)
+    str_set_byte(@s, 191,   8)
+    str_set_byte(@s, 192, 186)
+    str_set_byte(@s, 193, 120)
+    str_set_byte(@s, 194,  37)
+    str_set_byte(@s, 195,  46)
+    str_set_byte(@s, 196,  28)
+    str_set_byte(@s, 197, 166)
+    str_set_byte(@s, 198, 180)
+    str_set_byte(@s, 199, 198)
+    str_set_byte(@s, 200, 232)
+    str_set_byte(@s, 201, 221)
+    str_set_byte(@s, 202, 116)
+    str_set_byte(@s, 203,  31)
+    str_set_byte(@s, 204,  75)
+    str_set_byte(@s, 205, 189)
+    str_set_byte(@s, 206, 139)
+    str_set_byte(@s, 207, 138)
+    str_set_byte(@s, 208, 112)
+    str_set_byte(@s, 209,  62)
+    str_set_byte(@s, 210, 181)
+    str_set_byte(@s, 211, 102)
+    str_set_byte(@s, 212,  72)
+    str_set_byte(@s, 213,   3)
+    str_set_byte(@s, 214, 246)
+    str_set_byte(@s, 215,  14)
+    str_set_byte(@s, 216,  97)
+    str_set_byte(@s, 217,  53)
+    str_set_byte(@s, 218,  87)
+    str_set_byte(@s, 219, 185)
+    str_set_byte(@s, 220, 134)
+    str_set_byte(@s, 221, 193)
+    str_set_byte(@s, 222,  29)
+    str_set_byte(@s, 223, 158)
+    str_set_byte(@s, 224, 225)
+    str_set_byte(@s, 225, 248)
+    str_set_byte(@s, 226, 152)
+    str_set_byte(@s, 227,  17)
+    str_set_byte(@s, 228, 105)
+    str_set_byte(@s, 229, 217)
+    str_set_byte(@s, 230, 142)
+    str_set_byte(@s, 231, 148)
+    str_set_byte(@s, 232, 155)
+    str_set_byte(@s, 233,  30)
+    str_set_byte(@s, 234,  135)
+    str_set_byte(@s, 235, 233)
+    str_set_byte(@s, 236, 206)
+    str_set_byte(@s, 237,  85)
+    str_set_byte(@s, 238,  40)
+    str_set_byte(@s, 239, 223)
+    str_set_byte(@s, 240, 140)
+    str_set_byte(@s, 241, 161)
+    str_set_byte(@s, 242, 137)
+    str_set_byte(@s, 243,  13)
+    str_set_byte(@s, 244, 191)
+    str_set_byte(@s, 245, 230)
+    str_set_byte(@s, 246,  66)
+    str_set_byte(@s, 247, 104)
+    str_set_byte(@s, 248,  65)
+    str_set_byte(@s, 249, 153)
+    str_set_byte(@s, 250,  45)
+    str_set_byte(@s, 251,  15)
+    str_set_byte(@s, 252, 176)
+    str_set_byte(@s, 253,  84)
+    str_set_byte(@s, 254, 187)
+    str_set_byte(@s, 255,  22)
+    return @s
+
+
+# --- AES round constants (Rcon) ---------------------------------------
+#
+# Rcon[i] for i in 1..10 covers AES-128; AES-256 needs through i=7 only
+# (it consumes one Rcon every 2 round-key words at the 8-word boundary).
+# We supply 10 entries which is more than enough for both.
+
+fn _aes_rcon(@i: int) -> int
+    # Rcon[1..10]
+    if @i == 1
+        return 1
+    if @i == 2
+        return 2
+    if @i == 3
+        return 4
+    if @i == 4
+        return 8
+    if @i == 5
+        return 16
+    if @i == 6
+        return 32
+    if @i == 7
+        return 64
+    if @i == 8
+        return 128
+    if @i == 9
+        return 27
+    if @i == 10
+        return 54
+    return 0
+
+
+# --- GF(2^8) helpers for MixColumns / key expansion -------------------
+
+# xtime(b) = b multiplied by x in GF(2^8) with reduction poly 0x11b.
+fn _aes_xtime(@b: int) -> int
+    @r = (@b << 1) & 255
+    if (@b & 128) != 0
+        @r = @r ^ 27
+    return @r
+
+
+# --- Key expansion ----------------------------------------------------
+#
+# Returns a buffer of (Nr+1)*16 bytes containing all round keys, where
+# Nr = 10 for AES-128 and Nr = 14 for AES-256.
+
+fn _aes_key_expand(@key: int, @sbox: int) -> int
+    @klen = str_len(@key)
+    @Nk = 4
+    @Nr = 10
+    if @klen == 32
+        @Nk = 8
+        @Nr = 14
+    @total_words = 4 * (@Nr + 1)
+    @rk = new_str(@total_words * 4)
+
+    # First Nk words = the key itself.
+    @i = 0
+    while @i < @Nk * 4
+        str_set_byte(@rk, @i, str_byte(@key, @i))
+        @i = @i + 1
+
+    @rcon_idx = 1
+    @w = @Nk
+    while @w < @total_words
+        @off = @w * 4
+        @t0 = str_byte(@rk, @off - 4)
+        @t1 = str_byte(@rk, @off - 3)
+        @t2 = str_byte(@rk, @off - 2)
+        @t3 = str_byte(@rk, @off - 1)
+
+        @mod = @w % @Nk
+        if @mod == 0
+            # RotWord then SubWord then XOR Rcon.
+            @r0 = @t1
+            @r1 = @t2
+            @r2 = @t3
+            @r3 = @t0
+            @t0 = str_byte(@sbox, @r0) ^ _aes_rcon(@rcon_idx)
+            @t1 = str_byte(@sbox, @r1)
+            @t2 = str_byte(@sbox, @r2)
+            @t3 = str_byte(@sbox, @r3)
+            @rcon_idx = @rcon_idx + 1
+        elif @Nk == 8
+            if @mod == 4
+                # AES-256 extra SubWord between Rcon points.
+                @t0 = str_byte(@sbox, @t0)
+                @t1 = str_byte(@sbox, @t1)
+                @t2 = str_byte(@sbox, @t2)
+                @t3 = str_byte(@sbox, @t3)
+        @prev = (@w - @Nk) * 4
+        str_set_byte(@rk, @off,     @t0 ^ str_byte(@rk, @prev))
+        str_set_byte(@rk, @off + 1, @t1 ^ str_byte(@rk, @prev + 1))
+        str_set_byte(@rk, @off + 2, @t2 ^ str_byte(@rk, @prev + 2))
+        str_set_byte(@rk, @off + 3, @t3 ^ str_byte(@rk, @prev + 3))
+        @w = @w + 1
+    return @rk
+
+
+# --- AES block encrypt -----------------------------------------------
+#
+# Encrypts one 16-byte block @in into @out (both 16-byte strings).
+# Uses pre-expanded @rk and S-box @sbox. Number of rounds derived from
+# round-key length (16*(Nr+1)).
+
+fn _aes_encrypt_block(@in: int, @rk: int, @sbox: int) -> int
+    @state = new_str(16)
+    @i = 0
+    while @i < 16
+        str_set_byte(@state, @i, str_byte(@in, @i) ^ str_byte(@rk, @i))
+        @i = @i + 1
+
+    @Nr = (str_len(@rk) / 16) - 1
+    @round = 1
+    while @round <= @Nr
+        _aes_sub_bytes(@state, @sbox)
+        _aes_shift_rows(@state)
+        if @round < @Nr
+            _aes_mix_columns(@state)
+        # AddRoundKey
+        @off = @round * 16
+        @j = 0
+        while @j < 16
+            @v = str_byte(@state, @j) ^ str_byte(@rk, @off + @j)
+            str_set_byte(@state, @j, @v)
+            @j = @j + 1
+        @round = @round + 1
+    return @state
+
+
+fn _aes_sub_bytes(@state: int, @sbox: int) -> int
+    @i = 0
+    while @i < 16
+        @b = str_byte(@state, @i)
+        str_set_byte(@state, @i, str_byte(@sbox, @b))
+        @i = @i + 1
+    return 0
+
+
+# AES state is stored column-major:
+#   s0  s4  s8  s12
+#   s1  s5  s9  s13
+#   s2  s6  s10 s14
+#   s3  s7  s11 s15
+# Row 0 shifts by 0, row 1 by 1, row 2 by 2, row 3 by 3.
+fn _aes_shift_rows(@state: int) -> int
+    # Row 1: s1 s5 s9 s13 -> s5 s9 s13 s1
+    @t = str_byte(@state, 1)
+    str_set_byte(@state, 1,  str_byte(@state, 5))
+    str_set_byte(@state, 5,  str_byte(@state, 9))
+    str_set_byte(@state, 9,  str_byte(@state, 13))
+    str_set_byte(@state, 13, @t)
+    # Row 2: s2 s6 s10 s14 -> s10 s14 s2 s6
+    @t = str_byte(@state, 2)
+    @u = str_byte(@state, 6)
+    str_set_byte(@state, 2,  str_byte(@state, 10))
+    str_set_byte(@state, 6,  str_byte(@state, 14))
+    str_set_byte(@state, 10, @t)
+    str_set_byte(@state, 14, @u)
+    # Row 3: s3 s7 s11 s15 -> s15 s3 s7 s11
+    @t = str_byte(@state, 15)
+    str_set_byte(@state, 15, str_byte(@state, 11))
+    str_set_byte(@state, 11, str_byte(@state, 7))
+    str_set_byte(@state, 7,  str_byte(@state, 3))
+    str_set_byte(@state, 3,  @t)
+    return 0
+
+
+fn _aes_mix_columns(@state: int) -> int
+    @c = 0
+    while @c < 4
+        @off = @c * 4
+        @a0 = str_byte(@state, @off)
+        @a1 = str_byte(@state, @off + 1)
+        @a2 = str_byte(@state, @off + 2)
+        @a3 = str_byte(@state, @off + 3)
+        @x0 = _aes_xtime(@a0)
+        @x1 = _aes_xtime(@a1)
+        @x2 = _aes_xtime(@a2)
+        @x3 = _aes_xtime(@a3)
+        # MixColumns multiplies each column by the fixed polynomial
+        # ({02} {03} {01} {01}). The {03} term = xtime(b) XOR b.
+        @r0 = @x0 ^ (@x1 ^ @a1) ^ @a2 ^ @a3
+        @r1 = @a0 ^ @x1 ^ (@x2 ^ @a2) ^ @a3
+        @r2 = @a0 ^ @a1 ^ @x2 ^ (@x3 ^ @a3)
+        @r3 = (@x0 ^ @a0) ^ @a1 ^ @a2 ^ @x3
+        str_set_byte(@state, @off,     @r0 & 255)
+        str_set_byte(@state, @off + 1, @r1 & 255)
+        str_set_byte(@state, @off + 2, @r2 & 255)
+        str_set_byte(@state, @off + 3, @r3 & 255)
+        @c = @c + 1
+    return 0
+
+
+# --- GHASH (GF(2^128) multiplication) --------------------------------
+#
+# Operates on 16-byte big-endian strings. Bit i of a byte at offset k
+# represents x^(8*k + (7-i)) in the polynomial. The reduction poly is
+# 1 + x + x^2 + x^7 + x^128. Right-shift by 1 across the whole 16-byte
+# block carries the bottom bit of byte k into the top bit of byte k+1.
+#
+# _ghash_mul(@x_io, @y) — computes (x * y) in GF(2^128) and stores the
+# result back into @x_io. Both @x_io and @y are 16 bytes.
+
+fn _ghash_mul(@x_io: int, @y: int) -> int
+    @z = new_str(16)
+    # @z starts as zero (new_str zero-fills).
+    @v = new_str(16)
+    @i = 0
+    while @i < 16
+        str_set_byte(@v, @i, str_byte(@y, @i))
+        @i = @i + 1
+
+    @bit = 0
+    while @bit < 128
+        @byte_idx = @bit / 8
+        @bit_in_byte = 7 - (@bit % 8)
+        @xb = str_byte(@x_io, @byte_idx)
+        @do_xor = (@xb >> @bit_in_byte) & 1
+        if @do_xor == 1
+            @j = 0
+            while @j < 16
+                @zb = str_byte(@z, @j) ^ str_byte(@v, @j)
+                str_set_byte(@z, @j, @zb)
+                @j = @j + 1
+        # Now shift V right by 1, with reduction if low bit was set.
+        @lsb = str_byte(@v, 15) & 1
+        _ghash_shr1(@v)
+        if @lsb == 1
+            # XOR R = 0xe1 || 0^120 into the top byte of V.
+            @v0 = str_byte(@v, 0) ^ 225
+            str_set_byte(@v, 0, @v0)
+        @bit = @bit + 1
+
+    # Copy @z back into @x_io.
+    @i = 0
+    while @i < 16
+        str_set_byte(@x_io, @i, str_byte(@z, @i))
+        @i = @i + 1
+    return 0
+
+
+# Right-shift the 16-byte big-endian buffer @v by 1 bit (toward higher
+# array index = lower polynomial degree). Mutates in place.
+fn _ghash_shr1(@v: int) -> int
+    @carry = 0
+    @i = 0
+    while @i < 16
+        @b = str_byte(@v, @i)
+        @nb = ((@carry << 7) | (@b >> 1)) & 255
+        @carry = @b & 1
+        str_set_byte(@v, @i, @nb)
+        @i = @i + 1
+    return 0
+
+
+# _ghash_update(@y, @data, @H) — for each 16-byte block in @data, XOR
+# into @y then multiply by @H. Mutates @y. Final partial block of @data
+# is zero-padded on the right (GHASH spec).
+fn _ghash_update(@y: int, @data: int, @H: int) -> int
+    @n = str_len(@data)
+    @off = 0
+    while @off + 16 <= @n
+        @i = 0
+        while @i < 16
+            @yb = str_byte(@y, @i) ^ str_byte(@data, @off + @i)
+            str_set_byte(@y, @i, @yb)
+            @i = @i + 1
+        _ghash_mul(@y, @H)
+        @off = @off + 16
+    if @off < @n
+        @rem = @n - @off
+        @i = 0
+        while @i < @rem
+            @yb = str_byte(@y, @i) ^ str_byte(@data, @off + @i)
+            str_set_byte(@y, @i, @yb)
+            @i = @i + 1
+        _ghash_mul(@y, @H)
+    return 0
+
+
+# --- Counter-mode helpers --------------------------------------------
+
+# _ctr_inc(@cb) — increment the last 4 bytes of @cb as big-endian u32.
+# Wraps modulo 2^32.
+fn _ctr_inc(@cb: int) -> int
+    @b3 = (str_byte(@cb, 15) + 1) & 255
+    str_set_byte(@cb, 15, @b3)
+    if @b3 != 0
+        return 0
+    @b2 = (str_byte(@cb, 14) + 1) & 255
+    str_set_byte(@cb, 14, @b2)
+    if @b2 != 0
+        return 0
+    @b1 = (str_byte(@cb, 13) + 1) & 255
+    str_set_byte(@cb, 13, @b1)
+    if @b1 != 0
+        return 0
+    @b0 = (str_byte(@cb, 12) + 1) & 255
+    str_set_byte(@cb, 12, @b0)
+    return 0
+
+
+# --- Length encoding (64-bit big-endian) -----------------------------
+
+fn _be64_pack(@buf: int, @off: int, @v: int) -> int
+    @i = 0
+    while @i < 8
+        @shift = (7 - @i) * 8
+        str_set_byte(@buf, @off + @i, (@v >> @shift) & 255)
+        @i = @i + 1
+    return 0
+
+
+# --- Top-level GCM ----------------------------------------------------
+#
+# Both encrypt and decrypt share the same setup: derive H = AES(0^128),
+# J0 = nonce || 0x00000001 (96-bit nonce), then stream-encrypt the
+# plaintext starting from inc32(J0) and authenticate over (AAD || CT).
+
+fn _aes_gcm_core(@key: int, @nonce: int, @data: int, @aad: int, @encrypting: int) -> int
+    @sbox = _aes_build_sbox()
+    @rk = _aes_key_expand(@key, @sbox)
+
+    # H = E_K(0^128)
+    @zero_block = new_str(16)
+    @H = _aes_encrypt_block(@zero_block, @rk, @sbox)
+
+    # J0 = nonce || 00 00 00 01 (12-byte nonce branch).
+    @J0 = new_str(16)
+    @i = 0
+    while @i < 12
+        str_set_byte(@J0, @i, str_byte(@nonce, @i))
+        @i = @i + 1
+    str_set_byte(@J0, 15, 1)
+
+    # Counter for keystream starts at inc32(J0).
+    @ctr = new_str(16)
+    @i = 0
+    while @i < 16
+        str_set_byte(@ctr, @i, str_byte(@J0, @i))
+        @i = @i + 1
+    _ctr_inc(@ctr)
+
+    @n = str_len(@data)
+    @out = new_str(@n)
+    @off = 0
+    while @off < @n
+        @ks = _aes_encrypt_block(@ctr, @rk, @sbox)
+        @blklen = 16
+        if @off + @blklen > @n
+            @blklen = @n - @off
+        @i = 0
+        while @i < @blklen
+            @cb = str_byte(@data, @off + @i) ^ str_byte(@ks, @i)
+            str_set_byte(@out, @off + @i, @cb)
+            @i = @i + 1
+        _ctr_inc(@ctr)
+        @off = @off + 16
+
+    # Build the GHASH input: AAD || pad || CT || pad || len_a || len_c.
+    # @ct_for_tag is the ciphertext regardless of direction (for decrypt
+    # the caller passes ciphertext as @data; @out is the plaintext).
+    @ct_for_tag = @out
+    if @encrypting == 0
+        @ct_for_tag = @data
+
+    @y = new_str(16)
+    _ghash_update(@y, @aad, @H)
+    _ghash_update(@y, @ct_for_tag, @H)
+    # Length block: aad_bits (64) || ct_bits (64), both big-endian.
+    @lenblk = new_str(16)
+    _be64_pack(@lenblk, 0, str_len(@aad) * 8)
+    _be64_pack(@lenblk, 8, str_len(@ct_for_tag) * 8)
+    @i = 0
+    while @i < 16
+        @yb = str_byte(@y, @i) ^ str_byte(@lenblk, @i)
+        str_set_byte(@y, @i, @yb)
+        @i = @i + 1
+    _ghash_mul(@y, @H)
+
+    # T = E_K(J0) XOR Y.
+    @ekJ0 = _aes_encrypt_block(@J0, @rk, @sbox)
+    @tag = new_str(16)
+    @i = 0
+    while @i < 16
+        str_set_byte(@tag, @i, str_byte(@ekJ0, @i) ^ str_byte(@y, @i))
+        @i = @i + 1
+
+    # On encrypt: append tag. On decrypt: caller compares tags upstream.
+    if @encrypting == 1
+        @final = new_str(@n + 16)
+        @i = 0
+        while @i < @n
+            str_set_byte(@final, @i, str_byte(@out, @i))
+            @i = @i + 1
+        @i = 0
+        while @i < 16
+            str_set_byte(@final, @n + @i, str_byte(@tag, @i))
+            @i = @i + 1
+        return @final
+
+    # Decrypt path: pack [plaintext || expected_tag] so caller can
+    # compare. _aes_gcm_core is internal; aes_gcm_decrypt strips this.
+    @final = new_str(@n + 16)
+    @i = 0
+    while @i < @n
+        str_set_byte(@final, @i, str_byte(@out, @i))
+        @i = @i + 1
+    @i = 0
+    while @i < 16
+        str_set_byte(@final, @n + @i, str_byte(@tag, @i))
+        @i = @i + 1
+    return @final
+
+
+# --- Public surface ---------------------------------------------------
+
+fn aes_gcm_check_inputs(@key: int, @nonce: int) -> int
+    @kl = str_len(@key)
+    if @kl != 16
+        if @kl != 32
+            return 0
+    if str_len(@nonce) != 12
+        return 0
+    return 1
+
+
+fn aes_gcm_encrypt(@key: int, @nonce: int, @plaintext: int, @aad: int) -> int
+    if aes_gcm_check_inputs(@key, @nonce) == 0
+        return ""
+    return _aes_gcm_core(@key, @nonce, @plaintext, @aad, 1)
+
+
+fn aes_gcm_decrypt(@key: int, @nonce: int, @cipher_plus_tag: int, @aad: int) -> int
+    if aes_gcm_check_inputs(@key, @nonce) == 0
+        return ""
+    @total = str_len(@cipher_plus_tag)
+    if @total < 16
+        return ""
+    @ctlen = @total - 16
+
+    # Split ciphertext and tag.
+    @ct = new_str(@ctlen)
+    @i = 0
+    while @i < @ctlen
+        str_set_byte(@ct, @i, str_byte(@cipher_plus_tag, @i))
+        @i = @i + 1
+    @want_tag = new_str(16)
+    @i = 0
+    while @i < 16
+        str_set_byte(@want_tag, @i, str_byte(@cipher_plus_tag, @ctlen + @i))
+        @i = @i + 1
+
+    # Run the core with @encrypting=0 so it returns [plaintext || tag_we_computed].
+    @core = _aes_gcm_core(@key, @nonce, @ct, @aad, 0)
+    @pt = new_str(@ctlen)
+    @i = 0
+    while @i < @ctlen
+        str_set_byte(@pt, @i, str_byte(@core, @i))
+        @i = @i + 1
+    @got_tag = new_str(16)
+    @i = 0
+    while @i < 16
+        str_set_byte(@got_tag, @i, str_byte(@core, @ctlen + @i))
+        @i = @i + 1
+
+    # Constant-time tag compare.
+    @diff = 0
+    @i = 0
+    while @i < 16
+        @diff = @diff | (str_byte(@got_tag, @i) ^ str_byte(@want_tag, @i))
+        @i = @i + 1
+    if @diff != 0
+        return ""
+    return @pt
+
+
+# aes_gcm_hex(@bytes) -> lowercase hex string. Useful for KAT diffing.
+fn aes_gcm_hex(@bytes: int) -> int
+    @n = str_len(@bytes)
+    @out = new_str(@n * 2)
+    @i = 0
+    while @i < @n
+        @b = str_byte(@bytes, @i)
+        @hi = (@b >> 4) & 15
+        @lo = @b & 15
+        if @hi < 10
+            str_set_byte(@out, @i * 2, 48 + @hi)
+        else
+            str_set_byte(@out, @i * 2, 87 + @hi)
+        if @lo < 10
+            str_set_byte(@out, @i * 2 + 1, 48 + @lo)
+        else
+            str_set_byte(@out, @i * 2 + 1, 87 + @lo)
+        @i = @i + 1
+    return @out

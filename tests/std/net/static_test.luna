@@ -1,0 +1,61 @@
+# Tests for std/net/static — MIME detection + path-traversal guard.
+# E2E (real HTTP request) lives in static_e2e.sh.
+
+import static
+import test
+
+
+fn run_static_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # MIME detection via file extension.
+    @r = assert_eq_str("html mime", _static_mime("page.html"), "text/html; charset=utf-8")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("css mime",  _static_mime("style.css"),  "text/css")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("js mime",   _static_mime("app.js"),     "application/javascript")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("png mime",  _static_mime("logo.png"),   "image/png")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("svg mime",  _static_mime("icon.svg"),   "image/svg+xml")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("json mime", _static_mime("data.json"),  "application/json")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("wasm mime", _static_mime("app.wasm"),   "application/wasm")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("unknown",   _static_mime("blob.xyz"),   "application/octet-stream")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("no ext",    _static_mime("Makefile"),   "application/octet-stream")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Path-traversal guard.
+    @r = assert_eq_int("dotdot caught",   _static_has_dotdot("/foo/../etc/passwd"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("two-dot at start", _static_has_dotdot("../secret"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("no dotdot",        _static_has_dotdot("/foo/bar.html"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("single dot ok",    _static_has_dotdot("/foo/bar.css"),  0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("static", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_static_tests(0, 0)

@@ -1,0 +1,30 @@
+# tier: T8
+# deps: http_server
+# ffi: none
+#
+# Minimal HTTP server in pure Luna. Listens on 127.0.0.1:8080 and
+# returns a different body for `/` vs everything else.
+#
+# Build & run:
+#     export LUNA_PATH=$(pwd)/std/runtime:$(pwd)/std/core:$(pwd)/std/std:$(pwd)/std/net:$(pwd)/std/ext
+#     luna run examples/net/hello_server.luna
+#
+# Then in another terminal:
+#     curl http://127.0.0.1:8080/         # -> Hello, Luna!
+#     curl http://127.0.0.1:8080/health   # -> ok
+#     curl http://127.0.0.1:8080/missing  # -> Not Found (404)
+
+import http_server
+
+
+fn handle(@req: HttpRequest, @cli: int) -> int
+    if str_eq(@req.path, "/") == 1
+        return http_send_text(@cli, "Hello, Luna!\n")
+    if str_eq(@req.path, "/health") == 1
+        return http_send_text(@cli, "ok\n")
+    return http_send_404(@cli)
+
+
+fn main() -> int
+    shine("Luna HTTP server listening on http://127.0.0.1:8080/")
+    return http_serve(8080, handle)

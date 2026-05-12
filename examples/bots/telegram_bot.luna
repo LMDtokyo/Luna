@@ -1,70 +1,154 @@
-import beam
-import lumen
-import chrono
-import cosmos
+# tier: T8
+# deps: https, json, env, kvstore
+# ffi: openssl-cli
+#
+# A real Telegram bot in pure Luna — long-poll getUpdates, respond
+# to /start, /help, /echo, /stats. Persistence in kvstore so the
+# message count survives restarts.
+#
+# Build & run:
+#   export LUNA_PATH=$(pwd)/std/runtime:$(pwd)/std/core:$(pwd)/std/std:$(pwd)/std/net:$(pwd)/std/ext
+#   export TG_TOKEN="<your-bot-token-from-@BotFather>"
+#   luna run examples/bots/telegram_bot.luna
+#
+# Talk to your bot in Telegram and watch:
+#   /start    -> "Hello from Luna!"
+#   /help     -> command list
+#   /echo X   -> "X" mirrored back
+#   /stats    -> message counter
 
-struct Incoming
-    update_id: int
-    chat_id:   int
-    text:      str
+import https
+import json
+import env
+import kvstore
 
-seal @tg_api = "https://api.telegram.org/bot"
 
-fn parse_incoming(@node: lumen.Node) -> phase<Incoming>
-    seal @uid  = @node.at("update_id").as_int()?
-    seal @msg  = @node.at("message")?
-    seal @chat = @msg.at("chat")?
-    seal @cid  = @chat.at("id").as_int()?
-    seal @text = @msg.at("text").as_text()?
-    shine Bright(Incoming { update_id: @uid, chat_id: @cid, text: @text })
+fn _tg_db() -> int
+    return "/tmp/luna-tg-bot.kv"
 
-fn fetch_updates(@token: str, @offset: int) -> phase<lumen.Node>
-    seal @url = @tg_api + @token
-                + "/getUpdates?timeout=25&offset=" + @offset.show()
-                + "&allowed_updates=%5B%22message%22%5D"
-    seal @echo = beam.fetch(@url)?
-    unless @echo.status.is_ok()
-        shine Dim(Fault.net("getUpdates " + @echo.status.show()))
-    shine Bright(lumen.parse(@echo.carry)?)
 
-fn reply(@token: str, @chat: int, @text: str) -> phase<unit>
-    seal @url = @tg_api + @token + "/sendMessage"
-    seal @body = lumen.compose
-        "chat_id": @chat
-        "text":    @text
-    seal @echo = beam.push_lumen(@url, @body)?
-    unless @echo.status.is_ok()
-        shine Dim(Fault.net("sendMessage " + @echo.status.show()))
-    shine Bright(unit)
+# tg_call(@token, @method) -> HttpResponse for a GET-style endpoint.
+fn tg_call(@token: int, @method: int) -> HttpResponse
+    @path = str_concat("/bot", @token)
+    @path = str_concat(@path, "/")
+    @path = str_concat(@path, @method)
+    return https_get("api.telegram.org", @path)
 
-fn handle(@token: str, @msg: Incoming) -> phase<unit>
-    if @msg.text == "/start"
-        reply(@token, @msg.chat_id, "Luna bot online.")?
-        shine Bright(unit)
-    if @msg.text.starts_with("/echo ")
-        seal @payload = @msg.text.slice(6, @msg.text.len())
-        reply(@token, @msg.chat_id, @payload)?
-        shine Bright(unit)
-    reply(@token, @msg.chat_id, @msg.text)?
-    shine Bright(unit)
 
-fn main() -> phase<int>
-    seal @token = cosmos.peek("TELEGRAM_BOT_TOKEN")?
-    shine "telegram bot ready"
+# tg_get_updates(@token, @offset) -> raw JSON body, or "" on error.
+fn tg_get_updates(@token: int, @offset: int) -> int
+    @method = str_concat("getUpdates?offset=", int_to_str(@offset))
+    @method = str_concat(@method, "&timeout=20")
+    let @r: HttpResponse = tg_call(@token, @method)
+    if @r.status != 200
+        return ""
+    return @r.body
 
-    meow @offset: int = 0
-    orbit _ in 0..9999999999
-        phase fetch_updates(@token, @offset)
-            Bright(@doc) =>
-                orbit @raw in @doc.at("result")?.items()
-                    phase parse_incoming(@raw)
-                        Bright(@msg) =>
-                            handle(@token, @msg)?
-                            if @msg.update_id >= @offset
-                                @offset = @msg.update_id + 1
-                        Dim(_) =>
-                            pass
-            Dim(@fault) =>
-                shine "poll failed: " + @fault.msg
-                chrono.slumber(arc.seconds(3))
-    shine Bright(0)
+
+# tg_send(@token, @chat_id, @text) -> HTTP status (200 on success).
+fn tg_send(@token: int, @chat_id: int, @text: int) -> int
+    @path = str_concat("/bot", @token)
+    @path = str_concat(@path, "/sendMessage")
+    @body = str_concat("{\"chat_id\":", int_to_str(@chat_id))
+    @body = str_concat(@body, ",\"text\":")
+    @body = str_concat(@body, json_escape(@text))
+    @body = str_concat(@body, "}")
+    let @r: HttpResponse = https_post("api.telegram.org", @path, @body, "application/json")
+    return @r.status
+
+
+# Strip "/echo " from a message; return the rest, or "" if there's
+# nothing after the command.
+fn _strip_echo(@text: int) -> int
+    @tlen = str_len(@text)
+    if @tlen <= 6
+        return ""
+    @want = "/echo "
+    @i = 0
+    while @i < 6
+        if str_byte(@text, @i) != str_byte(@want, @i)
+            return ""
+        @i = @i + 1
+    return str_substr(@text, 6, @tlen - 6)
+
+
+# Pick a response for a given incoming text. Side effect: bumps the
+# message counter in kvstore.
+fn handle_text(@token: int, @chat_id: int, @text: int) -> int
+    @cur = kv_get(_tg_db(), "msg_count")
+    @n = 0
+    if str_len(@cur) > 0
+        @n = parse_int(@cur)
+    @n = @n + 1
+    kv_put(_tg_db(), "msg_count", int_to_str(@n))
+
+    if str_eq(@text, "/start") == 1
+        return tg_send(@token, @chat_id, "Hello from Luna! Try /help.")
+    if str_eq(@text, "/help") == 1
+        return tg_send(@token, @chat_id, "Commands:\n  /start\n  /help\n  /echo <text>\n  /stats")
+    if str_eq(@text, "/stats") == 1
+        @reply = str_concat("Messages seen since boot: ", int_to_str(@n))
+        return tg_send(@token, @chat_id, @reply)
+
+    @echoed = _strip_echo(@text)
+    if str_len(@echoed) > 0
+        return tg_send(@token, @chat_id, @echoed)
+
+    return tg_send(@token, @chat_id, "Unknown command. Try /help.")
+
+
+# Process one updates payload. Returns the new offset (largest
+# update_id + 1).
+fn process_updates(@token: int, @body: int, @cur_offset: int) -> int
+    @ok = json_get_bool(@body, "ok")
+    if @ok != 1
+        return @cur_offset
+
+    @result_pos = json_obj_pos(@body, 0, "result")
+    if @result_pos < 0
+        return @cur_offset
+
+    let @updates: Vec = json_array_positions(@body, @result_pos)
+    @max_id = @cur_offset - 1
+    @i = 0
+    while @i < vec_len(@updates)
+        @upd = vec_get(@updates, @i)
+        @uid = json_obj_int(@body, @upd, "update_id")
+        if @uid > @max_id
+            @max_id = @uid
+
+        @msg = json_obj_pos(@body, @upd, "message")
+        if @msg >= 0
+            @chat = json_obj_pos(@body, @msg, "chat")
+            if @chat >= 0
+                @chat_id = json_obj_int(@body, @chat, "id")
+                @text = json_obj_str(@body, @msg, "text")
+                if str_len(@text) > 0
+                    handle_text(@token, @chat_id, @text)
+        @i = @i + 1
+
+    return @max_id + 1
+
+
+fn main() -> int
+    @token = env_get("TG_TOKEN")
+    if str_len(@token) == 0
+        shine("error: set TG_TOKEN to your bot's token (BotFather)")
+        return 1
+
+    shine("luna telegram bot — checking auth...")
+    let @who: HttpResponse = tg_call(@token, "getMe")
+    if @who.status != 200
+        shine("getMe failed — is the token valid?")
+        print_int(@who.status)
+        shine("")
+        return 1
+    shine("auth ok, entering long-poll loop")
+    shine(@who.body)
+
+    @offset = 0
+    while 1
+        @body = tg_get_updates(@token, @offset)
+        if str_len(@body) > 0
+            @offset = process_updates(@token, @body, @offset)
+    return 0

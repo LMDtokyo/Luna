@@ -1,0 +1,63 @@
+# Tests for std/std/template.
+
+import template
+import test
+
+
+fn run_template_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1) No vars — template returned as-is.
+    @r = assert_eq_str("no vars", template_render("plain text", ""), "plain text")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) Single substitution.
+    @r = assert_eq_str("single", template_render("Hi {{name}}!", "name=alice;"), "Hi alice!")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) Multiple substitutions.
+    @r = assert_eq_str("two vars", template_render("{{a}}+{{b}}={{sum}}", "a=2;b=3;sum=5;"), "2+3=5")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) Same var twice.
+    @r = assert_eq_str("repeat", template_render("{{x}}{{x}}{{x}}", "x=ha;"), "hahaha")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) Unknown var -> empty.
+    @r = assert_eq_str("unknown", template_render("[{{missing}}]", "x=1;"), "[]")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) Whitespace inside braces tolerated.
+    @r = assert_eq_str("spaces", template_render("Hi {{ name }}!", "name=bob;"), "Hi bob!")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7) Lone '{' is copied verbatim (no opening pair).
+    @r = assert_eq_str("lone brace", template_render("{json}", "json=x;"), "{json}")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8) Unclosed '{{' — copied as a literal byte.
+    @r = assert_eq_str("unclosed", template_render("oops {{name", "name=alice;"), "oops {{name")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 9) HTML-flavoured template — realistic messenger use.
+    @tmpl = "<h1>Welcome, {{user}}</h1><p>You have {{count}} new messages.</p>"
+    @r = assert_eq_str("html", template_render(@tmpl, "user=alice;count=7;"), "<h1>Welcome, alice</h1><p>You have 7 new messages.</p>")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("template", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_template_tests(0, 0)

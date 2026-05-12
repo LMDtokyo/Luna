@@ -1,0 +1,97 @@
+# tier: T8
+# deps: http_router, json
+# ffi: none
+#
+# Skeleton REST API showing the building blocks of a messenger backend
+# in pure Luna: routing, JSON-shaped responses, request bodies. No
+# database, no auth yet — that's the next sprint. State lives in
+# globals for now so the example stays one file.
+#
+# Build & run:
+#     export LUNA_PATH=$(pwd)/std/runtime:$(pwd)/std/core:$(pwd)/std/std:$(pwd)/std/net:$(pwd)/std/ext
+#     luna run examples/net/messenger_api.luna
+#
+# Try it (in another terminal):
+#     curl -i http://127.0.0.1:8080/
+#     curl -i http://127.0.0.1:8080/api/health
+#     curl -i http://127.0.0.1:8080/api/users/42
+#     curl -i -X POST -d '{"name":"alice"}' http://127.0.0.1:8080/api/register
+#     curl -i -X POST -d 'hello' http://127.0.0.1:8080/api/messages
+
+import http_router
+import json
+
+
+fn route_index(@req: HttpRequest, @cli: int) -> int
+    @body = "Luna messenger API\n\nEndpoints:\n  GET  /api/health\n  GET  /api/users/:id\n  POST /api/register   body: {\"name\":\"...\"}\n  POST /api/messages   body: <text>\n"
+    return http_send_text(@cli, @body)
+
+
+# GET /api/users/:id — path-param demo. Echoes the captured id.
+fn route_user_get(@req: HttpRequest, @cli: int) -> int
+    @id = req_param(@req, "id")
+    if str_len(@id) == 0
+        return http_send(@cli, 400, "Bad Request", "application/json", "{\"error\":\"missing id\"}")
+    @reply = str_concat("{\"id\":\"", @id)
+    @reply = str_concat(@reply, "\",\"name\":\"user-")
+    @reply = str_concat(@reply, @id)
+    @reply = str_concat(@reply, "\"}")
+    return http_send_json(@cli, @reply)
+
+
+fn route_health(@req: HttpRequest, @cli: int) -> int
+    return http_send_json(@cli, "{\"status\":\"ok\"}")
+
+
+# POST /api/register — parses {"name":"<x>"} via std/std/json and
+# echoes a fake {"id":1,"name":"<x>"} reply. A real implementation
+# would persist the user and return a session token.
+fn route_register(@req: HttpRequest, @cli: int) -> int
+    @body = @req.body
+    @name_pos = json_obj_str(@body, 0, "name")
+    if @name_pos < 0
+        return http_send(@cli, 400, "Bad Request", "application/json", "{\"error\":\"missing 'name'\"}")
+    @name_len = json_str_len(@body, @name_pos)
+    @name = json_str_decode(@body, @name_pos, @name_len)
+    @reply = str_concat("{\"id\":1,\"name\":\"", @name)
+    @reply = str_concat(@reply, "\"}")
+    return http_send_json(@cli, @reply)
+
+
+# POST /api/messages — accepts a plain-text body and acks the length.
+fn route_messages(@req: HttpRequest, @cli: int) -> int
+    @len = str_len(@req.body)
+    @reply = "{\"accepted\":true,\"bytes\":"
+    @reply = str_concat(@reply, _int_to_str(@len))
+    @reply = str_concat(@reply, "}")
+    return http_send_json(@cli, @reply)
+
+
+# Local int->string helper. (Once std/std/strings is migrated this
+# moves over there.)
+fn _int_to_str(@n: int) -> int
+    if @n == 0
+        return "0"
+    @tmp = new_str(24)
+    @i = 0
+    while @n > 0
+        u8_set(@tmp, @i, 48 + (@n % 10))
+        @n = @n / 10
+        @i = @i + 1
+    @out = new_str(@i)
+    @j = 0
+    while @j < @i
+        u8_set(@out, @j, u8_at(@tmp, @i - 1 - @j))
+        @j = @j + 1
+    return @out
+
+
+fn main() -> int
+    let @r: Router = router_new()
+    router_get(@r,  "/",                route_index)
+    router_get(@r,  "/api/health",      route_health)
+    router_get(@r,  "/api/users/:id",   route_user_get)
+    router_post(@r, "/api/register",    route_register)
+    router_post(@r, "/api/messages",    route_messages)
+    shine("Luna messenger API listening on http://127.0.0.1:8080/")
+    return router_serve(@r, 8080)

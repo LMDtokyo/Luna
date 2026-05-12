@@ -1,0 +1,54 @@
+# tier: T3
+# deps:
+# ffi: none
+#
+# std/core/sys — process-level helpers: argv, exit codes.
+#
+# The prelude already exposes `arg(i)` (returning a freshly substr'd
+# string per call) and `sys_*` syscalls. This module wraps the common
+# patterns: counting argv, materializing it as a Vec, and slicing off
+# the program name.
+
+
+# args_count() -> total number of argv entries, including arg(0).
+# Walks until arg(@i) returns "" (the documented EOF marker).
+fn args_count() -> int
+    @i = 0
+    while str_eq(arg(@i), "") == 0
+        @i = @i + 1
+    return @i
+
+# args_collect() -> Vec of all argv entries, in order, including arg(0).
+fn args_collect() -> Vec
+    @v = vec_new()
+    @i = 0
+    while 1
+        @s = arg(@i)
+        if str_eq(@s, "") == 1
+            break
+        vec_push(@v, @s)
+        @i = @i + 1
+    return @v
+
+# args_user() -> Vec of argv entries excluding arg(0), i.e. the user
+# arguments suitable for handing to cli_parse. Returns an empty Vec
+# when invoked with no extra arguments.
+fn args_user() -> Vec
+    @v = vec_new()
+    @i = 1
+    while 1
+        @s = arg(@i)
+        if str_eq(@s, "") == 1
+            break
+        vec_push(@v, @s)
+        @i = @i + 1
+    return @v
+
+# program_name() -> arg(0), or "" if argv is empty.
+fn program_name() -> int
+    return arg(0)
+
+# exit(@code) -> never returns. Calls sys_exit directly.
+fn exit(@code: int) -> int
+    sys_exit(@code)
+    return 0

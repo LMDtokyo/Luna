@@ -1,0 +1,151 @@
+# Tests for std/ext/db/sqlite — exercises CREATE/INSERT/SELECT/UPDATE
+# round-trips against a fresh on-disk database under /tmp.
+
+import sqlite
+import test
+
+
+fn _testdb() -> int
+    return "/tmp/luna-sqlite-test.db"
+
+fn _cleanup() -> int
+    shell_run("rm -f /tmp/luna-sqlite-test.db /tmp/luna-sqlite-sql.txt /tmp/luna-sqlite-out.txt")
+    return 0
+
+
+fn run_sqlite_tests(@p: int, @f: int) -> int
+    @r = 0
+    _cleanup()
+    @h = db_open(_testdb())
+
+    # 1) CREATE + INSERT.
+    @rc = db_exec(@h, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);")
+    @r = assert_eq_int("create table", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @rc = db_exec(@h, "INSERT INTO users (name, age) VALUES ('alice', 30);")
+    @r = assert_eq_int("insert 1", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @rc = db_exec(@h, "INSERT INTO users (name, age) VALUES ('bob', 25); INSERT INTO users (name, age) VALUES ('carol', 35);")
+    @r = assert_eq_int("insert batch", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) SELECT COUNT.
+    @count = db_scalar(@h, "SELECT COUNT(*) FROM users;")
+    @r = assert_eq_str("count == 3", @count, "3")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) SELECT scalar.
+    @age = db_scalar(@h, "SELECT age FROM users WHERE name='alice';")
+    @r = assert_eq_str("alice age", @age, "30")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) SELECT row.
+    let @row: Vec = db_query_one(@h, "SELECT id, name, age FROM users WHERE name='bob';")
+    @r = assert_eq_int("row width 3", vec_len(@row), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("bob name", vec_get(@row, 1), "bob")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("bob age",  vec_get(@row, 2), "25")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) SELECT all rows.
+    let @all: Vec = db_query(@h, "SELECT name FROM users ORDER BY age;")
+    @r = assert_eq_int("3 rows back", vec_len(@all), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    let @r0: Vec = vec_get(@all, 0)
+    @r = assert_eq_str("ordered: bob first", vec_get(@r0, 0), "bob")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    let @r2: Vec = vec_get(@all, 2)
+    @r = assert_eq_str("ordered: carol last", vec_get(@r2, 0), "carol")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) UPDATE.
+    @rc = db_exec(@h, "UPDATE users SET age = 31 WHERE name = 'alice';")
+    @r = assert_eq_int("update", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @age = db_scalar(@h, "SELECT age FROM users WHERE name='alice';")
+    @r = assert_eq_str("alice age after update", @age, "31")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7) DELETE.
+    @rc = db_exec(@h, "DELETE FROM users WHERE name = 'carol';")
+    @r = assert_eq_int("delete", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @count = db_scalar(@h, "SELECT COUNT(*) FROM users;")
+    @r = assert_eq_str("count == 2", @count, "2")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8) Transactions in one exec call.
+    @rc = db_exec(@h, "BEGIN; INSERT INTO users (name, age) VALUES ('dan', 40); ROLLBACK;")
+    @r = assert_eq_int("rollback", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @count = db_scalar(@h, "SELECT COUNT(*) FROM users;")
+    @r = assert_eq_str("still 2 after rollback", @count, "2")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @rc = db_exec(@h, "BEGIN; INSERT INTO users (name, age) VALUES ('dan', 40); COMMIT;")
+    @r = assert_eq_int("commit", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @count = db_scalar(@h, "SELECT COUNT(*) FROM users;")
+    @r = assert_eq_str("3 after commit", @count, "3")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 9) Index — should not break anything.
+    @rc = db_exec(@h, "CREATE INDEX users_by_age ON users(age);")
+    @r = assert_eq_int("create index", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 10) Error path: invalid SQL returns -1.
+    @rc = db_exec(@h, "INSERT INTO no_such_table (x) VALUES (1);")
+    @r = assert_eq_int("bad sql -> -1", @rc, -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 11) db_quote.
+    @r = assert_eq_str("quote plain",    db_quote("alice"), "'alice'")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("quote w/ apos", db_quote("o'brien"), "'o''brien'")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 12) db_int.
+    @r = assert_eq_int("db_int 42",  db_int("42"),  42)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("db_int empty", db_int(""), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    db_close(@h)
+    _cleanup()
+    test_summary("sqlite", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_sqlite_tests(0, 0)

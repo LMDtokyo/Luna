@@ -1,0 +1,325 @@
+# tier: T5
+# deps: http_server
+# ffi: none
+#
+# std/net/http_router — method + path routing for std/net/http_server.
+#
+# Usage sketch:
+#
+#   import http_router
+#
+#   fn home(@req: HttpRequest, @cli: int) -> int
+#       return http_send_text(@cli, "welcome\n")
+#
+#   fn health(@req: HttpRequest, @cli: int) -> int
+#       return http_send_text(@cli, "ok\n")
+#
+#   fn main() -> int
+#       let @r: Router = router_new()
+#       router_get(@r, "/",        home)
+#       router_get(@r, "/health",  health)
+#       return router_serve(@r, 8080)
+#
+# What it does now:
+#   - Linked-list route table walked top-to-bottom.
+#   - Method matched literally ("GET", "POST", ...) or "*" wildcard.
+#   - Path matched literally ("/users/42" vs "/users/:id" is not yet a
+#     thing — :param captures will land alongside the path-template
+#     parser).
+#   - Falls back to a user-set not_found handler or a built-in 404.
+
+import http_server
+
+
+struct Router
+    head:      int        # first Route, or 0
+    not_found: int        # function pointer or 0
+
+
+struct Route
+    method:  int          # "GET", "POST", "*"
+    pattern: int          # "/users"
+    handler: int          # fn(@req: HttpRequest, @cli: int) -> int
+    next:    int          # next Route or 0
+
+
+fn router_new() -> Router
+    let @r: Router = new_str(16)
+    @r.head = 0
+    @r.not_found = 0
+    return @r
+
+
+# _route_next(@r) -> next pointer via typed parameter access.
+fn _route_next(@r: Route) -> int
+    return @r.next
+
+
+# _route_set_next(@r, @new_next) -> 0.
+fn _route_set_next(@r: Route, @new_next: int) -> int
+    @r.next = @new_next
+    return 0
+
+
+# _route_handler_of(@r) -> handler fn-pointer.
+fn _route_handler_of(@r: Route) -> int
+    return @r.handler
+
+
+# _route_pattern_of(@r) / _route_method_of(@r) — typed-param accessors.
+fn _route_pattern_of(@r: Route) -> int
+    return @r.pattern
+
+fn _route_method_of(@r: Route) -> int
+    return @r.method
+
+
+# --- Path-template matcher ---------------------------------------------
+#
+# Pattern segments are split by '/'. A pattern segment starting with ':'
+# captures the matching request segment by name (":id" captures into
+# the variable `id`). Other segments must match literally.
+#
+# On match, returns a non-zero ";"-terminated params buffer:
+#     "id=42;msg=hi;"
+# Literal matches with no params return a non-empty sentinel string
+# ("_") so the caller can distinguish "match without params" from
+# "no match" (return value 0).
+
+fn _path_seg_end(@s: int, @off: int, @slen: int) -> int
+    while @off < @slen
+        if str_byte(@s, @off) == 47
+            return @off
+        @off = @off + 1
+    return @slen
+
+fn _seg_eq(@a: int, @ao: int, @b: int, @bo: int, @len: int) -> int
+    @i = 0
+    while @i < @len
+        if str_byte(@a, @ao + @i) != str_byte(@b, @bo + @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+fn _buf_append_byte(@buf: int, @off: int, @c: int) -> int
+    u8_set(@buf, @off, @c)
+    return @off + 1
+
+fn _buf_append_sub(@buf: int, @off: int, @src: int, @src_off: int, @src_len: int) -> int
+    @i = 0
+    while @i < @src_len
+        u8_set(@buf, @off, str_byte(@src, @src_off + @i))
+        @off = @off + 1
+        @i = @i + 1
+    return @off
+
+# _match_path(@pattern, @path) -> 0 (no match) or params string.
+# An empty pattern/path is rejected. Trailing '/' on either side must
+# match the other side's trailing '/'.
+fn _match_path(@pattern: int, @path: int) -> int
+    @plen = str_len(@pattern)
+    @rlen = str_len(@path)
+    if @plen < 1
+        return 0
+    if @rlen < 1
+        return 0
+    if str_byte(@pattern, 0) != 47
+        return 0
+    if str_byte(@path, 0) != 47
+        return 0
+
+    @params = new_str(256)
+    @poff = 0
+    @pi = 1
+    @ri = 1
+
+    while @pi <= @plen
+        if @pi == @plen
+            # Pattern fully consumed; succeed iff path is too.
+            if @ri == @rlen
+                if @poff == 0
+                    return "_"
+                return str_substr(@params, 0, @poff)
+            return 0
+
+        @pe = _path_seg_end(@pattern, @pi, @plen)
+        @re = _path_seg_end(@path, @ri, @rlen)
+        @pseg_len = @pe - @pi
+        @rseg_len = @re - @ri
+
+        @is_param = 0
+        if @pseg_len > 0
+            if str_byte(@pattern, @pi) == 58
+                @is_param = 1
+
+        if @is_param == 1
+            @poff = _buf_append_sub(@params, @poff, @pattern, @pi + 1, @pseg_len - 1)
+            @poff = _buf_append_byte(@params, @poff, 61)
+            @poff = _buf_append_sub(@params, @poff, @path, @ri, @rseg_len)
+            @poff = _buf_append_byte(@params, @poff, 59)
+        else
+            if @pseg_len != @rseg_len
+                return 0
+            if _seg_eq(@pattern, @pi, @path, @ri, @pseg_len) == 0
+                return 0
+
+        @pi = @pe + 1
+        @ri = @re + 1
+
+    # Pattern empty (pi > plen): success only if path also exhausted.
+    if @ri >= @rlen + 1
+        if @poff == 0
+            return "_"
+        return str_substr(@params, 0, @poff)
+    return 0
+
+
+# _route_match(@r, @method, @path) -> 0 (no match) or params string.
+fn _route_match(@r: Route, @method: int, @path: int) -> int
+    if str_eq(@r.method, "*") == 0
+        if str_eq(@r.method, @method) == 0
+            return 0
+    return _match_path(@r.pattern, @path)
+
+
+# --- Param accessor ----------------------------------------------------
+
+# req_param(@req, @name) -> value string, or "" if absent.
+# Walks the ";"-delimited params buffer set by the router.
+fn req_param(@req: HttpRequest, @name: int) -> int
+    @params = @req.params
+    if @params == 0
+        return ""
+    @plen = str_len(@params)
+    if @plen == 0
+        return ""
+    @nlen = str_len(@name)
+    @i = 0
+    while @i < @plen
+        # Find '=' separating name and value.
+        @name_start = @i
+        @seek = 1
+        while @seek == 1
+            if @i >= @plen
+                @seek = 0
+            else
+                if str_byte(@params, @i) == 61
+                    @seek = 0
+                else
+                    @i = @i + 1
+        if @i >= @plen
+            return ""
+
+        @cand_len = @i - @name_start
+        @matched = 0
+        if @cand_len == @nlen
+            if _seg_eq(@params, @name_start, @name, 0, @nlen) == 1
+                @matched = 1
+
+        @i = @i + 1                     # past '='
+        @val_start = @i
+        @seek = 1
+        while @seek == 1
+            if @i >= @plen
+                @seek = 0
+            else
+                if str_byte(@params, @i) == 59
+                    @seek = 0
+                else
+                    @i = @i + 1
+
+        if @matched == 1
+            return str_substr(@params, @val_start, @i - @val_start)
+
+        @i = @i + 1                     # past ';'
+    return ""
+
+
+# Append a route to the router's linked list. Returns 0 on success.
+fn router_add(@router: Router, @method: int, @pattern: int, @handler: int) -> int
+    let @route: Route = new_str(32)
+    @route.method  = @method
+    @route.pattern = @pattern
+    @route.handler = @handler
+    @route.next    = 0
+
+    if @router.head == 0
+        @router.head = @route
+        return 0
+
+    @cur = @router.head
+    while _route_next(@cur) != 0
+        @cur = _route_next(@cur)
+    _route_set_next(@cur, @route)
+    return 0
+
+
+fn router_get(@router: Router, @pattern: int, @handler: int) -> int
+    return router_add(@router, "GET", @pattern, @handler)
+
+fn router_post(@router: Router, @pattern: int, @handler: int) -> int
+    return router_add(@router, "POST", @pattern, @handler)
+
+fn router_put(@router: Router, @pattern: int, @handler: int) -> int
+    return router_add(@router, "PUT", @pattern, @handler)
+
+fn router_delete(@router: Router, @pattern: int, @handler: int) -> int
+    return router_add(@router, "DELETE", @pattern, @handler)
+
+fn router_any(@router: Router, @pattern: int, @handler: int) -> int
+    return router_add(@router, "*", @pattern, @handler)
+
+
+# Set a fallback handler for unmatched requests. Without one, 404
+# is returned automatically.
+fn router_set_not_found(@router: Router, @handler: int) -> int
+    @router.not_found = @handler
+    return 0
+
+
+# router_handle(@router, @req, @cli) -> handler's return or 0.
+# Walks the route table, calls the first matching handler, otherwise
+# delegates to @router.not_found, otherwise sends a built-in 404.
+fn router_handle(@router: Router, @req: HttpRequest, @cli: int) -> int
+    @cur = @router.head
+    while @cur != 0
+        @match = _route_match(@cur, @req.method, @req.path)
+        if @match != 0
+            # Strip the "_" sentinel that signals "matched, no params".
+            if str_eq(@match, "_") == 1
+                @req.params = ""
+            else
+                @req.params = @match
+            @h = _route_handler_of(@cur)
+            return @h(@req, @cli)
+        @cur = _route_next(@cur)
+
+    @nf = @router.not_found
+    if @nf != 0
+        return @nf(@req, @cli)
+    return http_send_404(@cli)
+
+
+# Dispatcher passed to http_serve_ctx; @ctx is the Router pointer.
+fn _router_dispatch(@ctx: int, @req: HttpRequest, @cli: int) -> int
+    let @router: Router = @ctx
+    return router_handle(@router, @req, @cli)
+
+
+# Bind and serve forever using @router. Returns -1 on bind failure.
+fn router_serve(@router: Router, @port: int) -> int
+    return http_serve_ctx(@port, _router_dispatch, @router)
+
+
+# Forking variant — forks per accepted connection. Safe under load
+# because each child gets its own COW heap, bypassing the bump
+# allocator's lack of thread safety.
+fn router_serve_forking(@router: Router, @port: int) -> int
+    return http_serve_ctx_forking(@port, _router_dispatch, @router)
+
+
+# Pre-forked worker pool — start @n_workers up front, all sharing
+# the listen socket. ~100× less per-request overhead than the
+# per-request fork variant. Tune @n_workers to CPU count.
+fn router_serve_prefork(@router: Router, @port: int, @n_workers: int) -> int
+    return http_serve_ctx_prefork(@port, _router_dispatch, @router, @n_workers)

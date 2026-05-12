@@ -1,0 +1,168 @@
+# tier: T8
+# deps: tls_server, tcp
+# ffi: libssl-via-dlopen
+#
+# A minimal HTTPS server in pure Luna.
+#
+# Builds on std/ext/tls_server (in-process TLS via dlopen libssl) and
+# the existing TCP primitives. Serves three routes — /, /health, and a
+# catch-all 404 — over a real HTTPS channel. No nginx/caddy fronting.
+#
+# Build & run:
+#     openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+#         -keyout /tmp/key.pem -out /tmp/cert.pem -subj /CN=localhost
+#     # luna-mini supports --dynamic directly; the `luna` CLI wrapper
+#     # doesn't pass it through yet (see docs/TLS_DESIGN.md).
+#     $HOME/.luna/bin/luna-mini examples/net/https_server.luna \
+#         -o /tmp/https_server.elf --dynamic
+#     /tmp/https_server.elf
+#
+# Then from another terminal:
+#     curl -k https://127.0.0.1:8443/
+#     curl -k https://127.0.0.1:8443/health
+#     curl -k https://127.0.0.1:8443/missing
+#
+# Notes:
+#   - We don't reuse std/net/http_server because that module reads
+#     directly off a tcp fd; routing over a TLS-wrapped channel needs
+#     transport-abstraction work that's tracked as a follow-up. Until
+#     that lands, this example does HTTP parsing inline. It's about 60
+#     lines of glue — cheap enough to embed.
+#   - Cert + key paths are hard-coded for the demo. Production code
+#     would read them from the environment / config.
+
+import tls_server
+import tcp
+
+
+# Returns 1 if @buf[@off..@off+3] is CRLF CRLF, 0 otherwise. Pulled out
+# so _read_until_headers stays under the bootminor nesting budget.
+fn _is_crlf_crlf(@buf: int, @off: int) -> int
+    if str_byte(@buf, @off) != 13
+        return 0
+    if str_byte(@buf, @off + 1) != 10
+        return 0
+    if str_byte(@buf, @off + 2) != 13
+        return 0
+    if str_byte(@buf, @off + 3) != 10
+        return 0
+    return 1
+
+
+# Read the request bytes until we see \r\n\r\n (end of headers). HTTP
+# bodies aren't read here — toy demo, GET-only.
+fn _read_until_headers(@conn: TlsServerConn, @cap: int) -> int
+    @buf = new_str(@cap)
+    @total = 0
+    while @total < @cap
+        @chunk = tls_server_read(@conn, @cap - @total)
+        @n = str_len(@chunk)
+        if @n == 0
+            return str_substr(@buf, 0, @total)
+        @i = 0
+        while @i < @n
+            str_set_byte(@buf, @total + @i, str_byte(@chunk, @i))
+            @i = @i + 1
+        @total = @total + @n
+        if @total >= 4
+            @j = 0
+            @end = @total - 3
+            while @j < @end
+                if _is_crlf_crlf(@buf, @j) == 1
+                    return str_substr(@buf, 0, @total)
+                @j = @j + 1
+    return str_substr(@buf, 0, @total)
+
+
+# Pull "/path" out of "GET /path HTTP/1.1\r\n...". Returns "/" on any
+# parse miss so the request still hits a valid route.
+fn _extract_path(@req: int) -> int
+    @n = str_len(@req)
+    if @n < 5
+        return "/"
+    @s = 0
+    while @s < @n
+        if str_byte(@req, @s) == 32
+            break
+        @s = @s + 1
+    if @s >= @n
+        return "/"
+    @s = @s + 1
+    @e = @s
+    while @e < @n
+        @c = str_byte(@req, @e)
+        if @c == 32
+            break
+        if @c == 13
+            break
+        if @c == 10
+            break
+        @e = @e + 1
+    if @e <= @s
+        return "/"
+    return str_substr(@req, @s, @e - @s)
+
+
+fn _make_response(@status_line: int, @body: int) -> int
+    @r = str_concat("HTTP/1.1 ", @status_line)
+    @r = str_concat(@r, "\r\nContent-Type: text/plain\r\nContent-Length: ")
+    @r = str_concat(@r, int_to_str(str_len(@body)))
+    @r = str_concat(@r, "\r\nConnection: close\r\n\r\n")
+    @r = str_concat(@r, @body)
+    return @r
+
+
+fn _route(@path: int) -> int
+    if str_eq(@path, "/") == 1
+        return _make_response("200 OK", "Hello, Luna over HTTPS!\n")
+    if str_eq(@path, "/health") == 1
+        return _make_response("200 OK", "ok\n")
+    return _make_response("404 Not Found", "Not Found\n")
+
+
+fn _serve_one(@ctx: TlsServerCtx, @client_fd: int) -> int
+    let @conn: TlsServerConn = tls_server_accept(@ctx, @client_fd)
+    if tls_server_conn_ok(@conn) == 0
+        # Failed handshake — close fd and move on. tls_server_error()
+        # holds the OpenSSL-side reason for debugging.
+        tcp_close(@client_fd)
+        return 0
+    @req  = _read_until_headers(@conn, 8192)
+    @path = _extract_path(@req)
+    @resp = _route(@path)
+    tls_server_write(@conn, @resp)
+    tls_server_close(@conn)
+    tcp_close(@client_fd)
+    return 0
+
+
+fn main() -> int
+    if tls_server_init() != 0
+        shine("FATAL tls_server_init failed:")
+        shine(tls_server_error())
+        return 1
+
+    let @ctx: TlsServerCtx = tls_server_ctx_new("/tmp/cert.pem", "/tmp/key.pem")
+    if tls_server_ctx_ok(@ctx) == 0
+        shine("FATAL ctx_new failed (do /tmp/cert.pem and /tmp/key.pem exist?):")
+        shine(tls_server_error())
+        return 1
+
+    @srv = tcp_listen(8443)
+    if @srv < 0
+        shine("FATAL tcp_listen(8443) failed")
+        tls_server_ctx_free(@ctx)
+        return 1
+
+    shine("Luna HTTPS server on https://127.0.0.1:8443/")
+    shine("try: curl -k https://127.0.0.1:8443/")
+
+    while 1
+        @client = tcp_accept(@srv)
+        if @client < 0
+            continue
+        _serve_one(@ctx, @client)
+
+    tls_server_ctx_free(@ctx)
+    tcp_close(@srv)
+    return 0

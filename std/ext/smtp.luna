@@ -1,0 +1,222 @@
+# tier: T6
+# deps: tcp
+# ffi: none
+#
+# std/ext/smtp — minimal SMTP client (no TLS, no auth).
+#
+# Implements the smallest useful subset of RFC 5321:
+#   EHLO / MAIL FROM / RCPT TO / DATA / QUIT
+# Multi-line server responses (lines starting with "NNN-") are coalesced;
+# the final status code is returned. Message bodies are dot-stuffed per
+# RFC 5321 section 4.5.2 before being sent.
+#
+# Public surface:
+#   smtp_send(@host, @port, @from, @to, @subject, @body) -> int
+#     0 on success, -1 on any failure (connect, status mismatch, EOF).
+#
+# Helpers (exported so callers can drive a session manually):
+#   _smtp_send_line(@fd, @line)            -> 0 on full send, -1 on error
+#   _smtp_recv_response(@fd)               -> 3-digit status (int), or -1
+#   _smtp_expect(@fd, @want_code)          -> 1 on match, 0 otherwise
+#   _smtp_dot_stuff(@body)                 -> body with leading-dot escaping
+
+import tcp
+
+
+# _smtp_parse_status(@line) — parse the first three ASCII digits of @line.
+# Returns the integer (0..999), or -1 if the line is too short / not numeric.
+fn _smtp_parse_status(@line: int) -> int
+    if str_len(@line) < 3
+        return -1
+    @c0 = str_byte(@line, 0)
+    @c1 = str_byte(@line, 1)
+    @c2 = str_byte(@line, 2)
+    if @c0 < 48
+        return -1
+    if @c0 > 57
+        return -1
+    if @c1 < 48
+        return -1
+    if @c1 > 57
+        return -1
+    if @c2 < 48
+        return -1
+    if @c2 > 57
+        return -1
+    return (@c0 - 48) * 100 + (@c1 - 48) * 10 + (@c2 - 48)
+
+
+# _smtp_recv_line(@fd, @buf, @cap) — read until CRLF, single byte at a time.
+# Returns number of bytes written to @buf (excluding the CRLF itself), or
+# -1 on connection failure before any byte arrived.
+fn _smtp_recv_line(@fd: int, @buf: int, @cap: int) -> int
+    @i = 0
+    @b = new_str(1)
+    while @i < @cap
+        @n = tcp_recv(@fd, @b, 1)
+        if @n <= 0
+            if @i == 0
+                return -1
+            return @i
+        @c = str_byte(@b, 0)
+        if @c == 13
+            # \r: consume the following \n and finish.
+            @bb = new_str(1)
+            tcp_recv(@fd, @bb, 1)
+            return @i
+        if @c == 10
+            # Stray \n (some servers); accept it as line terminator.
+            return @i
+        str_set_byte(@buf, @i, @c)
+        @i = @i + 1
+    return @i
+
+
+# _smtp_recv_response(@fd) -> final status code of an SMTP response.
+# Eats continuation lines whose 4th byte is '-'. Returns -1 on EOF
+# before any line was received.
+fn _smtp_recv_response(@fd: int) -> int
+    @final = -1
+    @done = 0
+    while @done == 0
+        @buf = new_str(512)
+        @n = _smtp_recv_line(@fd, @buf, 512)
+        if @n < 0
+            return -1
+        @line = str_substr(@buf, 0, @n)
+        @code = _smtp_parse_status(@line)
+        if @code < 0
+            return -1
+        @final = @code
+        # Continuation marker: position 3 == '-'. Anything else (space,
+        # or shorter line) means this was the final line.
+        @done = 1
+        if @n > 3
+            if str_byte(@line, 3) == 45
+                @done = 0
+    return @final
+
+
+# _smtp_send_line(@fd, @line) — write @line + CRLF.
+# Returns 0 on full send, -1 on any short write.
+fn _smtp_send_line(@fd: int, @line: int) -> int
+    @ll = str_len(@line)
+    @out = new_str(@ll + 2)
+    @i = 0
+    while @i < @ll
+        str_set_byte(@out, @i, str_byte(@line, @i))
+        @i = @i + 1
+    str_set_byte(@out, @ll, 13)
+    str_set_byte(@out, @ll + 1, 10)
+    return tcp_send_str(@fd, @out)
+
+
+# _smtp_expect(@fd, @want) -> 1 if next response status == @want, else 0.
+fn _smtp_expect(@fd: int, @want: int) -> int
+    @got = _smtp_recv_response(@fd)
+    if @got == @want
+        return 1
+    return 0
+
+
+# _smtp_dot_stuff(@body) — RFC 5321 §4.5.2 dot-stuffing.
+#
+# Every line that begins with '.' gets an extra '.' prefixed so the
+# transparency-decoder on the server side sees one fewer dot. A "line"
+# starts at byte 0 of @body or right after any '\n' byte.
+#
+# Worst case grows the body by 1 byte per line; we walk it twice — once
+# to count the dots, once to copy.
+fn _smtp_dot_stuff(@body: int) -> int
+    @blen = str_len(@body)
+    if @blen == 0
+        return @body
+    # Pass 1: count line starts that begin with '.'.
+    @extras = 0
+    @at_start = 1
+    @i = 0
+    while @i < @blen
+        @c = str_byte(@body, @i)
+        if @at_start == 1
+            if @c == 46
+                @extras = @extras + 1
+        if @c == 10
+            @at_start = 1
+        else
+            @at_start = 0
+        @i = @i + 1
+    if @extras == 0
+        return @body
+    # Pass 2: copy with insertions.
+    @out = new_str(@blen + @extras)
+    @at_start = 1
+    @i = 0
+    @oi = 0
+    while @i < @blen
+        @c = str_byte(@body, @i)
+        if @at_start == 1
+            if @c == 46
+                str_set_byte(@out, @oi, 46)
+                @oi = @oi + 1
+        str_set_byte(@out, @oi, @c)
+        @oi = @oi + 1
+        if @c == 10
+            @at_start = 1
+        else
+            @at_start = 0
+        @i = @i + 1
+    return @out
+
+
+# _smtp_fail(@fd) — common close+error path; returns -1.
+fn _smtp_fail(@fd: int) -> int
+    tcp_close(@fd)
+    return -1
+
+
+# smtp_send(...) — full SMTP transaction. Returns 0 on success, -1 on
+# any failure including connect, missing greeting, or rejected step.
+fn smtp_send(@host: int, @port: int, @from: int, @to: int, @subject: int, @body: int) -> int
+    @fd = tcp_connect(@host, @port)
+    if @fd < 0
+        return -1
+    if _smtp_expect(@fd, 220) == 0
+        return _smtp_fail(@fd)
+
+    _smtp_send_line(@fd, "EHLO luna.client")
+    if _smtp_expect(@fd, 250) == 0
+        return _smtp_fail(@fd)
+
+    @mail_from = str_concat("MAIL FROM:<", @from)
+    @mail_from = str_concat(@mail_from, ">")
+    _smtp_send_line(@fd, @mail_from)
+    if _smtp_expect(@fd, 250) == 0
+        return _smtp_fail(@fd)
+
+    @rcpt_to = str_concat("RCPT TO:<", @to)
+    @rcpt_to = str_concat(@rcpt_to, ">")
+    _smtp_send_line(@fd, @rcpt_to)
+    if _smtp_expect(@fd, 250) == 0
+        return _smtp_fail(@fd)
+
+    _smtp_send_line(@fd, "DATA")
+    if _smtp_expect(@fd, 354) == 0
+        return _smtp_fail(@fd)
+
+    _smtp_send_line(@fd, str_concat("From: ", @from))
+    _smtp_send_line(@fd, str_concat("To: ", @to))
+    _smtp_send_line(@fd, str_concat("Subject: ", @subject))
+    _smtp_send_line(@fd, "")
+
+    @stuffed = _smtp_dot_stuff(@body)
+    tcp_send_str(@fd, @stuffed)
+    # If the body didn't end in CRLF, the lone "." below would attach
+    # to the last body line. Always emit a blank line first.
+    _smtp_send_line(@fd, "")
+    _smtp_send_line(@fd, ".")
+    if _smtp_expect(@fd, 250) == 0
+        return _smtp_fail(@fd)
+
+    _smtp_send_line(@fd, "QUIT")
+    tcp_close(@fd)
+    return 0

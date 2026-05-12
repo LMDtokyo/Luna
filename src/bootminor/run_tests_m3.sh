@@ -13,8 +13,17 @@
 
 set -u
 
-LUNA_BOOT="${LUNA_BOOT:-./bootstrap/luna-boot.exe}"
-OUT_DIR="${OUT_DIR:-c:/tmp/luna_m3}"
+if [ -z "${LUNA_NATIVE:-}" ] && ! grep -qiE 'microsoft|WSL' /proc/sys/kernel/osrelease 2>/dev/null; then
+    LUNA_NATIVE=1
+fi
+LUNA_NATIVE="${LUNA_NATIVE:-0}"
+if [ "$LUNA_NATIVE" = "1" ]; then
+    LUNA_BOOT="${LUNA_BOOT:-./bootstrap/luna-boot}"
+    OUT_DIR="${OUT_DIR:-/tmp/luna_m3}"
+else
+    LUNA_BOOT="${LUNA_BOOT:-./bootstrap/luna-boot.exe}"
+    OUT_DIR="${OUT_DIR:-c:/tmp/luna_m3}"
+fi
 SRC_DIR="$(dirname "$0")"
 WSL_DISTRO="${WSL_DISTRO:-Ubuntu}"
 
@@ -27,7 +36,11 @@ _wsl_path() {
         *)       echo "$p" ;;
     esac
 }
-OUT_DIR_WSL="$(_wsl_path "$OUT_DIR")"
+if [ "$LUNA_NATIVE" = "1" ]; then
+    OUT_DIR_WSL="$OUT_DIR"
+else
+    OUT_DIR_WSL="$(_wsl_path "$OUT_DIR")"
+fi
 
 [ -x "$LUNA_BOOT" ] || { echo "luna-boot not found"; exit 2; }
 
@@ -44,7 +57,11 @@ cat "$SRC_DIR/bootminor_prelude.luna" \
     "$SRC_DIR/main2.luna" > "$OUT_DIR/bootminor_self.luna"
 
 run_wsl() {
-    wsl.exe -d "$WSL_DISTRO" bash -c "$1"
+    if [ "$LUNA_NATIVE" = "1" ]; then
+        bash -c "$1"
+    else
+        wsl.exe -d "$WSL_DISTRO" bash -c "$1"
+    fi
 }
 
 # Stage 2: luna-mini2 compiles bootminor_self → luna-mini3.

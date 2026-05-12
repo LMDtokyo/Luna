@@ -1,0 +1,91 @@
+# =============================================================================
+# Luna Bot — main entry point
+# =============================================================================
+# Long-poll loop on Telegram's getUpdates. Imports the rest of the bot
+# in dependency order: helpers + stats first, then the API plumbing,
+# then handler modules, finally the dispatcher that routes incoming
+# messages to handlers.
+#
+# Build:  bootstrap/luna-boot examples/luna_bot/main.luna -o tg_bot --target linux
+# Run:    BOT_TOKEN=<token> ./tg_bot
+# =============================================================================
+
+import helpers
+import stats
+import api
+import help
+import basic
+import text
+import crypto
+import encoding
+import world
+import notes
+import dispatch
+
+
+fn process_updates(@token: int, @body: int, @last_id: int) -> int
+    @ok_pos = json_find_key(@body, "ok")
+    if @ok_pos < 0
+        shine("telegram api: no 'ok' field, raw:")
+        shine(@body)
+        return @last_id
+    if json_bool(@body, @ok_pos) == 0
+        shine("telegram api returned ok=false, raw:")
+        shine(@body)
+        return @last_id
+
+    @p = json_find_key(@body, "result")
+    if @p < 0
+        return @last_id
+    @arr_end = _json_skip_value(@body, @p)
+
+    @idx = 0
+    while 1
+        @item_pos = json_array_at(@body, @p, @idx)
+        if @item_pos < 0
+            return @last_id
+        if @item_pos >= @arr_end
+            return @last_id
+
+        @upd = json_subobj(@body, @item_pos)
+        @uid = json_get_int(@upd, "update_id")
+        if @uid > @last_id
+            @last_id = @uid
+
+        @msg = json_pick_obj(@upd, "message")
+        if str_len(@msg) > 0
+            handle_message(@token, @msg)
+
+        @idx = @idx + 1
+    return @last_id
+
+
+fn main() -> int
+    @token = env_get("BOT_TOKEN")
+    if str_len(@token) == 0
+        shine("set BOT_TOKEN environment variable first")
+        shine("example: BOT_TOKEN=123:AAA ./tg_bot")
+        return 1
+
+    random_seed(now_unix())
+    _stat_set("started_at", now_unix())
+
+    shine("luna telegram bot online — long-polling /getUpdates")
+    @offset = 0
+    @loops = 0
+    while @loops < 100000
+        @url = api_url(@token, "getUpdates")
+        @url = str_concat(@url, "?timeout=25&offset=")
+        @url = str_concat(@url, int_to_str(@offset + 1))
+
+        @resp = http_get(@url)
+        if str_len(@resp) == 0
+            shine("http_get returned empty, sleeping 3s")
+            sleep(3)
+            @loops = @loops + 1
+            continue
+
+        @new_offset = process_updates(@token, @resp, @offset)
+        @offset = @new_offset
+        @loops = @loops + 1
+    return 0

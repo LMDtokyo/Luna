@@ -1,0 +1,88 @@
+# tier: T6
+# deps: redis
+# ffi: none
+#
+# std/ext/rate_limit — fixed-window rate limiting on top of Redis.
+#
+# Each rate-limit key (e.g. "user:42:api") tracks a counter in Redis
+# that is reset every `window_secs` seconds. The first INCR in a
+# window also sets EXPIRE so the counter dies on its own. Once the
+# counter exceeds `max_per_window`, further calls return 0 (block).
+#
+# Public surface:
+#   rate_limit_check(@fd, @key, @max, @win)  -> 1 allow, 0 block
+#   rate_limit_remaining(@fd, @key, @max)    -> requests left
+#   rate_limit_reset(@fd, @key)              -> 1 if existed, 0 if not
+#   rate_limit_ttl(@fd, @key)                -> secs left, -2 absent
+#
+# All four take a connected redis fd from std/ext/db/redis. The caller
+# owns the fd's lifetime; we never connect or close on the user's
+# behalf.
+
+import redis
+
+
+# _rl_parse_int(@s) — local int parser so this module doesn't drag in
+# std/std/strings as a dependency. Mirrors redis.luna's helper.
+fn _rl_parse_int(@s: int) -> int
+    @slen = str_len(@s)
+    if @slen == 0
+        return 0
+    @neg = 0
+    @i = 0
+    if str_byte(@s, 0) == 45
+        @neg = 1
+        @i = 1
+    @n = 0
+    while @i < @slen
+        @c = str_byte(@s, @i)
+        if @c < 48
+            return @n
+        if @c > 57
+            return @n
+        @n = @n * 10 + (@c - 48)
+        @i = @i + 1
+    if @neg == 1
+        return 0 - @n
+    return @n
+
+
+# rate_limit_check — increment the counter, return 1 if still under
+# the limit, 0 if the request should be rejected. On the first INCR
+# of a new window we set EXPIRE @win seconds so the counter resets
+# automatically. Subsequent INCRs reuse the existing TTL.
+fn rate_limit_check(@fd: int, @key: int, @max: int, @win: int) -> int
+    @count = redis_incr(@fd, @key)
+    if @count == 1
+        redis_expire(@fd, @key, @win)
+    if @count > @max
+        return 0
+    return 1
+
+
+# rate_limit_remaining — how many requests the caller still has in
+# the current window. Returns @max when the key doesn't exist yet
+# (no requests consumed). Never returns negative.
+fn rate_limit_remaining(@fd: int, @key: int, @max: int) -> int
+    @raw = redis_get(@fd, @key)
+    if str_len(@raw) == 0
+        return @max
+    @used = _rl_parse_int(@raw)
+    @left = @max - @used
+    if @left < 0
+        @left = 0
+    return @left
+
+
+# rate_limit_reset — drop the counter. Returns 1 if a key existed
+# before the call, 0 otherwise. Useful for tests and admin endpoints
+# that want to clear a user's quota.
+fn rate_limit_reset(@fd: int, @key: int) -> int
+    return redis_del(@fd, @key)
+
+
+# rate_limit_ttl — seconds until the current window expires. Mirrors
+# Redis TTL semantics: -2 if the key is absent, -1 if the key exists
+# without a TTL, otherwise a positive integer.
+fn rate_limit_ttl(@fd: int, @key: int) -> int
+    return redis_ttl(@fd, @key)

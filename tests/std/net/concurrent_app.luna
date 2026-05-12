@@ -1,0 +1,21 @@
+# Concurrent HTTP server used by concurrent_e2e.sh. Fork-per-connection
+# under the hood (router_serve_forking) — safe with bootminor's
+# non-thread-safe bump allocator. Single route returns the request
+# path back; we use that to verify each parallel client got its own
+# response (paths /one, /two, ...).
+
+import http_router
+
+
+fn echo_path(@req: HttpRequest, @cli: int) -> int
+    return http_send_text(@cli, @req.path)
+
+
+fn main() -> int
+    let @r: Router = router_new()
+    router_any(@r, "/one",   echo_path)
+    router_any(@r, "/two",   echo_path)
+    router_any(@r, "/three", echo_path)
+    router_any(@r, "/four",  echo_path)
+    router_any(@r, "/five",  echo_path)
+    return router_serve_forking(@r, 18084)

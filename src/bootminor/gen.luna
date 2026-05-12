@@ -74,6 +74,13 @@ struct Gen
     had_error:       int # 1 once _die has fired (driver bails before writing)
     target_os:       int # 0 = linux ELF64 (default), 1 = windows PE64
     imp_patches:     int # Vec: [call_site_off, import_name_str]* for PE64
+    fn_pc_hi:        int # Vec<int>: code offset AFTER each fn's epilogue (for stack-trace table)
+    fn_decl_line:    int # Vec<int>: 1-based source line of each fn declaration
+    dbg_table_off:   int # data offset where the (pc_lo, pc_hi, line, name_off) records start
+    dbg_pool_off:    int # data offset where the fn-name string pool starts (NUL-terminated)
+    sig_tramp_off:   int # code offset of the rt_sigreturn trampoline (9 bytes)
+    dynamic:         int # 0 = static ELF (default), 1 = dynamic (PT_INTERP + libc + dlopen)
+    start_off:       int # code offset of the dynamic-mode `_start` stub (entry point)
 
 
 fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
@@ -121,14 +128,24 @@ fn gen_new(@src: int, @kind: int, @start: int, @tlen: int, @iv: int) -> Gen
     @g.had_error        = 0
     @g.target_os        = 0
     @g.imp_patches      = vec_new()
-    # Reserve 40 bytes at the very start of the data section:
+    @g.fn_pc_hi         = vec_new()
+    @g.fn_decl_line     = vec_new()
+    @g.dbg_table_off    = 0
+    @g.dbg_pool_off     = 0
+    @g.sig_tramp_off    = 0
+    @g.dynamic          = 0
+    @g.start_off        = 0
+    # Reserve 64 bytes at the very start of the data section:
     #   [0..8)   heap_top (runtime bump pointer)
     #   [8..16)  hotswap slots vaddr       (patched by main2)
     #   [16..24) hotswap fn count          (patched by main2)
     #   [24..32) hotswap names vaddr       (patched by main2)
     #   [32..40) hotswap name pool vaddr   (patched by main2)
+    #   [40..48) dbg_table_vaddr           (patched by main2)
+    #   [48..56) dbg_table_count           (patched by main2)
+    #   [56..64) dbg_pool_vaddr            (patched by main2)
     @i = 0
-    while @i < 40
+    while @i < 64
         strbuf_add_byte(@g.data, 0)
         @i = @i + 1
     return @g
@@ -160,6 +177,17 @@ fn _accept(@g: Gen, @k: int) -> int
         _advance(@g)
         return 1
     return 0
+
+# Compute 1-based source line for a byte offset in @g.src.
+# O(N) per call; used at fn-decl time so the cost is paid once per fn.
+fn _line_of(@g: Gen, @bo: int) -> int
+    @line = 1
+    @i = 0
+    while @i < @bo
+        if str_byte(@g.src, @i) == 10
+            @line = @line + 1
+        @i = @i + 1
+    return @line
 
 fn _die(@g: Gen, @msg: int) -> int
     # Compute 1-based (line, col) from the offending token's byte offset
@@ -458,6 +486,20 @@ fn _em_mov_rcx_rax(@g: Gen) -> int
     _eb(@g, 72)
     _eb(@g, 137)
     _eb(@g, 193)
+    return 0
+
+# mov rsi, rax ; 48 89 c6
+fn _em_mov_rsi_rax(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 198)
+    return 0
+
+# mov rdx, rax ; 48 89 c2
+fn _em_mov_rdx_rax(@g: Gen) -> int
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 194)
     return 0
 
 # mov rax, rdx ; 48 89 d0  (for modulo: remainder is in rdx after idiv)
@@ -845,6 +887,70 @@ fn _em_epilogue(@g: Gen) -> int
     _eb(@g, 93)
     _eb(@g, 195)
     return 0
+
+# Emit dynamic-mode `_start` entry stub (P3 of docs/TLS_DESIGN.md):
+# reads argc/argv off the stack, calls __libc_start_main(main, argc,
+# argv, init=NULL, fini=NULL, rtld_fini=NULL, stack_end=...). libc
+# initializes TLS/errno/stdio and then calls our main(). On main's ret,
+# libc.exit() flushes stdio and exits cleanly.
+fn _emit_start_stub(@g: Gen) -> int
+    @g.start_off = _code_len(@g)
+    _eb(@g, 49)
+    _eb(@g, 237)
+    _eb(@g, 95)
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 230)
+    _eb(@g, 72)
+    _eb(@g, 131)
+    _eb(@g, 228)
+    _eb(@g, 240)
+    _eb(@g, 80)
+    _eb(@g, 80)
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 242)
+    _eb(@g, 72)
+    _eb(@g, 137)
+    _eb(@g, 254)
+    _eb(@g, 72)
+    _eb(@g, 141)
+    _eb(@g, 61)
+    @lea_at = _code_len(@g)
+    @lea_disp = @g.main_off - (@lea_at + 4)
+    _e32(@g, @lea_disp)
+    _eb(@g, 49)
+    _eb(@g, 201)
+    _eb(@g, 69)
+    _eb(@g, 49)
+    _eb(@g, 192)
+    _eb(@g, 69)
+    _eb(@g, 49)
+    _eb(@g, 201)
+    _em_call_import_placeholder(@g, "__libc_start_main")
+    _eb(@g, 244)
+    return 0
+
+# Emit the dynamic-mode `_start` stub (P3 of docs/TLS_DESIGN.md).
+# This is the entry point for dynamic ELFs. It reads argc/argv off the
+# stack, sets up the SysV register convention for __libc_start_main,
+# and calls it. __libc_start_main runs libc init (TLS, errno, stdio
+# FILE* setup) then calls our `main(argc, argv, envp)`.
+#
+# Layout (38 bytes):
+#   31 ed                  xor ebp, ebp           # frame-pointer chain end
+#   5f                     pop rdi                # rdi = argc (kernel stack top)
+#   48 89 e6               mov rsi, rsp           # rsi = argv
+#   48 83 e4 f0            and rsp, -16           # 16-byte align
+#   50 50                  push rax x2            # space for stack_end arg + pad
+#   48 89 f2               mov rdx, rsi           # rdx = argv
+#   48 89 fe               mov rsi, rdi           # rsi = argc
+#   48 8d 3d <disp32>      lea rdi, [rip + main]  # rdi = &main (rip-relative)
+#   31 c9                  xor ecx, ecx           # init = NULL
+#   45 31 c0               xor r8d, r8d           # fini = NULL
+#   45 31 c9               xor r9d, r9d           # rtld_fini = NULL
+#   ff 15 <disp32>         call qword [rip + __libc_start_main@GOT]
+#   f4                     hlt                    # unreachable
 
 # Resolve a forward-jump rel32 whose target is the current code position.
 fn _patch_here(@g: Gen, @patch_at: int) -> int
@@ -2084,13 +2190,16 @@ fn parse_primary(@g: Gen) -> int
             _eb(@g, 8)
             return 0
         # new_str(n) — bump allocate from heap_top; returns pointer past
-        # the 8-byte length prefix. Inlines ~37 bytes of x86-64.
+        # the 8-byte length prefix. The heap_top update uses LOCK XADD
+        # so multiple threads can allocate concurrently without racing
+        # on the bump pointer — see commit notes for the design.
+        # ~33 bytes of x86-64.
         if str_eq(@name, "new_str") == 1
             _advance(@g)
             _expect(@g, TK_LPAREN, "expected '(' after new_str")
             parse_expr(@g)                # rax = n (requested length)
             _expect(@g, TK_RPAREN, "expected ')'")
-            # mov rcx, rax                ; save n
+            # mov rcx, rax                ; save n (used as length prefix)
             _eb(@g, 72)
             _eb(@g, 137)
             _eb(@g, 193)
@@ -2115,26 +2224,22 @@ fn parse_primary(@g: Gen) -> int
             @lea_at = _code_len(@g)
             _e32(@g, 0)
             vec_push(@g.heap_patches, @lea_at)
-            # mov rsi, [rax]               ; rsi = current heap_top
-            _eb(@g, 72)
-            _eb(@g, 139)
-            _eb(@g, 48)
-            # add r11, rsi                 ; r11 = new heap_top
-            _eb(@g, 73)
-            _eb(@g, 1)
-            _eb(@g, 243)
-            # mov [rax], r11               ; store new heap_top
+            # lock xadd [rax], r11         ; atomically: r11 = old top,
+            #                                *heap_top += r11
+            # F0 4C 0F C1 18
+            _eb(@g, 240)
             _eb(@g, 76)
-            _eb(@g, 137)
+            _eb(@g, 15)
+            _eb(@g, 193)
             _eb(@g, 24)
-            # mov [rsi], rcx               ; write length prefix at old top
-            _eb(@g, 72)
+            # mov [r11], rcx               ; write length prefix at old top
+            _eb(@g, 73)
             _eb(@g, 137)
-            _eb(@g, 14)
-            # lea rax, [rsi + 8]           ; return pointer
-            _eb(@g, 72)
+            _eb(@g, 11)
+            # lea rax, [r11 + 8]           ; return pointer
+            _eb(@g, 73)
             _eb(@g, 141)
-            _eb(@g, 70)
+            _eb(@g, 67)
             _eb(@g, 8)
             return 0
         # Linux syscall intrinsics. Each evaluates args left-to-right,
@@ -2143,6 +2248,54 @@ fn parse_primary(@g: Gen) -> int
         #
         # The Linux syscall ABI for integer args: rdi, rsi, rdx, r10,
         # r8, r9 — slightly different from SysV (r10 instead of rcx).
+        # arena_mark() -> current heap_top. Used to snapshot the bump
+        # pointer before a unit of work so that arena_reset(mark) can
+        # rewind it afterwards, freeing every allocation since the
+        # mark. The same trick servers use to bound per-request memory.
+        if str_eq(@name, "arena_mark") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after arena_mark")
+            _expect(@g, TK_RPAREN, "expected ')' for arena_mark")
+            # lea rax, [rip + heap_top_disp32]
+            _eb(@g, 72)
+            _eb(@g, 141)
+            _eb(@g, 5)
+            @mark_lea = _code_len(@g)
+            _e32(@g, 0)
+            vec_push(@g.heap_patches, @mark_lea)
+            # mov rax, [rax]   ; rax = current heap_top
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 0)
+            return 0
+        # arena_reset(mark) — restore heap_top to the captured mark.
+        # Allocations made between mark and reset are released; any
+        # pointers into that range become dangling. Caller is
+        # responsible for not keeping them.
+        if str_eq(@name, "arena_reset") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after arena_reset")
+            parse_expr(@g)                  # rax = mark
+            _expect(@g, TK_RPAREN, "expected ')' for arena_reset")
+            # mov rcx, rax                 ; save mark
+            _eb(@g, 72)
+            _eb(@g, 137)
+            _eb(@g, 193)
+            # lea rax, [rip + heap_top_disp32]
+            _eb(@g, 72)
+            _eb(@g, 141)
+            _eb(@g, 5)
+            @reset_lea = _code_len(@g)
+            _e32(@g, 0)
+            vec_push(@g.heap_patches, @reset_lea)
+            # mov [rax], rcx               ; store mark back to heap_top
+            _eb(@g, 72)
+            _eb(@g, 137)
+            _eb(@g, 8)
+            # xor eax, eax                 ; return 0
+            _eb(@g, 49)
+            _eb(@g, 192)
+            return 0
         if str_eq(@name, "sys_read") == 1
             _advance(@g)
             _emit_syscall_intrinsic(@g, 3, 0)
@@ -2192,6 +2345,28 @@ fn parse_primary(@g: Gen) -> int
             _advance(@g)
             _emit_syscall_intrinsic(@g, 3, 318)
             return 0
+        # --- Process spawning (fork via sys_clone + exec/wait) -----------
+        # sys_execve(path, argv, envp) -> -1 on failure (does not return on
+        # success; the calling thread image is replaced).
+        if str_eq(@name, "sys_execve") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 3, 59)
+            return 0
+        # sys_wait4(pid, status_ptr, options, rusage_ptr) -> reaped pid.
+        if str_eq(@name, "sys_wait4") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 4, 61)
+            return 0
+        # sys_pipe(fd2_array) -> 0; fd2_array[0] = read end, fd2_array[1] = write end.
+        if str_eq(@name, "sys_pipe") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 1, 22)
+            return 0
+        # sys_dup2(old_fd, new_fd) -> new_fd.
+        if str_eq(@name, "sys_dup2") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 2, 33)
+            return 0
         # --- Socket / memory-protect syscalls (for hot-swap listener) ---
         if str_eq(@name, "sys_socket") == 1
             _advance(@g)
@@ -2212,6 +2387,28 @@ fn parse_primary(@g: Gen) -> int
         if str_eq(@name, "sys_connect") == 1
             _advance(@g)
             _emit_syscall_intrinsic(@g, 3, 42)
+            return 0
+        if str_eq(@name, "sys_setsockopt") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 5, 54)
+            return 0
+        if str_eq(@name, "sys_time") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 1, 201)
+            return 0
+        # sys_rt_sigaction(signum, act_ptr, oldact_ptr, sigsetsize)
+        # — install/query a signal disposition. Custom handlers need
+        # sa_restorer pointing to a trampoline; SIG_IGN / SIG_DFL
+        # don't.
+        if str_eq(@name, "sys_rt_sigaction") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 4, 13)
+            return 0
+        # sys_kill(pid, sig) — send signal to process. pid<=0 hits
+        # process groups; see kill(2).
+        if str_eq(@name, "sys_kill") == 1
+            _advance(@g)
+            _emit_syscall_intrinsic(@g, 2, 62)
             return 0
         if str_eq(@name, "sys_mprotect") == 1
             _advance(@g)
@@ -2369,6 +2566,212 @@ fn parse_primary(@g: Gen) -> int
             _expect(@g, TK_LPAREN, "expected '(' after hot_meta_base")
             _expect(@g, TK_RPAREN, "expected ')'")
             _emit_hotmeta_load(@g, 32)
+            return 0
+        # Stack-trace runtime intrinsics (see docs/STACKTRACE_DESIGN.md).
+        # _get_rbp() returns the CURRENT frame pointer — the caller (panic)
+        # uses it as the starting point for rbp-chain walking.
+        if str_eq(@name, "_get_rbp") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _get_rbp")
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov rax, rbp ; 48 89 e8
+            _eb(@g, 72)
+            _eb(@g, 137)
+            _eb(@g, 232)
+            return 0
+        # _load_u64(addr) -> u64 at addr.
+        if str_eq(@name, "_load_u64") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _load_u64")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov rax, [rax] ; 48 8b 00
+            _eb(@g, 72)
+            _eb(@g, 139)
+            _eb(@g, 0)
+            return 0
+        # _load_u32(addr) -> u32 (zero-extended).
+        if str_eq(@name, "_load_u32") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _load_u32")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # mov eax, [rax] ; 8b 00  (writing eax clears top 32 bits of rax)
+            _eb(@g, 139)
+            _eb(@g, 0)
+            return 0
+        # _load_u8(addr) -> u8 (zero-extended).
+        if str_eq(@name, "_load_u8") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _load_u8")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # movzx rax, byte [rax] ; 48 0f b6 00
+            _eb(@g, 72)
+            _eb(@g, 15)
+            _eb(@g, 182)
+            _eb(@g, 0)
+            return 0
+        # Debug-table metadata loads. See docs/STACKTRACE_DESIGN.md.
+        # Each reads a u64 stored at a fixed slot in the data section
+        # header, patched by main2 after layout.
+        if str_eq(@name, "dbg_table_ptr") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after dbg_table_ptr")
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_hotmeta_load(@g, 40)
+            return 0
+        if str_eq(@name, "dbg_count") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after dbg_count")
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_hotmeta_load(@g, 48)
+            return 0
+        if str_eq(@name, "dbg_pool_ptr") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after dbg_pool_ptr")
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _emit_hotmeta_load(@g, 56)
+            return 0
+        # libc / libdl intrinsics for dynamic ELFs (P2/P3 of TLS_DESIGN).
+        # Each emits `call qword [rip + disp32]` and records the symbol
+        # name in @g.imp_patches; main2 fixes the disp32 to the GOT slot
+        # for that symbol (resolved by ld-linux at load-time with BIND_NOW).
+        # Only valid when compiled with `--dynamic`.
+        if str_eq(@name, "_libc_puts") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _libc_puts")
+            parse_expr(@g)
+            _em_mov_rdi_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _em_call_import_placeholder(@g, "puts")
+            return 0
+        # _libc_write(fd, buf, n) — bypasses stdio buffering.
+        if str_eq(@name, "_libc_write") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _libc_write")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' after fd in _libc_write")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' after buf in _libc_write")
+            parse_expr(@g)
+            _em_mov_rdx_rax(@g)
+            _em_pop_rax(@g)
+            _em_mov_rsi_rax(@g)
+            _em_pop_rax(@g)
+            _em_mov_rdi_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _em_call_import_placeholder(@g, "write")
+            return 0
+        if str_eq(@name, "_libc_dlopen") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _libc_dlopen")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' in _libc_dlopen")
+            parse_expr(@g)
+            _em_mov_rsi_rax(@g)
+            _em_pop_rax(@g)
+            _em_mov_rdi_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _em_call_import_placeholder(@g, "dlopen")
+            return 0
+        if str_eq(@name, "_libc_dlsym") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _libc_dlsym")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' in _libc_dlsym")
+            parse_expr(@g)
+            _em_mov_rsi_rax(@g)
+            _em_pop_rax(@g)
+            _em_mov_rdi_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _em_call_import_placeholder(@g, "dlsym")
+            return 0
+        # Indirect calls through a function pointer in rax (SysV ABI).
+        # _call_ptr0(fp) -> int — calls fp() with no args.
+        if str_eq(@name, "_call_ptr0") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _call_ptr0")
+            parse_expr(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _eb(@g, 255)
+            _eb(@g, 208)
+            return 0
+        # _call_ptr1(fp, a1) -> int.
+        if str_eq(@name, "_call_ptr1") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _call_ptr1")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' in _call_ptr1")
+            parse_expr(@g)
+            _em_mov_rdi_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _eb(@g, 255)
+            _eb(@g, 208)
+            return 0
+        # _call_ptr2(fp, a1, a2) -> int.
+        if str_eq(@name, "_call_ptr2") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _call_ptr2")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' in _call_ptr2")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' in _call_ptr2")
+            parse_expr(@g)
+            _em_mov_rsi_rax(@g)
+            _em_pop_rax(@g)
+            _em_mov_rdi_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _eb(@g, 255)
+            _eb(@g, 208)
+            return 0
+        # _call_ptr3(fp, a1, a2, a3) -> int.
+        if str_eq(@name, "_call_ptr3") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _call_ptr3")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' in _call_ptr3")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' in _call_ptr3")
+            parse_expr(@g)
+            _em_push_rax(@g)
+            _expect(@g, TK_COMMA, "expected ',' in _call_ptr3")
+            parse_expr(@g)
+            _em_mov_rdx_rax(@g)
+            _em_pop_rax(@g)
+            _em_mov_rsi_rax(@g)
+            _em_pop_rax(@g)
+            _em_mov_rdi_rax(@g)
+            _em_pop_rax(@g)
+            _expect(@g, TK_RPAREN, "expected ')'")
+            _eb(@g, 255)
+            _eb(@g, 208)
+            return 0
+        # Return the absolute vaddr of the rt_sigreturn trampoline emitted
+        # at @g.sig_tramp_off. Encoded as `lea rax, [rip+disp32]` so the
+        # delta is resolved at compile time (no main2 fixup needed).
+        if str_eq(@name, "_panic_sig_trampoline_ptr") == 1
+            _advance(@g)
+            _expect(@g, TK_LPAREN, "expected '(' after _panic_sig_trampoline_ptr")
+            _expect(@g, TK_RPAREN, "expected ')'")
+            # 48 8d 05 <disp32>
+            _eb(@g, 72)
+            _eb(@g, 141)
+            _eb(@g, 5)
+            @tramp_at = _code_len(@g)
+            @tramp_disp = @g.sig_tramp_off - (@tramp_at + 4)
+            _e32(@g, @tramp_disp)
             return 0
         # --- f64 math (via SSE xmm0/xmm1) ---
         # Inputs/outputs pass through rax as the raw 64-bit bit pattern
@@ -3127,7 +3530,10 @@ fn parse_stmt(@g: Gen, @patches: Vec) -> int
         _advance(@g)
         parse_expr(@g)
         if @g.is_main == 1
-            _em_main_exit(@g)
+            if @g.dynamic == 1
+                _em_epilogue(@g)
+            else
+                _em_main_exit(@g)
         else
             _em_epilogue(@g)
         return 0
@@ -3540,6 +3946,7 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
         _die(@g, "expected function name after 'fn'")
         return 1
     @fn_name = _tok_substr(@g, @g.pos)
+    @fn_decl_bo = _peek_start(@g)
     _advance(@g)
 
     # Optional generic parameter list `<T, U: Trait>`. In Luna's
@@ -3551,6 +3958,7 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
     # Register fn NAME at current code offset (before prologue).
     @fn_off = _code_len(@g)
     _fn_register(@g, @fn_name, @fn_off)
+    vec_push(@g.fn_decl_line, _line_of(@g, @fn_decl_bo))
     if str_eq(@fn_name, "main") == 1
         @g.is_main  = 1
         @g.main_off = @fn_off
@@ -3624,12 +4032,18 @@ fn parse_fn(@g: Gen, @patches: Vec) -> int
     parse_block(@g, @patches)
 
     # Implicit return: main exits with 0, other fns do `return 0`.
+    # Dynamic-mode main returns into __libc_start_main so libc.exit
+    # can flush stdio + run atexit handlers.
     if @g.is_main == 1
         _em_mov_eax_imm(@g, 0)
-        _em_main_exit(@g)
+        if @g.dynamic == 1
+            _em_epilogue(@g)
+        else
+            _em_main_exit(@g)
     else
         _em_mov_eax_imm(@g, 0)
         _em_epilogue(@g)
+    vec_push(@g.fn_pc_hi, _code_len(@g))
 
     # Patch frame size.
     @sz = @g.frame
@@ -4105,10 +4519,11 @@ fn parse_program(@g: Gen, @patches: Vec) -> int
 # --- Top-level entry: compile source → (code_bytes, data_bytes) ------
 
 fn compile_to_gen(@src: int) -> Gen
-    return compile_to_gen_target(@src, 0)
+    return compile_to_gen_target(@src, 0, 0)
 
 # target_os: 0 = linux (ELF64), 1 = windows (PE64).
-fn compile_to_gen_target(@src: int, @target_os: int) -> Gen
+# dynamic:   0 = static (default), 1 = dynamic ELF (libc + dlopen reachable).
+fn compile_to_gen_target(@src: int, @target_os: int, @dynamic: int) -> Gen
     @kind = vec_new()
     @start = vec_new()
     @tlen = vec_new()
@@ -4116,14 +4531,32 @@ fn compile_to_gen_target(@src: int, @target_os: int) -> Gen
     lex(@src, @kind, @start, @tlen, @iv)
     let @g: Gen = gen_new(@src, @kind, @start, @tlen, @iv)
     @g.target_os = @target_os
+    @g.dynamic   = @dynamic
     # Emit print_int runtime first so shine_int can call it.
     _emit_print_int(@g)
+    # Emit the sa_restorer trampoline for fatal-signal handling
+    # (docs/STACKTRACE_DESIGN.md P4). 9 bytes: mov rax, 15 ; syscall.
+    # The kernel jumps here as the "return from signal handler" path;
+    # rt_sigreturn restores the interrupted ucontext.
+    @g.sig_tramp_off = _code_len(@g)
+    _eb(@g, 72)
+    _eb(@g, 199)
+    _eb(@g, 192)
+    _eb(@g, 15)
+    _eb(@g, 0)
+    _eb(@g, 0)
+    _eb(@g, 0)
+    _eb(@g, 15)
+    _eb(@g, 5)
     # Parse all fn decls; str_patches is filled on the go via parse_shine.
     parse_program(@g, @g.str_patches)
 
     # Emit any deferred lambda bodies now, extending the code section
     # before the hot-swap table gets appended to data.
     _emit_deferred_lambdas(@g, @g.str_patches)
+
+    if @g.dynamic == 1
+        _emit_start_stub(@g)
 
     # Emit the hot-swap function table at the end of the data section.
     # Layout (all u64, little-endian):
@@ -4154,6 +4587,32 @@ fn compile_to_gen_target(@src: int, @target_os: int) -> Gen
             @ci = @ci + 1
         strbuf_add_byte(@g.data, 0)
         @pi = @pi + 1
+
+    # Debug-info table for stack traces (see docs/STACKTRACE_DESIGN.md, P2).
+    # Each record is 24 bytes: pc_lo:u64, pc_hi:u64, line:u32, name_off:u32.
+    # name_off is a byte offset RELATIVE to dbg_pool_off (so panic() does
+    # `pool_vaddr + name_off` to get the C-string).
+    # pc_lo/pc_hi are absolute code vaddrs, filled by main2 (so gen.luna
+    # writes zeros here; main2 substitutes real vaddrs after layout).
+    @g.dbg_table_off = _sb_len(@g.data)
+    @dz = 0
+    while @dz < @nfn * 24
+        strbuf_add_byte(@g.data, 0)
+        @dz = @dz + 1
+    # Debug name pool — separate from hotswap pool so the indices stay
+    # stable even when one of them moves.
+    @g.dbg_pool_off = _sb_len(@g.data)
+    @dp = 0
+    while @dp < @nfn
+        @dnm = vec_get(@g.fn_names, @dp)
+        @dnl = str_len(@dnm)
+        @dc = 0
+        while @dc < @dnl
+            strbuf_add_byte(@g.data, str_byte(@dnm, @dc))
+            @dc = @dc + 1
+        strbuf_add_byte(@g.data, 0)
+        @dp = @dp + 1
+    # Source-file lines table is encoded INSIDE each record's `line` field.
 
     # Resolve forward fn-call patches. Every user-fn call emits an
     # indirect `call qword [rip+disp32]` whose disp32 points to the

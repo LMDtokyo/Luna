@@ -1,0 +1,230 @@
+# ChaCha20-Poly1305 tests — RFC 8439 known-answer vectors.
+#
+# All hex constants here are quoted verbatim from RFC 8439:
+#   §2.4.2  Test vector for the ChaCha20 cipher
+#   §2.5.2  Test vector for Poly1305
+#   §2.8.2  AEAD test vector
+# plus a round-trip / wrong-key / tamper sanity sweep.
+
+import chacha20
+import test
+
+
+# --- hex -> bytes / bytes -> hex --------------------------------------
+
+fn _hex_digit(@c: int) -> int
+    if @c >= 48
+        if @c <= 57
+            return @c - 48
+    if @c >= 97
+        if @c <= 102
+            return @c - 87
+    if @c >= 65
+        if @c <= 70
+            return @c - 55
+    return 0
+
+
+fn _hex(@s: int) -> int
+    @n = str_len(@s)
+    @out_len = @n / 2
+    @out = new_str(@out_len)
+    @i = 0
+    while @i < @out_len
+        @hi = _hex_digit(str_byte(@s, @i * 2))
+        @lo = _hex_digit(str_byte(@s, @i * 2 + 1))
+        str_set_byte(@out, @i, ((@hi << 4) | @lo) & 255)
+        @i = @i + 1
+    return @out
+
+
+fn _to_hex(@b: int) -> int
+    @n = str_len(@b)
+    @out = new_str(@n * 2)
+    @i = 0
+    while @i < @n
+        @v = str_byte(@b, @i)
+        @hi = (@v >> 4) & 15
+        @lo = @v & 15
+        if @hi < 10
+            str_set_byte(@out, @i * 2, 48 + @hi)
+        else
+            str_set_byte(@out, @i * 2, 87 + @hi)
+        if @lo < 10
+            str_set_byte(@out, @i * 2 + 1, 48 + @lo)
+        else
+            str_set_byte(@out, @i * 2 + 1, 87 + @lo)
+        @i = @i + 1
+    return @out
+
+
+fn run_chacha20_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # ==================================================================
+    # RFC 8439 §2.4.2 — ChaCha20 raw cipher
+    # ==================================================================
+
+    @key_242 = _hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+    @nonce_242 = _hex("000000000000004a00000000")
+    @pt_242 = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+    @ct_242_want = "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d"
+
+    @ct_242 = chacha20_xor(@key_242, @nonce_242, 1, @pt_242)
+    @r = assert_eq_str("chacha20 RFC8439 2.4.2", _to_hex(@ct_242), @ct_242_want)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # RFC 8439 §2.5.2 — Poly1305 raw MAC
+    # ==================================================================
+
+    @key_252 = _hex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b")
+    @msg_252 = "Cryptographic Forum Research Group"
+    @tag_252 = poly1305_mac(@key_252, @msg_252)
+    @r = assert_eq_str("poly1305 RFC8439 2.5.2", _to_hex(@tag_252), "a8061dc1305136c6c22b8baf0c0127a9")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # RFC 8439 §2.6.2 — Poly1305 key generation from a ChaCha20 key.
+    # This exercises chacha20_xor(counter=0) which is what the AEAD uses
+    # to derive its per-message Poly1305 key.
+    # ==================================================================
+
+    @key_262 = _hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    @nonce_262 = _hex("000000000001020304050607")
+    @zero32 = new_str(32)
+    @pk_262 = chacha20_xor(@key_262, @nonce_262, 0, @zero32)
+    @r = assert_eq_str("poly1305-keygen RFC8439 2.6.2", _to_hex(@pk_262), "8ad5a08b905f81cc815040274ab29471a833b637e3fd0da508dbb8e2fdd1a646")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # RFC 8439 §2.8.2 — AEAD ChaCha20-Poly1305
+    # ==================================================================
+
+    @key_282 = _hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    @nonce_282 = _hex("070000004041424344454647")
+    @aad_282 = _hex("50515253c0c1c2c3c4c5c6c7")
+    @pt_282 = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+
+    @want_ct = "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116"
+    @want_tag = "1ae10b594f09e26a7e902ecbd0600691"
+
+    @aead_out = chacha20_poly1305_encrypt(@key_282, @nonce_282, @pt_282, @aad_282)
+    @ct_only = str_substr(@aead_out, 0, str_len(@aead_out) - 16)
+    @tag_only = str_substr(@aead_out, str_len(@aead_out) - 16, 16)
+    @r = assert_eq_str("aead RFC8439 2.8.2 ciphertext", _to_hex(@ct_only), @want_ct)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("aead RFC8439 2.8.2 tag", _to_hex(@tag_only), @want_tag)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # Round-trip: encrypt then decrypt must round-trip the plaintext.
+    # ==================================================================
+
+    @dec_282 = chacha20_poly1305_decrypt(@key_282, @nonce_282, @aead_out, @aad_282)
+    @r = assert_eq_str("aead RFC8439 2.8.2 decrypt round-trip", @dec_282, @pt_282)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # Wrong key → "" (authentication failure).
+    # ==================================================================
+
+    @bad_key = _hex("000000000000000000000000000000000000000000000000000000000000dead")
+    @bad1 = chacha20_poly1305_decrypt(@bad_key, @nonce_282, @aead_out, @aad_282)
+    @r = assert_eq_str("aead wrong-key rejected", @bad1, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # Wrong nonce → "".
+    # ==================================================================
+
+    @bad_nonce = _hex("000000000000000000000000")
+    @bad2 = chacha20_poly1305_decrypt(@key_282, @bad_nonce, @aead_out, @aad_282)
+    @r = assert_eq_str("aead wrong-nonce rejected", @bad2, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # Tampered ciphertext byte → "".
+    # ==================================================================
+
+    @tampered = new_str(str_len(@aead_out))
+    @ti = 0
+    while @ti < str_len(@aead_out)
+        str_set_byte(@tampered, @ti, str_byte(@aead_out, @ti))
+        @ti = @ti + 1
+    # Flip one byte in the middle of the ciphertext.
+    @flip_at = 20
+    str_set_byte(@tampered, @flip_at, (str_byte(@tampered, @flip_at) ^ 1) & 255)
+    @bad3 = chacha20_poly1305_decrypt(@key_282, @nonce_282, @tampered, @aad_282)
+    @r = assert_eq_str("aead tampered-ct rejected", @bad3, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # Tampered tag → "".
+    # ==================================================================
+
+    @tampered_tag = new_str(str_len(@aead_out))
+    @ti = 0
+    while @ti < str_len(@aead_out)
+        str_set_byte(@tampered_tag, @ti, str_byte(@aead_out, @ti))
+        @ti = @ti + 1
+    @tag_pos = str_len(@aead_out) - 1
+    str_set_byte(@tampered_tag, @tag_pos, (str_byte(@tampered_tag, @tag_pos) ^ 1) & 255)
+    @bad4 = chacha20_poly1305_decrypt(@key_282, @nonce_282, @tampered_tag, @aad_282)
+    @r = assert_eq_str("aead tampered-tag rejected", @bad4, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # Wrong AAD → "" (associated data is authenticated, not encrypted,
+    # so changing one byte must invalidate the tag).
+    # ==================================================================
+
+    @bad_aad = _hex("50515253c0c1c2c3c4c5c6ff")
+    @bad5 = chacha20_poly1305_decrypt(@key_282, @nonce_282, @aead_out, @bad_aad)
+    @r = assert_eq_str("aead wrong-aad rejected", @bad5, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # Empty plaintext + empty AAD round-trip — useful for catching off-
+    # by-one length-encoding bugs in the MAC input.
+    # ==================================================================
+
+    @empty_ct = chacha20_poly1305_encrypt(@key_282, @nonce_282, "", "")
+    # The output is just the 16-byte authentication tag.
+    @r = assert_eq_int("aead empty-pt empty-aad len=16", str_len(@empty_ct), 16)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @empty_dec = chacha20_poly1305_decrypt(@key_282, @nonce_282, @empty_ct, "")
+    @r = assert_eq_str("aead empty-pt round-trip", @empty_dec, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # ==================================================================
+    # Short truncated input (< 16 bytes) → "" rather than crash.
+    # ==================================================================
+
+    @short = new_str(8)
+    @bad6 = chacha20_poly1305_decrypt(@key_282, @nonce_282, @short, "")
+    @r = assert_eq_str("aead truncated-input rejected", @bad6, "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("chacha20", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_chacha20_tests(0, 0)

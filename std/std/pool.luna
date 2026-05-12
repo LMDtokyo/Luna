@@ -1,0 +1,200 @@
+# tier: T5
+# deps: tcp
+# ffi: none
+#
+# std/std/pool — generic TCP connection pool.
+#
+# Pools amortise the cost of TCP handshakes for clients that issue
+# repeated short-lived requests to the same host:port (Redis, HTTP
+# keep-alive, SMTP, Memcached, future PostgreSQL/MySQL/MongoDB).
+#
+# This module is intentionally protocol-agnostic — it speaks TCP and
+# nothing else. Higher-level clients borrow an fd, do their wire
+# protocol, then either release it (clean) or invalidate it (broken).
+#
+# Concurrency: this first cut is single-threaded. There is no mutex
+# in the bootminor prelude yet, and bootminor's bump heap is not
+# lock-free, so guarding the pool would only paper over a deeper
+# issue. When prelude exposes mutex_new/lock/unlock — wrap every
+# public entry point with lock/unlock; the data structures here are
+# already arranged for that drop-in.
+#
+# Caller gotcha — type the receiver:
+#   The compiler computes struct field offsets only when the variable
+#   has an explicit type annotation. Always write:
+#       let @p: Pool = ...
+#   Without `: Pool`, every `@p.field` reads offset 0 and you get
+#   silent corruption.
+
+import tcp
+
+
+# All entry points return -1 on permanent failure (handle invalid,
+# pool closed, fresh connect failed, exhausted).
+
+
+# A pool handle. `idle_fds` is a Vec[int] used as a LIFO stack — the
+# most recently released fd is the next to be reused (best cache
+# locality on the kernel side). `active_count` is the number of fds
+# currently checked out; `idle_fds.len + active_count <= max_conns`
+# is the invariant.
+#
+# `host` is a string handle (dotted-quad IPv4 like "127.0.0.1"); DNS
+# is the caller's responsibility — resolve once, hand the IP in.
+struct Pool
+    host:         int
+    port:         int
+    max_conns:    int
+    idle_fds:     int
+    active_count: int
+    closed:       int
+
+
+# pool_new(@host, @port, @max_conns) -> Pool handle (int), or -1
+# on allocation failure. No connections are opened up front — the
+# pool grows lazily on demand.
+fn pool_new(@host: int, @port: int, @max_conns: int) -> int
+    if @max_conns <= 0
+        return -1
+    let @p: Pool = new_str(48)
+    @p.host         = @host
+    @p.port         = @port
+    @p.max_conns    = @max_conns
+    @p.idle_fds     = vec_new()
+    @p.active_count = 0
+    @p.closed       = 0
+    return @p
+
+
+# _pool_try_take_idle(@p) -> fd from idle stack, or -1 if empty.
+# Caller bumps active_count on a successful take.
+fn _pool_try_take_idle(@p: Pool) -> int
+    if vec_len(@p.idle_fds) <= 0
+        return -1
+    @fd = vec_pop(@p.idle_fds)
+    return @fd
+
+
+# _pool_open_new(@p) -> freshly connected fd, or -1 on failure.
+# Caller bumps active_count only on success.
+fn _pool_open_new(@p: Pool) -> int
+    @fd = tcp_connect(@p.host, @p.port)
+    if @fd < 0
+        return -1
+    return @fd
+
+
+# pool_acquire(@pool) -> fd (>=0), or -1 if the pool is
+# exhausted or a fresh connect failed. Non-blocking.
+fn pool_acquire(@pool: int) -> int
+    let @p: Pool = @pool
+    if @p.closed != 0
+        return -1
+    @fd = _pool_try_take_idle(@p)
+    if @fd >= 0
+        @p.active_count = @p.active_count + 1
+        return @fd
+    if @p.active_count >= @p.max_conns
+        return -1
+    @fd = _pool_open_new(@p)
+    if @fd < 0
+        return -1
+    @p.active_count = @p.active_count + 1
+    return @fd
+
+
+# _pool_sleep_1ms() — single-millisecond sleep via sys_nanosleep.
+# Used by pool_acquire_wait's poll loop.
+fn _pool_sleep_1ms() -> int
+    @ts = new_str(16)
+    u64_set(@ts, 0, 0)
+    u64_set(@ts, 1, 1000000)
+    sys_nanosleep(@ts, 0)
+    return 0
+
+
+# pool_acquire_wait(@pool, @timeout_ms) -> fd or -1.
+# Polls pool_acquire every 1 ms until success or @timeout_ms elapses.
+# @timeout_ms <= 0 means try once. This is a pure poll — when the
+# prelude grows a futex-based wait primitive we'll route through it.
+fn pool_acquire_wait(@pool: int, @timeout_ms: int) -> int
+    let @p: Pool = @pool
+    if @p.closed != 0
+        return -1
+    @fd = pool_acquire(@pool)
+    if @fd >= 0
+        return @fd
+    if @timeout_ms <= 0
+        return -1
+    @waited = 0
+    while @waited < @timeout_ms
+        _pool_sleep_1ms()
+        @fd = pool_acquire(@pool)
+        if @fd >= 0
+            return @fd
+        if @p.closed != 0
+            return -1
+        @waited = @waited + 1
+    return -1
+
+
+# pool_release(@pool, @fd) -> 0 on success, -1 if @fd is
+# negative or pool is closed (in which case the fd is just closed).
+# After release, the caller MUST NOT touch @fd again — the pool owns
+# it and may hand it to someone else on the next acquire.
+fn pool_release(@pool: int, @fd: int) -> int
+    if @fd < 0
+        return -1
+    let @p: Pool = @pool
+    if @p.closed != 0
+        tcp_close(@fd)
+        return 0
+    vec_push(@p.idle_fds, @fd)
+    @p.active_count = @p.active_count - 1
+    return 0
+
+
+# pool_invalidate(@pool, @fd) -> 0. The connection is bad (peer
+# closed, write failed, half-open, whatever) — pool closes it
+# and decrements active_count without returning it to the idle
+# stack. Next acquire may open a fresh one.
+fn pool_invalidate(@pool: int, @fd: int) -> int
+    if @fd < 0
+        return -1
+    let @p: Pool = @pool
+    tcp_close(@fd)
+    if @p.active_count > 0
+        @p.active_count = @p.active_count - 1
+    return 0
+
+
+# pool_close(@pool) -> 0. Closes every idle fd and marks the pool
+# closed so further acquires return -1. fds that were checked
+# out before close get closed on their eventual release.
+fn pool_close(@pool: int) -> int
+    let @p: Pool = @pool
+    if @p.closed != 0
+        return 0
+    @p.closed = 1
+    @n = vec_len(@p.idle_fds)
+    @i = 0
+    while @i < @n
+        @fd = vec_get(@p.idle_fds, @i)
+        tcp_close(@fd)
+        @i = @i + 1
+    # Drain the vec so a re-close (defensive) doesn't double-close.
+    while vec_len(@p.idle_fds) > 0
+        vec_pop(@p.idle_fds)
+    return 0
+
+
+# pool_active(@pool) -> number of fds currently checked out.
+fn pool_active(@pool: int) -> int
+    let @p: Pool = @pool
+    return @p.active_count
+
+
+# pool_idle(@pool) -> number of fds sitting in the idle stack.
+fn pool_idle(@pool: int) -> int
+    let @p: Pool = @pool
+    return vec_len(@p.idle_fds)

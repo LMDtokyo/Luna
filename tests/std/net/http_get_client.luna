@@ -1,0 +1,27 @@
+# Standalone HTTP GET round-trip test.
+#
+# Targets 127.0.0.1:18081 (a Python http.server started by
+# http_get.sh) and prints PASS/FAIL based on status code + body.
+
+import http
+
+
+fn main() -> int
+    let @resp: HttpResponse = http_get("127.0.0.1", 18081, "/luna_http_probe.txt")
+    if @resp.status != 200
+        shine("FAIL: expected status 200")
+        return 1
+
+    @body = @resp.body
+    @blen = str_len(@body)
+    if @blen == 0
+        shine("FAIL: empty body")
+        return 1
+
+    @expected = "hello from python http.server"
+    if str_eq(@body, @expected) == 0
+        shine("FAIL: body mismatch")
+        return 1
+
+    shine("PASS: HTTP GET round-trip")
+    return 0

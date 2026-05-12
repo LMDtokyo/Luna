@@ -18,7 +18,15 @@
 set -u
 
 SRC_DIR="$(dirname "$0")"
-OUT_DIR="${OUT_DIR:-c:/tmp/luna_selfhost_build}"
+if [ -z "${LUNA_NATIVE:-}" ] && ! grep -qiE 'microsoft|WSL' /proc/sys/kernel/osrelease 2>/dev/null; then
+    LUNA_NATIVE=1
+fi
+LUNA_NATIVE="${LUNA_NATIVE:-0}"
+if [ "$LUNA_NATIVE" = "1" ]; then
+    OUT_DIR="${OUT_DIR:-/tmp/luna_selfhost_build}"
+else
+    OUT_DIR="${OUT_DIR:-c:/tmp/luna_selfhost_build}"
+fi
 WSL_DISTRO="${WSL_DISTRO:-Ubuntu}"
 VERIFY_FP="${VERIFY_FP:-1}"
 
@@ -31,8 +39,13 @@ _wsl_path() {
         *)       echo "$p" ;;
     esac
 }
-OUT_DIR_WSL="$(_wsl_path "$OUT_DIR")"
-SRC_DIR_WSL="$(_wsl_path "$(realpath "$SRC_DIR" 2>/dev/null || echo "$SRC_DIR")")"
+if [ "$LUNA_NATIVE" = "1" ]; then
+    OUT_DIR_WSL="$OUT_DIR"
+    SRC_DIR_WSL="$(realpath "$SRC_DIR" 2>/dev/null || echo "$SRC_DIR")"
+else
+    OUT_DIR_WSL="$(_wsl_path "$OUT_DIR")"
+    SRC_DIR_WSL="$(_wsl_path "$(realpath "$SRC_DIR" 2>/dev/null || echo "$SRC_DIR")")"
+fi
 
 if [ ! -f "$SRC_DIR/luna-mini.elf" ]; then
     echo "luna-mini.elf not found in $SRC_DIR — run run_tests_m3.sh first"
@@ -47,7 +60,11 @@ cat "$SRC_DIR/bootminor_prelude.luna" \
     "$SRC_DIR/main2.luna"            > "$OUT_DIR/bootminor.luna"
 
 run_wsl() {
-    wsl.exe -d "$WSL_DISTRO" bash -c "$1"
+    if [ "$LUNA_NATIVE" = "1" ]; then
+        bash -c "$1"
+    else
+        wsl.exe -d "$WSL_DISTRO" bash -c "$1"
+    fi
 }
 
 if ! run_wsl "cd '$OUT_DIR_WSL' && chmod +x luna-mini.elf && ./luna-mini.elf bootminor.luna -o luna-mini.elf.new" >/dev/null 2>&1; then

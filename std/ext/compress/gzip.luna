@@ -1,0 +1,661 @@
+# tier: T6
+# deps:
+# ffi: none
+#
+# std/ext/compress/gzip — RFC 1951 DEFLATE + RFC 1952 gzip decoder
+# in pure Luna. No FFI.
+#
+# Public API:
+#   gzip_decompress(@src)   -> decompressed bytes, or "" on error
+#   deflate_decompress(@src) -> raw-DEFLATE decompressed bytes, or "" on error
+#   gzip_error()             -> diagnostic for the most recent failed call
+#   is_gzip(@src)            -> 1 if @src starts with 1F 8B, else 0
+#
+# Caveats:
+#   - Decoder only; the matching encoder is a separate module (TBD).
+#   - The gzip footer CRC32 + ISIZE are verified.
+#   - Multi-member gzip streams (concatenated members) are not supported
+#     in this MVP; only the first member is read.
+#   - Error state is stored in /tmp/.luna_gzip_err.<pid> so it survives
+#     across calls without relying on mutable globals.
+
+
+# ---------- Error state -----------------------------------------------------
+
+# _gzip_err_path() -> /tmp/.luna_gzip_err.<pid> path string.
+fn _gzip_err_path() -> int
+    @pid = sys_getpid()
+    @base = "/tmp/.luna_gzip_err."
+    return str_concat(@base, int_to_str(@pid))
+
+# _gzip_set_err(@msg) -> 0 always. Writes @msg into the per-pid file so
+# a later gzip_error() call can read it back. Truncates on each call.
+fn _gzip_set_err(@msg: int) -> int
+    @path = _gzip_err_path()
+    write_file(@path, @msg)
+    return 0
+
+# _gzip_clear_err() -> wipe any previous error.
+fn _gzip_clear_err() -> int
+    @path = _gzip_err_path()
+    write_file(@path, "")
+    return 0
+
+# gzip_error() -> last error string (possibly ""). Reads the per-pid file.
+fn gzip_error() -> int
+    @path = _gzip_err_path()
+    @fd = sys_open(@path, 0, 0)
+    if @fd < 0
+        return ""
+    @cap = 256
+    @buf = new_str(@cap)
+    @n = sys_read(@fd, @buf, @cap)
+    sys_close(@fd)
+    if @n <= 0
+        return ""
+    return str_substr(@buf, 0, @n)
+
+
+# ---------- Magic detection -------------------------------------------------
+
+# is_gzip(@src) -> 1 if @src starts with the gzip magic (1F 8B), else 0.
+fn is_gzip(@src: int) -> int
+    if str_len(@src) < 2
+        return 0
+    if str_byte(@src, 0) != 31
+        return 0
+    if str_byte(@src, 1) != 139
+        return 0
+    return 1
+
+
+# ---------- Bit reader ------------------------------------------------------
+#
+# DEFLATE packs bits LSB-first within each byte (RFC 1951 §3.1.1).
+# Reading N bits builds an integer whose LSB is the first bit pulled.
+# We pack reader state into a 24-byte struct so it can be returned /
+# threaded through helpers.
+
+struct BitReader
+    buf:     int
+    pos:     int
+    bit_off: int
+
+fn _br_new(@buf: int) -> BitReader
+    let @br: BitReader = new_str(24)
+    @br.buf = @buf
+    @br.pos = 0
+    @br.bit_off = 0
+    return @br
+
+# _br_byte_align(@br) -> advance to the next byte boundary. Used after
+# stored-block headers (§3.2.4 says "any bits of input up to the next
+# byte boundary are ignored").
+fn _br_byte_align(@br: BitReader) -> int
+    if @br.bit_off != 0
+        @br.pos = @br.pos + 1
+        @br.bit_off = 0
+    return 0
+
+# _br_read_bits(@br, @n) -> integer holding @n bits, LSB-first.
+# Returns -1 if the stream runs out.
+fn _br_read_bits(@br: BitReader, @n: int) -> int
+    @val = 0
+    @i = 0
+    @blen = str_len(@br.buf)
+    while @i < @n
+        if @br.pos >= @blen
+            return 0 - 1
+        @b = str_byte(@br.buf, @br.pos)
+        @bit = (@b >> @br.bit_off) & 1
+        @val = @val | (@bit << @i)
+        @br.bit_off = @br.bit_off + 1
+        if @br.bit_off == 8
+            @br.bit_off = 0
+            @br.pos = @br.pos + 1
+        @i = @i + 1
+    return @val
+
+
+# ---------- Output buffer ---------------------------------------------------
+#
+# We use a StrBuf-like grow-on-demand byte buffer. The DEFLATE
+# back-reference logic reads bytes that are already in the buffer, so
+# the underlying storage must remain stable across appends; we therefore
+# resize in chunks of 2x current capacity.
+
+struct OutBuf
+    buf: int
+    len: int
+    cap: int
+
+fn _ob_new() -> OutBuf
+    let @o: OutBuf = new_str(24)
+    @o.buf = new_str(4096)
+    @o.len = 0
+    @o.cap = 4096
+    return @o
+
+fn _ob_reserve(@o: OutBuf, @need: int) -> int
+    if @o.len + @need <= @o.cap
+        return 0
+    @new_cap = @o.cap * 2
+    while @new_cap < @o.len + @need
+        @new_cap = @new_cap * 2
+    @new_buf = new_str(@new_cap)
+    memcpy(@new_buf, @o.buf, @o.len)
+    @o.buf = @new_buf
+    @o.cap = @new_cap
+    return 0
+
+fn _ob_push(@o: OutBuf, @b: int) -> int
+    _ob_reserve(@o, 1)
+    u8_set(@o.buf, @o.len, @b)
+    @o.len = @o.len + 1
+    return 0
+
+# _ob_copy_from(@o, @dist, @len) -> copy @len bytes starting @dist bytes
+# behind the current end. LZ77 back-reference. The copy MUST proceed
+# byte-by-byte because @dist can be 1 (RLE-style: stretch the last byte).
+fn _ob_copy_from(@o: OutBuf, @dist: int, @len: int) -> int
+    _ob_reserve(@o, @len)
+    @src = @o.len - @dist
+    @i = 0
+    while @i < @len
+        @b = u8_at(@o.buf, @src + @i)
+        u8_set(@o.buf, @o.len + @i, @b)
+        @i = @i + 1
+    @o.len = @o.len + @len
+    return 0
+
+fn _ob_done(@o: OutBuf) -> int
+    @out = new_str(@o.len)
+    memcpy(@out, @o.buf, @o.len)
+    return @out
+
+
+# ---------- Canonical Huffman -----------------------------------------------
+#
+# We follow the puff.c approach (zlib reference, public domain). For each
+# code length L (1..15) we count how many codes have that length and
+# arrange the symbols in canonical order. Decoding walks bit-by-bit:
+# build `code` MSB-first, and at each length compare against the count
+# bucket. The first symbol gets code 0, next 1, etc. — the standard
+# canonical Huffman rule.
+#
+# Tables are packed into two strings:
+#   counts: 16 u16 entries (counts[len] for len 0..15; counts[0] unused)
+#   syms:   N u16 entries, symbols sorted by ascending code length
+#
+# Max alphabet for DEFLATE is 288 (literal/length codes), so syms fits
+# easily in a 576-byte buffer.
+
+struct Huff
+    counts: int
+    syms:   int
+
+# _huff_build(@lengths, @n) -> Huff. @lengths is a string of u8s of
+# length @n giving each symbol's code length (0 means absent). Returns
+# 0 if the table is over-subscribed; the caller should treat that as a
+# malformed stream.
+fn _huff_build(@lengths: int, @n: int) -> Huff
+    let @h: Huff = new_str(16)
+    @h.counts = new_str(16 * 2)
+    @h.syms = new_str(@n * 2)
+
+    @i = 0
+    while @i < @n
+        @l = u8_at(@lengths, @i)
+        if @l > 0
+            @cur = u16_at(@h.counts, @l * 2)
+            u16_set(@h.counts, @l * 2, @cur + 1)
+        @i = @i + 1
+
+    # offset[len] = starting index in syms[] for symbols of that length.
+    @offs = new_str(16 * 2)
+    @offset = 0
+    @l = 1
+    while @l < 16
+        u16_set(@offs, @l * 2, @offset)
+        @offset = @offset + u16_at(@h.counts, @l * 2)
+        @l = @l + 1
+    # Per RFC 1951: if @offset == 1 the tree is a single-symbol tree,
+    # which is legal (used by some encoders). If @offset > N the table
+    # is over-subscribed; caller will catch this via decode failure.
+
+    @i = 0
+    while @i < @n
+        @l = u8_at(@lengths, @i)
+        if @l > 0
+            @slot = u16_at(@offs, @l * 2)
+            u16_set(@h.syms, @slot * 2, @i)
+            u16_set(@offs, @l * 2, @slot + 1)
+        @i = @i + 1
+
+    return @h
+
+# _huff_decode(@br, @h) -> next decoded symbol, or -1 on error.
+# Walks bit-by-bit, MSB-first within the symbol code, comparing against
+# the count buckets. RFC 1951 §3.2.2.
+fn _huff_decode(@br: BitReader, @h: Huff) -> int
+    @code = 0
+    @first = 0
+    @index = 0
+    @len = 1
+    while @len < 16
+        @bit = _br_read_bits(@br, 1)
+        if @bit < 0
+            return 0 - 1
+        @code = (@code << 1) | @bit
+        @count = u16_at(@h.counts, @len * 2)
+        if @code < @first + @count
+            @sym = u16_at(@h.syms, (@index + (@code - @first)) * 2)
+            return @sym
+        @index = @index + @count
+        @first = (@first + @count) << 1
+        @len = @len + 1
+    return 0 - 1
+
+
+# ---------- Constant tables -------------------------------------------------
+
+# _len_base(@idx) -> length-base table for codes 257..285 (idx 0..28).
+# Values from RFC 1951 §3.2.5.
+fn _len_base(@idx: int) -> int
+    @t = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+    return @t[@idx]
+
+fn _len_extra(@idx: int) -> int
+    @t = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+    return @t[@idx]
+
+fn _dist_base(@idx: int) -> int
+    @t = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+    return @t[@idx]
+
+fn _dist_extra(@idx: int) -> int
+    @t = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+    return @t[@idx]
+
+fn _clen_order(@idx: int) -> int
+    @t = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+    return @t[@idx]
+
+# _fixed_litlen_lengths() -> 288-byte buffer of code lengths for the
+# fixed literal/length Huffman alphabet (RFC 1951 §3.2.6).
+fn _fixed_litlen_lengths() -> int
+    @buf = new_str(288)
+    @i = 0
+    while @i < 144
+        u8_set(@buf, @i, 8)
+        @i = @i + 1
+    while @i < 256
+        u8_set(@buf, @i, 9)
+        @i = @i + 1
+    while @i < 280
+        u8_set(@buf, @i, 7)
+        @i = @i + 1
+    while @i < 288
+        u8_set(@buf, @i, 8)
+        @i = @i + 1
+    return @buf
+
+# _fixed_dist_lengths() -> 32-byte buffer of all-5s for the fixed
+# distance alphabet.
+fn _fixed_dist_lengths() -> int
+    @buf = new_str(32)
+    @i = 0
+    while @i < 32
+        u8_set(@buf, @i, 5)
+        @i = @i + 1
+    return @buf
+
+
+# ---------- DEFLATE block decoders ------------------------------------------
+
+# _decode_stored_block(@br, @out) -> 0 ok, -1 on error.
+# Type 0 block: align to byte boundary, read LEN/NLEN (16-bit LE),
+# copy LEN raw bytes.
+fn _decode_stored_block(@br: BitReader, @out: OutBuf) -> int
+    _br_byte_align(@br)
+    @blen = str_len(@br.buf)
+    if @br.pos + 4 > @blen
+        _gzip_set_err("stored block: header truncated")
+        return 0 - 1
+    @len = str_byte(@br.buf, @br.pos) | (str_byte(@br.buf, @br.pos + 1) << 8)
+    @nlen = str_byte(@br.buf, @br.pos + 2) | (str_byte(@br.buf, @br.pos + 3) << 8)
+    @br.pos = @br.pos + 4
+    if (@len ^ 65535) != @nlen
+        _gzip_set_err("stored block: LEN/NLEN mismatch")
+        return 0 - 1
+    if @br.pos + @len > @blen
+        _gzip_set_err("stored block: data truncated")
+        return 0 - 1
+    _ob_reserve(@out, @len)
+    memcpy(@out.buf + @out.len, @br.buf + @br.pos, @len)
+    @out.len = @out.len + @len
+    @br.pos = @br.pos + @len
+    return 0
+
+# _decode_huff_block(@br, @out, @lit, @dist) -> 0 ok, -1 on error.
+# Drives the literal/length + distance loop given pre-built Huff tables.
+fn _decode_huff_block(@br: BitReader, @out: OutBuf, @lit: Huff, @dist: Huff) -> int
+    while 1
+        @sym = _huff_decode(@br, @lit)
+        if @sym < 0
+            _gzip_set_err("huffman: literal decode failed")
+            return 0 - 1
+        if @sym < 256
+            _ob_push(@out, @sym)
+            continue
+        if @sym == 256
+            return 0
+        if @sym > 285
+            _gzip_set_err("huffman: literal symbol out of range")
+            return 0 - 1
+        @lidx = @sym - 257
+        @extra = _len_extra(@lidx)
+        @length = _len_base(@lidx)
+        if @extra > 0
+            @e = _br_read_bits(@br, @extra)
+            if @e < 0
+                _gzip_set_err("huffman: length extra bits truncated")
+                return 0 - 1
+            @length = @length + @e
+        @dsym = _huff_decode(@br, @dist)
+        if @dsym < 0
+            _gzip_set_err("huffman: distance decode failed")
+            return 0 - 1
+        if @dsym > 29
+            _gzip_set_err("huffman: distance symbol out of range")
+            return 0 - 1
+        @dextra = _dist_extra(@dsym)
+        @distance = _dist_base(@dsym)
+        if @dextra > 0
+            @e = _br_read_bits(@br, @dextra)
+            if @e < 0
+                _gzip_set_err("huffman: distance extra bits truncated")
+                return 0 - 1
+            @distance = @distance + @e
+        if @distance > @out.len
+            _gzip_set_err("huffman: distance points before stream start")
+            return 0 - 1
+        _ob_copy_from(@out, @distance, @length)
+    return 0
+
+# _decode_fixed_block(@br, @out) -> 0 ok, -1 on error. Type 1 block.
+fn _decode_fixed_block(@br: BitReader, @out: OutBuf) -> int
+    @llens = _fixed_litlen_lengths()
+    @dlens = _fixed_dist_lengths()
+    let @lit: Huff = _huff_build(@llens, 288)
+    let @dist: Huff = _huff_build(@dlens, 32)
+    return _decode_huff_block(@br, @out, @lit, @dist)
+
+# _read_dyn_code_lengths(@br, @clh, @total) -> a (@total)-byte buffer
+# of decoded code lengths, or 0 on error. Implements the RLE encoding
+# of RFC 1951 §3.2.7: codes 0..15 are literal lengths, 16 means
+# "repeat the previous length 3+(2 bits) times", 17 means "0 repeated
+# 3+(3 bits) times", 18 means "0 repeated 11+(7 bits) times".
+fn _read_dyn_code_lengths(@br: BitReader, @clh: Huff, @total: int) -> int
+    @out = new_str(@total)
+    @i = 0
+    @prev = 0
+    while @i < @total
+        @sym = _huff_decode(@br, @clh)
+        if @sym < 0
+            _gzip_set_err("dynamic: code-length decode failed")
+            return 0
+        if @sym < 16
+            u8_set(@out, @i, @sym)
+            @prev = @sym
+            @i = @i + 1
+            continue
+        @rep = 0
+        @val = 0
+        if @sym == 16
+            @e = _br_read_bits(@br, 2)
+            if @e < 0
+                _gzip_set_err("dynamic: repeat-16 truncated")
+                return 0
+            @rep = 3 + @e
+            @val = @prev
+        elif @sym == 17
+            @e = _br_read_bits(@br, 3)
+            if @e < 0
+                _gzip_set_err("dynamic: repeat-17 truncated")
+                return 0
+            @rep = 3 + @e
+            @val = 0
+        elif @sym == 18
+            @e = _br_read_bits(@br, 7)
+            if @e < 0
+                _gzip_set_err("dynamic: repeat-18 truncated")
+                return 0
+            @rep = 11 + @e
+            @val = 0
+        else
+            _gzip_set_err("dynamic: bad code-length symbol")
+            return 0
+        if @i + @rep > @total
+            _gzip_set_err("dynamic: repeat overruns code-length table")
+            return 0
+        @k = 0
+        while @k < @rep
+            u8_set(@out, @i + @k, @val)
+            @k = @k + 1
+        @i = @i + @rep
+        @prev = @val
+    return @out
+
+# _decode_dynamic_block(@br, @out) -> 0 ok, -1 on error. Type 2 block.
+fn _decode_dynamic_block(@br: BitReader, @out: OutBuf) -> int
+    @hlit = _br_read_bits(@br, 5)
+    @hdist = _br_read_bits(@br, 5)
+    @hclen = _br_read_bits(@br, 4)
+    if @hclen < 0
+        _gzip_set_err("dynamic: header truncated")
+        return 0 - 1
+    @nlit = @hlit + 257
+    @ndist = @hdist + 1
+    @nclen = @hclen + 4
+
+    # Code-length code lengths come first, in the canonical order.
+    @clens = new_str(19)
+    @i = 0
+    while @i < @nclen
+        @v = _br_read_bits(@br, 3)
+        if @v < 0
+            _gzip_set_err("dynamic: code-length code truncated")
+            return 0 - 1
+        u8_set(@clens, _clen_order(@i), @v)
+        @i = @i + 1
+    let @clh: Huff = _huff_build(@clens, 19)
+
+    # Then the literal/length + distance code lengths, RLE-encoded
+    # under @clh. We decode them into one buffer of @nlit+@ndist
+    # entries, then split.
+    @total = @nlit + @ndist
+    @all = _read_dyn_code_lengths(@br, @clh, @total)
+    if @all == 0
+        return 0 - 1
+
+    @llens = new_str(@nlit)
+    @dlens = new_str(@ndist)
+    @i = 0
+    while @i < @nlit
+        u8_set(@llens, @i, u8_at(@all, @i))
+        @i = @i + 1
+    @i = 0
+    while @i < @ndist
+        u8_set(@dlens, @i, u8_at(@all, @nlit + @i))
+        @i = @i + 1
+
+    let @lit: Huff = _huff_build(@llens, @nlit)
+    let @dist: Huff = _huff_build(@dlens, @ndist)
+    return _decode_huff_block(@br, @out, @lit, @dist)
+
+
+# ---------- DEFLATE top level -----------------------------------------------
+
+# _inflate(@br, @out) -> 0 ok, -1 on error.
+# Loops over DEFLATE blocks until the BFINAL bit is set.
+fn _inflate(@br: BitReader, @out: OutBuf) -> int
+    while 1
+        @bfinal = _br_read_bits(@br, 1)
+        if @bfinal < 0
+            _gzip_set_err("deflate: stream truncated at block header")
+            return 0 - 1
+        @btype = _br_read_bits(@br, 2)
+        if @btype < 0
+            _gzip_set_err("deflate: stream truncated at block type")
+            return 0 - 1
+        @rc = 0
+        if @btype == 0
+            @rc = _decode_stored_block(@br, @out)
+        elif @btype == 1
+            @rc = _decode_fixed_block(@br, @out)
+        elif @btype == 2
+            @rc = _decode_dynamic_block(@br, @out)
+        else
+            _gzip_set_err("deflate: reserved block type 3")
+            return 0 - 1
+        if @rc < 0
+            return 0 - 1
+        if @bfinal == 1
+            return 0
+    return 0
+
+
+# deflate_decompress(@src) -> decompressed bytes, or "" on error.
+fn deflate_decompress(@src: int) -> int
+    _gzip_clear_err()
+    let @br: BitReader = _br_new(@src)
+    let @out: OutBuf = _ob_new()
+    @rc = _inflate(@br, @out)
+    if @rc < 0
+        return ""
+    return _ob_done(@out)
+
+
+# ---------- CRC32 (RFC 1952 verification) -----------------------------------
+#
+# IEEE 802.3 polynomial 0xEDB88320 (reflected). Table-driven.
+
+fn _crc32_table() -> int
+    @tbl = new_str(256 * 4)
+    @i = 0
+    while @i < 256
+        @c = @i
+        @k = 0
+        while @k < 8
+            if (@c & 1) == 1
+                @c = (@c >> 1) ^ 3988292384
+            else
+                @c = @c >> 1
+            @k = @k + 1
+        u32_set(@tbl, @i * 4, @c)
+        @i = @i + 1
+    return @tbl
+
+# _crc32(@data) -> CRC-32 of @data (RFC 1952 / IEEE 802.3).
+fn _crc32(@data: int) -> int
+    @tbl = _crc32_table()
+    @crc = 4294967295
+    @n = str_len(@data)
+    @i = 0
+    while @i < @n
+        @idx = (@crc ^ str_byte(@data, @i)) & 255
+        @crc = (@crc >> 8) ^ u32_at(@tbl, @idx * 4)
+        @i = @i + 1
+    return @crc ^ 4294967295
+
+
+# ---------- gzip envelope ---------------------------------------------------
+
+# gzip_decompress(@src) -> decompressed bytes, or "" on error.
+# Implements the RFC 1952 header + footer wrapping a single DEFLATE
+# stream. Verifies the CRC32 and ISIZE footer fields.
+fn gzip_decompress(@src: int) -> int
+    _gzip_clear_err()
+    @n = str_len(@src)
+    if @n < 18
+        _gzip_set_err("gzip: input too short for header+footer")
+        return ""
+    if is_gzip(@src) == 0
+        _gzip_set_err("gzip: bad magic (not a gzip stream)")
+        return ""
+    @method = str_byte(@src, 2)
+    if @method != 8
+        _gzip_set_err("gzip: unsupported compression method")
+        return ""
+    @flags = str_byte(@src, 3)
+    # Bytes 4..8 = MTIME, 8 = XFL, 9 = OS. We skip them.
+    @pos = 10
+
+    # FEXTRA (bit 2)
+    if (@flags & 4) != 0
+        if @pos + 2 > @n
+            _gzip_set_err("gzip: FEXTRA truncated")
+            return ""
+        @xlen = str_byte(@src, @pos) | (str_byte(@src, @pos + 1) << 8)
+        @pos = @pos + 2 + @xlen
+        if @pos > @n
+            _gzip_set_err("gzip: FEXTRA overruns input")
+            return ""
+    # FNAME (bit 3) — NUL-terminated
+    if (@flags & 8) != 0
+        while @pos < @n
+            if str_byte(@src, @pos) == 0
+                @pos = @pos + 1
+                break
+            @pos = @pos + 1
+        if @pos > @n
+            _gzip_set_err("gzip: FNAME unterminated")
+            return ""
+    # FCOMMENT (bit 4) — NUL-terminated
+    if (@flags & 16) != 0
+        while @pos < @n
+            if str_byte(@src, @pos) == 0
+                @pos = @pos + 1
+                break
+            @pos = @pos + 1
+        if @pos > @n
+            _gzip_set_err("gzip: FCOMMENT unterminated")
+            return ""
+    # FHCRC (bit 1) — two trailing bytes of header CRC16; skip.
+    if (@flags & 2) != 0
+        if @pos + 2 > @n
+            _gzip_set_err("gzip: FHCRC truncated")
+            return ""
+        @pos = @pos + 2
+
+    # Body = src[@pos .. n-8]; footer = last 8 bytes.
+    if @pos + 8 > @n
+        _gzip_set_err("gzip: body shorter than footer")
+        return ""
+    @body_len = @n - 8 - @pos
+    if @body_len < 0
+        _gzip_set_err("gzip: negative body length")
+        return ""
+    @body = str_substr(@src, @pos, @body_len)
+
+    let @br: BitReader = _br_new(@body)
+    let @out: OutBuf = _ob_new()
+    @rc = _inflate(@br, @out)
+    if @rc < 0
+        return ""
+    @plain = _ob_done(@out)
+
+    # Footer: 4 bytes CRC32 (LE) + 4 bytes ISIZE (LE, mod 2^32).
+    @fp = @n - 8
+    @want_crc = str_byte(@src, @fp) | (str_byte(@src, @fp + 1) << 8) | (str_byte(@src, @fp + 2) << 16) | (str_byte(@src, @fp + 3) << 24)
+    @want_isize = str_byte(@src, @fp + 4) | (str_byte(@src, @fp + 5) << 8) | (str_byte(@src, @fp + 6) << 16) | (str_byte(@src, @fp + 7) << 24)
+    @got_isize = str_len(@plain) & 4294967295
+    if @got_isize != @want_isize
+        _gzip_set_err("gzip: ISIZE mismatch")
+        return ""
+    @got_crc = _crc32(@plain)
+    if @got_crc != @want_crc
+        _gzip_set_err("gzip: CRC32 mismatch")
+        return ""
+    return @plain

@@ -1,0 +1,250 @@
+# Tests for std/yaml.
+
+import yaml
+import test
+
+
+fn run_yaml_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1. Simple flat mapping ----------------------------------------------
+    @v1 = yaml_parse("key: value")
+    @r = assert_eq_int("flat: tag is map", yaml_tag(@v1), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("flat: key value",  yaml_get_str(@v1, "key"), "value")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2. Nested mapping ---------------------------------------------------
+    @src2 = "server:\n  host: localhost\n  port: 8080\n"
+    @v2 = yaml_parse(@src2)
+    @r = assert_eq_int("nested: tag is map", yaml_tag(@v2), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @srv = yaml_map_get(@v2, "server")
+    @r = assert_eq_int("nested: srv is map", yaml_tag(@srv), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("nested: srv.host", yaml_get_str(@srv, "host"), "localhost")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("nested: srv.port", yaml_get_int(@srv, "port"), 8080)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3. Top-level sequence ----------------------------------------------
+    @v3 = yaml_parse("- a\n- b\n- c\n")
+    @r = assert_eq_int("seq: tag is seq",  yaml_tag(@v3),    5)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("seq: len 3",       yaml_seq_len(@v3), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @e0 = yaml_seq_get(@v3, 0)
+    @r = assert_eq_str("seq[0]",           yaml_as_str(@e0), "a")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @e2 = yaml_seq_get(@v3, 2)
+    @r = assert_eq_str("seq[2]",           yaml_as_str(@e2), "c")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4. Mixed: list of mappings -----------------------------------------
+    @src4 = "users:\n  - name: alice\n    age: 30\n  - name: bob\n    age: 25\n"
+    @v4 = yaml_parse(@src4)
+    @users = yaml_map_get(@v4, "users")
+    @r = assert_eq_int("mixed: users is seq", yaml_tag(@users), 5)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("mixed: users len 2", yaml_seq_len(@users), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @u0 = yaml_seq_get(@users, 0)
+    @r = assert_eq_str("mixed: users[0].name", yaml_get_str(@u0, "name"), "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("mixed: users[0].age",  yaml_get_int(@u0, "age"),  30)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @u1 = yaml_seq_get(@users, 1)
+    @r = assert_eq_str("mixed: users[1].name", yaml_get_str(@u1, "name"), "bob")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("mixed: users[1].age",  yaml_get_int(@u1, "age"),  25)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5. Comments ignored ------------------------------------------------
+    @src5 = "# top comment\nkey: 42  # inline\n# trailing\n"
+    @v5 = yaml_parse(@src5)
+    @r = assert_eq_int("comments: key", yaml_get_int(@v5, "key"), 42)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6. Quoted strings preserve content ---------------------------------
+    @src6 = "a: \"hello: world\"\nb: 'raw # not comment'\nc: \"line\\nbreak\"\n"
+    @v6 = yaml_parse(@src6)
+    @r = assert_eq_str("quoted: colon in dq",  yaml_get_str(@v6, "a"), "hello: world")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("quoted: hash in sq",   yaml_get_str(@v6, "b"), "raw # not comment")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("quoted: escape \\n",   yaml_get_str(@v6, "c"), "line\nbreak")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7. Booleans and null -----------------------------------------------
+    @src7 = "a: true\nb: false\nc: yes\nd: No\ne: null\nf: ~\ng:\n"
+    @v7 = yaml_parse(@src7)
+    @r = assert_eq_int("bool: true",   yaml_get_bool(@v7, "a"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("bool: false",  yaml_get_bool(@v7, "b"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @cv = yaml_map_get(@v7, "c")
+    @r = assert_eq_int("bool: yes is bool", yaml_tag(@cv), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("bool: yes true",    yaml_as_bool(@cv), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @dv = yaml_map_get(@v7, "d")
+    @r = assert_eq_int("bool: No false",    yaml_as_bool(@dv), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @ev = yaml_map_get(@v7, "e")
+    @r = assert_eq_int("null: null word",   yaml_tag(@ev), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @fv = yaml_map_get(@v7, "f")
+    @r = assert_eq_int("null: tilde",       yaml_tag(@fv), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @gv = yaml_map_get(@v7, "g")
+    @r = assert_eq_int("null: empty value", yaml_tag(@gv), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8. Negative ints / floats -----------------------------------------
+    @src8 = "a: -42\nb: 1.5\nc: -0.001\n"
+    @v8 = yaml_parse(@src8)
+    @r = assert_eq_int("num: negative int",  yaml_get_int(@v8, "a"), 0 - 42)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @bv = yaml_map_get(@v8, "b")
+    @r = assert_eq_int("num: float tag",     yaml_tag(@bv), 6)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("num: float text",    yaml_as_str(@bv), "1.5")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @cv2 = yaml_map_get(@v8, "c")
+    @r = assert_eq_str("num: neg float",     yaml_as_str(@cv2), "-0.001")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 9. Empty input -----------------------------------------------------
+    @v9 = yaml_parse("")
+    @r = assert_eq_int("empty: map (empty)", yaml_tag(@v9), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    let @keys9: Vec = yaml_keys(@v9)
+    @r = assert_eq_int("empty: zero keys", vec_len(@keys9), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 10. Tab in indentation is an error ---------------------------------
+    @src10 = "a:\n\tb: 1\n"
+    @v10 = yaml_parse(@src10)
+    @r = assert_eq_int("tab: is error", yaml_is_error(@v10), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 11. yaml_keys ordering --------------------------------------------
+    @src11 = "one: 1\ntwo: 2\nthree: 3\n"
+    @v11 = yaml_parse(@src11)
+    let @keys: Vec = yaml_keys(@v11)
+    @r = assert_eq_int("keys: count",   vec_len(@keys), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("keys: [0]",     vec_get(@keys, 0), "one")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("keys: [2]",     vec_get(@keys, 2), "three")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 12. Flow-style mapping ---------------------------------------------
+    @src12 = "config: {host: example.com, port: 80}\n"
+    @v12 = yaml_parse(@src12)
+    @cfg = yaml_map_get(@v12, "config")
+    @r = assert_eq_int("flow map: tag",      yaml_tag(@cfg), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("flow map: host",     yaml_get_str(@cfg, "host"), "example.com")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("flow map: port",     yaml_get_int(@cfg, "port"), 80)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 13. Flow-style sequence --------------------------------------------
+    @src13 = "nums: [1, 2, 3, 4]\n"
+    @v13 = yaml_parse(@src13)
+    @nums = yaml_map_get(@v13, "nums")
+    @r = assert_eq_int("flow seq: tag", yaml_tag(@nums), 5)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("flow seq: len", yaml_seq_len(@nums), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @n0 = yaml_seq_get(@nums, 0)
+    @r = assert_eq_int("flow seq: [0]", yaml_as_int(@n0), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @n3 = yaml_seq_get(@nums, 3)
+    @r = assert_eq_int("flow seq: [3]", yaml_as_int(@n3), 4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 14. Reserved/unsupported markers -----------------------------------
+    @v_dd = yaml_parse("---\nfoo: 1\n")
+    @r = assert_eq_int("reject: multi-doc", yaml_is_error(@v_dd), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @v_pipe = yaml_parse("a: |\n  hi\n")
+    @pipe_a = yaml_map_get(@v_pipe, "a")
+    @r = assert_eq_int("reject: '|' block",  yaml_is_error(@pipe_a), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @v_amp = yaml_parse("a: &anchor 1\n")
+    @amp_a = yaml_map_get(@v_amp, "a")
+    @r = assert_eq_int("reject: anchor",     yaml_is_error(@amp_a), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 15. Deeply nested mapping (3 levels) -------------------------------
+    @src15 = "a:\n  b:\n    c: 42\n"
+    @v15 = yaml_parse(@src15)
+    @a15 = yaml_map_get(@v15, "a")
+    @b15 = yaml_map_get(@a15, "b")
+    @r = assert_eq_int("deep: a.b.c", yaml_get_int(@b15, "c"), 42)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 16. yaml_error on success returns "" -------------------------------
+    @r = assert_eq_str("error: empty on success", yaml_error(@v15), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("yaml", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_yaml_tests(0, 0)

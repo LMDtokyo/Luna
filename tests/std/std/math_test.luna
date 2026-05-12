@@ -1,0 +1,166 @@
+# Tests for std/std/math — integer ops + IEEE-754 helpers.
+
+import math
+import test
+
+
+fn run_math_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # --- int_abs ---
+    @r = assert_eq_int("abs 0",       int_abs(0),       0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("abs +7",      int_abs(7),       7)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("abs -42",     int_abs(0 - 42),  42)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- int_sign ---
+    @r = assert_eq_int("sign 0",   int_sign(0),       0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("sign +5",  int_sign(5),       1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("sign -5",  int_sign(0 - 5),   0 - 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- int_min / int_max ---
+    @r = assert_eq_int("min(3,7)", int_min(3, 7), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("max(3,7)", int_max(3, 7), 7)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("min(-2,-9)", int_min(0 - 2, 0 - 9), 0 - 9)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- int_clamp ---
+    @r = assert_eq_int("clamp inside",  int_clamp(5, 0, 10),       5)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("clamp lo",      int_clamp(0 - 1, 0, 10),   0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("clamp hi",      int_clamp(20, 0, 10),      10)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- int_pow ---
+    @r = assert_eq_int("pow 2^10",  int_pow(2, 10),       1024)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("pow 3^0",   int_pow(3, 0),        1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("pow 5^-1",  int_pow(5, 0 - 1),    0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("pow 7^1",   int_pow(7, 1),        7)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("pow -2^3",  int_pow(0 - 2, 3),    0 - 8)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- int_sqrt ---
+    @r = assert_eq_int("sqrt 0",   int_sqrt(0),         0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("sqrt 1",   int_sqrt(1),         1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("sqrt 16",  int_sqrt(16),        4)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("sqrt 99",  int_sqrt(99),        9)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("sqrt neg", int_sqrt(0 - 4),     0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- int_log2 ---
+    @r = assert_eq_int("log2 1",    int_log2(1),        0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("log2 2",    int_log2(2),        1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("log2 1024", int_log2(1024),     10)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("log2 0",    int_log2(0),        0 - 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("log2 7",    int_log2(7),        2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- int_gcd / int_lcm ---
+    @r = assert_eq_int("gcd 12,18", int_gcd(12, 18),    6)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("gcd 7,13",  int_gcd(7, 13),     1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("gcd 0,9",   int_gcd(0, 9),      9)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("lcm 4,6",   int_lcm(4, 6),      12)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("lcm 0,5",   int_lcm(0, 5),      0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- constants ---
+    @r = assert_eq_int("INT_MAX", INT_MAX, 9223372036854775807)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("INT_MIN", INT_MIN, 0 - 9223372036854775807 - 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- f64_zero / f64_one round-trip via f64_to_int ---
+    @r = assert_eq_int("f64_zero -> int",  f64_to_int(f64_zero()),  0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("f64_one -> int",   f64_to_int(f64_one()),   1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- f64_neg / f64_abs (round-trip through f64_to_int) ---
+    @r = assert_eq_int("f64_neg(1.0) -> -1", f64_to_int(f64_neg(f64_one())), 0 - 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("f64_abs(-1.0) -> 1", f64_to_int(f64_abs(f64_neg(f64_one()))), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("f64_abs(1.0) -> 1",  f64_to_int(f64_abs(f64_one())), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- f64_min / f64_max ---
+    @three = f64_from_int(3)
+    @seven = f64_from_int(7)
+    @r = assert_eq_int("f64_min(3,7)", f64_to_int(f64_min(@three, @seven)), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("f64_max(3,7)", f64_to_int(f64_max(@three, @seven)), 7)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("math", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_math_tests(0, 0)

@@ -1,0 +1,388 @@
+# tier: T5
+# deps: http_router, json
+# ffi: none
+#
+# std/net/openapi — OpenAPI 3.0 spec generator + Swagger UI for Luna
+# HTTP apps. Pairs with std/net/http_router.
+#
+# Usage sketch:
+#
+#   import http_router
+#   import openapi
+#
+#   fn route_hello(@req: HttpRequest, @cli: int) -> int
+#       return http_send_text(@cli, "hi\n")
+#
+#   fn main() -> int
+#       let @r: Router = router_new()
+#       let @s: Spec   = openapi_new("Demo API", "1.0.0")
+#
+#       router_get(@r, "/hello", route_hello)
+#       openapi_route(@s, "GET", "/hello", "Say hi", "{\"type\":\"string\"}")
+#       openapi_tag(@s, "greetings")
+#
+#       openapi_serve(@r, "/docs", @s)
+#       return router_serve(@r, 8080)
+#
+# Browse http://localhost:8080/docs for interactive Swagger UI; the raw
+# spec is at http://localhost:8080/docs/openapi.json.
+#
+# Mental model:
+#   - Routes are stored in parallel Vecs on the Spec (method, path,
+#     summary, etc.). openapi_param / openapi_request_body / openapi_tag
+#     attach metadata to the *most recently* added route.
+#   - openapi_to_json walks the route table, groups by path, emits a
+#     standards-compliant minimal OpenAPI 3.0.3 document.
+#   - The `schema` strings are pasted in verbatim. Caller is responsible
+#     for making them valid JSON (we don't validate).
+#
+# openapi_serve singleton caveat:
+#   The two mounted handlers (HTML page + openapi.json) read their
+#   payload from /tmp/luna-openapi-<pid>.{json,html}. The bootminor
+#   subset has no mutable globals, so the cached strings live on disk.
+#   Calling openapi_serve a second time in the same process overwrites
+#   the previous payload — one spec per process.
+
+import http_router
+import json
+
+
+# --- types ---------------------------------------------------------------
+
+struct Spec
+    title:            int     # API title (e.g. "Demo API")
+    version:          int     # API version (e.g. "1.0.0")
+    description:      int     # long description, "" if unset
+    server_url:       int     # "" if unset
+    server_desc:      int     # "" if unset
+    methods:          int     # Vec of method strings ("GET", ...)
+    paths:            int     # Vec of path strings ("/users/{id}", ...)
+    summaries:        int     # Vec of summary strings
+    response_schemas: int     # Vec of JSON-string schemas
+    tags:             int     # Vec of tag strings (or "" if untagged)
+    param_lists:      int     # Vec of Vec<Param>, one per route
+    body_ctypes:      int     # Vec of content-type strings ("" if no body)
+    body_schemas:     int     # Vec of JSON-string body schemas ("" if no body)
+
+
+struct Param
+    name:       int     # "id"
+    located_in: int     # "path" / "query" / "header" / "cookie"
+    required:   int     # 0 or 1
+    schema:     int     # raw JSON-string e.g. "{\"type\":\"integer\"}"
+    desc:       int     # human description, "" if unset
+
+
+# --- spec construction --------------------------------------------------
+
+# openapi_new(@title, @version) -> fresh Spec handle.
+fn openapi_new(@title: int, @version: int) -> Spec
+    let @s: Spec = new_str(104)
+    @s.title            = @title
+    @s.version          = @version
+    @s.description      = ""
+    @s.server_url       = ""
+    @s.server_desc      = ""
+    @s.methods          = vec_new()
+    @s.paths            = vec_new()
+    @s.summaries        = vec_new()
+    @s.response_schemas = vec_new()
+    @s.tags             = vec_new()
+    @s.param_lists      = vec_new()
+    @s.body_ctypes      = vec_new()
+    @s.body_schemas     = vec_new()
+    return @s
+
+
+fn openapi_set_description(@spec: Spec, @desc: int) -> int
+    @spec.description = @desc
+    return 0
+
+
+fn openapi_set_server(@spec: Spec, @url: int, @desc: int) -> int
+    @spec.server_url  = @url
+    @spec.server_desc = @desc
+    return 0
+
+
+# openapi_route(@spec, @method, @path, @summary, @response_schema) -> 0.
+# Appends a new route to the spec. Subsequent calls to openapi_param /
+# openapi_request_body / openapi_tag operate on this route.
+fn openapi_route(@spec: Spec, @method: int, @path: int, @summary: int, @response_schema: int) -> int
+    vec_push(@spec.methods,          @method)
+    vec_push(@spec.paths,            @path)
+    vec_push(@spec.summaries,        @summary)
+    vec_push(@spec.response_schemas, @response_schema)
+    vec_push(@spec.tags,             "")
+    let @pl: Vec = vec_new()
+    vec_push(@spec.param_lists,      @pl)
+    vec_push(@spec.body_ctypes,      "")
+    vec_push(@spec.body_schemas,     "")
+    return 0
+
+
+# Index of the most recently added route. -1 if none.
+fn _openapi_last_idx(@spec: Spec) -> int
+    return vec_len(@spec.paths) - 1
+
+
+fn openapi_param(@spec: Spec, @name: int, @located_in: int, @required: int, @schema: int, @desc: int) -> int
+    @i = _openapi_last_idx(@spec)
+    if @i < 0
+        return 0 - 1
+    let @p: Param = new_str(40)
+    @p.name       = @name
+    @p.located_in = @located_in
+    @p.required   = @required
+    @p.schema     = @schema
+    @p.desc       = @desc
+    let @plist: Vec = vec_get(@spec.param_lists, @i)
+    vec_push(@plist, @p)
+    return 0
+
+
+fn openapi_request_body(@spec: Spec, @content_type: int, @schema: int) -> int
+    @i = _openapi_last_idx(@spec)
+    if @i < 0
+        return 0 - 1
+    vec_set(@spec.body_ctypes,  @i, @content_type)
+    vec_set(@spec.body_schemas, @i, @schema)
+    return 0
+
+
+fn openapi_tag(@spec: Spec, @tag: int) -> int
+    @i = _openapi_last_idx(@spec)
+    if @i < 0
+        return 0 - 1
+    vec_set(@spec.tags, @i, @tag)
+    return 0
+
+
+# --- JSON emit ----------------------------------------------------------
+
+# Append json_escape(@s) to the buffer.
+fn _oa_emit_str(@b: StrBuf, @s: int) -> int
+    strbuf_add_str(@b, json_escape(@s))
+    return 0
+
+
+# Find @needle in the Vec<string> @hay starting at @from. Returns the
+# next index >= @from whose value equals @needle, or -1 if none.
+fn _oa_find_str_in_vec(@hay: Vec, @needle: int, @from: int) -> int
+    @n = vec_len(@hay)
+    @i = @from
+    while @i < @n
+        if str_eq(vec_get(@hay, @i), @needle) == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
+
+# Emit "/path": { (method: op-object), ... } for one path. @first_path
+# is 1 for the first path-key in the parent object (controls leading ",").
+fn _oa_emit_path_block(@b: StrBuf, @spec: Spec, @path: int, @first_path: int) -> int
+    if @first_path == 0
+        strbuf_add_str(@b, ",")
+    _oa_emit_str(@b, @path)
+    strbuf_add_str(@b, ":{")
+
+    @i = 0
+    @first_method = 1
+    @n = vec_len(@spec.paths)
+    while @i < @n
+        if str_eq(vec_get(@spec.paths, @i), @path) == 1
+            if @first_method == 0
+                strbuf_add_str(@b, ",")
+            _oa_emit_operation(@b, @spec, @i)
+            @first_method = 0
+        @i = @i + 1
+
+    strbuf_add_str(@b, "}")
+    return 0
+
+
+# Emit `"<lower(method)>": { ...operation... }` for route @i.
+fn _oa_emit_operation(@b: StrBuf, @spec: Spec, @i: int) -> int
+    @method_lower = str_to_lower(vec_get(@spec.methods, @i))
+    _oa_emit_str(@b, @method_lower)
+    strbuf_add_str(@b, ":{")
+
+    strbuf_add_str(@b, "\"summary\":")
+    _oa_emit_str(@b, vec_get(@spec.summaries, @i))
+
+    @tag = vec_get(@spec.tags, @i)
+    if str_len(@tag) > 0
+        strbuf_add_str(@b, ",\"tags\":[")
+        _oa_emit_str(@b, @tag)
+        strbuf_add_str(@b, "]")
+
+    let @plist: Vec = vec_get(@spec.param_lists, @i)
+    @np = vec_len(@plist)
+    if @np > 0
+        strbuf_add_str(@b, ",\"parameters\":[")
+        @k = 0
+        while @k < @np
+            if @k > 0
+                strbuf_add_str(@b, ",")
+            _oa_emit_param(@b, vec_get(@plist, @k))
+            @k = @k + 1
+        strbuf_add_str(@b, "]")
+
+    @ctype = vec_get(@spec.body_ctypes, @i)
+    if str_len(@ctype) > 0
+        strbuf_add_str(@b, ",\"requestBody\":{\"content\":{")
+        _oa_emit_str(@b, @ctype)
+        strbuf_add_str(@b, ":{\"schema\":")
+        strbuf_add_str(@b, vec_get(@spec.body_schemas, @i))
+        strbuf_add_str(@b, "}}}")
+
+    strbuf_add_str(@b, ",\"responses\":{\"200\":{\"description\":\"ok\",\"content\":{\"application/json\":{\"schema\":")
+    strbuf_add_str(@b, vec_get(@spec.response_schemas, @i))
+    strbuf_add_str(@b, "}}}}")
+    strbuf_add_str(@b, "}")
+    return 0
+
+
+fn _oa_emit_param(@b: StrBuf, @p: Param) -> int
+    strbuf_add_str(@b, "{\"name\":")
+    _oa_emit_str(@b, @p.name)
+    strbuf_add_str(@b, ",\"in\":")
+    _oa_emit_str(@b, @p.located_in)
+    strbuf_add_str(@b, ",\"required\":")
+    if @p.required == 1
+        strbuf_add_str(@b, "true")
+    else
+        strbuf_add_str(@b, "false")
+    if str_len(@p.desc) > 0
+        strbuf_add_str(@b, ",\"description\":")
+        _oa_emit_str(@b, @p.desc)
+    strbuf_add_str(@b, ",\"schema\":")
+    strbuf_add_str(@b, @p.schema)
+    strbuf_add_str(@b, "}")
+    return 0
+
+
+# openapi_to_json(@spec) -> the full OpenAPI 3.0.3 JSON document.
+fn openapi_to_json(@spec: Spec) -> int
+    let @b: StrBuf = strbuf_new()
+    strbuf_add_str(@b, "{\"openapi\":\"3.0.3\",\"info\":{")
+    strbuf_add_str(@b, "\"title\":")
+    _oa_emit_str(@b, @spec.title)
+    strbuf_add_str(@b, ",\"version\":")
+    _oa_emit_str(@b, @spec.version)
+    if str_len(@spec.description) > 0
+        strbuf_add_str(@b, ",\"description\":")
+        _oa_emit_str(@b, @spec.description)
+    strbuf_add_str(@b, "}")
+
+    if str_len(@spec.server_url) > 0
+        strbuf_add_str(@b, ",\"servers\":[{\"url\":")
+        _oa_emit_str(@b, @spec.server_url)
+        if str_len(@spec.server_desc) > 0
+            strbuf_add_str(@b, ",\"description\":")
+            _oa_emit_str(@b, @spec.server_desc)
+        strbuf_add_str(@b, "}]")
+
+    strbuf_add_str(@b, ",\"paths\":{")
+    @n = vec_len(@spec.paths)
+    @i = 0
+    @first_path = 1
+    while @i < @n
+        @p = vec_get(@spec.paths, @i)
+        # Skip duplicates — only emit the first occurrence of each path.
+        if _oa_find_str_in_vec(@spec.paths, @p, 0) == @i
+            _oa_emit_path_block(@b, @spec, @p, @first_path)
+            @first_path = 0
+        @i = @i + 1
+    strbuf_add_str(@b, "}}")
+    return strbuf_done(@b)
+
+
+# --- Swagger UI HTML ----------------------------------------------------
+#
+# CDN choice: jsDelivr-hosted Swagger UI 5.x. Single CSS + single JS
+# bundle, no extra fonts. Redoc is a one-line alternative — see the
+# commented branch below.
+
+fn _oa_html(@prefix: int) -> int
+    let @b: StrBuf = strbuf_new()
+    strbuf_add_str(@b, "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <title>API Docs</title>\n")
+    strbuf_add_str(@b, "  <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css\">\n")
+    strbuf_add_str(@b, "</head>\n<body>\n  <div id=\"swagger-ui\"></div>\n")
+    strbuf_add_str(@b, "  <script src=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>\n")
+    strbuf_add_str(@b, "  <script>\n    window.onload = function () {\n      SwaggerUIBundle({\n        url: \"")
+    strbuf_add_str(@b, @prefix)
+    strbuf_add_str(@b, "/openapi.json\",\n        dom_id: \"#swagger-ui\"\n      });\n    };\n  </script>\n</body>\n</html>\n")
+    return strbuf_done(@b)
+
+
+# Alternative renderer using Redoc (single-bundle, minimal config).
+# Not wired in by default — to use it, change the `_oa_html(@prefix)`
+# call in openapi_serve to `_oa_html_redoc(@prefix)`.
+fn _oa_html_redoc(@prefix: int) -> int
+    let @b: StrBuf = strbuf_new()
+    strbuf_add_str(@b, "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <title>API Docs</title>\n</head>\n<body>\n  <redoc spec-url=\"")
+    strbuf_add_str(@b, @prefix)
+    strbuf_add_str(@b, "/openapi.json\"></redoc>\n  <script src=\"https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js\"></script>\n</body>\n</html>\n")
+    return strbuf_done(@b)
+
+
+# --- mounting on a router ----------------------------------------------
+#
+# Singleton storage: the bootminor subset doesn't expose mutable
+# globals, so the cached HTML/JSON payloads live in /tmp. The handlers
+# below re-read these on every request. Generation runs once, at
+# openapi_serve time.
+#
+# Path layout (PID-keyed so concurrent processes don't stomp on each
+# other; not a security boundary — /tmp is world-readable):
+#   /tmp/luna-openapi-<pid>.json
+#   /tmp/luna-openapi-<pid>.html
+
+fn _oa_pid() -> int
+    return sys_getpid()
+
+
+fn _oa_temp_path(@suffix: int) -> int
+    @r = str_concat("/tmp/luna-openapi-", int_to_str(_oa_pid()))
+    @r = str_concat(@r, @suffix)
+    return @r
+
+
+fn _oa_handler_json(@req: HttpRequest, @cli: int) -> int
+    @path = _oa_temp_path(".json")
+    @body = read_file(@path)
+    if str_len(@body) == 0
+        return http_send(@cli, 500, "Internal Server Error", "application/json", "{\"error\":\"openapi cache missing\"}")
+    return http_send_json(@cli, @body)
+
+
+fn _oa_handler_html(@req: HttpRequest, @cli: int) -> int
+    @path = _oa_temp_path(".html")
+    @body = read_file(@path)
+    if str_len(@body) == 0
+        return http_send(@cli, 500, "Internal Server Error", "text/plain", "openapi cache missing")
+    return http_send_html(@cli, @body)
+
+
+# openapi_serve(@router, @prefix, @spec) -> 0 on success, -1 on cache
+# write failure. Registers two routes:
+#   GET <prefix>             -> Swagger UI HTML page
+#   GET <prefix>/openapi.json -> raw spec
+#
+# If @prefix is "" or "/" the HTML lives at "/" — which usually
+# collides with an existing root handler, so the recommended prefix is
+# "/docs".
+fn openapi_serve(@router: Router, @prefix: int, @spec: Spec) -> int
+    @json = openapi_to_json(@spec)
+    @html = _oa_html(@prefix)
+
+    if write_file(_oa_temp_path(".json"), @json) < 0
+        return 0 - 1
+    if write_file(_oa_temp_path(".html"), @html) < 0
+        return 0 - 1
+
+    @json_path = str_concat(@prefix, "/openapi.json")
+    router_get(@router, @json_path, _oa_handler_json)
+    router_get(@router, @prefix,    _oa_handler_html)
+    return 0

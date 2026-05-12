@@ -1,0 +1,72 @@
+# Tests for std/net/multipart — RFC 7578 vectors built inline.
+
+import multipart
+import test
+
+
+fn run_multipart_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # Boundary extraction from Content-Type.
+    @ct1 = "multipart/form-data; boundary=----WebKitFormBoundary123"
+    @r = assert_eq_str("boundary plain", multipart_boundary(@ct1), "----WebKitFormBoundary123")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @ct2 = "multipart/form-data; boundary=\"qb\""
+    @r = assert_eq_str("boundary quoted", multipart_boundary(@ct2), "qb")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @ct3 = "multipart/form-data; charset=utf-8; boundary=ABC; q=1"
+    @r = assert_eq_str("boundary mid",   multipart_boundary(@ct3), "ABC")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @ct4 = "application/json"
+    @r = assert_eq_str("boundary none",  multipart_boundary(@ct4), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Simple two-field body (text + text).
+    @body1 = "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nhello\r\n--B\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nworld\r\n--B--\r\n"
+    @r = assert_eq_str("part a",       multipart_part(@body1, "B", "a"),    "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("part b",       multipart_part(@body1, "B", "b"),    "world")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("part missing", multipart_part(@body1, "B", "nope"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # File upload — name + filename + content-type.
+    @body2 = "--B\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nhi\r\n--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nBYTES_HERE\r\n--B--\r\n"
+    @r = assert_eq_str("file body",     multipart_part(@body2, "B", "file"),     "BYTES_HERE")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("file filename", multipart_filename(@body2, "B", "file"), "photo.jpg")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("text alongside", multipart_part(@body2, "B", "text"),    "hi")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("text no filename", multipart_filename(@body2, "B", "text"), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Binary-ish content with \r\n inside the part body should NOT be
+    # cut at the wrong place — only \r\n--BOUNDARY counts.
+    @body3 = "--B\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\nline1\r\nline2\r\n--B--\r\n"
+    @r = assert_eq_str("multiline body", multipart_part(@body3, "B", "x"), "line1\r\nline2")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("multipart", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_multipart_tests(0, 0)

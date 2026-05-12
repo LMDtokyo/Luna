@@ -1,0 +1,435 @@
+# tier: T6
+# deps: tcp, dns
+# ffi: libssl-via-dlopen
+#
+# std/ext/tls — in-process TLS client over libssl.so.3, loaded at
+# runtime via dlopen / dlsym. Implements P5 of docs/TLS_DESIGN.md.
+#
+# This module replaces the openssl(1) subprocess shim that
+# std/ext/https.luna currently uses. Once this lands, P6 rewrites
+# https.luna on top of these primitives and the per-request fork+exec
+# disappears.
+#
+# Wire-up:
+#   The compiler emits `call qword [rip + got_slot]` for `_libc_dlopen`
+#   and `_libc_dlsym` when invoked with `--dynamic`. The resulting ELF
+#   carries DT_NEEDED libc.so.6 + libdl.so.2, so ld-linux resolves
+#   them at process load. libssl itself is opened lazily inside
+#   tls_init().
+#
+# Public API (per docs/TLS_DESIGN.md):
+#   tls_init()                          -> 0 on success, -1 on failure
+#   tls_connect(@host, @port)           -> TlsConn (all-zero on failure)
+#   tls_conn_ok(@c)                     -> 1 if usable
+#   tls_read(@c, @max_len)              -> Luna string (may be empty)
+#   tls_write(@c, @data)                -> bytes written or -1
+#   tls_close(@c)                       -> 0
+#   tls_error()                         -> last error message
+#
+# Limitations (MVP):
+#   - No SNI yet. SSL_set_tlsext_host_name is a macro that expands to
+#     SSL_ctrl(ssl, 55, 0, name) — four pointer-sized args, but
+#     bootminor's indirect-call intrinsics top out at three. Many
+#     public servers (Cloudflare, GitHub, ...) hard-fail without SNI,
+#     so this MVP is most useful for development / private endpoints.
+#     Adding `_call_ptr4` is small (~20 lines in gen.luna) and is the
+#     next thing to do.
+#   - No certificate verification. OpenSSL defaults to "do not verify";
+#     wiring SSL_CTX_set_verify + a trust store comes after SNI lands.
+#   - IPv4 only (inherited from tcp_connect).
+#   - One TLS_method / SSL_CTX per connection. A real client would
+#     pool the SSL_CTX; pooling lives at the caller layer for now.
+
+import tcp
+import dns
+
+
+# === Function-pointer cache (process-wide singleton) ====================
+#
+# Bootminor has no mutable module-static storage, so we park the dlsym'd
+# function pointers in a single 4 KiB page mapped MAP_FIXED_NOREPLACE
+# at a fixed virtual address. The same trick std/net/http2.luna uses
+# for its last-error pointer.
+#
+# Layout (8 bytes per slot, byte offsets):
+#   0   TLS_client_method
+#   8   SSL_CTX_new
+#  16   SSL_new
+#  24   SSL_set_fd
+#  32   SSL_connect
+#  40   SSL_read
+#  48   SSL_write
+#  56   SSL_shutdown
+#  64   SSL_free
+#  72   SSL_CTX_free
+#  80   libssl handle (dlopen result)
+#  88   initialized flag (0 = un-init, 1 = ready, -1 = failed)
+#  96   last-error-message pointer (Luna string)
+
+const _TLS_SLOT_ADDR:  int = 0x600200000000
+const _TLS_SLOT_LEN:   int = 4096
+# MAP_PRIVATE(2) | MAP_ANONYMOUS(0x20) | MAP_FIXED_NOREPLACE(0x100000)
+const _TLS_SLOT_FLAGS: int = 1048626
+
+const _TLS_OFF_METHOD:    int = 0
+const _TLS_OFF_CTX_NEW:   int = 8
+const _TLS_OFF_SSL_NEW:   int = 16
+const _TLS_OFF_SET_FD:    int = 24
+const _TLS_OFF_CONNECT:   int = 32
+const _TLS_OFF_READ:      int = 40
+const _TLS_OFF_WRITE:     int = 48
+const _TLS_OFF_SHUTDOWN:  int = 56
+const _TLS_OFF_FREE:      int = 64
+const _TLS_OFF_CTX_FREE:  int = 72
+const _TLS_OFF_LIB:       int = 80
+const _TLS_OFF_INIT:      int = 88
+const _TLS_OFF_ERR:       int = 96
+
+# Map (or recover) the singleton page. Returns its base address, or 0
+# if the kernel refused us — that would be a serious mmap failure and
+# the caller should bail.
+fn _tls_slot() -> int
+    @p = sys_mmap(_TLS_SLOT_ADDR, _TLS_SLOT_LEN, 3, _TLS_SLOT_FLAGS, 0 - 1, 0)
+    if @p == _TLS_SLOT_ADDR
+        return _TLS_SLOT_ADDR
+    if @p == 0 - 17
+        # EEXIST: page already mapped from a prior call — ours.
+        return _TLS_SLOT_ADDR
+    return 0
+
+# Little-endian 8-byte load/store helpers. bootminor exposes u64_get /
+# u64_set but those index by **word** offset (multiply by 8). Here we
+# want byte-granular offsets so the layout constants above stay
+# self-documenting.
+fn _tls_load_qword(@base: int, @off: int) -> int
+    @v = 0
+    @i = 0
+    while @i < 8
+        @b = u8_at(@base, @off + @i)
+        @v = @v | (@b << (@i * 8))
+        @i = @i + 1
+    return @v
+
+fn _tls_store_qword(@base: int, @off: int, @val: int) -> int
+    @v = @val
+    @i = 0
+    while @i < 8
+        u8_set(@base, @off + @i, @v & 255)
+        @v = @v >> 8
+        @i = @i + 1
+    return 0
+
+
+# === Error reporting ====================================================
+#
+# tls_error() returns the most recently stored message. The pointer
+# lives at _TLS_OFF_ERR inside the slot page; setting it just stores a
+# Luna-string pointer there. The string itself stays alive because
+# bootminor's string heap is bump-allocated and never freed for the
+# process lifetime, which is exactly what we need here.
+
+fn _tls_set_err(@msg: int) -> int
+    @slot = _tls_slot()
+    if @slot == 0
+        return 0
+    _tls_store_qword(@slot, _TLS_OFF_ERR, @msg)
+    return 0
+
+fn tls_error() -> int
+    @slot = _tls_slot()
+    if @slot == 0
+        return ""
+    @p = _tls_load_qword(@slot, _TLS_OFF_ERR)
+    if @p == 0
+        return ""
+    return @p
+
+
+# === Initialization =====================================================
+#
+# tls_init() dlopens libssl.so.3 (fallback: libssl.so) and dlsym's the
+# 10 OpenSSL entry points we need. On success it flips _TLS_OFF_INIT
+# to 1; on failure to -1 (so subsequent calls don't keep retrying a
+# missing libssl).
+#
+# Idempotent: a second call after success is a no-op and returns 0.
+
+fn _tls_resolve(@lib: int, @name: int, @slot: int, @off: int) -> int
+    @p = _libc_dlsym(@lib, @name)
+    if @p == 0
+        _tls_set_err(str_concat("tls_init: missing symbol ", @name))
+        return -1
+    _tls_store_qword(@slot, @off, @p)
+    return 0
+
+fn tls_init() -> int
+    @slot = _tls_slot()
+    if @slot == 0
+        _tls_set_err("tls_init: cannot mmap singleton page")
+        return -1
+
+    @flag = _tls_load_qword(@slot, _TLS_OFF_INIT)
+    if @flag == 1
+        return 0
+    if @flag == 0 - 1
+        # A prior call already failed; replay the failure without doing
+        # the work again. Error message is still in the slot.
+        return -1
+
+    # RTLD_NOW = 2. Force eager symbol resolution so a missing libssl
+    # surfaces here, not later inside _call_ptrN.
+    @h = _libc_dlopen("libssl.so.3", 2)
+    if @h == 0
+        @h = _libc_dlopen("libssl.so", 2)
+    if @h == 0
+        _tls_set_err("tls_init: cannot dlopen libssl.so.3 / libssl.so")
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+
+    _tls_store_qword(@slot, _TLS_OFF_LIB, @h)
+
+    if _tls_resolve(@h, "TLS_client_method", @slot, _TLS_OFF_METHOD) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+    if _tls_resolve(@h, "SSL_CTX_new", @slot, _TLS_OFF_CTX_NEW) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+    if _tls_resolve(@h, "SSL_new", @slot, _TLS_OFF_SSL_NEW) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+    if _tls_resolve(@h, "SSL_set_fd", @slot, _TLS_OFF_SET_FD) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+    if _tls_resolve(@h, "SSL_connect", @slot, _TLS_OFF_CONNECT) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+    if _tls_resolve(@h, "SSL_read", @slot, _TLS_OFF_READ) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+    if _tls_resolve(@h, "SSL_write", @slot, _TLS_OFF_WRITE) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+    if _tls_resolve(@h, "SSL_shutdown", @slot, _TLS_OFF_SHUTDOWN) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+    if _tls_resolve(@h, "SSL_free", @slot, _TLS_OFF_FREE) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+    if _tls_resolve(@h, "SSL_CTX_free", @slot, _TLS_OFF_CTX_FREE) < 0
+        _tls_store_qword(@slot, _TLS_OFF_INIT, 0 - 1)
+        return -1
+
+    _tls_store_qword(@slot, _TLS_OFF_INIT, 1)
+    _tls_set_err("")
+    return 0
+
+
+# === Connection struct ==================================================
+
+struct TlsConn
+    ctx: int    # SSL_CTX*
+    ssl: int    # SSL*
+    fd:  int    # underlying TCP fd
+
+fn _tls_new_conn() -> TlsConn
+    let @c: TlsConn = new_str(24)
+    @c.ctx = 0
+    @c.ssl = 0
+    @c.fd  = 0
+    return @c
+
+fn tls_conn_ok(@c: TlsConn) -> int
+    if @c.ctx == 0
+        return 0
+    if @c.ssl == 0
+        return 0
+    if @c.fd == 0
+        return 0
+    return 1
+
+
+# === Connect ============================================================
+#
+# tls_connect(@host, @port):
+#   1. Resolve the hostname (pass-through if it's already a dotted-quad).
+#   2. tcp_connect — plain TCP.
+#   3. SSL_CTX_new(TLS_client_method()) — fresh client context.
+#   4. SSL_new(ctx) — fresh SSL object.
+#   5. SSL_set_fd(ssl, fd) — wrap the socket.
+#   6. SSL_connect(ssl) — drive the handshake.
+#
+# On any failure we tear down whatever was allocated and return a
+# zeroed TlsConn so tls_conn_ok() reports 0.
+
+fn tls_connect(@host: int, @port: int) -> TlsConn
+    let @c: TlsConn = _tls_new_conn()
+
+    if tls_init() < 0
+        return @c
+
+    @slot = _tls_slot()
+    if @slot == 0
+        _tls_set_err("tls_connect: slot page lost")
+        return @c
+
+    @ip = dns_resolve(@host)
+    if str_len(@ip) == 0
+        _tls_set_err(str_concat("tls_connect: dns_resolve failed for ", @host))
+        return @c
+
+    @fd = tcp_connect(@ip, @port)
+    if @fd < 0
+        _tls_set_err(str_concat("tls_connect: tcp_connect failed to ", @host))
+        return @c
+
+    @method_fp = _tls_load_qword(@slot, _TLS_OFF_METHOD)
+    @method = _call_ptr0(@method_fp)
+    if @method == 0
+        _tls_set_err("tls_connect: TLS_client_method returned NULL")
+        sys_close(@fd)
+        return @c
+
+    @ctx_new_fp = _tls_load_qword(@slot, _TLS_OFF_CTX_NEW)
+    @ctx = _call_ptr1(@ctx_new_fp, @method)
+    if @ctx == 0
+        _tls_set_err("tls_connect: SSL_CTX_new returned NULL")
+        sys_close(@fd)
+        return @c
+
+    @ssl_new_fp = _tls_load_qword(@slot, _TLS_OFF_SSL_NEW)
+    @ssl = _call_ptr1(@ssl_new_fp, @ctx)
+    if @ssl == 0
+        _tls_set_err("tls_connect: SSL_new returned NULL")
+        @ctx_free_fp = _tls_load_qword(@slot, _TLS_OFF_CTX_FREE)
+        _call_ptr1(@ctx_free_fp, @ctx)
+        sys_close(@fd)
+        return @c
+
+    @set_fd_fp = _tls_load_qword(@slot, _TLS_OFF_SET_FD)
+    @r = _call_ptr2(@set_fd_fp, @ssl, @fd)
+    if @r != 1
+        _tls_set_err("tls_connect: SSL_set_fd failed")
+        @ssl_free_fp = _tls_load_qword(@slot, _TLS_OFF_FREE)
+        _call_ptr1(@ssl_free_fp, @ssl)
+        @ctx_free_fp = _tls_load_qword(@slot, _TLS_OFF_CTX_FREE)
+        _call_ptr1(@ctx_free_fp, @ctx)
+        sys_close(@fd)
+        return @c
+
+    # SNI would go here once _call_ptr4 lands. See TODO at the top.
+
+    @connect_fp = _tls_load_qword(@slot, _TLS_OFF_CONNECT)
+    @r = _call_ptr1(@connect_fp, @ssl)
+    if @r != 1
+        _tls_set_err("tls_connect: SSL_connect handshake failed")
+        @ssl_free_fp = _tls_load_qword(@slot, _TLS_OFF_FREE)
+        _call_ptr1(@ssl_free_fp, @ssl)
+        @ctx_free_fp = _tls_load_qword(@slot, _TLS_OFF_CTX_FREE)
+        _call_ptr1(@ctx_free_fp, @ctx)
+        sys_close(@fd)
+        return @c
+
+    @c.ctx = @ctx
+    @c.ssl = @ssl
+    @c.fd  = @fd
+    _tls_set_err("")
+    return @c
+
+
+# === Read ===============================================================
+#
+# tls_read(@c, @max_len): reads up to @max_len bytes from the encrypted
+# stream. Returns a Luna string containing exactly the bytes received
+# (possibly shorter than @max_len, possibly empty on close/error).
+#
+# Note the return type is `int` in the API contract but every Luna
+# string is also an int pointer to a length-prefixed buffer, so this
+# is the natural shape.
+
+fn tls_read(@c: TlsConn, @max_len: int) -> int
+    if tls_conn_ok(@c) == 0
+        _tls_set_err("tls_read: connection not usable")
+        return ""
+    if @max_len <= 0
+        return ""
+    @slot = _tls_slot()
+    if @slot == 0
+        return ""
+    @read_fp = _tls_load_qword(@slot, _TLS_OFF_READ)
+
+    @buf = new_str(@max_len)
+    @n = _call_ptr3(@read_fp, @c.ssl, @buf, @max_len)
+    if @n <= 0
+        # SSL_read returns 0 on clean shutdown, <0 on error. Either
+        # way the caller gets an empty string and can introspect via
+        # tls_error() if they care.
+        if @n == 0
+            _tls_set_err("tls_read: peer closed")
+        else
+            _tls_set_err("tls_read: SSL_read returned negative")
+        return ""
+    return str_substr(@buf, 0, @n)
+
+
+# === Write ==============================================================
+#
+# tls_write(@c, @data): writes the *entire* Luna string @data to the
+# encrypted stream. Loops over SSL_write until everything is sent or
+# SSL_write returns <= 0 (peer closed / error). Returns total bytes
+# written, or -1 if nothing went through.
+
+fn tls_write(@c: TlsConn, @data: int) -> int
+    if tls_conn_ok(@c) == 0
+        _tls_set_err("tls_write: connection not usable")
+        return -1
+    @n = str_len(@data)
+    if @n == 0
+        return 0
+    @slot = _tls_slot()
+    if @slot == 0
+        return -1
+    @write_fp = _tls_load_qword(@slot, _TLS_OFF_WRITE)
+
+    @off = 0
+    while @off < @n
+        @r = _call_ptr3(@write_fp, @c.ssl, @data + @off, @n - @off)
+        if @r <= 0
+            if @off > 0
+                return @off
+            _tls_set_err("tls_write: SSL_write returned non-positive")
+            return -1
+        @off = @off + @r
+    return @off
+
+
+# === Close ==============================================================
+#
+# Idempotent. Calling tls_close on a half-zeroed conn (e.g. one that
+# tls_connect couldn't finish) skips whichever steps don't apply. We
+# zero out the fields after freeing so a second close is a no-op.
+
+fn tls_close(@c: TlsConn) -> int
+    @slot = _tls_slot()
+    if @slot == 0
+        return 0
+
+    if @c.ssl != 0
+        @shutdown_fp = _tls_load_qword(@slot, _TLS_OFF_SHUTDOWN)
+        if @shutdown_fp != 0
+            _call_ptr1(@shutdown_fp, @c.ssl)
+        @ssl_free_fp = _tls_load_qword(@slot, _TLS_OFF_FREE)
+        if @ssl_free_fp != 0
+            _call_ptr1(@ssl_free_fp, @c.ssl)
+        @c.ssl = 0
+
+    if @c.ctx != 0
+        @ctx_free_fp = _tls_load_qword(@slot, _TLS_OFF_CTX_FREE)
+        if @ctx_free_fp != 0
+            _call_ptr1(@ctx_free_fp, @c.ctx)
+        @c.ctx = 0
+
+    if @c.fd > 0
+        sys_close(@c.fd)
+        @c.fd = 0
+
+    return 0

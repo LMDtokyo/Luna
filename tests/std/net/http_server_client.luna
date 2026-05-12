@@ -1,0 +1,19 @@
+# Client side of the http_server_e2e: GET 127.0.0.1:18082/ and check
+# the response status + body match what http_server_app sends back.
+
+import http
+
+
+fn main() -> int
+    let @resp: HttpResponse = http_get("127.0.0.1", 18082, "/")
+    if @resp.status != 200
+        shine("FAIL: expected status 200, got:")
+        print_int(@resp.status)
+        return 1
+    @expected = "hello from luna server"
+    if str_eq(@resp.body, @expected) == 0
+        shine("FAIL: body mismatch:")
+        shine(@resp.body)
+        return 1
+    shine("PASS: Luna server <-> Luna client round-trip")
+    return 0

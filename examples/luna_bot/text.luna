@@ -1,0 +1,30 @@
+# text.luna — pure-string command handlers.
+# /echo /upper /lower /reverse /rot13 /len
+
+fn cmd_echo(@token: int, @chat_id: int, @arg: int) -> int
+    if str_len(@arg) == 0
+        send_markdown(@token, @chat_id, "usage: `/echo <text>`")
+        return 0
+    send_message(@token, @chat_id, @arg)
+    return 0
+
+fn cmd_upper(@token: int, @chat_id: int, @arg: int) -> int
+    send_message(@token, @chat_id, str_to_upper(@arg))
+    return 0
+
+fn cmd_lower(@token: int, @chat_id: int, @arg: int) -> int
+    send_message(@token, @chat_id, str_to_lower(@arg))
+    return 0
+
+fn cmd_reverse(@token: int, @chat_id: int, @arg: int) -> int
+    send_message(@token, @chat_id, _str_reverse(@arg))
+    return 0
+
+fn cmd_rot13(@token: int, @chat_id: int, @arg: int) -> int
+    send_message(@token, @chat_id, _str_rot13(@arg))
+    return 0
+
+fn cmd_len(@token: int, @chat_id: int, @arg: int) -> int
+    @msg = str_concat("length: ", int_to_str(str_len(@arg)))
+    send_message(@token, @chat_id, @msg)
+    return 0

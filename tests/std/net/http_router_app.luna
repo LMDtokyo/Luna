@@ -1,0 +1,25 @@
+# Router demo server used by http_router_e2e.sh. Three routes:
+#   GET  /         -> "root"
+#   GET  /health   -> "ok"
+#   POST /echo     -> echoes request body
+# Anything else -> 404.
+
+import http_router
+
+
+fn route_root(@req: HttpRequest, @cli: int) -> int
+    return http_send_text(@cli, "root")
+
+fn route_health(@req: HttpRequest, @cli: int) -> int
+    return http_send_text(@cli, "ok")
+
+fn route_echo(@req: HttpRequest, @cli: int) -> int
+    return http_send_text(@cli, @req.body)
+
+
+fn main() -> int
+    let @r: Router = router_new()
+    router_get(@r,  "/",       route_root)
+    router_get(@r,  "/health", route_health)
+    router_post(@r, "/echo",   route_echo)
+    return router_serve(@r, 18083)

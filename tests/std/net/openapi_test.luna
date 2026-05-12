@@ -1,0 +1,125 @@
+# Unit tests for std/net/openapi — spec assembly + JSON emission.
+
+import openapi
+import test
+
+
+# Helper: does @s contain @sub?
+fn _contains(@s: int, @sub: int) -> int
+    return str_contains(@s, @sub)
+
+
+fn run_openapi_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1) openapi_new returns a non-zero handle.
+    let @s: Spec = openapi_new("Test API", "1.0.0")
+    @r = assert_true("new returns handle", @s != 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) Title + version appear in info.
+    @json = openapi_to_json(@s)
+    @r = assert_true("title in info", _contains(@json, "\"title\":\"Test API\""))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("version in info", _contains(@json, "\"version\":\"1.0.0\""))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) After a GET / route, JSON contains "/" key and "get".
+    openapi_route(@s, "GET", "/", "Root", "{\"type\":\"object\"}")
+    @json = openapi_to_json(@s)
+    @r = assert_true("path / present", _contains(@json, "\"/\":"))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("get verb present", _contains(@json, "\"get\":"))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) Path + query params survive into parameters[].
+    openapi_route(@s, "GET", "/users/{id}", "Find user", "{\"type\":\"object\"}")
+    openapi_param(@s, "id",      "path",  1, "{\"type\":\"integer\"}", "user id")
+    openapi_param(@s, "verbose", "query", 0, "{\"type\":\"boolean\"}", "")
+    @json = openapi_to_json(@s)
+    @r = assert_true("path param emitted", _contains(@json, "\"name\":\"id\""))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("query param emitted", _contains(@json, "\"name\":\"verbose\""))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("path param in=path", _contains(@json, "\"in\":\"path\""))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("required=true present", _contains(@json, "\"required\":true"))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) Multiple distinct paths each appear in paths.
+    openapi_route(@s, "POST", "/echo", "Echo body", "{\"type\":\"object\"}")
+    openapi_request_body(@s, "application/json", "{\"type\":\"object\"}")
+    @json = openapi_to_json(@s)
+    @r = assert_true("/echo path present", _contains(@json, "\"/echo\":"))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("post verb present", _contains(@json, "\"post\":"))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("requestBody present", _contains(@json, "\"requestBody\""))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) Tagging — openapi_tag groups in UI sidebar.
+    openapi_route(@s, "GET", "/admin/stats", "Admin", "{\"type\":\"object\"}")
+    openapi_tag(@s, "admin")
+    @json = openapi_to_json(@s)
+    @r = assert_true("tag present", _contains(@json, "\"tags\":[\"admin\"]"))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7) Description + server reach JSON when set.
+    openapi_set_description(@s, "A demo API")
+    openapi_set_server(@s, "http://localhost:8080", "local")
+    @json = openapi_to_json(@s)
+    @r = assert_true("description in info", _contains(@json, "\"description\":\"A demo API\""))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("server url present", _contains(@json, "\"servers\":"))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_true("server url value present", _contains(@json, "http://localhost:8080"))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8) Output parses as JSON (skip-value covers the whole document).
+    @end = json_skip_value(@json, 0)
+    @r = assert_eq_int("json parses end-to-end", @end, str_len(@json))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 9) info object is a parseable object with title key.
+    @info_pos = json_obj_pos(@json, 0, "info")
+    @r = assert_true("info object found", @info_pos > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("title round-trips", json_obj_str(@json, @info_pos, "title"), "Test API")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 10) JSON escaping: a summary with a quote should not break parsing.
+    let @s2: Spec = openapi_new("Quote\"Test", "1")
+    openapi_route(@s2, "GET", "/x", "Has \"quote\"", "{}")
+    @json2 = openapi_to_json(@s2)
+    @end2 = json_skip_value(@json2, 0)
+    @r = assert_eq_int("escaped json still parses", @end2, str_len(@json2))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("openapi", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_openapi_tests(0, 0)

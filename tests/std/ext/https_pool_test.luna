@@ -1,0 +1,115 @@
+# Unit tests for std/ext/https — pool bookkeeping and HTTP framing.
+#
+# This file does NOT speak HTTPS to anywhere; it just verifies that
+# https_pool_new returns a usable handle, that closing an empty pool
+# is a no-op, that _https_pool_find returns -1 when the host is absent,
+# and that the response parsers (status / CRLF-CRLF / Content-Length /
+# chunked detect) handle the standard cases.
+#
+# Wire-level coverage (real TLS handshake, keep-alive reuse, response
+# parsing) lives in https_pool_e2e.sh which stands up a local Python
+# HTTPS server.
+
+import https
+import test
+
+
+fn run_https_pool_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # --- pool_new returns a non-zero handle ---
+    @pool = https_pool_new()
+    @r = assert_true("pool_new non-zero", @pool)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- closing an empty pool is a no-op ---
+    @r = assert_eq_int("close empty pool", https_pool_close(@pool), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- closing again is idempotent ---
+    @r = assert_eq_int("close-close idempotent", https_pool_close(@pool), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- _https_pool_find returns -1 when host absent ---
+    @r = assert_eq_int("find missing host", _https_pool_find(@pool, "example.com", 443), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- _https_parse_status reads the status code out of a status line ---
+    @r = assert_eq_int("parse 200", _https_parse_status("HTTP/1.1 200 OK\r\n", 17), 200)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("parse 404", _https_parse_status("HTTP/1.1 404 Not Found\r\n", 24), 404)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("parse 500", _https_parse_status("HTTP/1.1 500 Err\r\n", 18), 500)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- _https_parse_status rejects garbage ---
+    @r = assert_eq_int("parse short", _https_parse_status("HTTP", 4), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- _https_find_crlf_crlf locates the header terminator ---
+    @raw = "HTTP/1.1 200 OK\r\nX: y\r\n\r\nhello"
+    @r = assert_eq_int("crlf-crlf offset", _https_find_crlf_crlf(@raw, str_len(@raw)), 21)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- _https_scan_headers extracts Content-Length ---
+    @hdrs = "HTTP/1.1 200 OK\r\nContent-Length: 42\r\nConnection: close\r\n\r\n"
+    @flags = new_str(4)
+    @he = _https_find_crlf_crlf(@hdrs, str_len(@hdrs))
+    @cl = _https_scan_headers(@hdrs, @he, @flags)
+    @r = assert_eq_int("scan content-length", @cl, 42)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("scan connection: close", u8_at(@flags, 0), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- _https_scan_headers detects Transfer-Encoding: chunked ---
+    @hdrs2 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    @flags2 = new_str(4)
+    @he2 = _https_find_crlf_crlf(@hdrs2, str_len(@hdrs2))
+    _https_scan_headers(@hdrs2, @he2, @flags2)
+    @r = assert_eq_int("scan chunked flag", u8_at(@flags2, 1), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # --- _https_hex_digit handles the common cases ---
+    @r = assert_eq_int("hex digit '0'", _https_hex_digit(48), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("hex digit '9'", _https_hex_digit(57), 9)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("hex digit 'a'", _https_hex_digit(97), 10)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("hex digit 'F'", _https_hex_digit(70), 15)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("hex digit junk", _https_hex_digit(122), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("https_pool", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_https_pool_tests(0, 0)

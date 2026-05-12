@@ -1,0 +1,85 @@
+# tier: T8
+# deps: http_router, openapi
+# ffi: none
+#
+# Tiny REST API with auto-generated Swagger UI docs.
+#
+# Build & run:
+#     export LUNA_PATH=$(pwd)/std/runtime:$(pwd)/std/core:$(pwd)/std/std:$(pwd)/std/net:$(pwd)/std/ext
+#     luna run examples/net/openapi_demo.luna
+#
+# Open http://localhost:8080/docs in a browser to see the live Swagger
+# UI. Or curl the raw spec:
+#     curl http://localhost:8080/docs/openapi.json | python -m json.tool
+#
+# Try the routes:
+#     curl http://localhost:8080/hello
+#     curl -X POST -d 'hi' http://localhost:8080/echo
+#     curl http://localhost:8080/users/42
+
+import http_router
+import openapi
+
+
+# --- handlers ----------------------------------------------------------
+
+fn route_hello(@req: HttpRequest, @cli: int) -> int
+    return http_send_json(@cli, "{\"msg\":\"hello, world\"}")
+
+
+fn route_echo(@req: HttpRequest, @cli: int) -> int
+    @body = @req.body
+    if str_len(@body) == 0
+        @body = "(empty body)"
+    @reply = str_concat("{\"echoed\":", json_escape(@body))
+    @reply = str_concat(@reply, "}")
+    return http_send_json(@cli, @reply)
+
+
+fn route_user_get(@req: HttpRequest, @cli: int) -> int
+    @id = req_param(@req, "id")
+    if str_len(@id) == 0
+        return http_send(@cli, 400, "Bad Request", "application/json", "{\"error\":\"missing id\"}")
+    @reply = str_concat("{\"id\":\"", @id)
+    @reply = str_concat(@reply, "\",\"name\":\"user-")
+    @reply = str_concat(@reply, @id)
+    @reply = str_concat(@reply, "\"}")
+    return http_send_json(@cli, @reply)
+
+
+# --- wire everything together -----------------------------------------
+
+fn main() -> int
+    let @r: Router = router_new()
+    let @s: Spec   = openapi_new("Luna Demo API", "1.0.0")
+
+    openapi_set_description(@s, "A tiny REST API showing off auto-generated OpenAPI docs.")
+    openapi_set_server(@s, "http://localhost:8080", "local dev")
+
+    # GET /hello — no params, hard-coded response.
+    router_get(@r, "/hello", route_hello)
+    openapi_route(@s, "GET", "/hello", "Say hello", "{\"type\":\"object\",\"properties\":{\"msg\":{\"type\":\"string\"}}}")
+    openapi_tag(@s, "greetings")
+
+    # POST /echo — body in, body out.
+    router_post(@r, "/echo", route_echo)
+    openapi_route(@s, "POST", "/echo", "Echo the request body", "{\"type\":\"object\",\"properties\":{\"echoed\":{\"type\":\"string\"}}}")
+    openapi_request_body(@s, "application/json", "{\"type\":\"object\"}")
+    openapi_tag(@s, "echo")
+
+    # GET /users/{id} — path param.
+    router_get(@r, "/users/:id", route_user_get)
+    openapi_route(@s, "GET", "/users/{id}", "Look up a user", "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}}}")
+    openapi_param(@s, "id", "path", 1, "{\"type\":\"integer\"}", "user id")
+    openapi_tag(@s, "users")
+
+    # Mount Swagger UI + raw spec on /docs.
+    openapi_serve(@r, "/docs", @s)
+
+    shine("Listening on http://localhost:8080")
+    shine("  GET  /hello           ->   plain JSON")
+    shine("  POST /echo            ->   echoes body")
+    shine("  GET  /users/:id       ->   path-param demo")
+    shine("  GET  /docs            ->   Swagger UI")
+    shine("  GET  /docs/openapi.json -> raw OpenAPI spec")
+    return router_serve(@r, 8080)

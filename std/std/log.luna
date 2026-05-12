@@ -1,0 +1,163 @@
+# tier: T4
+# deps: json, time
+# ffi: none
+#
+# std/std/log — structured JSON logging.
+#
+# Each call emits a single line of JSON to stderr (fd 2). Fields
+# always include `ts` (ISO 8601 UTC), `level` ("debug"/"info"/"warn"/
+# "error"), and `msg`. Caller-supplied key-value pairs are merged in.
+#
+# Why JSON to stderr: ops folks expect logs there, container runtimes
+# capture both fd 1 (program output) and fd 2 (logs) but separate
+# them, and `jq` / log aggregators (Loki, ELK, CloudWatch) parse
+# JSON lines natively.
+#
+# This module replaces the deleted `src/stdlib_new/logger.luna` which
+# called `_putenv` and didn't survive the bootminor toolchain. We
+# rebuild from scratch with no FFI.
+#
+# Public surface:
+#   log_info(@msg)
+#   log_info_1(@msg, @k1, @v1)
+#   log_info_2(@msg, @k1, @v1, @k2, @v2)
+#   log_info_3(@msg, @k1, @v1, @k2, @v2, @k3, @v3)
+#   log_info_vec(@msg, @kvs)         # @kvs = Vec of alternating k,v
+#
+# Same family for log_debug, log_warn, log_error.
+
+import json
+import time
+
+
+# log_format(@level, @msg, @kvs) -> JSON string (without the trailing
+# newline). Used internally by _log_emit and exposed for tests so
+# they can assert structure without scraping stderr. @kvs is a Vec
+# of alternating key,value strings; odd length silently drops the
+# dangling key.
+fn log_format(@level: int, @msg: int, @kvs: int) -> int
+    @line = str_concat("{\"ts\":\"", time_format_iso(time_now()))
+    @line = str_concat(@line, "\",\"level\":\"")
+    @line = str_concat(@line, @level)
+    @line = str_concat(@line, "\",\"msg\":")
+    @line = str_concat(@line, json_escape(@msg))
+
+    @i = 0
+    @n = vec_len(@kvs)
+    while @i + 1 < @n
+        @k = vec_get(@kvs, @i)
+        @v = vec_get(@kvs, @i + 1)
+        @line = str_concat(@line, ",")
+        @line = str_concat(@line, json_escape(@k))
+        @line = str_concat(@line, ":")
+        @line = str_concat(@line, json_escape(@v))
+        @i = @i + 2
+
+    @line = str_concat(@line, "}")
+    return @line
+
+
+# _log_emit(@level, @msg, @kvs) — write the JSON line to stderr.
+fn _log_emit(@level: int, @msg: int, @kvs: int) -> int
+    @line = log_format(@level, @msg, @kvs)
+    @line = str_concat(@line, "\n")
+    sys_write(2, @line, str_len(@line))
+    return 0
+
+
+# --- info -------------------------------------------------------------
+
+fn log_info(@msg: int) -> int
+    @kvs = vec_new()
+    return _log_emit("info", @msg, @kvs)
+
+fn log_info_1(@msg: int, @k1: int, @v1: int) -> int
+    @kvs = vec_new()
+    vec_push(@kvs, @k1)
+    vec_push(@kvs, @v1)
+    return _log_emit("info", @msg, @kvs)
+
+fn log_info_2(@msg: int, @k1: int, @v1: int, @k2: int, @v2: int) -> int
+    @kvs = vec_new()
+    vec_push(@kvs, @k1)
+    vec_push(@kvs, @v1)
+    vec_push(@kvs, @k2)
+    vec_push(@kvs, @v2)
+    return _log_emit("info", @msg, @kvs)
+
+fn log_info_3(@msg: int, @k1: int, @v1: int, @k2: int, @v2: int, @k3: int, @v3: int) -> int
+    @kvs = vec_new()
+    vec_push(@kvs, @k1)
+    vec_push(@kvs, @v1)
+    vec_push(@kvs, @k2)
+    vec_push(@kvs, @v2)
+    vec_push(@kvs, @k3)
+    vec_push(@kvs, @v3)
+    return _log_emit("info", @msg, @kvs)
+
+fn log_info_vec(@msg: int, @kvs: int) -> int
+    return _log_emit("info", @msg, @kvs)
+
+
+# --- warn -------------------------------------------------------------
+
+fn log_warn(@msg: int) -> int
+    @kvs = vec_new()
+    return _log_emit("warn", @msg, @kvs)
+
+fn log_warn_1(@msg: int, @k1: int, @v1: int) -> int
+    @kvs = vec_new()
+    vec_push(@kvs, @k1)
+    vec_push(@kvs, @v1)
+    return _log_emit("warn", @msg, @kvs)
+
+fn log_warn_2(@msg: int, @k1: int, @v1: int, @k2: int, @v2: int) -> int
+    @kvs = vec_new()
+    vec_push(@kvs, @k1)
+    vec_push(@kvs, @v1)
+    vec_push(@kvs, @k2)
+    vec_push(@kvs, @v2)
+    return _log_emit("warn", @msg, @kvs)
+
+fn log_warn_vec(@msg: int, @kvs: int) -> int
+    return _log_emit("warn", @msg, @kvs)
+
+
+# --- error ------------------------------------------------------------
+
+fn log_error(@msg: int) -> int
+    @kvs = vec_new()
+    return _log_emit("error", @msg, @kvs)
+
+fn log_error_1(@msg: int, @k1: int, @v1: int) -> int
+    @kvs = vec_new()
+    vec_push(@kvs, @k1)
+    vec_push(@kvs, @v1)
+    return _log_emit("error", @msg, @kvs)
+
+fn log_error_2(@msg: int, @k1: int, @v1: int, @k2: int, @v2: int) -> int
+    @kvs = vec_new()
+    vec_push(@kvs, @k1)
+    vec_push(@kvs, @v1)
+    vec_push(@kvs, @k2)
+    vec_push(@kvs, @v2)
+    return _log_emit("error", @msg, @kvs)
+
+fn log_error_vec(@msg: int, @kvs: int) -> int
+    return _log_emit("error", @msg, @kvs)
+
+
+# --- debug ------------------------------------------------------------
+
+fn log_debug(@msg: int) -> int
+    @kvs = vec_new()
+    return _log_emit("debug", @msg, @kvs)
+
+fn log_debug_1(@msg: int, @k1: int, @v1: int) -> int
+    @kvs = vec_new()
+    vec_push(@kvs, @k1)
+    vec_push(@kvs, @v1)
+    return _log_emit("debug", @msg, @kvs)
+
+fn log_debug_vec(@msg: int, @kvs: int) -> int
+    return _log_emit("debug", @msg, @kvs)

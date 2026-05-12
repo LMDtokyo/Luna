@@ -1,0 +1,110 @@
+# Tests for std/map.
+
+import map
+import test
+
+
+fn run_map_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # empty map
+    @m = map_new()
+    @r = assert_eq_int("empty len",        map_len(@m), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("empty has miss",   map_has(@m, "x"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("empty get miss",   map_get(@m, "x"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # insert + lookup
+    map_set(@m, "name",    "alice")
+    map_set(@m, "country", "estonia")
+    map_set(@m, "age",     "29")
+
+    @r = assert_eq_int("len after 3",      map_len(@m), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("has name",         map_has(@m, "name"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("get name",         map_get(@m, "name"), "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("get country",      map_get(@m, "country"), "estonia")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # overwrite
+    map_set(@m, "name", "bob")
+    @r = assert_eq_int("len unchanged",    map_len(@m), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("name overwritten", map_get(@m, "name"), "bob")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # default
+    @r = assert_eq_str("get_or default",   map_get_or(@m, "missing", "fallback"), "fallback")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("get_or hit",       map_get_or(@m, "name",    "fallback"), "bob")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # remove
+    @rc = map_remove(@m, "country")
+    @r = assert_eq_int("remove existing",  @rc, 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("len after remove", map_len(@m), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("has after remove", map_has(@m, "country"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @rc2 = map_remove(@m, "country")
+    @r = assert_eq_int("remove missing",   @rc2, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # remaining keys still readable
+    @r = assert_eq_str("name still",       map_get(@m, "name"), "bob")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_str("age still",        map_get(@m, "age"),  "29")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # keys / values vectors
+    @keys = map_keys(@m)
+    @r = assert_eq_int("keys len", vec_len(@keys), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @vals = map_values(@m)
+    @r = assert_eq_int("values len", vec_len(@vals), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("map", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_map_tests(0, 0)

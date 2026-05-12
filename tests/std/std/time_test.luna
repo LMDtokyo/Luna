@@ -1,0 +1,57 @@
+# Tests for std/std/time — fixed-point conversions of known Unix timestamps.
+
+import time
+import test
+
+
+fn run_time_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # Unix epoch.
+    @r = assert_eq_str("epoch ISO",  time_format_iso(0),  "1970-01-01T00:00:00Z")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("epoch date", time_format_date(0), "1970-01-01")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2001-09-09T01:46:40Z — the famous billennium.
+    @r = assert_eq_str("billennium", time_format_iso(1000000000), "2001-09-09T01:46:40Z")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2024-01-15T10:30:00Z (1705314600).
+    @r = assert_eq_str("2024 mid-Jan", time_format_iso(1705314600), "2024-01-15T10:30:00Z")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2023-11-14T22:13:20Z (1700000000).
+    @r = assert_eq_str("2023 Nov",   time_format_iso(1700000000), "2023-11-14T22:13:20Z")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2026-12-31T23:59:59Z — leap-day corner check, one second before
+    # 2027 begins.
+    @r = assert_eq_str("end of 2026", time_format_iso(1798761599), "2026-12-31T23:59:59Z")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2024-02-29T00:00:00Z — leap-year day (1709164800).
+    @r = assert_eq_str("leap day",   time_format_date(1709164800), "2024-02-29")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # time_now() — just sanity-check it returns a 10-digit-ish int
+    # (i.e. > 1.6e9, which we crossed in 2020).
+    @r = assert_true("time_now sane", time_now() > 1600000000)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("time", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_time_tests(0, 0)

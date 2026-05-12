@@ -1,0 +1,93 @@
+# tier: T6
+# deps: sqlite
+# ffi: sqlite3-cli
+#
+# std/ext/db/migrate — sequential numbered SQL migrations for SQLite.
+#
+# Each migration is a (id, sql) pair. They run in numeric order. A
+# bookkeeping table `_luna_migrations` records what's been applied;
+# already-applied IDs are skipped on subsequent runs.
+#
+# Usage:
+#   import sqlite
+#   import migrate
+#
+#   fn main() -> int
+#       @h = db_open("/var/data/app.db")
+#       let @ms: Vec = vec_new()
+#       migrate_push(@ms, 1, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+#       migrate_push(@ms, 2, "CREATE INDEX users_by_name ON users(name)")
+#       migrate_push(@ms, 3, "ALTER TABLE users ADD COLUMN email TEXT")
+#       @n = db_migrate(@h, @ms)
+#       shine("migrations applied:")
+#       print_int(@n)
+#       shine("")
+#       return 0
+#
+# Each migration runs in its own transaction — partial failures roll
+# back cleanly and the version number stays at the last successful
+# step.
+
+import sqlite
+
+
+# migrate_push(@list, @id, @sql) — append a migration to @list.
+# Convenience over building Vec-of-Vec by hand.
+fn migrate_push(@list: int, @id: int, @sql: int) -> int
+    @m = vec_new()
+    vec_push(@m, int_to_str(@id))
+    vec_push(@m, @sql)
+    vec_push(@list, @m)
+    return 0
+
+
+# _migrate_ensure(@h) — create the bookkeeping table if missing.
+fn _migrate_ensure(@h: int) -> int
+    return db_exec(@h, "CREATE TABLE IF NOT EXISTS _luna_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)")
+
+
+# _migrate_applied(@h, @id) -> 1 if migration @id is recorded, 0 otherwise.
+fn _migrate_applied(@h: int, @id: int) -> int
+    @sql = str_concat("SELECT id FROM _luna_migrations WHERE id = ", int_to_str(@id))
+    @row = db_scalar(@h, @sql)
+    if str_len(@row) > 0
+        return 1
+    return 0
+
+
+# _migrate_apply(@h, @id, @sql) -> 0 success / -1 failure. Wraps the
+# migration body and the bookkeeping insert in a transaction.
+fn _migrate_apply(@h: int, @id: int, @sql: int) -> int
+    @full = "BEGIN; "
+    @full = str_concat(@full, @sql)
+    @full = str_concat(@full, "; INSERT INTO _luna_migrations (id, applied_at) VALUES (")
+    @full = str_concat(@full, int_to_str(@id))
+    @full = str_concat(@full, ", strftime('%s','now')); COMMIT;")
+    return db_exec(@h, @full)
+
+
+# db_migrate(@h, @migrations) -> count of newly-applied migrations.
+# @migrations is a Vec where each entry is a 2-element Vec: [id_str, sql_text].
+# Use migrate_push() to build it.
+fn db_migrate(@h: int, @migrations: int) -> int
+    _migrate_ensure(@h)
+    @applied = 0
+    @i = 0
+    @n = vec_len(@migrations)
+    while @i < @n
+        let @m: Vec = vec_get(@migrations, @i)
+        @id_str = vec_get(@m, 0)
+        @id = parse_int(@id_str)
+        if _migrate_applied(@h, @id) == 0
+            @sql = vec_get(@m, 1)
+            if _migrate_apply(@h, @id, @sql) == 0
+                @applied = @applied + 1
+        @i = @i + 1
+    return @applied
+
+
+# db_migrate_version(@h) -> highest applied migration id, or 0.
+fn db_migrate_version(@h: int) -> int
+    _migrate_ensure(@h)
+    @row = db_scalar(@h, "SELECT COALESCE(MAX(id), 0) FROM _luna_migrations")
+    return parse_int(@row)

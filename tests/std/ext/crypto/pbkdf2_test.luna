@@ -1,0 +1,133 @@
+# PBKDF2-HMAC-SHA256 tests.
+#
+# Known-answer vectors are the canonical PBKDF2-HMAC-SHA256 vectors
+# (e.g. cryptography.io, RFC 7914 §11-style values, reproducible in
+# any reference implementation):
+#
+#   pbkdf2_sha256("password", "salt", 1, 32) =
+#       120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b
+#   pbkdf2_sha256("password", "salt", 2, 32) =
+#       ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43
+
+import pbkdf2
+import test
+
+
+# Hex-encode the raw bytes returned by pbkdf2_sha256 so test failure
+# messages are human-readable.
+fn _hex(@bytes: int) -> int
+    @n = str_len(@bytes)
+    @out = new_str(@n * 2)
+    @i = 0
+    while @i < @n
+        @b = str_byte(@bytes, @i)
+        @hi = (@b >> 4) & 15
+        @lo = @b & 15
+        if @hi < 10
+            str_set_byte(@out, @i * 2, 48 + @hi)
+        else
+            str_set_byte(@out, @i * 2, 87 + @hi)
+        if @lo < 10
+            str_set_byte(@out, @i * 2 + 1, 48 + @lo)
+        else
+            str_set_byte(@out, @i * 2 + 1, 87 + @lo)
+        @i = @i + 1
+    return @out
+
+
+fn run_pbkdf2_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # KAT 1: iter=1, dkLen=32.
+    @k1 = pbkdf2_sha256("password", "salt", 1, 32)
+    @r = assert_eq_str("pbkdf2 iter=1 len=32", _hex(@k1), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # KAT 2: iter=2, dkLen=32. Distinct from iter=1 result.
+    @k2 = pbkdf2_sha256("password", "salt", 2, 32)
+    @r = assert_eq_str("pbkdf2 iter=2 len=32", _hex(@k2), "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # KAT 3: dkLen=20 is a prefix of the dkLen=32 result (single-block KDF).
+    @k3 = pbkdf2_sha256("password", "salt", 1, 20)
+    @r = assert_eq_str("pbkdf2 iter=1 len=20", _hex(@k3), "120fb6cffcf8b32c43e7225256c4f837a86548c9")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Determinism: same inputs -> same output, run twice.
+    @det_a = pbkdf2_sha256("hunter2", "abcdef", 50, 32)
+    @det_b = pbkdf2_sha256("hunter2", "abcdef", 50, 32)
+    @r = assert_eq_str("pbkdf2 determinism", _hex(@det_a), _hex(@det_b))
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Iterations actually change the output.
+    @it_a = pbkdf2_sha256("hunter2", "abcdef", 50, 32)
+    @it_b = pbkdf2_sha256("hunter2", "abcdef", 51, 32)
+    @same = 0
+    if str_eq(@it_a, @it_b) == 1
+        @same = 1
+    @r = assert_false("pbkdf2 iter changes output", @same)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Round-trip: pwhash_make / pwhash_verify with correct password.
+    @stored = pwhash_make("hunter2", 1000)
+    @r = assert_true("pwhash_make produces output", str_len(@stored) > 20)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("pwhash_verify correct", pwhash_verify("hunter2", @stored), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("pwhash_verify wrong password", pwhash_verify("wrong", @stored), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Salt randomness: two pwhash_make calls with same password produce
+    # different stored strings (different salts).
+    @s1 = pwhash_make("samepw", 500)
+    @s2 = pwhash_make("samepw", 500)
+    @same2 = 0
+    if str_eq(@s1, @s2) == 1
+        @same2 = 1
+    @r = assert_false("pwhash salt randomizes output", @same2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Both independently-salted hashes still verify the right password.
+    @r = assert_eq_int("pwhash_verify s1", pwhash_verify("samepw", @s1), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @r = assert_eq_int("pwhash_verify s2", pwhash_verify("samepw", @s2), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Cross-verification fails: s1 doesn't accept a different password.
+    @r = assert_eq_int("pwhash_verify s1 wrong", pwhash_verify("other", @s1), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Tampered stored string fails verification.
+    @bad = "garbage"
+    @r = assert_eq_int("pwhash_verify garbage", pwhash_verify("hunter2", @bad), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Recommended iterations is sane (OWASP 2023 floor for SHA-256).
+    @r = assert_true("recommended >= 600k", pwhash_recommended_iterations() >= 600000)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("pbkdf2", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_pbkdf2_tests(0, 0)

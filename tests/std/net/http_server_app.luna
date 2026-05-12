@@ -1,0 +1,13 @@
+# Tiny HTTP server used by http_server_e2e.sh. Replies 200 OK with a
+# fixed body to every request, then closes the connection. Bound to
+# 127.0.0.1:18082.
+
+import http_server
+
+
+fn handle(@req: HttpRequest, @cli: int) -> int
+    return http_send_text(@cli, "hello from luna server")
+
+
+fn main() -> int
+    return http_serve(18082, handle)

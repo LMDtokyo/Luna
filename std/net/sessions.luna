@@ -1,0 +1,145 @@
+# tier: T5
+# deps: kvstore, random, json, time
+# ffi: none
+#
+# std/net/sessions — server-side session management built on kvstore.
+#
+# Sessions are stored on disk in a kvstore file. Each session has:
+#   ID       — random ~43-char URL-safe token (32 bytes of entropy)
+#   created  — unix timestamp of session creation
+#   seen     — unix timestamp of the last touch
+#   ttl      — lifetime in seconds (created + ttl > now => valid)
+#   data     — opaque application payload (any string)
+#
+# The store key is the session ID; the value is a JSON record:
+#   {"created":<int>,"seen":<int>,"ttl":<int>,"data":<json-string>}
+#
+# Usage:
+#   @path = session_path("/var/lib/myapp")
+#   @sid  = session_create(@path, "{\"user\":\"alice\"}", 3600)
+#   # ... later, on each request that carries the cookie:
+#   if session_is_valid(@path, @sid) == 1
+#       session_touch(@path, @sid)
+#       @data = session_get(@path, @sid)
+#   # ... on logout:
+#   session_destroy(@path, @sid)
+#
+# Crash-safety: each write goes through kv_put, which appends a new
+# record. Periodically call kv_compact(@path) to shrink the file.
+
+import kvstore
+import random
+import json
+import time
+
+
+# session_path(@store_dir) -> "<store_dir>/sessions.kv". The caller
+# picks the directory; this is the only naming convention the module
+# imposes.
+fn session_path(@store_dir: int) -> int
+    @sep = new_str(1)
+    str_set_byte(@sep, 0, 47)            # '/'
+    @r = str_concat(@store_dir, @sep)
+    @r = str_concat(@r, "sessions.kv")
+    return @r
+
+
+# _session_make_record — build the JSON record for a new/updated session.
+fn _session_make_record(@created: int, @seen: int, @ttl: int, @data: int) -> int
+    @r = str_concat("{\"created\":", int_to_str(@created))
+    @r = str_concat(@r, ",\"seen\":")
+    @r = str_concat(@r, int_to_str(@seen))
+    @r = str_concat(@r, ",\"ttl\":")
+    @r = str_concat(@r, int_to_str(@ttl))
+    @r = str_concat(@r, ",\"data\":")
+    @r = str_concat(@r, json_escape(@data))
+    @r = str_concat(@r, "}")
+    return @r
+
+
+# session_create(@store_path, @data, @ttl_secs) -> new session ID, or ""
+# if token generation failed. The new record is written to disk before
+# returning.
+fn session_create(@store_path: int, @data: int, @ttl_secs: int) -> int
+    @id = crypto_token(32)
+    if str_len(@id) == 0
+        return ""
+    @now = time_now()
+    @rec = _session_make_record(@now, @now, @ttl_secs, @data)
+    kv_put(@store_path, @id, @rec)
+    return @id
+
+
+# session_get(@store_path, @id) -> the @data field of the session, or
+# "" if the session is absent or expired. Expired sessions are NOT
+# auto-deleted — call session_destroy explicitly.
+fn session_get(@store_path: int, @id: int) -> int
+    if str_len(@id) == 0
+        return ""
+    @rec = kv_get(@store_path, @id)
+    if str_len(@rec) == 0
+        return ""
+    @created = json_get_int(@rec, "created")
+    @ttl = json_get_int(@rec, "ttl")
+    if @created + @ttl <= time_now()
+        return ""
+    return json_get_str(@rec, "data")
+
+
+# session_touch(@store_path, @id) -> 1 if the session exists (regardless
+# of expiry), 0 otherwise. Updates the "seen" timestamp.
+fn session_touch(@store_path: int, @id: int) -> int
+    if str_len(@id) == 0
+        return 0
+    @rec = kv_get(@store_path, @id)
+    if str_len(@rec) == 0
+        return 0
+    @created = json_get_int(@rec, "created")
+    @ttl = json_get_int(@rec, "ttl")
+    @data = json_get_str(@rec, "data")
+    @new_rec = _session_make_record(@created, time_now(), @ttl, @data)
+    kv_put(@store_path, @id, @new_rec)
+    return 1
+
+
+# session_destroy(@store_path, @id) -> 1 if the session existed, 0
+# otherwise. Tombstones the record via kv_delete.
+fn session_destroy(@store_path: int, @id: int) -> int
+    if str_len(@id) == 0
+        return 0
+    @rec = kv_get(@store_path, @id)
+    if str_len(@rec) == 0
+        return 0
+    kv_delete(@store_path, @id)
+    return 1
+
+
+# session_set_data(@store_path, @id, @data) -> 1 if the session exists,
+# 0 otherwise. Replaces the "data" field; created/ttl are preserved,
+# "seen" is bumped to now.
+fn session_set_data(@store_path: int, @id: int, @data: int) -> int
+    if str_len(@id) == 0
+        return 0
+    @rec = kv_get(@store_path, @id)
+    if str_len(@rec) == 0
+        return 0
+    @created = json_get_int(@rec, "created")
+    @ttl = json_get_int(@rec, "ttl")
+    @new_rec = _session_make_record(@created, time_now(), @ttl, @data)
+    kv_put(@store_path, @id, @new_rec)
+    return 1
+
+
+# session_is_valid(@store_path, @id) -> 1 if the session exists AND
+# (created + ttl) > now, 0 otherwise.
+fn session_is_valid(@store_path: int, @id: int) -> int
+    if str_len(@id) == 0
+        return 0
+    @rec = kv_get(@store_path, @id)
+    if str_len(@rec) == 0
+        return 0
+    @created = json_get_int(@rec, "created")
+    @ttl = json_get_int(@rec, "ttl")
+    if @created + @ttl > time_now()
+        return 1
+    return 0

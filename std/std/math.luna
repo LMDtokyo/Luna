@@ -1,0 +1,166 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/std/math — integer math + IEEE-754 float helpers using SSE intrinsics.
+#
+# Integer ops work on Luna's 64-bit signed ints. Float ops treat ints as
+# raw IEEE-754 bit patterns; the prelude exposes f64_* SSE intrinsics
+# (f64_add, f64_sub, f64_mul, f64_div, f64_sqrt, f64_lt, f64_eq,
+# f64_from_int, f64_to_int) that take and return those bit patterns.
+
+
+# Range of Luna's signed 64-bit ints.
+const INT_MAX: int = 9223372036854775807
+const INT_MIN: int = 0 - 9223372036854775807 - 1
+
+# IEEE-754 sign bit (bit 63). XOR flips the sign; AND-NOT clears it.
+const _F64_SIGN_BIT: int = 1 << 63
+const _F64_ABS_MASK: int = 9223372036854775807
+
+# Bit pattern of the double 1.0: exponent bias 1023 in bits 62..52,
+# mantissa zero.
+const _F64_ONE_BITS: int = 0x3FF0000000000000
+
+
+# int_abs(@n) -> absolute value. INT_MIN overflows to itself (UB-ish,
+# but Luna's two's-complement wraps cleanly).
+fn int_abs(@n: int) -> int
+    if @n < 0
+        return 0 - @n
+    return @n
+
+# int_sign(@n) -> -1, 0, or 1.
+fn int_sign(@n: int) -> int
+    if @n > 0
+        return 1
+    if @n < 0
+        return 0 - 1
+    return 0
+
+# int_min(@a, @b) -> smaller of two ints.
+fn int_min(@a: int, @b: int) -> int
+    if @a < @b
+        return @a
+    return @b
+
+# int_max(@a, @b) -> larger of two ints.
+fn int_max(@a: int, @b: int) -> int
+    if @a > @b
+        return @a
+    return @b
+
+# int_clamp(@v, @lo, @hi) -> @v clamped into [@lo, @hi]. If @lo > @hi
+# the function still returns @lo (caller's contract is to pass sane
+# bounds; we don't second-guess).
+fn int_clamp(@v: int, @lo: int, @hi: int) -> int
+    if @v < @lo
+        return @lo
+    if @v > @hi
+        return @hi
+    return @v
+
+# int_pow(@base, @exp) -> @base raised to non-negative @exp.
+# Returns 0 for @exp < 0 (no fractional ints) and 1 for @exp == 0
+# (matches the mathematical convention 0^0 = 1 used in combinatorics).
+fn int_pow(@base: int, @exp: int) -> int
+    if @exp < 0
+        return 0
+    if @exp == 0
+        return 1
+    @result = 1
+    @b = @base
+    @e = @exp
+    while @e > 0
+        if (@e & 1) == 1
+            @result = @result * @b
+        @b = @b * @b
+        @e = @e >> 1
+    return @result
+
+# int_sqrt(@n) -> floor of the integer square root. Negative input
+# returns 0 (no imaginary numbers here).
+fn int_sqrt(@n: int) -> int
+    if @n < 0
+        return 0
+    if @n < 2
+        return @n
+    # Newton's method: x_{k+1} = (x_k + n/x_k) / 2. Start above the
+    # true root so the sequence decreases monotonically.
+    @x = @n
+    @y = (@x + 1) >> 1
+    while @y < @x
+        @x = @y
+        @y = (@x + @n / @x) >> 1
+    return @x
+
+# int_log2(@n) -> floor(log2(@n)). Returns -1 for @n <= 0 (log of
+# non-positive is undefined; -1 is a clear sentinel that callers can
+# distinguish from any valid result).
+fn int_log2(@n: int) -> int
+    if @n <= 0
+        return 0 - 1
+    @r = 0
+    @v = @n
+    while @v > 1
+        @v = @v >> 1
+        @r = @r + 1
+    return @r
+
+# int_gcd(@a, @b) -> greatest common divisor via Euclid. Operates on
+# absolute values so negative inputs return a positive result.
+fn int_gcd(@a: int, @b: int) -> int
+    @x = int_abs(@a)
+    @y = int_abs(@b)
+    while @y != 0
+        @t = @y
+        @y = @x % @y
+        @x = @t
+    return @x
+
+# int_lcm(@a, @b) -> least common multiple. lcm(0, *) is defined as 0
+# (matches Python/Mathematica). Divides before multiplying to keep
+# intermediate values smaller and reduce overflow risk.
+fn int_lcm(@a: int, @b: int) -> int
+    if @a == 0
+        return 0
+    if @b == 0
+        return 0
+    @g = int_gcd(@a, @b)
+    return int_abs(@a / @g * @b)
+
+
+# --- IEEE-754 double helpers --------------------------------------
+# Inputs and outputs are raw bit patterns (ints). Use f64_from_int /
+# f64_to_int / f64_lit to interconvert with Luna ints and literals.
+
+
+# f64_neg(@x) -> @x with its sign bit flipped.
+fn f64_neg(@x: int) -> int
+    return @x ^ _F64_SIGN_BIT
+
+# f64_abs(@x) -> @x with its sign bit cleared. Works for +0/-0, all
+# finites, and infinities; NaNs stay NaN (their payload survives).
+fn f64_abs(@x: int) -> int
+    return @x & _F64_ABS_MASK
+
+# f64_min(@a, @b) -> the smaller of two doubles (NaN-naive: if either
+# operand is NaN the comparison is false and @b wins).
+fn f64_min(@a: int, @b: int) -> int
+    if f64_lt(@a, @b) == 1
+        return @a
+    return @b
+
+# f64_max(@a, @b) -> the larger of two doubles (same NaN caveat).
+fn f64_max(@a: int, @b: int) -> int
+    if f64_lt(@a, @b) == 1
+        return @b
+    return @a
+
+# f64_zero() -> bit pattern of +0.0.
+fn f64_zero() -> int
+    return 0
+
+# f64_one() -> bit pattern of 1.0.
+fn f64_one() -> int
+    return _F64_ONE_BITS

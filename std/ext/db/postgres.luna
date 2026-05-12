@@ -1,0 +1,594 @@
+# tier: T6
+# deps: tcp
+# ffi: none
+#
+# std/ext/db/postgres — pure-Luna PostgreSQL client.
+#
+# Speaks the PostgreSQL Frontend/Backend protocol v3 directly over TCP.
+# No subprocess, no `psql` CLI, no FFI.
+#
+# Wire format (every message after StartupMessage):
+#   client -> server: 1-byte type, 4-byte big-endian length (including
+#                     the length field, excluding the type byte), body.
+#   server -> client: same shape, with type bytes like:
+#       'R' Authentication       'T' RowDescription
+#       'D' DataRow              'C' CommandComplete
+#       'Z' ReadyForQuery        'E' ErrorResponse
+#       'S' ParameterStatus      'K' BackendKeyData
+#       'N' NoticeResponse       '1'/'2'/'3' parse/bind/close confirms
+#
+# StartupMessage has no type byte — just length + protocol version
+# (196608 = 3 << 16) + null-terminated "user\0<user>\0database\0<db>\0\0".
+#
+# Auth supported in this MVP:
+#   - 0  AuthenticationOk        (trust auth — pg_hba.conf method=trust)
+# Auth NOT supported (errors out cleanly with a descriptive message):
+#   - 3  CleartextPassword       (rare; easy add later)
+#   - 5  MD5Password             (TODO — needs MD5 in std/ext/crypto)
+#   - 10 SASL/SCRAM-SHA-256      (PG 14+ default — separate module)
+#
+# We only implement the Simple Query protocol ('Q'). Extended/prepared
+# statements (Parse/Bind/Execute) and COPY are out of scope for MVP.
+#
+# Public surface:
+#   pg_connect(@host, @port, @database, @user, @password) -> handle, -1 on fail
+#   pg_close(@conn)                                       -> 0
+#   pg_query(@conn, @sql)                                 -> PgResult handle
+#   pg_exec(@conn, @sql)                                  -> affected rows, -1 on err
+#   pg_scalar(@conn, @sql)                                -> first cell as string
+#   pg_rows(@result)                                      -> row count
+#   pg_cols(@result)                                      -> column count
+#   pg_col_name(@result, @col)                            -> column name
+#   pg_value(@result, @row, @col)                         -> cell value as string
+#                                                            (NULL -> "")
+#   pg_affected_rows(@result)                             -> int
+#   pg_error(@result)                                     -> error message, "" if ok
+#   pg_free(@result)                                      -> 0
+#
+# Notes:
+# - All values returned by pg_value are text-format strings (the server
+#   default for the Simple Query protocol). Numbers come back as decimal
+#   ASCII; you can parse_int() them if needed.
+# - NULL values come back as the empty string. There's no way to
+#   distinguish NULL from '' in this MVP. Wire format keeps them
+#   distinct (length=-1 vs length=0) — exposing that takes another
+#   accessor and is left as future work.
+# - `pg_query` on a closed connection returns -1.
+# - `pg_query` returns a result handle even on SQL errors; check
+#   `pg_error(result)` for the message.
+
+import tcp
+
+
+# ---- Internal int helpers (avoid string-module dep). ---------------
+
+# _pg_parse_int(@s) — leading-decimal parse, stop at first non-digit.
+fn _pg_parse_int(@s: int) -> int
+    @slen = str_len(@s)
+    if @slen == 0
+        return 0
+    @neg = 0
+    @i = 0
+    if str_byte(@s, 0) == 45
+        @neg = 1
+        @i = 1
+    @n = 0
+    while @i < @slen
+        @c = str_byte(@s, @i)
+        if @c < 48
+            return @n
+        if @c > 57
+            return @n
+        @n = @n * 10 + (@c - 48)
+        @i = @i + 1
+    if @neg == 1
+        return 0 - @n
+    return @n
+
+
+# ---- Connection + result structs ------------------------------------
+
+# A PgConn struct holds the socket fd and a closed flag. We hand it out
+# as `int` (it's just a pointer); callers re-cast via accessors.
+struct PgConn
+    fd:     int
+    closed: int
+
+
+# A PgResult struct holds the parsed outcome of a query.
+#   error:    non-empty iff the server sent an ErrorResponse for this
+#             query, OR the client side hit a protocol failure (lost
+#             connection mid-query, bad message length, etc).
+#   cols:    Vec[str]  — column names from RowDescription.
+#   rows:    Vec[Vec]  — each row is a Vec[str] aligned with cols.
+#   affected: int      — parsed from CommandComplete tag for
+#                        INSERT/UPDATE/DELETE; 0 for SELECT/DDL.
+struct PgResult
+    error:    int
+    cols:     Vec
+    rows:     Vec
+    affected: int
+
+
+# ---- Big-endian int32 helpers on heap buffers -----------------------
+
+# _pg_write_be32(@buf, @off, @v) — store @v as 4 big-endian bytes.
+fn _pg_write_be32(@buf: int, @off: int, @v: int) -> int
+    u8_set(@buf, @off, (@v >> 24) & 255)
+    u8_set(@buf, @off + 1, (@v >> 16) & 255)
+    u8_set(@buf, @off + 2, (@v >> 8) & 255)
+    u8_set(@buf, @off + 3, @v & 255)
+    return 0
+
+
+# _pg_read_be32(@buf, @off) — load 4 big-endian bytes as int.
+fn _pg_read_be32(@buf: int, @off: int) -> int
+    @b0 = u8_at(@buf, @off)
+    @b1 = u8_at(@buf, @off + 1)
+    @b2 = u8_at(@buf, @off + 2)
+    @b3 = u8_at(@buf, @off + 3)
+    return (@b0 << 24) | (@b1 << 16) | (@b2 << 8) | @b3
+
+
+# _pg_read_be16(@buf, @off) — load 2 big-endian bytes as int.
+fn _pg_read_be16(@buf: int, @off: int) -> int
+    @b0 = u8_at(@buf, @off)
+    @b1 = u8_at(@buf, @off + 1)
+    return (@b0 << 8) | @b1
+
+
+# _pg_strbuf_add_cstr(@b, @s) — append @s plus a null terminator.
+fn _pg_strbuf_add_cstr(@b: StrBuf, @s: int) -> int
+    strbuf_add_str(@b, @s)
+    strbuf_add_byte(@b, 0)
+    return 0
+
+
+# ---- Low-level read helpers -----------------------------------------
+
+# _pg_recv_n(@fd, @n) — read exactly @n bytes. On short read returns
+# the partial buffer (caller must check length). For @n <= 0 returns "".
+fn _pg_recv_n(@fd: int, @n: int) -> int
+    if @n <= 0
+        return ""
+    @buf = new_str(@n)
+    @got = 0
+    while @got < @n
+        @r = tcp_recv(@fd, @buf + @got, @n - @got)
+        if @r <= 0
+            return str_substr(@buf, 0, @got)
+        @got = @got + @r
+    return @buf
+
+
+# _pg_recv_msg(@fd, @out_type) — read one server message. Stores the
+# type byte into @out_type[0] as a uint8. Returns the body as a string
+# (length = full-length-field - 4). Returns "" with @out_type[0] = 0
+# on read failure / EOF.
+fn _pg_recv_msg(@fd: int, @out_type: int) -> int
+    @hdr = _pg_recv_n(@fd, 5)
+    if str_len(@hdr) < 5
+        u8_set(@out_type, 0, 0)
+        return ""
+    @type = str_byte(@hdr, 0)
+    u8_set(@out_type, 0, @type)
+    @total_len = _pg_read_be32(@hdr, 1)
+    @body_len = @total_len - 4
+    if @body_len <= 0
+        return ""
+    @body = _pg_recv_n(@fd, @body_len)
+    if str_len(@body) < @body_len
+        u8_set(@out_type, 0, 0)
+        return ""
+    return @body
+
+
+# ---- StartupMessage -------------------------------------------------
+
+# _pg_build_startup(@user, @database) -> bytes of a complete
+# StartupMessage including the leading length field.
+#
+# Body layout:
+#   int32 length (including itself)
+#   int32 protocol (3<<16 = 196608)
+#   cstring "user", cstring <user>
+#   cstring "database", cstring <database>
+#   single null byte (parameter-list terminator)
+fn _pg_build_startup(@user: int, @database: int) -> int
+    let @b: StrBuf = strbuf_new()
+    _pg_strbuf_add_cstr(@b, "user")
+    _pg_strbuf_add_cstr(@b, @user)
+    _pg_strbuf_add_cstr(@b, "database")
+    _pg_strbuf_add_cstr(@b, @database)
+    strbuf_add_byte(@b, 0)
+    @params = strbuf_done(@b)
+    @plen = str_len(@params)
+    # 4 bytes length + 4 bytes proto + params
+    @total = 4 + 4 + @plen
+    @out = new_str(@total)
+    _pg_write_be32(@out, 0, @total)
+    _pg_write_be32(@out, 4, 196608)
+    @i = 0
+    while @i < @plen
+        u8_set(@out, 8 + @i, str_byte(@params, @i))
+        @i = @i + 1
+    return @out
+
+
+# ---- Handshake ------------------------------------------------------
+
+# _pg_parse_error_response(@body) — extract the 'M' (message) field
+# from an ErrorResponse body. The body is a sequence of field entries:
+# 1 byte field code, cstring value, terminated by a single 0 byte.
+fn _pg_parse_error_response(@body: int) -> int
+    @blen = str_len(@body)
+    @i = 0
+    while @i < @blen
+        @code = str_byte(@body, @i)
+        if @code == 0
+            return ""
+        @i = @i + 1
+        # Find the null terminator of this field value.
+        @start = @i
+        while @i < @blen
+            if str_byte(@body, @i) == 0
+                break
+            @i = @i + 1
+        if @code == 77
+            # 'M' — the human-readable primary message.
+            return str_substr(@body, @start, @i - @start)
+        @i = @i + 1
+    return ""
+
+
+# _pg_check_auth(@body) -> 0 if the auth subcode is supported
+# (AuthenticationOk only in this MVP), -1 otherwise. MD5, SCRAM, and
+# cleartext password challenges all fall into the unsupported bucket.
+fn _pg_check_auth(@body: int) -> int
+    if str_len(@body) < 4
+        return -1
+    @sub = _pg_read_be32(@body, 0)
+    if @sub == 0
+        return 0
+    return -1
+
+
+# _pg_handshake(@fd, @user, @database, @password) -> 0 on success,
+# -1 on any failure. Reads messages until ReadyForQuery ('Z') is seen
+# or an unsupported auth method / error is encountered.
+fn _pg_handshake(@fd: int, @user: int, @database: int, @password: int) -> int
+    @startup = _pg_build_startup(@user, @database)
+    if tcp_send_str(@fd, @startup) < 0
+        return -1
+    @type_cell = new_str(1)
+    while 1 == 1
+        @body = _pg_recv_msg(@fd, @type_cell)
+        @t = u8_at(@type_cell, 0)
+        if @t == 0
+            return -1
+        if @t == 69
+            # 'E' ErrorResponse during startup — definitive failure.
+            return -1
+        if @t == 90
+            # 'Z' ReadyForQuery — startup complete.
+            return 0
+        if @t == 82
+            @rc = _pg_check_auth(@body)
+            if @rc < 0
+                return -1
+        # Everything else ('S' ParameterStatus, 'K' BackendKeyData,
+        # 'N' NoticeResponse) is informational — fall through and read
+        # the next message.
+    return -1
+
+
+# ---- Public: connect / close ---------------------------------------
+
+# pg_connect(@host, @port, @database, @user, @password) -> handle, -1.
+# The handle is a PgConn pointer cast to int. Trust auth only (MVP);
+# @password is accepted for API stability but ignored unless we grow
+# md5/SCRAM support in a follow-up.
+fn pg_connect(@host: int, @port: int, @database: int, @user: int, @password: int) -> int
+    @fd = tcp_connect(@host, @port)
+    if @fd < 0
+        return -1
+    @rc = _pg_handshake(@fd, @user, @database, @password)
+    if @rc < 0
+        tcp_close(@fd)
+        return -1
+    let @c: PgConn = new_str(16)
+    @c.fd     = @fd
+    @c.closed = 0
+    return @c
+
+
+# pg_close(@conn) -> 0. Sends Terminate ('X', length 4) then closes
+# the socket. After this call any further pg_query on @conn returns -1.
+fn pg_close(@conn: int) -> int
+    if @conn <= 0
+        return 0
+    let @c: PgConn = @conn
+    if @c.closed != 0
+        return 0
+    # Terminate: 'X' + length(4)
+    @term = new_str(5)
+    u8_set(@term, 0, 88)
+    _pg_write_be32(@term, 1, 4)
+    tcp_send_str(@c.fd, @term)
+    tcp_close(@c.fd)
+    @c.closed = 1
+    @c.fd = -1
+    return 0
+
+
+# ---- Query execution -----------------------------------------------
+
+# _pg_send_query(@fd, @sql) — write a Query message ('Q' + length +
+# cstring sql). Returns 0 on full send, -1 on partial / error.
+fn _pg_send_query(@fd: int, @sql: int) -> int
+    @slen = str_len(@sql)
+    # Body = sql + null terminator. Total length field = 4 + slen + 1.
+    @total = 4 + @slen + 1
+    @msg = new_str(1 + @total)
+    u8_set(@msg, 0, 81)
+    _pg_write_be32(@msg, 1, @total)
+    @i = 0
+    while @i < @slen
+        u8_set(@msg, 5 + @i, str_byte(@sql, @i))
+        @i = @i + 1
+    u8_set(@msg, 5 + @slen, 0)
+    return tcp_send_str(@fd, @msg)
+
+
+# _pg_parse_row_description(@body) -> Vec[str] of column names.
+#
+# RowDescription body:
+#   int16 field count
+#   per field: cstring name, int32 table_oid, int16 column_attr,
+#              int32 type_oid, int16 type_size, int32 type_mod,
+#              int16 format_code.
+fn _pg_parse_row_description(@body: int) -> Vec
+    @cols = vec_new()
+    @blen = str_len(@body)
+    if @blen < 2
+        return @cols
+    @nfields = _pg_read_be16(@body, 0)
+    @off = 2
+    @i = 0
+    while @i < @nfields
+        # cstring name
+        @start = @off
+        while @off < @blen
+            if str_byte(@body, @off) == 0
+                break
+            @off = @off + 1
+        @name = str_substr(@body, @start, @off - @start)
+        vec_push(@cols, @name)
+        # Skip null terminator + 18 bytes of fixed metadata.
+        @off = @off + 1 + 18
+        @i = @i + 1
+    return @cols
+
+
+# _pg_parse_data_row(@body, @ncols) -> Vec[str] with one entry per column.
+# NULL values come back as the empty string in this MVP.
+#
+# DataRow body:
+#   int16 column count
+#   per column: int32 length (or -1 for NULL), then `length` bytes
+#               of value (text format, no null terminator).
+fn _pg_parse_data_row(@body: int, @ncols: int) -> Vec
+    @row = vec_new()
+    @blen = str_len(@body)
+    if @blen < 2
+        return @row
+    @off = 2
+    @i = 0
+    while @i < @ncols
+        @i = @i + 1
+        if @off + 4 > @blen
+            vec_push(@row, "")
+        else
+            @vlen = _pg_read_be32(@body, @off)
+            @off = @off + 4
+            @push_empty = 0
+            if @vlen < 0
+                @push_empty = 1
+                @vlen = 0
+            if @off + @vlen > @blen
+                @push_empty = 1
+                @off = @blen
+                @vlen = 0
+            if @push_empty == 1
+                vec_push(@row, "")
+            if @push_empty == 0
+                vec_push(@row, str_substr(@body, @off, @vlen))
+                @off = @off + @vlen
+    return @row
+
+
+# _pg_parse_command_complete(@body) -> affected-rows count parsed
+# from the CommandComplete tag. Tag formats per spec:
+#   "INSERT <oid> <rows>"   -> rows
+#   "DELETE <rows>"         -> rows
+#   "UPDATE <rows>"         -> rows
+#   "SELECT <rows>"         -> rows
+#   "MOVE <rows>"           -> rows
+#   "FETCH <rows>"          -> rows
+#   "COPY <rows>"           -> rows
+#   "CREATE TABLE" / "BEGIN" / "COMMIT" / etc. -> no number, returns 0
+fn _pg_parse_command_complete(@body: int) -> int
+    @blen = str_len(@body)
+    if @blen < 2
+        return 0
+    # The body is a cstring; strip the trailing null byte if present.
+    @tag_end = @blen
+    if str_byte(@body, @blen - 1) == 0
+        @tag_end = @blen - 1
+    # Walk backwards from tag_end to find the last whitespace; the
+    # trailing digit run after that is the row count.
+    @i = @tag_end - 1
+    while @i >= 0
+        if str_byte(@body, @i) == 32
+            break
+        @i = @i - 1
+    if @i < 0
+        return 0
+    return _pg_parse_int(str_substr(@body, @i + 1, @tag_end - @i - 1))
+
+
+# pg_query(@conn, @sql) -> PgResult handle, or -1 on closed conn.
+#
+# Reads messages until 'Z' (ReadyForQuery) — at which point all
+# DataRows for this query have arrived. On ErrorResponse the result's
+# error field is set; the rows Vec stays empty but other accessors
+# still work.
+fn pg_query(@conn: int, @sql: int) -> int
+    if @conn <= 0
+        return -1
+    let @c: PgConn = @conn
+    if @c.closed != 0
+        return -1
+
+    let @r: PgResult = new_str(32)
+    @r.error    = ""
+    @r.cols     = vec_new()
+    @r.rows     = vec_new()
+    @r.affected = 0
+
+    if _pg_send_query(@c.fd, @sql) < 0
+        @r.error = "pg_query: send failed"
+        return @r
+
+    @type_cell = new_str(1)
+    @ncols = 0
+    while 1 == 1
+        @body = _pg_recv_msg(@c.fd, @type_cell)
+        @t = u8_at(@type_cell, 0)
+        if @t == 0
+            if str_len(@r.error) == 0
+                @r.error = "pg_query: connection lost"
+            return @r
+        if @t == 90
+            # 'Z' ReadyForQuery — end of this query's response stream.
+            return @r
+        if @t == 84
+            # 'T' RowDescription
+            @r.cols = _pg_parse_row_description(@body)
+            @ncols = vec_len(@r.cols)
+        if @t == 68
+            # 'D' DataRow
+            let @row: Vec = _pg_parse_data_row(@body, @ncols)
+            vec_push(@r.rows, @row)
+        if @t == 67
+            # 'C' CommandComplete
+            @r.affected = _pg_parse_command_complete(@body)
+        if @t == 69
+            # 'E' ErrorResponse — keep reading until 'Z' so the
+            # connection is left in a clean state.
+            @r.error = _pg_parse_error_response(@body)
+        # Anything else (NoticeResponse 'N', ParameterStatus 'S', etc.)
+        # is ignored — we loop back and pull the next message.
+    return @r
+
+
+# pg_free(@result) -> 0. No heap reclamation in bootminor; this is an
+# API stub for forward compatibility once we have a real allocator.
+fn pg_free(@result: int) -> int
+    return 0
+
+
+# ---- Public: result accessors --------------------------------------
+
+# pg_rows(@result) -> data row count, 0 on invalid handle.
+fn pg_rows(@result: int) -> int
+    if @result <= 0
+        return 0
+    let @r: PgResult = @result
+    return vec_len(@r.rows)
+
+
+# pg_cols(@result) -> column count, 0 on invalid handle.
+fn pg_cols(@result: int) -> int
+    if @result <= 0
+        return 0
+    let @r: PgResult = @result
+    return vec_len(@r.cols)
+
+
+# pg_col_name(@result, @col) -> column name, "" if out of range.
+fn pg_col_name(@result: int, @col: int) -> int
+    if @result <= 0
+        return ""
+    let @r: PgResult = @result
+    if @col < 0
+        return ""
+    if @col >= vec_len(@r.cols)
+        return ""
+    return vec_get(@r.cols, @col)
+
+
+# pg_value(@result, @row, @col) -> cell value as string. Returns ""
+# for NULL, out-of-range row/col, or any other no-data condition.
+fn pg_value(@result: int, @row: int, @col: int) -> int
+    if @result <= 0
+        return ""
+    let @r: PgResult = @result
+    if @row < 0
+        return ""
+    if @row >= vec_len(@r.rows)
+        return ""
+    let @rowv: Vec = vec_get(@r.rows, @row)
+    if @col < 0
+        return ""
+    if @col >= vec_len(@rowv)
+        return ""
+    return vec_get(@rowv, @col)
+
+
+# pg_affected_rows(@result) -> CommandComplete row count.
+fn pg_affected_rows(@result: int) -> int
+    if @result <= 0
+        return 0
+    let @r: PgResult = @result
+    return @r.affected
+
+
+# pg_error(@result) -> server error message, "" if the query succeeded.
+fn pg_error(@result: int) -> int
+    if @result <= 0
+        return ""
+    let @r: PgResult = @result
+    return @r.error
+
+
+# ---- Convenience wrappers ------------------------------------------
+
+# pg_exec(@conn, @sql) -> affected rows, -1 on error.
+# Good for DDL and INSERT/UPDATE/DELETE where you don't care about
+# the row payload.
+fn pg_exec(@conn: int, @sql: int) -> int
+    @result = pg_query(@conn, @sql)
+    if @result < 0
+        return -1
+    let @r: PgResult = @result
+    if str_len(@r.error) > 0
+        return -1
+    return @r.affected
+
+
+# pg_scalar(@conn, @sql) -> first column of first row as string, ""
+# on error or no rows. Handy for `SELECT count(*) ...` style queries.
+fn pg_scalar(@conn: int, @sql: int) -> int
+    @result = pg_query(@conn, @sql)
+    if @result < 0
+        return ""
+    let @r: PgResult = @result
+    if str_len(@r.error) > 0
+        return ""
+    if vec_len(@r.rows) == 0
+        return ""
+    let @row: Vec = vec_get(@r.rows, 0)
+    if vec_len(@row) == 0
+        return ""
+    return vec_get(@row, 0)

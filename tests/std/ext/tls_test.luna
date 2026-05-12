@@ -1,0 +1,99 @@
+# End-to-end test for std/ext/tls. Drives a self-signed local
+# openssl s_server on 127.0.0.1:18443 (started by tls_e2e.sh) through
+# tls_init / tls_connect / tls_write / tls_read / tls_close.
+#
+# Must be compiled with `luna-mini --dynamic` because tls.luna uses
+# the libc dlopen/dlsym intrinsics. See tls_e2e.sh for the wiring.
+#
+# Output lines are designed for the shell wrapper to grep on:
+#   INIT ok / INIT fail
+#   CONN ok / CONN fail
+#   WRITE n=<N>
+#   READ len=<N>
+#   READ_BYTES <hex>...
+#   CLOSE ok
+#   CLOSED_PORT ok  (after a connection attempt to a closed port)
+#   DOUBLE_CLOSE ok
+
+import tls
+
+
+fn _print_hex_byte(@b: int) -> int
+    @hex = "0123456789abcdef"
+    @hi = (@b >> 4) & 15
+    @lo = @b & 15
+    @out = new_str(2)
+    str_set_byte(@out, 0, str_byte(@hex, @hi))
+    str_set_byte(@out, 1, str_byte(@hex, @lo))
+    print(@out)
+    return 0
+
+
+fn _print_hex(@s: int) -> int
+    @n = str_len(@s)
+    @i = 0
+    while @i < @n
+        _print_hex_byte(str_byte(@s, @i))
+        @i = @i + 1
+    return 0
+
+
+fn main() -> int
+    @rc = tls_init()
+    if @rc < 0
+        print("INIT fail: ")
+        shine(tls_error())
+        return 1
+    shine("INIT ok")
+
+    # ---- Closed-port test runs first so it's independent of the
+    # ---- live-server lifecycle (the e2e script keeps the server up
+    # ---- the whole time, but we still want this assertion).
+    let @bad: TlsConn = tls_connect("127.0.0.1", 1)
+    if tls_conn_ok(@bad) == 0
+        shine("CLOSED_PORT ok")
+    else
+        shine("CLOSED_PORT fail: expected empty conn")
+        tls_close(@bad)
+
+    # ---- Happy-path: connect, write a PING, read the echo. ----
+    let @c: TlsConn = tls_connect("127.0.0.1", 18443)
+    if tls_conn_ok(@c) == 0
+        print("CONN fail: ")
+        shine(tls_error())
+        return 1
+    shine("CONN ok")
+
+    @wrote = tls_write(@c, "PING\n")
+    if @wrote <= 0
+        print("WRITE fail: ")
+        shine(tls_error())
+        tls_close(@c)
+        return 1
+    print("WRITE n=")
+    shine(int_to_str(@wrote))
+
+    @resp = tls_read(@c, 1024)
+    @rlen = str_len(@resp)
+    print("READ len=")
+    shine(int_to_str(@rlen))
+    if @rlen > 0
+        print("READ_BYTES ")
+        _print_hex(@resp)
+        shine("")
+
+    @cr = tls_close(@c)
+    if @cr == 0
+        shine("CLOSE ok")
+    else
+        shine("CLOSE fail")
+
+    # Second close on the same (now-zeroed) conn must be a no-op
+    # success — guards against use-after-free style mistakes.
+    @cr2 = tls_close(@c)
+    if @cr2 == 0
+        shine("DOUBLE_CLOSE ok")
+    else
+        shine("DOUBLE_CLOSE fail")
+
+    return 0

@@ -12,6 +12,15 @@
 *.dylib
 *.exe
 *.out
+*.elf
+!src/bootminor/luna-mini.elf
+
+# C bootstrap binary (built locally from luna_bootstrap.c)
+bootstrap/luna-boot
+bootstrap/luna-boot.exe
+bootstrap/c_*.elf
+bootstrap/core_*.elf
+
 
 # Compiler intermediates
 *.luna.ir
@@ -81,6 +90,10 @@ temp/
 *.temp
 *.bak
 *.backup
+
+# Stray Windows-style path created by WSL build defaults running on plain Linux
+# (run_tests_*.sh use OUT_DIR=c:/tmp/...; on non-WSL `mkdir -p` makes a literal c:/)
+/c:/
 
 # Documentation build
 /docs/_build/

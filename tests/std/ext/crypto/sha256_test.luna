@@ -1,0 +1,59 @@
+# NIST FIPS 180-4 vectors for SHA-256 + RFC 4231 vectors for HMAC.
+
+import sha256
+import test
+
+
+fn run_sha256_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # NIST: sha256("abc")
+    @r = assert_eq_str("sha256 abc", sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # NIST: empty string
+    @r = assert_eq_str("sha256 empty", sha256_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # Multi-block: 448-bit (56-byte) message — last block before length is full.
+    @r = assert_eq_str("sha256 abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 1MB-ish — keep it short for test runtime. 1024 chars of 'a' (16 blocks).
+    @big = ""
+    @bn = 0
+    while @bn < 64
+        @big = str_concat(@big, "aaaaaaaaaaaaaaaa")
+        @bn = @bn + 1
+    @r = assert_eq_str("sha256 1024*a", sha256_hex(@big), "2edc986847e209b4016e141a6dc8716d3207350f416969382d431539bf292e4a")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # RFC 4231 #1: HMAC key 20 bytes 0x0b, msg "Hi There".
+    # Bootminor's lexer doesn't handle \xNN escapes, so we build the
+    # key by writing 0x0b twenty times into a fresh buffer.
+    @key1 = new_str(20)
+    @ki = 0
+    while @ki < 20
+        str_set_byte(@key1, @ki, 11)
+        @ki = @ki + 1
+    @r = assert_eq_str("hmac_sha256 Hi There", hmac_sha256_hex(@key1, "Hi There"), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # RFC 4231 #2: key "Jefe", msg "what do ya want for nothing?"
+    @r = assert_eq_str("hmac_sha256 Jefe", hmac_sha256_hex("Jefe", "what do ya want for nothing?"), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("sha256", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_sha256_tests(0, 0)

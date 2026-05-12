@@ -1,0 +1,352 @@
+# tier: T6
+# deps: tcp
+# ffi: none
+#
+# std/ext/db/redis — Redis client (RESP protocol) over std/net/tcp.
+#
+# RESP framing per https://redis.io/docs/reference/protocol-spec/ :
+#   +OK\r\n                  simple string
+#   -ERR ...\r\n             error
+#   :1234\r\n                integer
+#   $5\r\nhello\r\n          bulk string  ($-1\r\n = nil)
+#   *2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n   array
+#
+# Public surface:
+#   redis_connect(@host, @port)              -> fd, or -1
+#   redis_close(@fd)
+#   redis_ping(@fd)                          -> 1 if "PONG", 0 otherwise
+#
+#   redis_set(@fd, @key, @value)             -> 1 on +OK
+#   redis_get(@fd, @key)                     -> value, or "" if nil
+#   redis_del(@fd, @key)                     -> 1 if deleted, 0 if absent
+#   redis_exists(@fd, @key)                  -> 0/1
+#   redis_incr(@fd, @key)                    -> new integer value
+#   redis_expire(@fd, @key, @secs)           -> 1 if TTL set
+#   redis_ttl(@fd, @key)                     -> seconds, -2 (absent), -1 (no TTL)
+#
+#   redis_lpush(@fd, @key, @value)           -> new list length
+#   redis_rpush(@fd, @key, @value)           -> new list length
+#   redis_lpop(@fd, @key)                    -> value or ""
+#   redis_rpop(@fd, @key)                    -> value or ""
+#   redis_llen(@fd, @key)                    -> length
+#
+#   redis_hset(@fd, @key, @field, @value)    -> 1 (new), 0 (updated)
+#   redis_hget(@fd, @key, @field)            -> value or ""
+#
+# Lower-level for custom commands:
+#   redis_send_cmd(@fd, @argv: Vec)
+#   redis_recv_simple(@fd)                   -> "+OK" / "-ERR..." / ""
+#   redis_recv_bulk(@fd)                     -> value or ""
+#   redis_recv_integer(@fd)                  -> int
+
+import tcp
+
+
+# _redis_int_to_str(@n) — local int->ASCII, avoiding string-module dep.
+fn _redis_int_to_str(@n: int) -> int
+    if @n == 0
+        return "0"
+    @neg = 0
+    if @n < 0
+        @neg = 1
+        @n = 0 - @n
+    @tmp = new_str(24)
+    @i = 0
+    while @n > 0
+        u8_set(@tmp, @i, 48 + (@n % 10))
+        @n = @n / 10
+        @i = @i + 1
+    @out_len = @i + @neg
+    @out = new_str(@out_len)
+    @oi = 0
+    if @neg == 1
+        u8_set(@out, 0, 45)
+        @oi = 1
+    @j = 0
+    while @j < @i
+        u8_set(@out, @oi + @j, u8_at(@tmp, @i - 1 - @j))
+        @j = @j + 1
+    return @out
+
+
+# _redis_parse_int(@s) — local parse_int.
+fn _redis_parse_int(@s: int) -> int
+    @slen = str_len(@s)
+    if @slen == 0
+        return 0
+    @neg = 0
+    @i = 0
+    if str_byte(@s, 0) == 45
+        @neg = 1
+        @i = 1
+    @n = 0
+    while @i < @slen
+        @c = str_byte(@s, @i)
+        if @c < 48
+            return @n
+        if @c > 57
+            return @n
+        @n = @n * 10 + (@c - 48)
+        @i = @i + 1
+    if @neg == 1
+        return 0 - @n
+    return @n
+
+
+# redis_connect(@host, @port) -> fd, or -1 on failure.
+fn redis_connect(@host: int, @port: int) -> int
+    return tcp_connect(@host, @port)
+
+
+fn redis_close(@fd: int) -> int
+    return tcp_close(@fd)
+
+
+# redis_send_cmd(@fd, @argv) — send a RESP array of bulk strings.
+# @argv is a Vec of strings.
+fn redis_send_cmd(@fd: int, @argv: Vec) -> int
+    @n = vec_len(@argv)
+    @buf = str_concat("*", _redis_int_to_str(@n))
+    @buf = str_concat(@buf, "\r\n")
+    @i = 0
+    while @i < @n
+        @arg = vec_get(@argv, @i)
+        @alen = str_len(@arg)
+        @buf = str_concat(@buf, "$")
+        @buf = str_concat(@buf, _redis_int_to_str(@alen))
+        @buf = str_concat(@buf, "\r\n")
+        @buf = str_concat(@buf, @arg)
+        @buf = str_concat(@buf, "\r\n")
+        @i = @i + 1
+    return tcp_send_str(@fd, @buf)
+
+
+# _redis_recv_until_crlf(@fd, @buf, @cap) -> bytes-up-to-but-not-including-CRLF.
+# Single byte at a time — fine for control headers (a few bytes each).
+fn _redis_recv_until_crlf(@fd: int, @buf: int, @cap: int) -> int
+    @i = 0
+    while @i < @cap
+        @b = new_str(1)
+        @n = tcp_recv(@fd, @b, 1)
+        if @n <= 0
+            return @i
+        @c = str_byte(@b, 0)
+        if @c == 13                             # \r
+            # Consume the following \n.
+            @bb = new_str(1)
+            tcp_recv(@fd, @bb, 1)
+            return @i
+        str_set_byte(@buf, @i, @c)
+        @i = @i + 1
+    return @i
+
+
+# _redis_recv_n(@fd, @n) — read exactly @n bytes, return as string.
+fn _redis_recv_n(@fd: int, @n: int) -> int
+    @buf = new_str(@n)
+    @got = 0
+    while @got < @n
+        @r = tcp_recv(@fd, @buf + @got, @n - @got)
+        if @r <= 0
+            return str_substr(@buf, 0, @got)
+        @got = @got + @r
+    return @buf
+
+
+# Read one byte (type marker) and dispatch.
+# Returns: typed reply as string. For convenience we render integers
+# as decimal strings; explicit `redis_recv_integer` does the parse.
+fn redis_recv_simple(@fd: int) -> int
+    @marker = new_str(1)
+    @n = tcp_recv(@fd, @marker, 1)
+    if @n <= 0
+        return ""
+    @c = str_byte(@marker, 0)
+    @hdr = new_str(64)
+    @hlen = _redis_recv_until_crlf(@fd, @hdr, 64)
+    @line = str_substr(@hdr, 0, @hlen)
+    # Re-emit the prefix so caller can distinguish "+OK" / "-ERR" / etc.
+    @out = new_str(1 + @hlen)
+    str_set_byte(@out, 0, @c)
+    @j = 0
+    while @j < @hlen
+        str_set_byte(@out, 1 + @j, str_byte(@line, @j))
+        @j = @j + 1
+    return @out
+
+
+# redis_recv_integer(@fd) -> integer value of a `:N\r\n` reply.
+fn redis_recv_integer(@fd: int) -> int
+    @r = redis_recv_simple(@fd)
+    @rlen = str_len(@r)
+    if @rlen < 2
+        return 0
+    if str_byte(@r, 0) != 58                    # ':'
+        return 0
+    return _redis_parse_int(str_substr(@r, 1, @rlen - 1))
+
+
+# redis_recv_bulk(@fd) -> bulk-string value, "" for nil or short read.
+fn redis_recv_bulk(@fd: int) -> int
+    @marker = new_str(1)
+    @n = tcp_recv(@fd, @marker, 1)
+    if @n <= 0
+        return ""
+    if str_byte(@marker, 0) != 36               # '$'
+        # Not a bulk reply — consume the header and return "".
+        @hdr = new_str(64)
+        _redis_recv_until_crlf(@fd, @hdr, 64)
+        return ""
+    @hdr = new_str(24)
+    @hlen = _redis_recv_until_crlf(@fd, @hdr, 24)
+    @len_str = str_substr(@hdr, 0, @hlen)
+    @blen = _redis_parse_int(@len_str)
+    if @blen < 0
+        return ""                               # nil
+    @body = _redis_recv_n(@fd, @blen)
+    # Eat trailing \r\n.
+    @crlf = new_str(2)
+    tcp_recv(@fd, @crlf, 2)
+    return @body
+
+
+# --- High-level commands ----------------------------------------------
+
+fn redis_ping(@fd: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "PING")
+    redis_send_cmd(@fd, @argv)
+    @r = redis_recv_simple(@fd)
+    # Expect "+PONG"
+    if str_len(@r) < 5
+        return 0
+    if str_byte(@r, 0) != 43
+        return 0
+    return 1
+
+
+fn redis_set(@fd: int, @key: int, @value: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "SET")
+    vec_push(@argv, @key)
+    vec_push(@argv, @value)
+    redis_send_cmd(@fd, @argv)
+    @r = redis_recv_simple(@fd)
+    if str_eq(@r, "+OK") == 1
+        return 1
+    return 0
+
+
+fn redis_get(@fd: int, @key: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "GET")
+    vec_push(@argv, @key)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_bulk(@fd)
+
+
+fn redis_del(@fd: int, @key: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "DEL")
+    vec_push(@argv, @key)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)
+
+
+fn redis_exists(@fd: int, @key: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "EXISTS")
+    vec_push(@argv, @key)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)
+
+
+fn redis_incr(@fd: int, @key: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "INCR")
+    vec_push(@argv, @key)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)
+
+
+fn redis_expire(@fd: int, @key: int, @secs: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "EXPIRE")
+    vec_push(@argv, @key)
+    vec_push(@argv, _redis_int_to_str(@secs))
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)
+
+
+fn redis_ttl(@fd: int, @key: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "TTL")
+    vec_push(@argv, @key)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)
+
+
+# Lists.
+fn redis_lpush(@fd: int, @key: int, @value: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "LPUSH")
+    vec_push(@argv, @key)
+    vec_push(@argv, @value)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)
+
+fn redis_rpush(@fd: int, @key: int, @value: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "RPUSH")
+    vec_push(@argv, @key)
+    vec_push(@argv, @value)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)
+
+fn redis_lpop(@fd: int, @key: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "LPOP")
+    vec_push(@argv, @key)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_bulk(@fd)
+
+fn redis_rpop(@fd: int, @key: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "RPOP")
+    vec_push(@argv, @key)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_bulk(@fd)
+
+fn redis_llen(@fd: int, @key: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "LLEN")
+    vec_push(@argv, @key)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)
+
+
+# Hashes.
+fn redis_hset(@fd: int, @key: int, @field: int, @value: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "HSET")
+    vec_push(@argv, @key)
+    vec_push(@argv, @field)
+    vec_push(@argv, @value)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)
+
+fn redis_hget(@fd: int, @key: int, @field: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "HGET")
+    vec_push(@argv, @key)
+    vec_push(@argv, @field)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_bulk(@fd)
+
+fn redis_hdel(@fd: int, @key: int, @field: int) -> int
+    @argv = vec_new()
+    vec_push(@argv, "HDEL")
+    vec_push(@argv, @key)
+    vec_push(@argv, @field)
+    redis_send_cmd(@fd, @argv)
+    return redis_recv_integer(@fd)

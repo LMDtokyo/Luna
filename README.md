@@ -26,23 +26,27 @@ shipped `src/bootminor/luna-mini.elf` recompiles itself from its own
 | Component | State |
 |---|---|
 | C bootstrap compiler (`bootstrap/luna_bootstrap.c`) | 5.9 KLOC C99, x86-64 → both ELF64 + PE64 (first-time setup only) |
-| Self-hosted compiler (`src/bootminor/luna-mini.elf`) | 169 KB, Luna compiles itself byte-identically |
+| Self-hosted compiler (`src/bootminor/luna-mini.elf`) | 233 KB, Luna compiles itself byte-identically |
 | Targets | Linux ELF64 from bootminor; Linux ELF64 + Windows PE64 from C bootstrap |
 | Fixed point | ✓ `luna-mini3 == luna-mini4` |
-| Tests | 28 / 28 (M2b + M2c + tests_types via self-compiled luna-mini) |
+| Compiler tests | 53 / 53 (m2b + m2c + types + adt + generics + threads + closures) |
+| Stdlib tests | 123 / 123 across 6 modules (strings, env, map, cli, json, io) |
+| Module system | ✓ `import foo` resolves transitively; dedup, search path |
 | Coming next | hot-swap protocol (see [`docs/HOTSWAP.md`](docs/HOTSWAP.md)) |
 | VS Code extension | [editors/vscode](editors/vscode) — v0.1.4 |
 
 ## Why Luna
 
 - **Self-host in under 1 second.** `luna-mini.elf` re-emits its own
-  169 KB binary from source — no C compiler, no make, no linker.
-- **Native ELF binaries around 100 KB.** No runtime, no VM, no GC. A
+  233 KB binary from source — no C compiler, no make, no linker.
+- **Native ELF binaries from 4 KB up.** No runtime, no VM, no GC. A
   `hello.luna` compiles to a standalone executable you can `strace` or
-  `objdump`.
-- **Hot-swap on the horizon.** Function-level live patching over a
-  Unix socket is specified in [`docs/HOTSWAP.md`](docs/HOTSWAP.md) and
-  lands next.
+  `objdump`. A multi-module Telegram bot fits in 49 KB.
+- **Module system + stdlib.** `import strings`, `import json`,
+  `import http` — 9 pure-Luna modules ship with `install.sh`, all
+  compile via bootminor (no C dependency at runtime).
+- **Hot-swap protocol.** Function-level live patching over a Unix
+  socket — see [`docs/HOTSWAP.md`](docs/HOTSWAP.md).
 
 ## Feature highlights
 
@@ -105,28 +109,61 @@ luna-mini3 → luna-mini4`, then `cmp`):
 ```sh
 bash src/bootminor/run_tests_m3.sh
 # expected: [fixed-point] PASS — luna-mini3 = luna-mini4 byte-identical
-# expected: suite 28 PASS, 0 FAIL
+# expected: suite 38 PASS, 0 FAIL
 ```
 
-## Pure-Luna stdlib modules
+On native Linux (no WSL), set `LUNA_NATIVE=1`:
 
-These modules live under the C bootstrap (`src/stdlib_new/`) — they
-use language features that bootminor doesn't ship yet, so they are
-compiled via `bootstrap/luna-boot`, not via `luna-mini.elf`:
+```sh
+LUNA_NATIVE=1 bash src/bootminor/run_tests_m3.sh
+```
 
-- `base64` — RFC 4648 encode/decode
-- `csv` — RFC 4180 parser + encoder
-- `sha512` — FIPS 180-4 SHA-512 + RFC 4231 HMAC-SHA-512
-- `chacha20` — RFC 7539 stream cipher
-- `cli` — GNU-style argument parser (`--flag`, `--k=v`, `-xvf`, `--`)
-- `logger` — DEBUG/INFO/WARN/ERROR with ISO timestamps
-- `websocket` — RFC 6455 frame codec + handshake (uses `base64`)
+## Bootminor stdlib (`src/lib/std/`)
 
-Run the full stdlib test suite:
+Pure-Luna modules that compile via `luna-mini.elf` (no C bootstrap).
+`install.sh` ships them to `~/.luna/lib/std/`, where the `luna` CLI
+auto-resolves `import foo` against them.
+
+| Module | Lines | Functions |
+|---|---|---|
+| [`strings`](src/lib/std/strings.luna) | 200 | `parse_int`, `str_to_upper/lower`, `str_split/join`, `str_trim`, `str_replace`, `str_starts_with`, `str_index_of`, `str_contains`, … |
+| [`env`](src/lib/std/env.luna) | 65 | `env_get`, `env_lookup` (reads `/proc/self/environ`) |
+| [`map`](src/lib/std/map.luna) | 95 | `map_new`, `map_get`, `map_set`, `map_has`, `map_remove`, `map_keys/values` |
+| [`cli`](src/lib/std/cli.luna) | 130 | GNU-style argv parser: `--key=val`, `--flag`, `-xyz`, `--` sentinel |
+| [`sys`](src/lib/std/sys.luna) | 50 | `args_count`, `args_user`, `program_name`, `exit` |
+| [`process`](src/lib/std/process.luna) | 110 | `shell_run`, `shell_capture` — fork + execve + wait4 |
+| [`json`](src/lib/std/json.luna) | 320 | in-place scanner: `json_obj_str/int/bool/pos`, `json_array_positions`, `json_escape` |
+| [`http`](src/lib/std/http.luna) | 65 | `http_get`, `http_post_json` — TLS via curl shim |
+| [`io`](src/lib/std/io.luna) | 130 | `file_exists`, `file_size`, `read_lines`, `append_file`, `basename/dirname`, `path_join`, `path_extension/stem` |
+| [`test`](src/lib/std/test.luna) | 60 | `assert_eq_int/str`, `assert_true/false`, `test_summary` |
+
+Run all stdlib tests:
+
+```sh
+bash src/lib/std/run_tests.sh
+# expected: 6 modules, 123 PASS, 0 FAIL
+```
+
+### Larger stdlib (compiled via C bootstrap)
+
+These modules in `src/stdlib_new/` use language features bootminor
+doesn't ship yet (`extern "C"`-only helpers, etc.) — they go through
+`bootstrap/luna-boot`:
+
+- `base64`, `csv`, `sha512`, `chacha20`, `logger`, `websocket`
+
+Run them:
 
 ```sh
 make -C bootstrap test-stdlib
 ```
+
+## Real programs in Luna
+
+Multi-file Luna programs that compile via bootminor:
+
+- [`examples/wc/`](examples/wc/) — GNU-compatible word/line/byte counter (148 lines, 32 KB ELF)
+- [`examples/tg_bot/`](examples/tg_bot/) — Telegram bot (145 lines, 49 KB ELF) — uses `std/json`, `std/http`, `std/process`
 
 ## Cosmic syntax
 

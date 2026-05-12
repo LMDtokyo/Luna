@@ -1,0 +1,121 @@
+# Unit tests for std/net/dns.
+#
+# End-to-end resolution against a real public DNS server lives in
+# tests/std/net/dns_resolve.sh.
+
+import dns
+import test
+
+
+# _check_byte(@buf, @off, @expected, @label, @p_in, @f_in, @rp, @rf)
+# helper would be nicer, but bootminor doesn't support pass-by-ref ints
+# cleanly. We inline asserts the long way.
+
+
+fn run_dns_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1) int_to_str spot-checks.
+    @r = assert_eq_str("int 0",   _dns_int_to_str(0),   "0")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("int 7",   _dns_int_to_str(7),   "7")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("int 255", _dns_int_to_str(255), "255")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2) format_ip from a 4-byte buffer.
+    @ipbuf = new_str(4)
+    u8_set(@ipbuf, 0, 192)
+    u8_set(@ipbuf, 1, 168)
+    u8_set(@ipbuf, 2, 1)
+    u8_set(@ipbuf, 3, 1)
+    @r = assert_eq_str("format 192.168.1.1", _dns_format_ip(@ipbuf, 0), "192.168.1.1")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3) encode_name "x.com" -> [1, 'x', 3, 'c', 'o', 'm', 0] = 7 bytes.
+    @nbuf = new_str(16)
+    @nlen = _dns_encode_name("x.com", @nbuf, 0)
+    @r = assert_eq_int("encode x.com length", @nlen, 7)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("byte 0 = label len 1", u8_at(@nbuf, 0), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("byte 1 = 'x'",         u8_at(@nbuf, 1), 120)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("byte 2 = label len 3", u8_at(@nbuf, 2), 3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("byte 6 = root null",   u8_at(@nbuf, 6), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4) extract_first_a on a hand-rolled response:
+    #    header (12 B), question "x.com" A/IN, answer ptr 0xc00c -> 1.2.3.4.
+    @pkt = new_str(64)
+    # ANCOUNT = 1
+    u8_set(@pkt, 7, 1)
+    # Question name "x.com" at offset 12.
+    u8_set(@pkt, 12, 1)
+    u8_set(@pkt, 13, 120)         # 'x'
+    u8_set(@pkt, 14, 3)
+    u8_set(@pkt, 15, 99)          # 'c'
+    u8_set(@pkt, 16, 111)         # 'o'
+    u8_set(@pkt, 17, 109)         # 'm'
+    u8_set(@pkt, 18, 0)
+    u8_set(@pkt, 19, 0)
+    u8_set(@pkt, 20, 1)           # QTYPE = A
+    u8_set(@pkt, 21, 0)
+    u8_set(@pkt, 22, 1)           # QCLASS = IN
+    # Answer: name pointer to offset 12.
+    u8_set(@pkt, 23, 192)         # 0xc0 — pointer flag
+    u8_set(@pkt, 24, 12)
+    u8_set(@pkt, 25, 0)
+    u8_set(@pkt, 26, 1)           # TYPE = A
+    u8_set(@pkt, 27, 0)
+    u8_set(@pkt, 28, 1)           # CLASS = IN
+    # TTL = 60.
+    u8_set(@pkt, 29, 0)
+    u8_set(@pkt, 30, 0)
+    u8_set(@pkt, 31, 0)
+    u8_set(@pkt, 32, 60)
+    # RDLENGTH = 4.
+    u8_set(@pkt, 33, 0)
+    u8_set(@pkt, 34, 4)
+    # RDATA = 1.2.3.4.
+    u8_set(@pkt, 35, 1)
+    u8_set(@pkt, 36, 2)
+    u8_set(@pkt, 37, 3)
+    u8_set(@pkt, 38, 4)
+
+    @r = assert_eq_str("extract 1.2.3.4", _dns_extract_first_a(@pkt, 39), "1.2.3.4")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5) pass-through: dns_resolve("127.0.0.1") returns the input
+    #    verbatim (no network traffic).
+    @r = assert_eq_str("passthrough 127.0.0.1", dns_resolve("127.0.0.1"), "127.0.0.1")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("passthrough 8.8.8.8", dns_resolve("8.8.8.8"), "8.8.8.8")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6) Empty response -> "".
+    @r = assert_eq_str("empty response", _dns_extract_first_a(@pkt, 0), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("dns", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_dns_tests(0, 0)

@@ -1,0 +1,563 @@
+# tier: T6
+# deps:
+# ffi: none
+#
+# std/ext/crypto/chacha20 — ChaCha20 stream cipher + Poly1305 MAC, plus the
+# combined ChaCha20-Poly1305 AEAD, all per RFC 8439. Pure Luna, no FFI.
+#
+# Why this module: AES-GCM is the workhorse AEAD on hardware with AES-NI,
+# but on machines without it (older x86, most ARM SoCs, embedded targets,
+# and pure-software implementations like this one) ChaCha20-Poly1305 is
+# both faster and easier to make constant-time. Same security level, no
+# precomputed tables, no S-box timing leaks.
+#
+# Public API:
+#   chacha20_xor(@key, @nonce, @counter, @input) -> int
+#       Raw ChaCha20 stream cipher. Counter is the starting block index;
+#       use 1 for the AEAD encrypt/decrypt path (block 0 is reserved for
+#       Poly1305 key derivation).
+#
+#   poly1305_mac(@key, @msg) -> int
+#       Raw Poly1305 MAC over @msg. @key MUST be 32 bytes and used exactly
+#       once. Returns the 16-byte tag.
+#
+#   chacha20_poly1305_encrypt(@key, @nonce, @plaintext, @aad) -> int
+#       AEAD encrypt. Returns ciphertext || 16-byte tag.
+#
+#   chacha20_poly1305_decrypt(@key, @nonce, @cipher_plus_tag, @aad) -> int
+#       AEAD decrypt + verify. Returns plaintext on success, or "" if the
+#       tag does not validate (constant-time compare). An empty plaintext
+#       is impossible to confuse with failure here because a real empty
+#       plaintext still requires a 16-byte tag input; if the caller passes
+#       fewer than 16 bytes we treat it as failure.
+
+
+# --- 32-bit helpers ---------------------------------------------------
+#
+# Luna's `int` is 64-bit signed; every ChaCha20 word is 32-bit unsigned.
+# We mask after every arithmetic op that could overflow into the upper
+# 32 bits. The mask is the constant 0xFFFFFFFF = 4294967295.
+
+const CC_MASK32: int = 4294967295
+
+
+fn _cc_rotl32(@x: int, @n: int) -> int
+    return ((@x << @n) | (@x >> (32 - @n))) & CC_MASK32
+
+
+# Read 32-bit little-endian word at byte offset.
+# u32_at zero-extends already, so we just call it.
+fn _cc_le32(@buf: int, @off: int) -> int
+    return u32_at(@buf, @off)
+
+
+# Write a 32-bit little-endian word at byte offset.
+fn _cc_put_le32(@buf: int, @off: int, @v: int) -> int
+    u32_set(@buf, @off, @v & CC_MASK32)
+    return 0
+
+
+# --- ChaCha20 quarter round + block function -------------------------
+#
+# ChaCha20's state is 16 little-endian u32 words laid out as:
+#   const0 const1 const2 const3
+#   key0   key1   key2   key3
+#   key4   key5   key6   key7
+#   ctr    n0     n1     n2
+#
+# We keep the state in a 64-byte buffer indexed 0..15 via u32_at / u32_set.
+# Each quarter_round touches four words a,b,c,d at supplied indices.
+
+fn _cc_qr(@s: int, @ia: int, @ib: int, @ic: int, @id: int) -> int
+    @a = u32_at(@s, @ia * 4)
+    @b = u32_at(@s, @ib * 4)
+    @c = u32_at(@s, @ic * 4)
+    @d = u32_at(@s, @id * 4)
+
+    @a = (@a + @b) & CC_MASK32
+    @d = _cc_rotl32(@d ^ @a, 16)
+    @c = (@c + @d) & CC_MASK32
+    @b = _cc_rotl32(@b ^ @c, 12)
+    @a = (@a + @b) & CC_MASK32
+    @d = _cc_rotl32(@d ^ @a, 8)
+    @c = (@c + @d) & CC_MASK32
+    @b = _cc_rotl32(@b ^ @c, 7)
+
+    u32_set(@s, @ia * 4, @a)
+    u32_set(@s, @ib * 4, @b)
+    u32_set(@s, @ic * 4, @c)
+    u32_set(@s, @id * 4, @d)
+    return 0
+
+
+# _cc_block(@key, @nonce, @counter, @out) — produce one 64-byte keystream
+# block into @out. @key is 32 bytes, @nonce is 12 bytes, @counter is u32.
+fn _cc_block(@key: int, @nonce: int, @counter: int, @out: int) -> int
+    @s = new_str(64)
+    # Magic constants "expand 32-byte k" as four little-endian u32s.
+    u32_set(@s, 0,  0x61707865)
+    u32_set(@s, 4,  0x3320646e)
+    u32_set(@s, 8,  0x79622d32)
+    u32_set(@s, 12, 0x6b206574)
+    # Key occupies words 4..11.
+    @i = 0
+    while @i < 8
+        u32_set(@s, 16 + @i * 4, _cc_le32(@key, @i * 4))
+        @i = @i + 1
+    # Counter is word 12, nonce is words 13..15.
+    u32_set(@s, 48, @counter & CC_MASK32)
+    u32_set(@s, 52, _cc_le32(@nonce, 0))
+    u32_set(@s, 56, _cc_le32(@nonce, 4))
+    u32_set(@s, 60, _cc_le32(@nonce, 8))
+
+    # Working copy.
+    @w = new_str(64)
+    @j = 0
+    while @j < 64
+        str_set_byte(@w, @j, str_byte(@s, @j))
+        @j = @j + 1
+
+    # 20 rounds = 10 double-rounds (column then diagonal).
+    @r = 0
+    while @r < 10
+        _cc_qr(@w, 0, 4,  8, 12)
+        _cc_qr(@w, 1, 5,  9, 13)
+        _cc_qr(@w, 2, 6, 10, 14)
+        _cc_qr(@w, 3, 7, 11, 15)
+        _cc_qr(@w, 0, 5, 10, 15)
+        _cc_qr(@w, 1, 6, 11, 12)
+        _cc_qr(@w, 2, 7,  8, 13)
+        _cc_qr(@w, 3, 4,  9, 14)
+        @r = @r + 1
+
+    # Output = (working state + initial state), each word reduced mod 2^32.
+    @k = 0
+    while @k < 16
+        @sum = (u32_at(@w, @k * 4) + u32_at(@s, @k * 4)) & CC_MASK32
+        u32_set(@out, @k * 4, @sum)
+        @k = @k + 1
+    return 0
+
+
+# chacha20_xor — XOR @input against the ChaCha20 keystream starting at
+# the supplied block counter. Encrypt and decrypt are the same operation.
+# Returns a new string of the same length as @input.
+fn chacha20_xor(@key: int, @nonce: int, @counter: int, @input: int) -> int
+    @n = str_len(@input)
+    @out = new_str(@n)
+    @ks = new_str(64)
+    @ctr = @counter & CC_MASK32
+    @pos = 0
+    while @pos < @n
+        _cc_block(@key, @nonce, @ctr, @ks)
+        @ctr = (@ctr + 1) & CC_MASK32
+        @take = 64
+        if @n - @pos < @take
+            @take = @n - @pos
+        @i = 0
+        while @i < @take
+            @b = str_byte(@input, @pos + @i) ^ str_byte(@ks, @i)
+            str_set_byte(@out, @pos + @i, @b & 255)
+            @i = @i + 1
+        @pos = @pos + @take
+    return @out
+
+
+# =====================================================================
+# Poly1305 (RFC 8439 §2.5)
+# =====================================================================
+#
+# Poly1305 evaluates the polynomial
+#   tag = ( ((m1*r^n) + (m2*r^(n-1)) + ... + (mn*r)) mod (2^130 - 5) ) + s
+#         mod 2^128
+# where each m_i is a 16-byte (or short final) message block read as a
+# little-endian integer with an implicit high "1" bit appended (so blocks
+# are at most 129 bits wide).
+#
+# We use the standard 5-limb radix-2^26 representation. Each limb holds
+# 26 bits and a 64-bit Luna int comfortably holds the partial products
+# in the multiply (5 * 26 + 24 ≈ 154 bits would be required in the worst
+# case for an unreduced 130*130 product, but with the 2^130 ≡ 5 trick we
+# fold the high limbs of the product back through r1..r4 multiplied by 5,
+# keeping all running totals well under 2^63).
+
+
+# Clamp the 16-byte r value as specified in RFC 8439 §2.5:
+#   bytes 3, 7, 11, 15: top 4 bits cleared (& 0x0F)
+#   bytes 4, 8, 12:     bottom 2 bits cleared (& 0xFC)
+# Then split into five 26-bit limbs.
+# Writes r0..r4 into the 40-byte buffer @r as u64 words (limb i at index i).
+fn _p_clamp_r(@key: int, @r: int) -> int
+    @b0  = str_byte(@key, 0)
+    @b1  = str_byte(@key, 1)
+    @b2  = str_byte(@key, 2)
+    @b3  = str_byte(@key, 3) & 15
+    @b4  = str_byte(@key, 4) & 252
+    @b5  = str_byte(@key, 5)
+    @b6  = str_byte(@key, 6)
+    @b7  = str_byte(@key, 7) & 15
+    @b8  = str_byte(@key, 8) & 252
+    @b9  = str_byte(@key, 9)
+    @b10 = str_byte(@key, 10)
+    @b11 = str_byte(@key, 11) & 15
+    @b12 = str_byte(@key, 12) & 252
+    @b13 = str_byte(@key, 13)
+    @b14 = str_byte(@key, 14)
+    @b15 = str_byte(@key, 15) & 15
+
+    # Reassemble as four 32-bit little-endian words.
+    @w0 = @b0  | (@b1  << 8) | (@b2  << 16) | (@b3  << 24)
+    @w1 = @b4  | (@b5  << 8) | (@b6  << 16) | (@b7  << 24)
+    @w2 = @b8  | (@b9  << 8) | (@b10 << 16) | (@b11 << 24)
+    @w3 = @b12 | (@b13 << 8) | (@b14 << 16) | (@b15 << 24)
+
+    # Split clamped 128-bit r into five 26-bit limbs.
+    # Standard mapping (matching reference implementations):
+    #   r0 = w0           & 0x3ffffff
+    #   r1 = (w0 >>26 | w1 <<6)  & 0x3ffffff
+    #   r2 = (w1 >>20 | w2 <<12) & 0x3ffffff
+    #   r3 = (w2 >>14 | w3 <<18) & 0x3ffffff
+    #   r4 =  w3 >>8             & 0x3ffffff  (top 2 bits of byte 15 are zero from clamp)
+    u64_set(@r, 0,  @w0 & 67108863)
+    u64_set(@r, 1, ((@w0 >> 26) | (@w1 << 6))  & 67108863)
+    u64_set(@r, 2, ((@w1 >> 20) | (@w2 << 12)) & 67108863)
+    u64_set(@r, 3, ((@w2 >> 14) | (@w3 << 18)) & 67108863)
+    u64_set(@r, 4,  (@w3 >> 8)                 & 67108863)
+    return 0
+
+
+# _p_block_to_limbs(@blk, @blklen, @final, @t) — read a (possibly short)
+# message block into five 26-bit limbs in @t. The implicit "1 bit" is set
+# at position blklen*8: for a full 16-byte block that is bit 128 (so the
+# 17th-byte virtual value is 0x01 and lives in limb 4); for a short block
+# we append a real 0x01 byte after the message and zero-fill to 17 bytes.
+fn _p_block_to_limbs(@blk: int, @blklen: int, @t: int) -> int
+    # Pack the block into 17 bytes: blklen real bytes, then 0x01, then zeros.
+    @tmp = new_str(17)
+    @i = 0
+    while @i < @blklen
+        str_set_byte(@tmp, @i, str_byte(@blk, @i))
+        @i = @i + 1
+    str_set_byte(@tmp, @blklen, 1)
+    # remaining bytes already zero from new_str.
+
+    # Reassemble as four 32-bit little-endian words plus an extra byte.
+    @w0 = str_byte(@tmp, 0)  | (str_byte(@tmp, 1)  << 8) | (str_byte(@tmp, 2)  << 16) | (str_byte(@tmp, 3)  << 24)
+    @w1 = str_byte(@tmp, 4)  | (str_byte(@tmp, 5)  << 8) | (str_byte(@tmp, 6)  << 16) | (str_byte(@tmp, 7)  << 24)
+    @w2 = str_byte(@tmp, 8)  | (str_byte(@tmp, 9)  << 8) | (str_byte(@tmp, 10) << 16) | (str_byte(@tmp, 11) << 24)
+    @w3 = str_byte(@tmp, 12) | (str_byte(@tmp, 13) << 8) | (str_byte(@tmp, 14) << 16) | (str_byte(@tmp, 15) << 24)
+    @w4 = str_byte(@tmp, 16)
+    # Now split 129 bits across 5 limbs of 26 bits.
+    u64_set(@t, 0,  @w0 & 67108863)
+    u64_set(@t, 1, ((@w0 >> 26) | (@w1 << 6))  & 67108863)
+    u64_set(@t, 2, ((@w1 >> 20) | (@w2 << 12)) & 67108863)
+    u64_set(@t, 3, ((@w2 >> 14) | (@w3 << 18)) & 67108863)
+    u64_set(@t, 4, ((@w3 >> 8)  | (@w4 << 24)) & 67108863)
+    return 0
+
+
+# _p_mul_r — accumulator *= r, mod (2^130 - 5).
+# Inputs: @h (5 u64 limbs), @r (5 u64 limbs), @r5 (5 u64 limbs holding
+# r1..r4 multiplied by 5 — r5[0] is unused but kept for indexing symmetry).
+# Result written back into @h.
+fn _p_mul_r(@h: int, @r: int, @r5: int) -> int
+    @h0 = u64_get(@h, 0)
+    @h1 = u64_get(@h, 1)
+    @h2 = u64_get(@h, 2)
+    @h3 = u64_get(@h, 3)
+    @h4 = u64_get(@h, 4)
+
+    @r0 = u64_get(@r, 0)
+    @r1 = u64_get(@r, 1)
+    @r2 = u64_get(@r, 2)
+    @r3 = u64_get(@r, 3)
+    @r4 = u64_get(@r, 4)
+
+    @s1 = u64_get(@r5, 1)
+    @s2 = u64_get(@r5, 2)
+    @s3 = u64_get(@r5, 3)
+    @s4 = u64_get(@r5, 4)
+
+    # 130-bit * 130-bit product, folded back via 2^130 ≡ 5 (mod p):
+    # the four high limbs of the product get multiplied by 5 (i.e. use s_i).
+    @d0 = @h0 * @r0 + @h1 * @s4 + @h2 * @s3 + @h3 * @s2 + @h4 * @s1
+    @d1 = @h0 * @r1 + @h1 * @r0 + @h2 * @s4 + @h3 * @s3 + @h4 * @s2
+    @d2 = @h0 * @r2 + @h1 * @r1 + @h2 * @r0 + @h3 * @s4 + @h4 * @s3
+    @d3 = @h0 * @r3 + @h1 * @r2 + @h2 * @r1 + @h3 * @r0 + @h4 * @s4
+    @d4 = @h0 * @r4 + @h1 * @r3 + @h2 * @r2 + @h3 * @r1 + @h4 * @r0
+
+    # Carry-propagate. After clamp, r_i < 2^26 and s_i = 5*r_i < 2^29.
+    # h_i is bounded by 2^28 on every call (after a previous _p_mul_r leaves
+    # limbs ≲ 2^27 and `h += block` adds another < 2^26). The largest
+    # partial-product term is therefore < 2^28 * 2^29 = 2^57, and summing
+    # five of them stays under 2^60, comfortably inside int64.
+    @c  = @d0 >> 26
+    @h0 = @d0 & 67108863
+    @d1 = @d1 + @c
+    @c  = @d1 >> 26
+    @h1 = @d1 & 67108863
+    @d2 = @d2 + @c
+    @c  = @d2 >> 26
+    @h2 = @d2 & 67108863
+    @d3 = @d3 + @c
+    @c  = @d3 >> 26
+    @h3 = @d3 & 67108863
+    @d4 = @d4 + @c
+    @c  = @d4 >> 26
+    @h4 = @d4 & 67108863
+    # Fold the carry from limb 4 (worth 2^130) back into limb 0 (× 5).
+    @h0 = @h0 + @c * 5
+    @c  = @h0 >> 26
+    @h0 = @h0 & 67108863
+    @h1 = @h1 + @c
+    # No further carry can ripple past h1 since the worst case adds 1.
+
+    u64_set(@h, 0, @h0)
+    u64_set(@h, 1, @h1)
+    u64_set(@h, 2, @h2)
+    u64_set(@h, 3, @h3)
+    u64_set(@h, 4, @h4)
+    return 0
+
+
+# Final reduction: ensure h < 2^130 - 5 exactly, then add s (128-bit),
+# truncate to 128 bits, and emit 16 little-endian bytes.
+fn _p_finalize(@h: int, @key: int, @out: int) -> int
+    # Step 1: a final carry sweep so each limb is < 2^26.
+    @h0 = u64_get(@h, 0)
+    @h1 = u64_get(@h, 1)
+    @h2 = u64_get(@h, 2)
+    @h3 = u64_get(@h, 3)
+    @h4 = u64_get(@h, 4)
+
+    @c  = @h1 >> 26
+    @h1 = @h1 & 67108863
+    @h2 = @h2 + @c
+    @c  = @h2 >> 26
+    @h2 = @h2 & 67108863
+    @h3 = @h3 + @c
+    @c  = @h3 >> 26
+    @h3 = @h3 & 67108863
+    @h4 = @h4 + @c
+    @c  = @h4 >> 26
+    @h4 = @h4 & 67108863
+    @h0 = @h0 + @c * 5
+    @c  = @h0 >> 26
+    @h0 = @h0 & 67108863
+    @h1 = @h1 + @c
+
+    # Step 2: compute h' = h + (-p) = h - (2^130 - 5) = (h + 5) - 2^130.
+    # If h >= p, h' fits in 130 bits (top bit clear); else it underflows
+    # (top bit set). We use that bit to select.
+    @g0 = @h0 + 5
+    @c  = @g0 >> 26
+    @g0 = @g0 & 67108863
+    @g1 = @h1 + @c
+    @c  = @g1 >> 26
+    @g1 = @g1 & 67108863
+    @g2 = @h2 + @c
+    @c  = @g2 >> 26
+    @g2 = @g2 & 67108863
+    @g3 = @h3 + @c
+    @c  = @g3 >> 26
+    @g3 = @g3 & 67108863
+    @g4 = @h4 + @c - 67108864   # subtract 2^26 to chop off limb-4 high bit
+
+    # If g4 is non-negative, the subtraction succeeded → h was >= p, so we
+    # replace h with g (the reduced value). If g4 went negative, we keep h.
+    # We do this with an explicit conditional rather than bit-masking
+    # because Luna's `>>` is logical (zero-fill), so a sign-mask trick
+    # would need extra steps and is easier to get subtly wrong.
+    if @g4 >= 0
+        @h0 = @g0
+        @h1 = @g1
+        @h2 = @g2
+        @h3 = @g3
+        @h4 = @g4
+
+    # Step 3: serialize the five 26-bit limbs into four 32-bit LE words.
+    @w0 = (@h0       | (@h1 << 26)) & CC_MASK32
+    @w1 = ((@h1 >> 6)  | (@h2 << 20)) & CC_MASK32
+    @w2 = ((@h2 >> 12) | (@h3 << 14)) & CC_MASK32
+    @w3 = ((@h3 >> 18) | (@h4 << 8))  & CC_MASK32
+
+    # Step 4: tag = (h + s) mod 2^128, with s = key[16..32] as 4 LE u32s.
+    @s0 = _cc_le32(@key, 16)
+    @s1 = _cc_le32(@key, 20)
+    @s2 = _cc_le32(@key, 24)
+    @s3 = _cc_le32(@key, 28)
+
+    @f = @w0 + @s0
+    @w0 = @f & CC_MASK32
+    @carry = @f >> 32
+    @f = @w1 + @s1 + @carry
+    @w1 = @f & CC_MASK32
+    @carry = @f >> 32
+    @f = @w2 + @s2 + @carry
+    @w2 = @f & CC_MASK32
+    @carry = @f >> 32
+    @f = @w3 + @s3 + @carry
+    @w3 = @f & CC_MASK32
+
+    _cc_put_le32(@out, 0,  @w0)
+    _cc_put_le32(@out, 4,  @w1)
+    _cc_put_le32(@out, 8,  @w2)
+    _cc_put_le32(@out, 12, @w3)
+    return 0
+
+
+# poly1305_mac(@key, @msg) — RFC 8439 §2.5.1. @key must be exactly 32
+# bytes and used for one (key, message) pair only. Returns a 16-byte tag.
+fn poly1305_mac(@key: int, @msg: int) -> int
+    @r  = new_str(5 * 8)
+    @r5 = new_str(5 * 8)
+    @h  = new_str(5 * 8)
+    @t  = new_str(5 * 8)
+
+    _p_clamp_r(@key, @r)
+    # Precompute s_i = 5 * r_i for i in 1..4 (s_0 unused).
+    u64_set(@r5, 0, 0)
+    u64_set(@r5, 1, u64_get(@r, 1) * 5)
+    u64_set(@r5, 2, u64_get(@r, 2) * 5)
+    u64_set(@r5, 3, u64_get(@r, 3) * 5)
+    u64_set(@r5, 4, u64_get(@r, 4) * 5)
+
+    # h starts at 0 (new_str zero-initialises).
+
+    @n = str_len(@msg)
+    @pos = 0
+    while @pos < @n
+        @take = 16
+        if @n - @pos < @take
+            @take = @n - @pos
+        # Build the block into @t as 5 limbs of 26 bits with the implicit "1".
+        @blk = str_substr(@msg, @pos, @take)
+        _p_block_to_limbs(@blk, @take, @t)
+        # h += block.
+        u64_set(@h, 0, u64_get(@h, 0) + u64_get(@t, 0))
+        u64_set(@h, 1, u64_get(@h, 1) + u64_get(@t, 1))
+        u64_set(@h, 2, u64_get(@h, 2) + u64_get(@t, 2))
+        u64_set(@h, 3, u64_get(@h, 3) + u64_get(@t, 3))
+        u64_set(@h, 4, u64_get(@h, 4) + u64_get(@t, 4))
+        # h = h * r mod p.
+        _p_mul_r(@h, @r, @r5)
+        @pos = @pos + @take
+
+    @tag = new_str(16)
+    _p_finalize(@h, @key, @tag)
+    return @tag
+
+
+# =====================================================================
+# AEAD: ChaCha20-Poly1305 (RFC 8439 §2.8)
+# =====================================================================
+
+
+# Pad @buf out to a multiple of 16 by appending zero bytes. Returns a new
+# string. Used to build the Poly1305 input from AAD + ciphertext.
+fn _aead_pad16(@buf: int) -> int
+    @n = str_len(@buf)
+    @rem = @n % 16
+    if @rem == 0
+        return @buf
+    @pad = 16 - @rem
+    @out = new_str(@n + @pad)
+    @i = 0
+    while @i < @n
+        str_set_byte(@out, @i, str_byte(@buf, @i))
+        @i = @i + 1
+    return @out
+
+
+# 8-byte little-endian encoding of a non-negative int. Used to append the
+# AAD and ciphertext lengths to the Poly1305 input.
+fn _aead_le64(@v: int) -> int
+    @out = new_str(8)
+    @i = 0
+    while @i < 8
+        str_set_byte(@out, @i, (@v >> (@i * 8)) & 255)
+        @i = @i + 1
+    return @out
+
+
+# Derive the one-time Poly1305 key from (chacha20_key, nonce). Per RFC
+# 8439 §2.6, it is the first 32 bytes of the keystream at block 0.
+fn _aead_poly_key(@key: int, @nonce: int) -> int
+    @zero = new_str(32)
+    return chacha20_xor(@key, @nonce, 0, @zero)
+
+
+fn _aead_build_mac_input(@aad: int, @ciphertext: int) -> int
+    @padded_aad = _aead_pad16(@aad)
+    @padded_ct  = _aead_pad16(@ciphertext)
+    @la = _aead_le64(str_len(@aad))
+    @lc = _aead_le64(str_len(@ciphertext))
+    @total = str_len(@padded_aad) + str_len(@padded_ct) + 16
+    @buf = new_str(@total)
+    @off = 0
+    @i = 0
+    while @i < str_len(@padded_aad)
+        str_set_byte(@buf, @off + @i, str_byte(@padded_aad, @i))
+        @i = @i + 1
+    @off = @off + str_len(@padded_aad)
+    @i = 0
+    while @i < str_len(@padded_ct)
+        str_set_byte(@buf, @off + @i, str_byte(@padded_ct, @i))
+        @i = @i + 1
+    @off = @off + str_len(@padded_ct)
+    @i = 0
+    while @i < 8
+        str_set_byte(@buf, @off + @i, str_byte(@la, @i))
+        @i = @i + 1
+    @off = @off + 8
+    @i = 0
+    while @i < 8
+        str_set_byte(@buf, @off + @i, str_byte(@lc, @i))
+        @i = @i + 1
+    return @buf
+
+
+fn chacha20_poly1305_encrypt(@key: int, @nonce: int, @plaintext: int, @aad: int) -> int
+    @pk = _aead_poly_key(@key, @nonce)
+    @ct = chacha20_xor(@key, @nonce, 1, @plaintext)
+    @mac_in = _aead_build_mac_input(@aad, @ct)
+    @tag = poly1305_mac(@pk, @mac_in)
+    @clen = str_len(@ct)
+    @out = new_str(@clen + 16)
+    @i = 0
+    while @i < @clen
+        str_set_byte(@out, @i, str_byte(@ct, @i))
+        @i = @i + 1
+    @i = 0
+    while @i < 16
+        str_set_byte(@out, @clen + @i, str_byte(@tag, @i))
+        @i = @i + 1
+    return @out
+
+
+# Constant-time 16-byte tag compare. 1 if equal, 0 otherwise.
+fn _aead_ct_eq16(@a: int, @b: int) -> int
+    @diff = 0
+    @i = 0
+    while @i < 16
+        @diff = @diff | (str_byte(@a, @i) ^ str_byte(@b, @i))
+        @i = @i + 1
+    if @diff == 0
+        return 1
+    return 0
+
+
+fn chacha20_poly1305_decrypt(@key: int, @nonce: int, @cipher_plus_tag: int, @aad: int) -> int
+    @total = str_len(@cipher_plus_tag)
+    if @total < 16
+        return ""
+    @clen = @total - 16
+    @ct = str_substr(@cipher_plus_tag, 0, @clen)
+    @tag_got = str_substr(@cipher_plus_tag, @clen, 16)
+
+    @pk = _aead_poly_key(@key, @nonce)
+    @mac_in = _aead_build_mac_input(@aad, @ct)
+    @tag_want = poly1305_mac(@pk, @mac_in)
+    if _aead_ct_eq16(@tag_got, @tag_want) == 0
+        return ""
+    return chacha20_xor(@key, @nonce, 1, @ct)

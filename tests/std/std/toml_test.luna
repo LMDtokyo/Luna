@@ -1,0 +1,156 @@
+# Tests for std/std/toml.
+
+import toml
+import test
+
+
+fn run_toml_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    # 1. basic string
+    @root = toml_parse("name = \"Luna\"\n")
+    @r = assert_eq_str("string value", toml_get_str(@root, "name"), "Luna")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2. integer (decimal)
+    @root = toml_parse("port = 8080\n")
+    @r = assert_eq_int("int decimal", toml_get_int(@root, "port"), 8080)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3. negative int
+    @root = toml_parse("offset = -5\n")
+    @r = assert_eq_int("int negative", toml_get_int(@root, "offset"), 0 - 5)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4. hex / octal / binary
+    @root = toml_parse("mask = 0xff\numask = 0o755\nflags = 0b101\n")
+    @r = assert_eq_int("int hex",   toml_get_int(@root, "mask"),  255)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("int octal", toml_get_int(@root, "umask"), 493)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("int binary", toml_get_int(@root, "flags"), 5)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5. float — kept as string lexeme
+    @root = toml_parse("version = 0.1\n")
+    @r = assert_eq_str("float as str", toml_get_str(@root, "version"), "0.1")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6. booleans
+    @root = toml_parse("debug = true\nverbose = false\n")
+    @r = assert_eq_int("bool true",  toml_get_bool(@root, "debug"),   1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("bool false", toml_get_bool(@root, "verbose"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 7. section header
+    @root = toml_parse("[server]\nhost = \"localhost\"\n")
+    @r = assert_eq_str("section value", toml_get_str(@root, "server.host"), "localhost")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8. nested section
+    @root = toml_parse("[a.b.c]\nx = 1\n")
+    @r = assert_eq_int("nested section", toml_get_int(@root, "a.b.c.x"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 9. dotted key sugar
+    @root = toml_parse("a.b = 1\n")
+    @r = assert_eq_int("dotted key", toml_get_int(@root, "a.b"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 10. array of strings
+    @root = toml_parse("tags = [\"a\", \"b\", \"c\"]\n")
+    @r = assert_eq_int("array len",   toml_array_len(@root, "tags"),    3)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("array str 0", toml_array_str(@root, "tags", 0), "a")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("array str 2", toml_array_str(@root, "tags", 2), "c")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 11. inline table
+    @root = toml_parse("point = {x = 1, y = 2}\n")
+    @r = assert_eq_int("inline x", toml_get_int(@root, "point.x"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("inline y", toml_get_int(@root, "point.y"), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 12. comments
+    @root = toml_parse("# header\nname = \"x\"\n")
+    @r = assert_eq_str("with comment", toml_get_str(@root, "name"), "x")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 13. mini luna.toml — package + build sections
+    @doc = ""
+    @doc = str_concat(@doc, "# luna.toml\n")
+    @doc = str_concat(@doc, "[package]\n")
+    @doc = str_concat(@doc, "name = \"hello\"\n")
+    @doc = str_concat(@doc, "version = \"0.1.0\"\n")
+    @doc = str_concat(@doc, "\n")
+    @doc = str_concat(@doc, "[build]\n")
+    @doc = str_concat(@doc, "entry = \"src/main.luna\"\n")
+    @root = toml_parse(@doc)
+    @r = assert_eq_str("pkg.name",    toml_get_str(@root, "package.name"),    "hello")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("pkg.version", toml_get_str(@root, "package.version"), "0.1.0")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("build.entry", toml_get_str(@root, "build.entry"),     "src/main.luna")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 14. bad syntax → -1, toml_error non-empty
+    @bad = toml_parse("name = \n")
+    @r = assert_eq_int("bad syntax = -1", @bad, 0 - 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @err = toml_error()
+    @r = assert_true("error non-empty", str_len(@err) > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 15. literal string (single quotes, no escapes)
+    @root = toml_parse("path = 'C:\\\\Users'\n")
+    @r = assert_eq_str("literal string", toml_get_str(@root, "path"), "C:\\\\Users")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 16. toml_has + toml_keys
+    @root = toml_parse("a = 1\nb = 2\n")
+    @r = assert_eq_int("has present", toml_has(@root, "a"), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("has absent",  toml_has(@root, "missing"), 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    let @ks: Vec = toml_keys(@root)
+    @r = assert_eq_int("keys len", vec_len(@ks), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("toml", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_toml_tests(0, 0)

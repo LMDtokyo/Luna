@@ -1,0 +1,455 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/regex — minimal regular expression matcher in pure Luna.
+#
+# Backtracking recursive matcher (Kernighan/Pike style, no captures).
+# Supported meta-characters:
+#   .            any single byte
+#   ^  $         anchors (start of pattern / end of pattern)
+#   *  +  ?      greedy quantifiers over the previous atom
+#   \d \w \s     digit / word / whitespace classes
+#   \. \* \+ \?  \\   escaped literals
+#   [abc]  [a-z]  [^...]    character classes (negation with ^)
+#   any other byte         literal match
+#
+# Out of scope: groups, alternation, {m,n}, lazy quantifiers,
+# lookaround, backreferences. Use std/strings for plain substring work.
+#
+# Public API:
+#   regex_match(@pat, @text)          -> 1/0   unanchored (or anchored if pat begins ^)
+#   regex_full(@pat, @text)           -> 1/0   pattern must match entire text
+#   regex_find(@pat, @text)           -> int   byte offset of first match, -1 if none
+#   regex_replace_all(@pat, @text, @rep) -> str   replace every match with @rep
+#
+# Byte codes used throughout this module:
+#   46 '.'   42 '*'   43 '+'   63 '?'   94 '^'   36 '$'
+#   92 '\'   91 '['   93 ']'   45 '-'
+#   100 'd'  119 'w'  115 's'  95 '_'
+#   48 '0'   57 '9'   65 'A'   90 'Z'   97 'a'   122 'z'
+#   32 ' '    9 '\t'  10 '\n'  13 '\r'
+
+
+# -------- atom predicates -------------------------------------------------
+
+# 1 if @c is a decimal digit.
+fn _re_is_digit(@c: int) -> int
+    if @c < 48
+        return 0
+    if @c > 57
+        return 0
+    return 1
+
+# 1 if @c is a word char (A-Z, a-z, 0-9, _).
+fn _re_is_word(@c: int) -> int
+    if _re_is_digit(@c) == 1
+        return 1
+    if @c == 95
+        return 1
+    if @c >= 65
+        if @c <= 90
+            return 1
+    if @c >= 97
+        if @c <= 122
+            return 1
+    return 0
+
+# 1 if @c is ASCII whitespace.
+fn _re_is_space(@c: int) -> int
+    if @c == 32
+        return 1
+    if @c == 9
+        return 1
+    if @c == 10
+        return 1
+    if @c == 13
+        return 1
+    return 0
+
+
+# -------- character class ([...]) helpers --------------------------------
+
+# Length of a [...] atom starting at @p (which must point at '['):
+# returns count of bytes through the closing ']' (inclusive). If the
+# pattern is malformed (no ']'), returns the remaining pattern length.
+fn _re_class_len(@pat: int, @p: int) -> int
+    @n = str_len(@pat)
+    @i = @p + 1
+    # Allow a leading ']' (or '^]') to be literal — but simpler: just
+    # scan until we hit ']'.
+    while @i < @n
+        if str_byte(@pat, @i) == 93
+            return @i - @p + 1
+        @i = @i + 1
+    return @n - @p
+
+# Is the three-byte window at @i a range (c '-' d) with d != ']'?
+fn _re_class_is_range(@pat: int, @i: int, @n: int) -> int
+    if @i + 2 >= @n
+        return 0
+    if str_byte(@pat, @i + 1) != 45
+        return 0
+    if str_byte(@pat, @i + 2) == 93
+        return 0
+    return 1
+
+# 1 if @ch is in the inclusive range [@lo, @hi].
+fn _re_in_range(@ch: int, @lo: int, @hi: int) -> int
+    if @ch < @lo
+        return 0
+    if @ch > @hi
+        return 0
+    return 1
+
+# Does the character class starting at @p (pointing at '[') match @ch?
+# Handles negation with leading '^', and a-z ranges.
+fn _re_match_class(@pat: int, @p: int, @ch: int) -> int
+    @n = str_len(@pat)
+    @i = @p + 1
+    @neg = 0
+    if @i < @n
+        if str_byte(@pat, @i) == 94
+            @neg = 1
+            @i = @i + 1
+    @found = 0
+    while @i < @n
+        @c = str_byte(@pat, @i)
+        if @c == 93
+            break
+        if _re_class_is_range(@pat, @i, @n) == 1
+            @hi = str_byte(@pat, @i + 2)
+            if _re_in_range(@ch, @c, @hi) == 1
+                @found = 1
+            @i = @i + 3
+            continue
+        if @ch == @c
+            @found = 1
+        @i = @i + 1
+    if @neg == 1
+        return 1 - @found
+    return @found
+
+
+# -------- atom length + match --------------------------------------------
+
+# Length in bytes of the atom that starts at @p:
+#   '\X'      -> 2
+#   '[...]'   -> _re_class_len
+#   anything else -> 1
+fn _re_atom_len(@pat: int, @p: int) -> int
+    @n = str_len(@pat)
+    if @p >= @n
+        return 0
+    @c = str_byte(@pat, @p)
+    if @c == 92
+        return 2
+    if @c == 91
+        return _re_class_len(@pat, @p)
+    return 1
+
+# Does the atom starting at pattern offset @p match byte @ch?
+fn _re_match_atom(@pat: int, @p: int, @ch: int) -> int
+    @n = str_len(@pat)
+    if @p >= @n
+        return 0
+    @c = str_byte(@pat, @p)
+    if @c == 46
+        return 1
+    if @c == 92
+        if @p + 1 >= @n
+            return 0
+        @e = str_byte(@pat, @p + 1)
+        if @e == 100
+            return _re_is_digit(@ch)
+        if @e == 119
+            return _re_is_word(@ch)
+        if @e == 115
+            return _re_is_space(@ch)
+        if @ch == @e
+            return 1
+        return 0
+    if @c == 91
+        return _re_match_class(@pat, @p, @ch)
+    if @ch == @c
+        return 1
+    return 0
+
+
+# -------- recursive matcher ----------------------------------------------
+
+# Forward declaration via mutually recursive functions: bootminor
+# allows this since name resolution is global.
+
+fn _re_match_here(@pat: int, @p: int, @text: int, @t: int) -> int
+    @plen = str_len(@pat)
+    @tlen = str_len(@text)
+    if @p >= @plen
+        return 1
+    # '$' at end of pattern matches end of text.
+    if str_byte(@pat, @p) == 36
+        if @p + 1 == @plen
+            if @t == @tlen
+                return 1
+            return 0
+    @alen = _re_atom_len(@pat, @p)
+    @next = @p + @alen
+    # Quantifier on the atom?
+    if @next < @plen
+        @q = str_byte(@pat, @next)
+        if @q == 42
+            return _re_match_star(@pat, @p, @alen, @next + 1, @text, @t)
+        if @q == 43
+            return _re_match_plus(@pat, @p, @alen, @next + 1, @text, @t)
+        if @q == 63
+            return _re_match_question(@pat, @p, @alen, @next + 1, @text, @t)
+    # Unquantified atom: must match the byte at @t, then recurse.
+    if @t >= @tlen
+        return 0
+    if _re_match_atom(@pat, @p, str_byte(@text, @t)) == 1
+        return _re_match_here(@pat, @next, @text, @t + 1)
+    return 0
+
+# Greedy *: match the atom zero or more times, then try the rest at
+# each falling-back position from longest to shortest.
+fn _re_match_star(@pat: int, @ap: int, @alen: int, @rest: int, @text: int, @t: int) -> int
+    @tlen = str_len(@text)
+    @end = @t
+    while @end < @tlen
+        if _re_match_atom(@pat, @ap, str_byte(@text, @end)) == 0
+            break
+        @end = @end + 1
+    # Try matching the remainder of the pattern, peeling off one
+    # repetition at a time until we drop below @t.
+    while @end >= @t
+        if _re_match_here(@pat, @rest, @text, @end) == 1
+            return 1
+        if @end == @t
+            break
+        @end = @end - 1
+    return 0
+
+# Greedy +: same as *, but requires at least one match.
+fn _re_match_plus(@pat: int, @ap: int, @alen: int, @rest: int, @text: int, @t: int) -> int
+    @tlen = str_len(@text)
+    if @t >= @tlen
+        return 0
+    if _re_match_atom(@pat, @ap, str_byte(@text, @t)) == 0
+        return 0
+    @end = @t + 1
+    while @end < @tlen
+        if _re_match_atom(@pat, @ap, str_byte(@text, @end)) == 0
+            break
+        @end = @end + 1
+    # Peel back to the minimum of (@t + 1).
+    while @end > @t
+        if _re_match_here(@pat, @rest, @text, @end) == 1
+            return 1
+        @end = @end - 1
+    return 0
+
+# ?: try matching atom once then rest; if that fails, skip the atom.
+fn _re_match_question(@pat: int, @ap: int, @alen: int, @rest: int, @text: int, @t: int) -> int
+    @tlen = str_len(@text)
+    if @t < @tlen
+        if _re_match_atom(@pat, @ap, str_byte(@text, @t)) == 1
+            if _re_match_here(@pat, @rest, @text, @t + 1) == 1
+                return 1
+    return _re_match_here(@pat, @rest, @text, @t)
+
+
+# -------- search drivers -------------------------------------------------
+
+# Try to match starting at every position in @text. Returns the offset
+# of the first match, or -1.
+fn _re_search(@pat: int, @text: int) -> int
+    @plen = str_len(@pat)
+    @tlen = str_len(@text)
+    @p_start = 0
+    @anchored = 0
+    if @plen > 0
+        if str_byte(@pat, 0) == 94
+            @anchored = 1
+            @p_start = 1
+    if @anchored == 1
+        if _re_match_here(@pat, @p_start, @text, 0) == 1
+            return 0
+        return 0 - 1
+    @i = 0
+    while @i <= @tlen
+        if _re_match_here(@pat, @p_start, @text, @i) == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
+# Find the largest @len in [@from, @hi] s.t. the pattern matches the
+# prefix of @text of length @len starting at @t. Caller guarantees at
+# least one such @len exists at @from. Returns @best.
+fn _re_longest_from(@pat: int, @p_start: int, @text: int, @t: int, @from: int, @hi: int) -> int
+    @best = @from
+    @len = @from + 1
+    while @len <= @hi
+        if _re_match_prefix(@pat, @p_start, @text, @t, @len) == 1
+            @best = @len
+        @len = @len + 1
+    return @best
+
+# Length of the match starting at @t (assuming a match starts there),
+# or -1 if no match. Used by replace_all. @p_start is the pattern
+# offset after any leading '^'.
+fn _re_match_len_at(@pat: int, @p_start: int, @text: int, @t: int) -> int
+    @tlen = str_len(@text)
+    @hi = @tlen - @t
+    @len = 0
+    while @len <= @hi
+        if _re_match_prefix(@pat, @p_start, @text, @t, @len) == 1
+            return _re_longest_from(@pat, @p_start, @text, @t, @len, @hi)
+        @len = @len + 1
+    return 0 - 1
+
+# Match the pattern against a *prefix* of @text starting at @t with
+# exactly @len bytes available. Implemented by appending an implicit
+# end-anchor: we ask _re_match_here with a synthesised text slice.
+# To avoid copying we instead match against the original text but
+# require the matcher to land exactly at @t+@len. That needs a small
+# variant — implemented below.
+fn _re_match_prefix(@pat: int, @p_start: int, @text: int, @t: int, @len: int) -> int
+    return _re_match_bounded(@pat, @p_start, @text, @t, @t + @len)
+
+
+# Bounded version of _re_match_here: pattern must consume exactly the
+# bytes [@t .. @end) of @text. The treatment of '$' still works (must
+# coincide with @end). Quantifiers respect the @end bound naturally
+# because _re_match_atom is called only when t < end.
+fn _re_match_bounded(@pat: int, @p: int, @text: int, @t: int, @end: int) -> int
+    @plen = str_len(@pat)
+    if @p >= @plen
+        if @t == @end
+            return 1
+        return 0
+    if str_byte(@pat, @p) == 36
+        if @p + 1 == @plen
+            if @t == @end
+                return 1
+            return 0
+    @alen = _re_atom_len(@pat, @p)
+    @next = @p + @alen
+    if @next < @plen
+        @q = str_byte(@pat, @next)
+        if @q == 42
+            return _re_bstar(@pat, @p, @alen, @next + 1, @text, @t, @end)
+        if @q == 43
+            return _re_bplus(@pat, @p, @alen, @next + 1, @text, @t, @end)
+        if @q == 63
+            return _re_bquestion(@pat, @p, @alen, @next + 1, @text, @t, @end)
+    if @t >= @end
+        return 0
+    if _re_match_atom(@pat, @p, str_byte(@text, @t)) == 1
+        return _re_match_bounded(@pat, @next, @text, @t + 1, @end)
+    return 0
+
+fn _re_bstar(@pat: int, @ap: int, @alen: int, @rest: int, @text: int, @t: int, @end: int) -> int
+    @stop = @t
+    while @stop < @end
+        if _re_match_atom(@pat, @ap, str_byte(@text, @stop)) == 0
+            break
+        @stop = @stop + 1
+    while @stop >= @t
+        if _re_match_bounded(@pat, @rest, @text, @stop, @end) == 1
+            return 1
+        if @stop == @t
+            break
+        @stop = @stop - 1
+    return 0
+
+fn _re_bplus(@pat: int, @ap: int, @alen: int, @rest: int, @text: int, @t: int, @end: int) -> int
+    if @t >= @end
+        return 0
+    if _re_match_atom(@pat, @ap, str_byte(@text, @t)) == 0
+        return 0
+    @stop = @t + 1
+    while @stop < @end
+        if _re_match_atom(@pat, @ap, str_byte(@text, @stop)) == 0
+            break
+        @stop = @stop + 1
+    while @stop > @t
+        if _re_match_bounded(@pat, @rest, @text, @stop, @end) == 1
+            return 1
+        @stop = @stop - 1
+    return 0
+
+fn _re_bquestion(@pat: int, @ap: int, @alen: int, @rest: int, @text: int, @t: int, @end: int) -> int
+    if @t < @end
+        if _re_match_atom(@pat, @ap, str_byte(@text, @t)) == 1
+            if _re_match_bounded(@pat, @rest, @text, @t + 1, @end) == 1
+                return 1
+    return _re_match_bounded(@pat, @rest, @text, @t, @end)
+
+
+# -------- public API -----------------------------------------------------
+
+# regex_match — 1 if @pat matches anywhere in @text (or anchored if
+# @pat starts with '^'). 0 otherwise.
+fn regex_match(@pat: int, @text: int) -> int
+    if _re_search(@pat, @text) >= 0
+        return 1
+    return 0
+
+# regex_find — byte offset of first match, or -1 if none.
+fn regex_find(@pat: int, @text: int) -> int
+    return _re_search(@pat, @text)
+
+# regex_full — 1 iff @pat matches the entire @text (implicit ^…$).
+fn regex_full(@pat: int, @text: int) -> int
+    @plen = str_len(@pat)
+    @p_start = 0
+    if @plen > 0
+        if str_byte(@pat, 0) == 94
+            @p_start = 1
+    if _re_match_bounded(@pat, @p_start, @text, 0, str_len(@text)) == 1
+        return 1
+    return 0
+
+# Append the single byte at @text[@i] to @out and return the new
+# string. @i must be a valid index.
+fn _re_append_byte(@out: int, @text: int, @i: int) -> int
+    @ch = new_str(1)
+    str_set_byte(@ch, 0, str_byte(@text, @i))
+    return str_concat(@out, @ch)
+
+# regex_replace_all — return a new string with every match of @pat
+# replaced by @rep. Empty matches are stepped past by one byte to
+# guarantee termination (so e.g. `a*` against "bb" yields "_b_b_").
+fn regex_replace_all(@pat: int, @text: int, @rep: int) -> int
+    @plen = str_len(@pat)
+    @p_start = 0
+    @anchored = 0
+    if @plen > 0
+        if str_byte(@pat, 0) == 94
+            @anchored = 1
+            @p_start = 1
+    @tlen = str_len(@text)
+    @out = ""
+    @i = 0
+    while @i <= @tlen
+        @hit = _re_match_here(@pat, @p_start, @text, @i)
+        if @hit == 1
+            @mlen = _re_match_len_at(@pat, @p_start, @text, @i)
+            if @mlen < 0
+                @mlen = 0
+            @out = str_concat(@out, @rep)
+            if @mlen == 0
+                if @i < @tlen
+                    @out = _re_append_byte(@out, @text, @i)
+                @i = @i + 1
+            else
+                @i = @i + @mlen
+            if @anchored == 1
+                if @i < @tlen
+                    @out = str_concat(@out, str_substr(@text, @i, @tlen - @i))
+                return @out
+            continue
+        if @i < @tlen
+            @out = _re_append_byte(@out, @text, @i)
+        @i = @i + 1
+    return @out

@@ -1,0 +1,113 @@
+# dispatch.luna — single point that maps `text` to a command handler.
+#
+# Order: parse @msg into (chat_id, from_name, text), bump message
+# counter, log, and route. Unknown texts fall through to a default
+# echo. Handlers live in basic / text / crypto / encoding / world /
+# notes — all imported by main.luna.
+
+
+fn handle_message(@token: int, @msg: int) -> int
+    @chat = json_pick_obj(@msg, "chat")
+    @chat_id = json_get_int(@chat, "id")
+    @text = json_get_str(@msg, "text")
+    @from = json_pick_obj(@msg, "from")
+    @from_name = json_get_str(@from, "first_name")
+
+    _stat_inc("messages")
+
+    print("<- [")
+    print(int_to_str(@chat_id))
+    print("] ")
+    print(@from_name)
+    print(": ")
+    shine(@text)
+
+    # --- basics ---
+    if str_eq(@text, "/start")
+        return cmd_start(@token, @chat_id, @from_name)
+    if str_eq(@text, "/help")
+        return cmd_help(@token, @chat_id)
+    if str_eq(@text, "/about")
+        return cmd_about(@token, @chat_id)
+    if str_eq(@text, "/ping")
+        return cmd_ping(@token, @chat_id)
+    if str_eq(@text, "/time")
+        return cmd_time(@token, @chat_id)
+    if str_eq(@text, "/uptime")
+        return cmd_uptime(@token, @chat_id)
+    if str_eq(@text, "/stats")
+        return cmd_stats(@token, @chat_id)
+
+    # --- text ops ---
+    if str_starts_with(@text, "/echo ")
+        return cmd_echo(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/upper ")
+        return cmd_upper(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/lower ")
+        return cmd_lower(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/reverse ")
+        return cmd_reverse(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/rot13 ")
+        return cmd_rot13(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/len ")
+        return cmd_len(@token, @chat_id, _arg_after(@text))
+
+    # --- crypto / random ---
+    if str_starts_with(@text, "/sha256 ")
+        return cmd_sha256(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/hmac ")
+        return cmd_hmac(@token, @chat_id, _arg_after(@text))
+    if str_eq(@text, "/uuid")
+        return cmd_uuid(@token, @chat_id)
+    if str_eq(@text, "/random")
+        return cmd_random(@token, @chat_id)
+    if str_eq(@text, "/dice")
+        return cmd_dice(@token, @chat_id)
+    if str_eq(@text, "/coin")
+        return cmd_coin(@token, @chat_id)
+    if str_starts_with(@text, "/randhex")
+        return cmd_randhex(@token, @chat_id, _arg_after(@text))
+
+    # --- encodings ---
+    if str_starts_with(@text, "/b64enc ")
+        return cmd_b64enc(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/b64dec ")
+        return cmd_b64dec(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/hexenc ")
+        return cmd_hexenc(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/hexdec ")
+        return cmd_hexdec(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/urlenc ")
+        return cmd_urlenc(@token, @chat_id, _arg_after(@text))
+    if str_starts_with(@text, "/urldec ")
+        return cmd_urldec(@token, @chat_id, _arg_after(@text))
+
+    # --- world ---
+    if str_starts_with(@text, "/weather ")
+        return cmd_weather(@token, @chat_id, _arg_after(@text))
+    if str_eq(@text, "/quote")
+        return cmd_quote(@token, @chat_id)
+    if str_eq(@text, "/catfact")
+        return cmd_catfact(@token, @chat_id)
+    if str_eq(@text, "/btc")
+        return cmd_btc(@token, @chat_id)
+    if str_eq(@text, "/eth")
+        return cmd_eth(@token, @chat_id)
+    if str_starts_with(@text, "/ip ")
+        return cmd_ip(@token, @chat_id, _arg_after(@text))
+    if str_eq(@text, "/myip")
+        return cmd_myip(@token, @chat_id)
+    if str_eq(@text, "/joke")
+        return cmd_joke(@token, @chat_id)
+
+    # --- notes ---
+    if str_starts_with(@text, "/note ")
+        return cmd_note_add(@token, @chat_id, _arg_after(@text))
+    if str_eq(@text, "/notes")
+        return cmd_notes(@token, @chat_id)
+    if str_eq(@text, "/clearnotes")
+        return cmd_clearnotes(@token, @chat_id)
+
+    # --- default: echo ---
+    send_message(@token, @chat_id, str_concat("luna echo: ", @text))
+    return 0

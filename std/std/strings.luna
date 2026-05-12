@@ -1,0 +1,260 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/strings — pure-Luna string helpers for bootminor.
+#
+# Built on top of the bootminor prelude (str_len, str_byte,
+# str_set_byte, str_concat, str_substr, new_str, int_to_str, str_eq).
+# All functions use 0-based byte indexing; non-ASCII bytes are passed
+# through verbatim (no UTF-8 decoding here).
+#
+# Naming convention: shipped helpers are `str_*` so they read like
+# the prelude builtins.
+
+
+# str_starts_with(@s, @prefix) -> 1 if @s begins with @prefix, else 0.
+fn str_starts_with(@s: int, @prefix: int) -> int
+    @ls = str_len(@s)
+    @lp = str_len(@prefix)
+    if @lp > @ls
+        return 0
+    @i = 0
+    while @i < @lp
+        if str_byte(@s, @i) != str_byte(@prefix, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+# str_ends_with(@s, @suffix) -> 1 if @s ends with @suffix, else 0.
+fn str_ends_with(@s: int, @suffix: int) -> int
+    @ls = str_len(@s)
+    @lp = str_len(@suffix)
+    if @lp > @ls
+        return 0
+    @i = 0
+    while @i < @lp
+        if str_byte(@s, @ls - @lp + @i) != str_byte(@suffix, @i)
+            return 0
+        @i = @i + 1
+    return 1
+
+# str_index_byte(@s, @b) -> first index of byte @b in @s, or -1.
+fn str_index_byte(@s: int, @b: int) -> int
+    @n = str_len(@s)
+    @i = 0
+    while @i < @n
+        if str_byte(@s, @i) == @b
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
+# str_index_of(@s, @sub) -> first index of substring @sub in @s, or -1.
+# Empty needle returns 0 (matches Python/Go semantics).
+fn str_index_of(@s: int, @sub: int) -> int
+    @ns = str_len(@s)
+    @nu = str_len(@sub)
+    if @nu == 0
+        return 0
+    if @nu > @ns
+        return 0 - 1
+    @i = 0
+    while @i + @nu <= @ns
+        @j = 0
+        @match = 1
+        while @j < @nu
+            if str_byte(@s, @i + @j) != str_byte(@sub, @j)
+                @match = 0
+                break
+            @j = @j + 1
+        if @match == 1
+            return @i
+        @i = @i + 1
+    return 0 - 1
+
+# str_contains(@s, @sub) -> 1 if @s contains @sub, else 0.
+fn str_contains(@s: int, @sub: int) -> int
+    if str_index_of(@s, @sub) >= 0
+        return 1
+    return 0
+
+# str_to_upper(@s) -> new heap string with ASCII a-z mapped to A-Z.
+fn str_to_upper(@s: int) -> int
+    @n = str_len(@s)
+    @out = new_str(@n)
+    @i = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c >= 97
+            if @c <= 122
+                @c = @c - 32
+        str_set_byte(@out, @i, @c)
+        @i = @i + 1
+    return @out
+
+# str_to_lower(@s) -> new heap string with ASCII A-Z mapped to a-z.
+fn str_to_lower(@s: int) -> int
+    @n = str_len(@s)
+    @out = new_str(@n)
+    @i = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c >= 65
+            if @c <= 90
+                @c = @c + 32
+        str_set_byte(@out, @i, @c)
+        @i = @i + 1
+    return @out
+
+# Returns 1 if @c is ASCII whitespace (space, tab, CR, LF), else 0.
+fn _str_is_ws(@c: int) -> int
+    if @c == 32
+        return 1
+    if @c == 9
+        return 1
+    if @c == 10
+        return 1
+    if @c == 13
+        return 1
+    return 0
+
+# str_trim(@s) -> @s with leading and trailing whitespace stripped.
+fn str_trim(@s: int) -> int
+    @n = str_len(@s)
+    @start = 0
+    while @start < @n
+        if _str_is_ws(str_byte(@s, @start)) == 0
+            break
+        @start = @start + 1
+    @end = @n
+    while @end > @start
+        if _str_is_ws(str_byte(@s, @end - 1)) == 0
+            break
+        @end = @end - 1
+    return str_substr(@s, @start, @end - @start)
+
+# str_split(@s, @sep_byte) -> Vec<int> of substrings.
+# A trailing separator yields a trailing empty string, matching split
+# semantics in Go/Rust. The separator is a single byte, not a string.
+fn str_split(@s: int, @sep: int) -> Vec
+    @parts = vec_new()
+    @n = str_len(@s)
+    @start = 0
+    @i = 0
+    while @i < @n
+        if str_byte(@s, @i) == @sep
+            vec_push(@parts, str_substr(@s, @start, @i - @start))
+            @start = @i + 1
+        @i = @i + 1
+    vec_push(@parts, str_substr(@s, @start, @n - @start))
+    return @parts
+
+# str_join(@parts, @sep) -> single string with @sep between Vec entries.
+fn str_join(@parts: Vec, @sep: int) -> int
+    @n = vec_len(@parts)
+    if @n == 0
+        return ""
+    @out = vec_get(@parts, 0)
+    @i = 1
+    while @i < @n
+        @out = str_concat(@out, @sep)
+        @out = str_concat(@out, vec_get(@parts, @i))
+        @i = @i + 1
+    return @out
+
+# str_replace(@s, @from, @to) -> @s with every occurrence of @from
+# replaced by @to. Empty @from returns @s unchanged.
+fn str_replace(@s: int, @from: int, @to: int) -> int
+    @nf = str_len(@from)
+    if @nf == 0
+        return @s
+    @ns = str_len(@s)
+    @out = ""
+    @i = 0
+    while @i < @ns
+        if @i + @nf <= @ns
+            @j = 0
+            @match = 1
+            while @j < @nf
+                if str_byte(@s, @i + @j) != str_byte(@from, @j)
+                    @match = 0
+                    break
+                @j = @j + 1
+            if @match == 1
+                @out = str_concat(@out, @to)
+                @i = @i + @nf
+                continue
+        @ch = new_str(1)
+        str_set_byte(@ch, 0, str_byte(@s, @i))
+        @out = str_concat(@out, @ch)
+        @i = @i + 1
+    return @out
+
+# parse_int(@s) -> integer value parsed from leading sign + decimal
+# digits. Returns 0 if @s has no leading digits (lossy: distinguish
+# from "0" via parse_int_strict).
+fn parse_int(@s: int) -> int
+    @n = str_len(@s)
+    @i = 0
+    @neg = 0
+    if @i < @n
+        @c = str_byte(@s, @i)
+        if @c == 45
+            @neg = 1
+            @i = @i + 1
+        elif @c == 43
+            @i = @i + 1
+    @val = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c < 48
+            break
+        if @c > 57
+            break
+        @val = @val * 10 + (@c - 48)
+        @i = @i + 1
+    if @neg == 1
+        return 0 - @val
+    return @val
+
+# parse_int_strict(@s, @out_ok) -> integer value, with @out_ok set to
+# 1 if @s was a valid int (sign optional, digits only) or 0 otherwise.
+# @out_ok must be a 1-byte heap buffer the caller provides.
+fn parse_int_strict(@s: int, @out_ok: int) -> int
+    @n = str_len(@s)
+    @i = 0
+    @neg = 0
+    if @i < @n
+        @c = str_byte(@s, @i)
+        if @c == 45
+            @neg = 1
+            @i = @i + 1
+        elif @c == 43
+            @i = @i + 1
+    if @i >= @n
+        u8_set(@out_ok, 0, 0)
+        return 0
+    @val = 0
+    while @i < @n
+        @c = str_byte(@s, @i)
+        if @c < 48
+            u8_set(@out_ok, 0, 0)
+            return 0
+        if @c > 57
+            u8_set(@out_ok, 0, 0)
+            return 0
+        @val = @val * 10 + (@c - 48)
+        @i = @i + 1
+    u8_set(@out_ok, 0, 1)
+    if @neg == 1
+        return 0 - @val
+    return @val
+
+# str_repeat(@s, @n) -> @s concatenated with itself @n times.
+fn str_repeat(@s: int, @n: int) -> int
+    @out = ""
+    @i = 0
+    while @i < @n
+        @out = str_concat(@out, @s)
+        @i = @i + 1
+    return @out

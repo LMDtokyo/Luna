@@ -1,0 +1,107 @@
+# tier: T4
+# deps:
+# ffi: none
+#
+# std/std/time — Unix time + ISO 8601 formatting.
+#
+# Public surface:
+#   time_now()                  -> seconds since 1970-01-01 UTC
+#   time_format_iso(@ts)        -> "2026-05-11T05:35:10Z"
+#   time_format_date(@ts)       -> "2026-05-11"
+#
+# Date math is Howard Hinnant's "civil from days" algorithm, which is
+# branch-light, leap-year correct for any year, and easy to verify by
+# eye. See https://howardhinnant.github.io/date_algorithms.html
+
+
+fn time_now() -> int
+    return sys_time(0)
+
+
+# _time_put_uint(@buf, @off, @n, @width) — write @n as decimal with
+# leading zeros to fill @width. Returns @off + @width.
+fn _time_put_uint(@buf: int, @off: int, @n: int, @width: int) -> int
+    @i = @width - 1
+    while @i >= 0
+        str_set_byte(@buf, @off + @i, 48 + (@n % 10))
+        @n = @n / 10
+        @i = @i - 1
+    return @off + @width
+
+
+# _time_civil(@days, @out_buf) — fills @out_buf[0..3] with [year_hi, year_lo, month, day]
+# where year_hi*256+year_lo is the year. Uses u32_set so values up to
+# 2^32 fit cleanly.
+#
+# Returns 0; caller reads via u32_at.
+fn _time_civil(@days: int, @out: int) -> int
+    @z = @days + 719468
+    @era = @z / 146097
+    if @z < 0
+        @era = (@z - 146096) / 146097
+    @doe = @z - @era * 146097
+    @yoe = (@doe - @doe / 1460 + @doe / 36524 - @doe / 146096) / 365
+    @y = @yoe + @era * 400
+    @doy = @doe - (365 * @yoe + @yoe / 4 - @yoe / 100)
+    @mp = (5 * @doy + 2) / 153
+    @d = @doy - (153 * @mp + 2) / 5 + 1
+    if @mp < 10
+        @m = @mp + 3
+    else
+        @m = @mp - 9
+        @y = @y + 1
+    u32_set(@out, 0, @y)
+    u32_set(@out, 4, @m)
+    u32_set(@out, 8, @d)
+    return 0
+
+
+# time_format_iso(@ts) -> "YYYY-MM-DDTHH:MM:SSZ", always 20 bytes.
+fn time_format_iso(@ts: int) -> int
+    @days        = @ts / 86400
+    @sec_of_day  = @ts % 86400
+    if @sec_of_day < 0
+        @sec_of_day = @sec_of_day + 86400
+        @days = @days - 1
+    @hh = @sec_of_day / 3600
+    @mm = (@sec_of_day % 3600) / 60
+    @ss = @sec_of_day % 60
+
+    @civ = new_str(12)
+    _time_civil(@days, @civ)
+    @y = u32_at(@civ, 0)
+    @m = u32_at(@civ, 4)
+    @d = u32_at(@civ, 8)
+
+    @out = new_str(20)
+    @off = _time_put_uint(@out, 0, @y, 4)
+    str_set_byte(@out, @off, 45)            # '-'
+    @off = _time_put_uint(@out, @off + 1, @m, 2)
+    str_set_byte(@out, @off, 45)            # '-'
+    @off = _time_put_uint(@out, @off + 1, @d, 2)
+    str_set_byte(@out, @off, 84)            # 'T'
+    @off = _time_put_uint(@out, @off + 1, @hh, 2)
+    str_set_byte(@out, @off, 58)            # ':'
+    @off = _time_put_uint(@out, @off + 1, @mm, 2)
+    str_set_byte(@out, @off, 58)            # ':'
+    @off = _time_put_uint(@out, @off + 1, @ss, 2)
+    str_set_byte(@out, @off, 90)            # 'Z'
+    return @out
+
+
+# time_format_date(@ts) -> "YYYY-MM-DD", 10 bytes.
+fn time_format_date(@ts: int) -> int
+    @days = @ts / 86400
+    @civ = new_str(12)
+    _time_civil(@days, @civ)
+    @y = u32_at(@civ, 0)
+    @m = u32_at(@civ, 4)
+    @d = u32_at(@civ, 8)
+
+    @out = new_str(10)
+    @off = _time_put_uint(@out, 0, @y, 4)
+    str_set_byte(@out, @off, 45)
+    @off = _time_put_uint(@out, @off + 1, @m, 2)
+    str_set_byte(@out, @off, 45)
+    @off = _time_put_uint(@out, @off + 1, @d, 2)
+    return @out

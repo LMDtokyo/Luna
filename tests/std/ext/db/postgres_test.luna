@@ -1,0 +1,125 @@
+# Tests for std/ext/db/postgres. Connects to 127.0.0.1:15432 against a
+# sandbox cluster started by postgres_e2e.sh (trust auth). If no server
+# is reachable on that port we emit a zero-tally summary so run_all
+# treats the file as a clean skip.
+
+import postgres
+import test
+
+
+fn _pg_port() -> int
+    return 15432
+
+
+fn _pg_user() -> int
+    return "lunatest"
+
+
+fn _pg_db() -> int
+    return "lunatest"
+
+
+fn run_postgres_tests(@p: int, @f: int) -> int
+    @r = 0
+
+    @conn = pg_connect("127.0.0.1", _pg_port(), _pg_db(), _pg_user(), "")
+    if @conn < 0
+        shine("[postgres] skip (no postgres on 127.0.0.1:15432)")
+        test_summary("postgres", 0, 0)
+        return 0
+
+    # Clean slate — the table may exist from a previous (failed) run.
+    pg_exec(@conn, "DROP TABLE IF EXISTS luna_t")
+
+    # 1. DDL via pg_exec — CommandComplete has no row count, returns 0.
+    @rc = pg_exec(@conn, "CREATE TABLE luna_t (id int, name text)")
+    @r = assert_eq_int("create table", @rc, 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 2. Single INSERT — affected_rows = 1.
+    @rc = pg_exec(@conn, "INSERT INTO luna_t VALUES (1, 'alice')")
+    @r = assert_eq_int("insert one", @rc, 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 3. SELECT shape — 1 row, 2 cols.
+    @res = pg_query(@conn, "SELECT id, name FROM luna_t")
+    @r = assert_eq_int("rows=1", pg_rows(@res), 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_int("cols=2", pg_cols(@res), 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 4. Cell values come back as text (decimal for ints).
+    @r = assert_eq_str("v[0][0]=1",     pg_value(@res, 0, 0), "1")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("v[0][1]=alice", pg_value(@res, 0, 1), "alice")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 5. Column names from RowDescription.
+    @r = assert_eq_str("col[0]=id",   pg_col_name(@res, 0), "id")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    @r = assert_eq_str("col[1]=name", pg_col_name(@res, 1), "name")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 6. pg_error should be empty on a successful query.
+    @r = assert_eq_str("no error", pg_error(@res), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    pg_free(@res)
+
+    # 7. UPDATE and DELETE affected_rows.
+    @rc = pg_exec(@conn, "INSERT INTO luna_t VALUES (2, 'bob'), (3, 'carol')")
+    @r = assert_eq_int("insert two", @rc, 2)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    @rc = pg_exec(@conn, "UPDATE luna_t SET name = 'BOB' WHERE id = 2")
+    @r = assert_eq_int("update one", @rc, 1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 8. pg_scalar — COUNT(*) returns "3" as text.
+    @r = assert_eq_str("count=3", pg_scalar(@conn, "SELECT COUNT(*) FROM luna_t"), "3")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    # 9. NULL cells come back as "" (MVP behaviour, documented).
+    pg_exec(@conn, "INSERT INTO luna_t VALUES (4, NULL)")
+    @res = pg_query(@conn, "SELECT name FROM luna_t WHERE id = 4")
+    @r = assert_eq_str("null -> ''", pg_value(@res, 0, 0), "")
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    pg_free(@res)
+
+    # 10. Bad SQL — pg_error is non-empty.
+    @res = pg_query(@conn, "SELECT * FROM no_such_table_xyz")
+    @r = assert_true("error on bad sql", str_len(pg_error(@res)) > 0)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+    pg_free(@res)
+
+    # Cleanup.
+    pg_exec(@conn, "DROP TABLE luna_t")
+
+    # 11. After pg_close, pg_query returns -1.
+    pg_close(@conn)
+    @r = assert_eq_int("query after close = -1", pg_query(@conn, "SELECT 1"), -1)
+    @p = @p + @r
+    @f = @f + (1 - @r)
+
+    test_summary("postgres", @p, @f)
+    if @f > 0
+        return 1
+    return 0
+
+
+fn main() -> int
+    return run_postgres_tests(0, 0)

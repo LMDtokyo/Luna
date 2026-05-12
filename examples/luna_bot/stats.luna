@@ -1,0 +1,35 @@
+# stats.luna — tiny file-backed counter store.
+#
+# The bot wants persistent state (message counter, started_at) that
+# survives restarts. Everything sits under /tmp/luna_bot_*. One key
+# per file keeps reads/writes simple — no need for a full DB layer.
+
+
+fn _stats_path() -> int
+    return "/tmp/luna_bot_stat"
+
+# Build the on-disk path for a key: /tmp/luna_bot_stat_<key>.
+fn _stat_file(@key: int) -> int
+    @p = str_concat(_stats_path(), "_")
+    return str_concat(@p, @key)
+
+fn _stat_get(@key: int) -> int
+    @v = read_file(_stat_file(@key))
+    if @v == 0
+        return 0
+    if str_len(@v) == 0
+        return 0
+    return parse_int(str_trim(@v))
+
+fn _stat_set(@key: int, @v: int) -> int
+    write_file(_stat_file(@key), int_to_str(@v))
+    return 0
+
+fn _stat_inc(@key: int) -> int
+    @v = _stat_get(@key) + 1
+    _stat_set(@key, @v)
+    return @v
+
+# Per-chat notes path. One file per chat_id, lines separated by '\n'.
+fn _notes_path(@chat_id: int) -> int
+    return str_concat("/tmp/luna_bot_notes_", int_to_str(@chat_id))
